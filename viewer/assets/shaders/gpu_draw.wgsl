@@ -127,25 +127,10 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
 fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let m = materials[o.material_index];
 
-    // --- Pass class-discard (M3b1) ----------------------------------------------
-    // The SAME shader compiles into two pipelines discriminated by the BLEND_PASS shader_def.
-    // Each pass draws only its own material class; the other class is discarded HERE.
-    // This MUST be lexically BEFORE the top-level textureSample below: `discard` needs no
-    // implicit derivatives and does not introduce non-uniform control flow for the sample that
-    // follows, so naga's uniformity requirement on textureSample is preserved. (Do NOT move the
-    // sample into a branch or after a non-uniform guard.)
-    let is_blend = (m.flags & MAT_FLAG_BLEND) != 0u;
-#ifdef BLEND_PASS
-    // BLEND pipeline: keep ONLY blend materials (decal/glass/water/alphaMode=BLEND).
-    if (!is_blend) {
-        discard;
-    }
-#else
-    // OPAQUE pipeline: keep everything EXCEPT blend materials (cutout stays here).
-    if (is_blend) {
-        discard;
-    }
-#endif
+    // The pass class-discard is done AFTER the albedo sample below (Codex P0): a non-uniform
+    // `discard` placed BEFORE textureSample makes the sample's implicit derivatives non-uniform
+    // and FAILS naga validation, so both pipelines would fail to create. Sample first (uniform
+    // control flow), THEN discard the wrong material class.
 
     // --- Albedo -----------------------------------------------------------------
     // Sample with the RAW baked vertex UV. Per manifest.conventions for this pack:
@@ -164,6 +149,15 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // (guarded Rust-side); that feature covers the non-uniform INDEX, not non-uniform control flow.
     let idx = select(0u, m.albedo_index, has_albedo);
     let tex = textureSample(albedo_tex[idx], albedo_samp, o.uv);
+
+    // Pass class-discard (M3b1) — AFTER the sample above (Codex P0). Each pass keeps only its
+    // class; the discard is fine here because no derivative-requiring op follows it.
+    let is_blend = (m.flags & MAT_FLAG_BLEND) != 0u;
+#ifdef BLEND_PASS
+    if (!is_blend) { discard; } // BLEND pipeline: keep only decal/glass/water/alphaMode=BLEND
+#else
+    if (is_blend) { discard; }  // OPAQUE pipeline: keep everything except BLEND (cutout stays)
+#endif
 
     var albedo = m.tint; // untextured (sentinel) -> tint over implicit white
     if (has_albedo) {

@@ -28,6 +28,10 @@ Tracking issues deferred during M0–M2. Updated 2026-07-14.
 ## Features (roadmap)
 - [ ] **M3 textures/materials** (IN PROGRESS): bindless albedo + cutout first; then normal maps,
   emissive, glass/water, MicroSplat vert-paint terrain, SH-GI volume, EFT grade LUT.
+- [ ] **M3b2 transparency polish** (Codex-flagged during M3b1, deferred — not among the 4 reported bugs):
+  (a) back-to-front **sorting / OIT** for overlapping transparents (glass-behind-glass, stacked decals) — the blend pass is one unsorted multi-draw, so overlapping blend order is undefined;
+  (b) **restrict the decal depth-bias to decals only** — glass/water currently share the positive bias and can bleed through geometry near opaque intersections (split decal vs non-decal blend pipeline, or a MAT_FLAG_DECAL sub-pass);
+  (c) full **`vp` 3-layer splat** for tire-track/road detail; (d) **animated water** (flow/normal — needs new material params).
 - [ ] **On-screen FPS / HUD**. FPS is console-only (`LogDiagnosticsPlugin`). Add an on-screen counter
   (the `egui` overlay is behind the non-default `egui` feature).
 - [ ] **All 38 maps**. Only the Interchange `.eftpack` is built; wire per-map pack builds (one at a
