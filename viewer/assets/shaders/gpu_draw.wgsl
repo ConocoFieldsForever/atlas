@@ -1,4 +1,4 @@
-// eft::gpu_draw â€” M2 GPU-driven indirect surface shader, M3 textured.
+// eft::gpu_draw â€” M2 GPU-driven indirect surface shader, M3 textured, M3b1 BLEND.
 //
 // The M2 counterpart of instancing_m0.wgsl. Instead of instance-rate vertex attributes,
 // the per-instance affine is FETCHED from a GPU-resident storage buffer, indexed through
@@ -25,6 +25,19 @@
 //   stage passes the id @interpolate(flat) to the fragment, which indexes the material table SSBO
 //   -> a bindless albedo texture. flat is REQUIRED: a u32 cannot be perspective-interpolated.
 //
+// M3b1 BLEND (this file specializes into TWO pipelines off ONE source):
+//   The material `flags` now also carry bit1 = MAT_FLAG_BLEND (role âˆˆ {decal,glass,water} or
+//   alphaMode=BLEND, set in build_cpu_data). The Rust `specialize()` compiles this shader TWICE
+//   with the same entry points, discriminated by the `BLEND_PASS` shader_def:
+//     * OPAQUE build (no BLEND_PASS): discards BLEND materials, writes depth, outputs alpha 1.0.
+//     * BLEND  build (BLEND_PASS defined): discards non-BLEND (opaque/cutout) materials, no depth
+//       write, alpha-blends, outputs the REAL computed albedo.a (tex.a*tint.a, or tint.a
+//       untextured). Both ride the ONE Transparent3d pass; the opaque item is enqueued at a large
+//       negative distance so it runs FIRST and lays down depth the blend item tests against.
+//   SHADER_DEF NAME: "BLEND_PASS" (Rust must push ShaderDefVal "BLEND_PASS" into the FragmentState
+//   shader_defs iff key.blend_pass). The class-discard is LEXICALLY BEFORE the top-level
+//   textureSample so naga uniformity is preserved (the sample stays in uniform control flow).
+//
 // group(0) = Bevy's mesh view bind group (reused via SetMeshViewBindGroup<0> so
 // position_world_to_clip resolves). group(1) = our two instance/visible storage buffers.
 // group(2) = M3 material table + bindless albedo array + sampler (see Rust `material_layout`).
@@ -46,10 +59,11 @@ struct InstanceGpu {
 // 48 bytes, 16-aligned. Matches the Rust `MaterialGpu` POD.
 //   albedo_index : index into `albedo_tex`; 0xFFFFFFFF sentinel = untextured (use tint/white).
 //   flags        : bit0 = cutout (role=cutout / alphaMode=MASK) -> discard when alpha < cutoff.
+//                  bit1 = blend  (role âˆˆ {decal,glass,water} / alphaMode=BLEND) -> BLEND pass.
 //   alpha_cutoff : PER-MATERIAL cutoff (NOT a global 0.5).
 //   uv_xform     : (sx,sy,ox,oy) REFERENCE ONLY â€” tiling is already baked into the vertex UVs
 //                  (manifest.conventions.uvTilingBaked=true). Do NOT apply it (double-tile trap).
-//   tint         : linear rgba; rgb multiplies albedo (a is for the deferred BLEND path).
+//   tint         : linear rgba; rgb multiplies albedo. a is the BLEND-pass opacity (M3b1: used).
 struct MaterialGpu {
     albedo_index: u32,
     flags: u32,
@@ -61,6 +75,7 @@ struct MaterialGpu {
 
 const MAT_ALBEDO_NONE: u32 = 0xFFFFFFFFu; // sentinel: material has no albedo texture
 const MAT_FLAG_CUTOUT: u32 = 1u;          // bit0: alpha-tested (MASK) surface
+const MAT_FLAG_BLEND: u32 = 2u;           // bit1: alpha-blended (decal/glass/water/BLEND) surface
 
 @group(2) @binding(0) var<storage, read> materials: array<MaterialGpu>;
 @group(2) @binding(1) var albedo_tex: binding_array<texture_2d<f32>>;
@@ -112,6 +127,26 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
 fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let m = materials[o.material_index];
 
+    // --- Pass class-discard (M3b1) ----------------------------------------------
+    // The SAME shader compiles into two pipelines discriminated by the BLEND_PASS shader_def.
+    // Each pass draws only its own material class; the other class is discarded HERE.
+    // This MUST be lexically BEFORE the top-level textureSample below: `discard` needs no
+    // implicit derivatives and does not introduce non-uniform control flow for the sample that
+    // follows, so naga's uniformity requirement on textureSample is preserved. (Do NOT move the
+    // sample into a branch or after a non-uniform guard.)
+    let is_blend = (m.flags & MAT_FLAG_BLEND) != 0u;
+#ifdef BLEND_PASS
+    // BLEND pipeline: keep ONLY blend materials (decal/glass/water/alphaMode=BLEND).
+    if (!is_blend) {
+        discard;
+    }
+#else
+    // OPAQUE pipeline: keep everything EXCEPT blend materials (cutout stays here).
+    if (is_blend) {
+        discard;
+    }
+#endif
+
     // --- Albedo -----------------------------------------------------------------
     // Sample with the RAW baked vertex UV. Per manifest.conventions for this pack:
     //   uvVFlipBaked = true  -> V is already flipped; do NOT do 1.0 - uv.y (upside-down trap).
@@ -136,7 +171,8 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     }
 
     // Cutout / alpha-test (role=cutout, alphaMode=MASK). Per-material cutoff. discard needs no
-    // derivatives, so a non-uniform branch here is fine.
+    // derivatives, so a non-uniform branch here is fine. (Cutout is an OPAQUE-pass material â€”
+    // BLEND_PASS never reaches it because the class-discard above already dropped non-blend.)
     // Alpha-test on the COMPUTED albedo.a (tex.a*tint.a, or tint.a when untextured) so an
     // untextured cutout with tint.a < cutoff still discards (Codex P2), not just textured ones.
     if ((m.flags & MAT_FLAG_CUTOUT) != 0u && albedo.a < m.alpha_cutoff) {
@@ -152,5 +188,14 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let ndl = clamp(dot(n, key), 0.0, 1.0);
     let ambient = 0.28;
     let lit = albedo.rgb * (ambient + (1.0 - ambient) * ndl);
+
+#ifdef BLEND_PASS
+    // BLEND pass: emit the REAL computed opacity. albedo.a = tex.a*tint.a (textured) or tint.a
+    // (untextured water/glass/decal). Non-premultiplied to match the pipeline's
+    // BlendState::ALPHA_BLENDING (src=SrcAlpha, dst=OneMinusSrcAlpha), i.e. Unity _Color*_MainTex.
+    return vec4<f32>(lit, albedo.a);
+#else
+    // OPAQUE pass: fully opaque (blend materials were already discarded above).
     return vec4<f32>(lit, 1.0);
+#endif
 }

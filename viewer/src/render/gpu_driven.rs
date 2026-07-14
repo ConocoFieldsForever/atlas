@@ -55,7 +55,8 @@ use bevy::render::{
             sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
             uniform_buffer_sized,
         },
-        AddressMode, BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer,
+        AddressMode, BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
+        BlendState, Buffer,
         BufferDescriptor, BufferInitDescriptor, BufferUsages, CachedComputePipelineId,
         ColorTargetState, ColorWrites, CompareFunction,
         ComputePassDescriptor, ComputePipelineDescriptor, DepthBiasState, DepthStencilState,
@@ -161,6 +162,10 @@ pub struct GpuMaterial {
 pub const NO_ALBEDO: u32 = 0xFFFF_FFFF;
 /// `GpuMaterial::flags` bit: cutout (alpha-test discard).
 pub const MAT_FLAG_CUTOUT: u32 = 1 << 0;
+/// `GpuMaterial::flags` bit: BLEND transparency (role decal/glass/water or alphaMode=BLEND).
+/// Drawn in the P2 blend specialization (alpha blending, depth-write off); DISCARDED by the
+/// P1 opaque specialization. Disjoint from CUTOUT (cutout stays opaque-pass). See M3b1.
+pub const MAT_FLAG_BLEND: u32 = 1 << 1;
 
 // ===========================================================================
 // Frustum plane extraction (Gribbâ€“Hartmann). Planes point INWARD; a sphere is
@@ -364,11 +369,21 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             }),
             _ => NO_ALBEDO,
         };
-        // M3 v1 scope: opaque + cutout. role=cutout / alphaMode=MASK -> alpha-test discard.
-        // BLEND (glass/water/decal) deferred to M3b: rendered opaque here (no cutout bit).
+        // Material class flags. CUTOUT (role=cutout / alphaMode=MASK) -> alpha-test discard,
+        // stays in the OPAQUE (P1) pass. BLEND (M3b1: role decal/glass/water OR alphaMode=BLEND)
+        // -> the P2 alpha-blended pass (depth-write off). The two bits are disjoint: the P1
+        // opaque specialization discards BLEND, the P2 blend specialization discards non-BLEND,
+        // so a material authored as both cutout+blend would only ever draw in P2.
         let mut flags = 0u32;
         if mat.role == "cutout" || mat.alpha_mode == "MASK" {
             flags |= MAT_FLAG_CUTOUT;
+        }
+        if mat.role == "decal"
+            || mat.role == "glass"
+            || mat.role == "water"
+            || mat.alpha_mode == "BLEND"
+        {
+            flags |= MAT_FLAG_BLEND;
         }
         materials_gpu.push(GpuMaterial {
             albedo_index,
@@ -964,7 +979,7 @@ fn upload_frustum(
     render_queue.write_buffer(&buffers.cull_uniform, 0, bytemuck::bytes_of(&uniform));
 }
 
-// ---- QueueMeshes: specialize the draw pipeline + add ONE phase item ----------
+// ---- QueueMeshes: specialize both passes + add the TWO phase items ----------
 fn queue_gpu_driven(
     draw_functions: Res<DrawFunctions<Transparent3d>>,
     mut pipelines: ResMut<SpecializedRenderPipelines<EftDrawPipeline>>,
@@ -997,18 +1012,47 @@ fn queue_gpu_driven(
         let Some(phase) = transparent_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
-        let key = EftDrawKey {
-            samples: msaa.samples(),
-            hdr: view.hdr,
-        };
-        let pipeline = pipelines.specialize(&pipeline_cache, &draw_pipeline, key);
+        // M3b1: TWO specializations of the same shader/mesh, selected by `blend_pass`.
+        // They must be distinct keys so the cache yields two distinct pipeline ids.
+        let opaque_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey {
+                samples: msaa.samples(),
+                hdr: view.hdr,
+                blend_pass: false,
+            },
+        );
+        let blend_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey {
+                samples: msaa.samples(),
+                hdr: view.hdr,
+                blend_pass: true,
+            },
+        );
 
         for (entity, main_entity) in &markers {
+            // Transparent3d sorts ASCENDING by distance (values increase toward the camera), so
+            // the OPAQUE item at a large NEGATIVE distance runs FIRST and writes depth; the BLEND
+            // item at ~0.0 runs after and depth-tests against that. Both share the same draw_fn /
+            // multi-draw command and differ ONLY by pipeline (P1 discards BLEND mats, P2 discards
+            // the rest), so each pass draws exactly its material class in one multi_draw.
             phase.add(Transparent3d {
                 entity: (entity, *main_entity),
-                pipeline,
+                pipeline: opaque_pipeline,
                 draw_function: draw_fn,
-                distance: 0.0,
+                distance: -1.0e30, // sort FIRST (writes depth)
+                batch_range: 0..1,
+                extra_index: PhaseItemExtraIndex::None,
+                indexed: true,
+            });
+            phase.add(Transparent3d {
+                entity: (entity, *main_entity),
+                pipeline: blend_pipeline,
+                draw_function: draw_fn,
+                distance: 0.0, // sort AFTER opaque (depth-tests against P1's writes)
                 batch_range: 0..1,
                 extra_index: PhaseItemExtraIndex::None,
                 indexed: true,
@@ -1021,6 +1065,11 @@ fn queue_gpu_driven(
 struct EftDrawKey {
     samples: u32,
     hdr: bool,
+    /// M3b1 pass selector. `false` = P1 OPAQUE specialization (blend None, depth-write on,
+    /// default bias, discards BLEND materials). `true` = P2 BLEND specialization (alpha
+    /// blending, depth-write OFF, toward-camera depth bias, `BLEND_PASS` shader_def, discards
+    /// non-BLEND materials). MUST be part of Hash/Eq so P1 and P2 cache as SEPARATE pipelines.
+    blend_pass: bool,
 }
 
 impl SpecializedRenderPipeline for EftDrawPipeline {
@@ -1048,8 +1097,49 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             .clone()
             .expect("EftDrawPipeline.material_layout must be set before specialize (M3)");
 
+        // --- M3b1 pass-dependent state -----------------------------------------------
+        // P2 (blend_pass) uses non-premultiplied alpha blending (matches Unity _Color*_MainTex),
+        // turns OFF depth-write (transparents must not occlude each other or later opaques), and
+        // nudges decals TOWARD the camera under reverse-z so they win the coplanar z-test against
+        // the ground they lie on. P1 (opaque) keeps the original opaque state exactly.
+        let (blend, depth_write_enabled, bias, frag_defs): (
+            Option<BlendState>,
+            bool,
+            DepthBiasState,
+            Vec<bevy::shader::ShaderDefVal>,
+        ) = if key.blend_pass {
+            (
+                Some(BlendState::ALPHA_BLENDING),
+                false,
+                // Depth bias for coplanar decals under Bevy REVERSE-Z (near=1.0, far=0.0,
+                // depth_compare GreaterEqual). The rasterizer bias is ADDED to window-space depth
+                // [0,1]; a POSITIVE bias INCREASES depth = pulls the fragment TOWARD the camera
+                // (larger reverse-z value), so the decal beats the coplanar ground P1 wrote and
+                // passes GreaterEqual. (This matches Bevy StandardMaterial: positive depth bias
+                // renders "closer to the camera".) A negative bias would push decals BEHIND the
+                // ground and drop them.
+                // TODO(M3b1 depth-bias magnitude): CORE_3D_DEPTH_FORMAT is Depth32Float, so the
+                // `constant` unit scales with the polygon's depth exponent and huge Tarkov map
+                // distances can make constant:2 too weak. If road markings still z-fight after the
+                // first visual test, RAISE magnitude (constant: 4..16 and/or slope_scale: 2.0..4.0),
+                // keeping BOTH positive. Do NOT flip to negative â€” that hides decals entirely.
+                DepthBiasState {
+                    constant: 2,
+                    slope_scale: 1.0,
+                    clamp: 0.0,
+                },
+                vec!["BLEND_PASS".into()],
+            )
+        } else {
+            (None, true, DepthBiasState::default(), vec![])
+        };
+
         RenderPipelineDescriptor {
-            label: Some("eft_gpu_draw".into()),
+            label: Some(if key.blend_pass {
+                "eft_gpu_draw_blend".into()
+            } else {
+                "eft_gpu_draw_opaque".into()
+            }),
             layout: vec![view_layout, self.ssbo_layout.clone(), material_layout],
             push_constant_ranges: vec![],
             vertex: VertexState {
@@ -1092,11 +1182,13 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             },
             depth_stencil: Some(DepthStencilState {
                 format: CORE_3D_DEPTH_FORMAT,
-                depth_write_enabled: true,
-                // Bevy uses reverse-z; opaque geometry compares GreaterEqual.
+                // P1 opaque writes depth; P2 blend reads it but does NOT write (see above).
+                depth_write_enabled,
+                // Bevy uses reverse-z; both passes compare GreaterEqual (blend still depth-TESTS
+                // against the depth P1 wrote â€” both ride the one transparent pass that LOADS depth).
                 depth_compare: CompareFunction::GreaterEqual,
                 stencil: StencilState::default(),
-                bias: DepthBiasState::default(),
+                bias,
             }),
             multisample: MultisampleState {
                 count: key.samples,
@@ -1105,11 +1197,13 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
-                shader_defs: vec![],
+                // P2 pushes "BLEND_PASS" so the fragment discards NON-blend materials and outputs
+                // the real computed alpha; P1 has no def and discards BLEND materials, alpha 1.0.
+                shader_defs: frag_defs,
                 entry_point: Some("fragment".into()),
                 targets: vec![Some(ColorTargetState {
                     format,
-                    blend: None,
+                    blend,
                     write_mask: ColorWrites::ALL,
                 })],
             }),
