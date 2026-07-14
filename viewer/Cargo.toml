@@ -1,0 +1,29 @@
+[package]
+name = "eft_viewer"
+version = "0.1.0"
+edition = "2021"
+description = "Native GPU-driven EFT map viewer consuming .eftpack v1 packs"
+publish = false
+
+[dependencies]
+bevy = { workspace = true }
+# NOTE: no direct `wgpu` dep — all GPU types come via `bevy::render` (its
+# re-exports), which guarantees we use the exact wgpu version Bevy vendors and
+# never accidentally link two wgpu versions.
+bytemuck = { workspace = true }
+glam = { workspace = true }
+image = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bevy_egui = { workspace = true, optional = true }
+
+[features]
+# On by default? No — keep the default build robust against bevy_egui version
+# skew. Enable with `cargo run --features egui`.
+default = []
+egui = ["dep:bevy_egui"]
+
+[[bin]]
+name = "eft_viewer"
+path = "src/main.rs"

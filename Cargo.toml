@@ -1,0 +1,36 @@
+# eft_native_viewer — Cargo workspace root
+#
+# Native desktop EFT map viewer (Rust + Bevy, GPU-driven instancing) that
+# CONSUMES the .eftpack v1 packs emitted by assemble_bevy.py. Code-only repo:
+# it references assets IN PLACE under
+# C:\Users\user\beamng_blender_pipeline\eft_assets — nothing is copied here.
+
+[workspace]
+resolver = "2"
+members = ["viewer"]
+
+# Shared, version-pinned dependencies. The engine is LOCKED to the Bevy 0.17
+# era (GPU-driven / best-performance path). wgpu is re-exported by Bevy at
+# bevy::render::render_resource; the standalone `wgpu` pin below MUST match the
+# version Bevy 0.17 vendors (26.x) — see README if a `cargo update` drifts it.
+[workspace.dependencies]
+bevy = { version = "0.17", default-features = true }
+wgpu = "26"
+bytemuck = { version = "1.20", features = ["derive"] }
+glam = { version = "0.30", features = ["bytemuck"] }
+image = "0.25"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# egui overlay is OPTIONAL (behind the `egui` feature) so the default build
+# never blocks on a bevy_egui version that lags a fresh Bevy point release.
+bevy_egui = "0.37"
+
+[profile.dev]
+opt-level = 1          # the loader touches ~100 MB of vertex/instance bytes; keep debug builds usable
+[profile.dev.package."*"]
+opt-level = 3          # always optimize deps (bevy/wgpu/glam) even in dev
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
