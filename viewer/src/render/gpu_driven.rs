@@ -131,12 +131,13 @@ pub struct CullUniform {
 
 /// Stride of one indirect draw record, in bytes.
 pub const DRAW_ARG_STRIDE: u64 = 20;
-/// Interleaved draw vertex stride (M3): pos f32x3 @0 + normal f32x3 @12 + uv f32x2 @24
-/// + material_index u32 @32 = 36 bytes. The u32 material index is written as
-/// `f32::from_bits(material_id)` so vertex_data stays a single `Vec<f32>`; the GPU reads
-/// slot @32 as `Uint32` and recovers the id bit-exact (a pure reinterpretation, NOT a
-/// numeric cast which would corrupt large ids).
-pub const DRAW_VERTEX_STRIDE: u64 = 36;
+/// Interleaved draw vertex stride (M3/M3b2): pos f32x3 @0 + normal f32x3 @12 + uv f32x2 @24
+/// + material_index u32 @32 + color f32x4 @36 = 52 bytes. The u32 material index is written
+/// as `f32::from_bits(material_id)` so vertex_data stays a single `Vec<f32>`; the GPU reads
+/// slot @32 as `Uint32` and recovers the id bit-exact (a pure reinterpretation, NOT a numeric
+/// cast which would corrupt large ids). The trailing f32x4 @36 is the per-vertex COLOR_0
+/// vert-paint weight (interpolated); the SoftCutout road/track feather rides on color.a.
+pub const DRAW_VERTEX_STRIDE: u64 = 52;
 
 /// Per-material GPU record (M3). 48 bytes, 16-aligned. Indexed DIRECTLY by the global
 /// materialId (SubMesh.material_id == materials.json array index for this pack), which the
@@ -147,6 +148,11 @@ pub const DRAW_VERTEX_STRIDE: u64 = 36;
 /// `flags` bit0 = cutout (role=cutout / alphaMode=MASK -> discard albedo.a < alpha_cutoff).
 /// `uv_xform` is REFERENCE ONLY (uvTilingBaked=true: tiling already in the vertex UVs;
 /// the shader must NOT re-apply it). `tint` multiplies albedo.
+///
+/// M3b2: `vp` = `[_AlphaStrength, _Cutoff, _AlphaHeight, 0]` (from `Material.vp.softCutout`;
+/// zeros for non-SoftCutout materials). In the BLEND pass a SoftCutout material's coverage is
+/// `clamp(color.a * vp.x - (vp.y - vp.z), 0, 1)` (feathers roads/tire-tracks into the ground),
+/// NOT tex.a (tex.a is smoothness for that shader family).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct GpuMaterial {
@@ -156,6 +162,8 @@ pub struct GpuMaterial {
     pub _pad: u32,
     pub uv_xform: [f32; 4],
     pub tint: [f32; 4],
+    /// SoftCutout params [_AlphaStrength, _Cutoff, _AlphaHeight, 0]. @48 (16-aligned, size -> 64).
+    pub vp: [f32; 4],
 }
 
 /// `GpuMaterial::albedo_index` sentinel: material has no albedo texture.
@@ -166,6 +174,14 @@ pub const MAT_FLAG_CUTOUT: u32 = 1 << 0;
 /// Drawn in the P2 blend specialization (alpha blending, depth-write off); DISCARDED by the
 /// P1 opaque specialization. Disjoint from CUTOUT (cutout stays opaque-pass). See M3b1.
 pub const MAT_FLAG_BLEND: u32 = 1 << 1;
+/// `GpuMaterial::flags` bit (M3b2): Vert-Paint SoftCutout road/track decal (Custom/Vert Paint
+/// SoftCutout Decal — identified by the `vp.softCutout` param triple). BLEND-pass coverage =
+/// COLOR_0.a modulated by `vp`, NOT tex.a. Feathers the decal into the terrain. Implies BLEND.
+pub const MAT_FLAG_SOFTCUTOUT: u32 = 1 << 2;
+/// `GpuMaterial::flags` bit (M3b2): water/mirror surface (role=="water"). BLEND-pass outputs a
+/// translucent dark wet sheen instead of the white tint fallback (untextured water was WHITE).
+/// Implies BLEND.
+pub const MAT_FLAG_WATER: u32 = 1 << 3;
 
 // ===========================================================================
 // Frustum plane extraction (Gribbâ€“Hartmann). Planes point INWARD; a sphere is
@@ -338,6 +354,24 @@ fn free_cpu_staging(
     }
 }
 
+/// Extract the Vert-Paint SoftCutout params `[_AlphaStrength, _Cutoff, _AlphaHeight, 0]` from a
+/// material's `vp` block. Returns `Some` ONLY for the Custom/Vert Paint SoftCutout Decal family
+/// — identified by the `vp.softCutout` triple being present (there is no separate shader-name
+/// field; this param IS the shader signature). Returns `None` for plain vert-paint-solid (vp
+/// with NO softCutout), for water, and for every non-vp material.
+fn softcutout_params(vp: &Option<crate::eftpack::VertPaint>) -> Option<[f32; 4]> {
+    let arr = vp.as_ref()?.get("softCutout")?.as_array()?;
+    if arr.len() < 3 {
+        return None;
+    }
+    Some([
+        arr[0].as_f64()? as f32,
+        arr[1].as_f64()? as f32,
+        arr[2].as_f64()? as f32,
+        0.0,
+    ])
+}
+
 fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let Some(pack) = pack else {
         return;
@@ -385,6 +419,20 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         {
             flags |= MAT_FLAG_BLEND;
         }
+        // M3b2 SoftCutout / water classification. The Vert-Paint SoftCutout family (Custom/Vert
+        // Paint SoftCutout Decal) is identified by the `vp.softCutout` param triple — its BLEND
+        // coverage is COLOR_0.a modulated by these params, NOT tex.a (which is smoothness here).
+        // Water/mirror surfaces (role=="water") had (mostly) no usable albedo and fell back to a
+        // flat WHITE tint; they get a dark wet sheen instead. Both classes ALSO blend (force
+        // MAT_FLAG_BLEND even for the 16 SoftCutout materials the extractor marked OPAQUE, so
+        // they feather in the P2 pass instead of hard-slabbing in P1).
+        let vp_params = softcutout_params(&mat.vp);
+        if vp_params.is_some() {
+            flags |= MAT_FLAG_SOFTCUTOUT | MAT_FLAG_BLEND;
+        }
+        if mat.role == "water" {
+            flags |= MAT_FLAG_WATER | MAT_FLAG_BLEND;
+        }
         materials_gpu.push(GpuMaterial {
             albedo_index,
             flags,
@@ -392,6 +440,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             _pad: 0,
             uv_xform: mat.uv_xform, // reference only (uvTilingBaked=true); shader must NOT apply
             tint: mat.tint,
+            vp: vp_params.unwrap_or([0.0; 4]),
         });
     }
     info!(
@@ -401,6 +450,17 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         materials_gpu
             .iter()
             .filter(|m| m.albedo_index == NO_ALBEDO)
+            .count(),
+    );
+    info!(
+        "gpu-driven M3b2: {} SoftCutout (feathered road/track) + {} water materials",
+        materials_gpu
+            .iter()
+            .filter(|m| m.flags & MAT_FLAG_SOFTCUTOUT != 0)
+            .count(),
+        materials_gpu
+            .iter()
+            .filter(|m| m.flags & MAT_FLAG_WATER != 0)
             .count(),
     );
 
@@ -456,11 +516,16 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             let p = geom.positions[k];
             let nrm = *geom.normals.get(k).unwrap_or(&[0.0, 1.0, 0.0]);
             let uv = *geom.uvs.get(k).unwrap_or(&[0.0, 0.0]);
+            // M3b2: per-vertex COLOR_0 vert-paint weight. Every mesh in this pack carries a
+            // color attr (unorm8x4 @32) so geom.colors is populated; default opaque-white for
+            // any mesh that lacks it (color.a=1 -> SoftCutout coverage stays fully covered).
+            let col = *geom.colors.get(k).unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
             vertex_data.extend_from_slice(&[
                 p[0], p[1], p[2],
                 nrm[0], nrm[1], nrm[2],
                 uv[0], uv[1],
                 f32::from_bits(vert_mat[k]), // material_index (read as Uint32 on the GPU)
+                col[0], col[1], col[2], col[3], // color f32x4 @36 (interpolated in the shader)
             ]);
         }
         vtx_cursor += n as u32;
@@ -1170,6 +1235,13 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                             format: VertexFormat::Uint32,
                             offset: 32,
                             shader_location: 3,
+                        },
+                        // M3b2: per-vertex COLOR_0 vert-paint weight @36 (SoftCutout coverage
+                        // rides on color.a). Interpolated (NOT flat) in the fragment shader.
+                        VertexAttribute {
+                            format: VertexFormat::Float32x4,
+                            offset: 36,
+                            shader_location: 4,
                         },
                     ],
                 }],

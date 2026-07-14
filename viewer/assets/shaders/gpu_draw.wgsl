@@ -60,10 +60,14 @@ struct InstanceGpu {
 //   albedo_index : index into `albedo_tex`; 0xFFFFFFFF sentinel = untextured (use tint/white).
 //   flags        : bit0 = cutout (role=cutout / alphaMode=MASK) -> discard when alpha < cutoff.
 //                  bit1 = blend  (role âˆˆ {decal,glass,water} / alphaMode=BLEND) -> BLEND pass.
+//                  bit2 = softcutout (Custom/Vert Paint SoftCutout Decal) -> feather via color.a.
+//                  bit3 = water  (role=water) -> dark wet sheen, not the white tint fallback.
 //   alpha_cutoff : PER-MATERIAL cutoff (NOT a global 0.5).
 //   uv_xform     : (sx,sy,ox,oy) REFERENCE ONLY â€” tiling is already baked into the vertex UVs
 //                  (manifest.conventions.uvTilingBaked=true). Do NOT apply it (double-tile trap).
 //   tint         : linear rgba; rgb multiplies albedo. a is the BLEND-pass opacity (M3b1: used).
+//   vp           : SoftCutout params [_AlphaStrength, _Cutoff, _AlphaHeight, 0] (M3b2). BLEND-pass
+//                  coverage = clamp(color.a*vp.x - (vp.y - vp.z), 0, 1). Zeros for non-SoftCutout.
 struct MaterialGpu {
     albedo_index: u32,
     flags: u32,
@@ -71,11 +75,14 @@ struct MaterialGpu {
     _pad: u32,
     uv_xform: vec4<f32>,
     tint: vec4<f32>,
+    vp: vec4<f32>,
 };
 
 const MAT_ALBEDO_NONE: u32 = 0xFFFFFFFFu; // sentinel: material has no albedo texture
 const MAT_FLAG_CUTOUT: u32 = 1u;          // bit0: alpha-tested (MASK) surface
 const MAT_FLAG_BLEND: u32 = 2u;           // bit1: alpha-blended (decal/glass/water/BLEND) surface
+const MAT_FLAG_SOFTCUTOUT: u32 = 4u;      // bit2: Vert Paint SoftCutout decal (feather via color.a)
+const MAT_FLAG_WATER: u32 = 8u;           // bit3: water/mirror (dark wet sheen, not white fallback)
 
 @group(2) @binding(0) var<storage, read> materials: array<MaterialGpu>;
 @group(2) @binding(1) var albedo_tex: binding_array<texture_2d<f32>>;
@@ -86,6 +93,7 @@ struct Vertex {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) material_index: u32, // Uint32; per-submesh global materialId, tagged in build_cpu_data
+    @location(4) color: vec4<f32>,    // M3b2: per-vertex COLOR_0 vert-paint weight (SoftCutout coverage on .a)
 };
 
 struct VOut {
@@ -93,6 +101,7 @@ struct VOut {
     @location(0) world_normal: vec3<f32>,
     @location(1) uv: vec2<f32>,
     @location(2) @interpolate(flat) material_index: u32,
+    @location(3) color: vec4<f32>, // interpolated (NOT flat): SoftCutout feathers across the tri
 };
 
 // cofactor(linear 3x3) = det Â· inverse-transpose; columns = cross products of the linear
@@ -120,6 +129,7 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     o.world_normal = normalize(cofactor(col0, col1, col2) * v.normal);
     o.uv = v.uv;
     o.material_index = v.material_index;
+    o.color = v.color;
     return o;
 }
 
@@ -184,9 +194,28 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let lit = albedo.rgb * (ambient + (1.0 - ambient) * ndl);
 
 #ifdef BLEND_PASS
-    // BLEND pass: emit the REAL computed opacity. albedo.a = tex.a*tint.a (textured) or tint.a
-    // (untextured water/glass/decal). Non-premultiplied to match the pipeline's
+    // BLEND pass: emit the REAL computed opacity. Non-premultiplied to match the pipeline's
     // BlendState::ALPHA_BLENDING (src=SrcAlpha, dst=OneMinusSrcAlpha), i.e. Unity _Color*_MainTex.
+    //
+    // Three coverage laws (M3b2), by material class:
+    //  * SoftCutout (Custom/Vert Paint SoftCutout Decal): coverage is the PER-VERTEX COLOR_0.a
+    //    modulated by the SoftCutout params — tex.a is SMOOTHNESS here, NOT coverage. This
+    //    feathers roads / tire-tracks into the terrain (soft edges), fixing the floating-slab /
+    //    solid-quad look. rgb stays the lit (tex.rgb*tint.rgb).
+    //      coverage = clamp(color.a*_AlphaStrength - (_Cutoff - _AlphaHeight), 0, 1)
+    //    (matches the RE'd EFT road shader; NO polygonOffset — the feather + depth-write-off
+    //    handle coplanarity, per tarkmap-road-terrain-matte-and-hole-bake.)
+    //  * Water/mirror (role=water): untextured water had albedo=tint=WHITE -> a flat white slab.
+    //    Emit a translucent dark wet sheen instead (animated flow deferred).
+    //  * Other blend (glass / plain decal): keep the tex.a*tint.a coverage.
+    let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
+    let is_water = (m.flags & MAT_FLAG_WATER) != 0u;
+    if (is_softcutout) {
+        let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0);
+        return vec4<f32>(lit, coverage);
+    } else if (is_water) {
+        return vec4<f32>(vec3<f32>(0.03, 0.04, 0.05), 0.35);
+    }
     return vec4<f32>(lit, albedo.a);
 #else
     // OPAQUE pass: fully opaque (blend materials were already discarded above).
