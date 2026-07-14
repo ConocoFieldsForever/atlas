@@ -231,7 +231,8 @@ impl Plugin for EftGpuDrivenPlugin {
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
             ExtractResourcePlugin::<ExtractedCpuData>::default(),
         ))
-        .add_systems(Startup, build_cpu_data);
+        .add_systems(Startup, build_cpu_data)
+        .add_systems(Update, free_cpu_staging);
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -256,6 +257,25 @@ impl Plugin for EftGpuDrivenPlugin {
 // ===========================================================================
 // Main-world one-time CPU assembly.
 // ===========================================================================
+
+/// The CPU staging blob (~650 MiB of repacked geometry) is only needed for the
+/// one-time GPU upload. Drop the main-world source a few frames in — by then the
+/// render world has extracted + uploaded it, and prepare_gpu_buffers frees the
+/// render-world copy — so the whole Arc is released (Codex P1).
+fn free_cpu_staging(
+    mut commands: Commands,
+    mut frames: Local<u32>,
+    cpu: Option<Res<ExtractedCpuData>>,
+) {
+    if cpu.is_none() {
+        return;
+    }
+    *frames += 1;
+    if *frames >= 4 {
+        commands.remove_resource::<ExtractedCpuData>();
+    }
+}
+
 fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let Some(pack) = pack else {
         return;
@@ -504,7 +524,13 @@ fn prepare_gpu_buffers(
     draw: Option<Res<EftDrawPipeline>>,
 ) {
     if already.is_some() {
-        return; // built once; never re-upload
+        // Buffers are built. Drop any render-world copy of the ~650 MiB CPU staging
+        // blob that got re-extracted before free_cpu_staging drops the main-world
+        // source, so the whole Arc is released (Codex P1).
+        if cpu.is_some() {
+            commands.remove_resource::<ExtractedCpuData>();
+        }
+        return;
     }
     let (Some(cpu), Some(compute), Some(draw)) = (cpu, compute, draw) else {
         return; // wait for the extracted blob + layouts (also skipped if feature-disabled)

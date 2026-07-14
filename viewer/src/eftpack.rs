@@ -539,6 +539,18 @@ impl Pack {
 
         let mut out = Vec::with_capacity(self.manifest.meshes.len());
         for m in &self.manifest.meshes {
+            // Validate the vertex byte range before slicing so a truncated/corrupt
+            // meshes.bin returns an error the caller can handle, not a panic (Codex P2).
+            let vtx_end = m.vtx_offset as usize + m.vtx_count as usize * stride;
+            if vtx_end > self.meshes_bin.len() {
+                return Err(anyhow!(
+                    "mesh {} '{}' vertex range out of bounds (end {}, meshes.bin {})",
+                    m.id,
+                    m.name,
+                    vtx_end,
+                    self.meshes_bin.len()
+                ));
+            }
             let vb = self.vertex_bytes(m);
             let n = m.vtx_count as usize;
             let mut c = Vec3::ZERO;
