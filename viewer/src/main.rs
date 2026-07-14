@@ -15,7 +15,7 @@ mod render;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
-use bevy::window::{CursorGrabMode, PrimaryWindow};
+use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use eftpack::Pack;
 use render::{EftInstancingPlugin, LoadedPack};
@@ -84,7 +84,7 @@ fn main() {
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "EFT Native Viewer".into(),
-                    resolution: (1600.0, 900.0).into(),
+                    resolution: (1600u32, 900u32).into(),
                     ..default()
                 }),
                 ..default()
@@ -178,18 +178,20 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
 /// Hold RMB to capture the cursor for mouse-look; release to free it.
 fn cursor_grab(
     mouse: Res<ButtonInput<MouseButton>>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    // Bevy 0.17 split cursor state out of `Window` into a `CursorOptions` component
+    // on the same window entity.
+    mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
-    let Ok(mut window) = windows.single_mut() else {
+    let Ok(mut cursor) = cursors.single_mut() else {
         return;
     };
     if mouse.just_pressed(MouseButton::Right) {
-        window.cursor_options.grab_mode = CursorGrabMode::Locked;
-        window.cursor_options.visible = false;
+        cursor.grab_mode = CursorGrabMode::Locked;
+        cursor.visible = false;
     }
     if mouse.just_released(MouseButton::Right) {
-        window.cursor_options.grab_mode = CursorGrabMode::None;
-        window.cursor_options.visible = true;
+        cursor.grab_mode = CursorGrabMode::None;
+        cursor.visible = true;
     }
 }
 
