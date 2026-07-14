@@ -16,7 +16,7 @@ use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 
 use eftpack::Pack;
 use render::{CullCamera, EftGpuDrivenPlugin, EftInstancingPlugin, LoadedPack, RenderPath};
@@ -89,6 +89,9 @@ fn main() {
                 primary_window: Some(Window {
                     title: "EFT Native Viewer".into(),
                     resolution: (1600u32, 900u32).into(),
+                    // Lowest-latency present: no vsync wait — uncaps FPS and minimizes
+                    // input-to-photon latency. AutoNoVsync picks Immediate/Mailbox.
+                    present_mode: PresentMode::AutoNoVsync,
                     ..default()
                 }),
                 ..default()

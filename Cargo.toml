@@ -32,5 +32,8 @@ opt-level = 1          # the loader touches ~100 MB of vertex/instance bytes; ke
 opt-level = 3          # always optimize deps (bevy/wgpu/glam) even in dev
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
+# lto="thin" crashed rustc (STATUS_ACCESS_VIOLATION) codegen-ing the final binary over
+# Bevy's huge graph on Windows. Drop LTO (marginal perf vs a compiler crash) and use
+# parallel codegen; opt-level=3 (release default) still applies.
+lto = false
+codegen-units = 16
