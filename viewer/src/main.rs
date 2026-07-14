@@ -12,13 +12,14 @@
 mod eftpack;
 mod render;
 
+use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::render::view::NoIndirectDrawing;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use eftpack::Pack;
-use render::{EftInstancingPlugin, LoadedPack};
+use render::{EftGpuDrivenPlugin, EftInstancingPlugin, LoadedPack, RenderPath};
 
 /// Fly camera state (WASD + mouse-look while RMB held; QE up/down; Shift = fast).
 #[derive(Component)]
@@ -43,8 +44,11 @@ impl Default for FlyCam {
 }
 
 fn main() {
-    // ---- parse argv: pack dir ----
+    // ---- parse argv: pack dir + optional render-path token ----
     let pack_dir = std::env::args().nth(1);
+    // A/B selector: `EFT_RENDER=m0|gpu` env, or a 2nd argv token; default = GPU-driven.
+    let render_path = RenderPath::from_env_or(std::env::args().nth(2).as_deref());
+    eprintln!("render path: {render_path:?}  (override with EFT_RENDER=m0|gpu)");
     // NOTE: this runs BEFORE DefaultPlugins installs Bevy's log subscriber, so use
     // eprintln! (not info!/error!) or the diagnostics are silently dropped and a
     // bad pack opens an empty window with no message (Codex P2).
@@ -97,7 +101,21 @@ fn main() {
                 ..default()
             }),
     )
-    .add_plugins(EftInstancingPlugin);
+    // FPS readout for the before/after A/B measurement (prints to the console).
+    .add_plugins((
+        FrameTimeDiagnosticsPlugin::default(),
+        LogDiagnosticsPlugin::default(),
+    ));
+
+    // Install exactly ONE render path so the two can be FPS-compared cleanly.
+    match render_path {
+        RenderPath::M0Instanced => {
+            app.add_plugins(EftInstancingPlugin);
+        }
+        RenderPath::GpuDriven => {
+            app.add_plugins(EftGpuDrivenPlugin);
+        }
+    }
 
     if let Some(p) = pack {
         app.insert_resource(LoadedPack(p));
