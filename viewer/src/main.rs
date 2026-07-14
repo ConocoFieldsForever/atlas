@@ -45,10 +45,13 @@ impl Default for FlyCam {
 fn main() {
     // ---- parse argv: pack dir ----
     let pack_dir = std::env::args().nth(1);
+    // NOTE: this runs BEFORE DefaultPlugins installs Bevy's log subscriber, so use
+    // eprintln! (not info!/error!) or the diagnostics are silently dropped and a
+    // bad pack opens an empty window with no message (Codex P2).
     let pack = match &pack_dir {
         Some(dir) => match Pack::load(dir) {
             Ok(p) => {
-                info!(
+                eprintln!(
                     "loaded .eftpack '{}': {} unique meshes, {} instances, {} materials",
                     p.manifest.dataset,
                     p.manifest.meshes.len(),
@@ -56,7 +59,7 @@ fn main() {
                     p.materials.len(),
                 );
                 let mirrors = p.instances.iter().filter(|i| i.is_mirror()).count();
-                info!(
+                eprintln!(
                     "  bounds center {:?} extent {:.1}m; {} mirrored instances (winding-flip, NOT baked)",
                     p.bounds_center(),
                     p.bounds_extent(),
@@ -65,25 +68,35 @@ fn main() {
                 Some(p)
             }
             Err(e) => {
-                error!("failed to load pack '{}': {:#}", dir, e);
+                eprintln!("failed to load pack '{}': {:#}", dir, e);
                 None
             }
         },
         None => {
-            warn!("no .eftpack path given — opening empty viewer.  usage: eft_viewer <pack-dir>");
+            eprintln!("no .eftpack path given — opening empty viewer.  usage: eft_viewer <pack-dir>");
             None
         }
     };
 
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "EFT Native Viewer".into(),
-            resolution: (1600.0, 900.0).into(),
-            ..default()
-        }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "EFT Native Viewer".into(),
+                    resolution: (1600.0, 900.0).into(),
+                    ..default()
+                }),
+                ..default()
+            })
+            .set(AssetPlugin {
+                // Assets live in <viewer-crate>/assets; anchor to the crate dir so
+                // `cargo run` from the workspace root (the documented launch dir)
+                // resolves shaders regardless of cwd (Codex P1 — shader not found).
+                file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").to_string(),
+                ..default()
+            }),
+    )
     .add_plugins(EftInstancingPlugin);
 
     if let Some(p) = pack {
@@ -108,13 +121,19 @@ fn main() {
 /// Spawn camera + a key light, framed on the pack bounds if one is loaded.
 fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     // Frame the world AABB: stand back along +Y/+Z by the half-diagonal.
-    let (target, cam_pos) = match pack.as_ref() {
+    let (target, cam_pos, far) = match pack.as_ref() {
         Some(p) => {
             let c = p.0.bounds_center();
             let ext = p.0.bounds_extent().max(1.0);
-            (c, c + Vec3::new(0.0, ext * 0.6, ext * 1.2))
+            // Stand back ~1.34*ext; the far plane must clear the cam->far-corner
+            // distance (~3*ext) with margin or the map center clips (Codex P1).
+            (
+                c,
+                c + Vec3::new(0.0, ext * 0.6, ext * 1.2),
+                (ext * 6.0).max(2000.0),
+            )
         }
-        None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0)),
+        None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0), 2000.0),
     };
 
     let dir = (target - cam_pos).normalize_or_zero();
@@ -123,6 +142,12 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
 
     commands.spawn((
         Camera3d::default(),
+        // Far plane derived from pack bounds so the whole map is visible; the
+        // default 1000 m clipped Interchange (extent >745 m) — Codex P1.
+        Projection::Perspective(PerspectiveProjection {
+            far,
+            ..default()
+        }),
         Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
         // The custom instancing path is incompatible with Bevy's GPU indirect
         // draw preprocessing; opt this view out (matches the bevy example).

@@ -56,8 +56,8 @@ cargo run --release -- .\packs\interchange.eftpack
 `--limit N` caps the number of (mesh,material) groups for a fast smoke pack
 (truncates bounds + instances — not a usable full render).
 
-Toolchain: stable Rust (1.82+). First build compiles Bevy/wgpu (a few minutes,
-several GB in `target/` — mind the disk).
+Toolchain: stable Rust (1.88+, required by Bevy 0.17.3). First build compiles
+Bevy/wgpu (a few minutes, several GB in `target/` — mind the disk).
 
 Controls: **RMB** = mouse-look · **WASD** = move · **Q/E** = down/up · **Shift** =
 fast. With no pack argument the window still opens (empty) so you can verify the

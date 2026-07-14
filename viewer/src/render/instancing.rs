@@ -248,7 +248,11 @@ struct InstanceBuffer {
 
 fn prepare_instance_buffers(
     mut commands: Commands,
-    query: Query<(Entity, &InstanceMaterialData)>,
+    // Instance data is static for M0, so build each entity's buffer ONCE. In the
+    // retained render world the inserted InstanceBuffer persists across frames, so
+    // filtering `Without<InstanceBuffer>` skips already-built entities and avoids
+    // thousands of per-frame buffer reallocations/uploads at full-map scale (Codex P1).
+    query: Query<(Entity, &InstanceMaterialData), Without<InstanceBuffer>>,
     render_device: Res<RenderDevice>,
 ) {
     for (entity, instance_data) in &query {

@@ -415,6 +415,21 @@ impl Pack {
     pub fn mesh_geom(&self, m: &MeshEntry) -> Result<MeshGeom> {
         let vl = &self.manifest.vertex;
         let stride = vl.stride as usize;
+        // Validate byte ranges before slicing so a truncated / mismatched pack
+        // returns an error the caller can skip, not a panic (Codex P2).
+        let vtx_end = m.vtx_offset as usize + m.vtx_count as usize * stride;
+        let idx_end = m.idx_offset as usize + m.idx_count as usize * 4;
+        let blen = self.meshes_bin.len();
+        if vtx_end > blen || idx_end > blen {
+            return Err(anyhow!(
+                "mesh {} '{}' byte range out of bounds (vtx_end {}, idx_end {}, meshes.bin {})",
+                m.id,
+                m.name,
+                vtx_end,
+                idx_end,
+                blen
+            ));
+        }
         let vb = self.vertex_bytes(m);
         let n = m.vtx_count as usize;
 
