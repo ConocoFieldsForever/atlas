@@ -606,15 +606,16 @@ fn init_gpu_pipelines(
     // array be under-filled without padding. All three auto-enable on native Vulkan/RTX 5090
     // under Bevy's default (Functionality) priority; if absent we disable the whole path (empty
     // view) exactly like the MULTI_DRAW guard rather than force-request + hard-panic.
+    // Every array slot is supplied (count == texture count), so PARTIALLY_BOUND is NOT needed;
+    // requiring it would needlessly disable adapters that support the rest but not it (Codex P2).
     let need_bindless = WgpuFeatures::TEXTURE_BINDING_ARRAY
-        | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
-        | WgpuFeatures::PARTIALLY_BOUND_BINDING_ARRAY;
+        | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
     if !render_device.features().contains(need_bindless) {
         error!(
             "gpu-driven M3: adapter lacks TEXTURE_BINDING_ARRAY | \
-             SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING | \
-             PARTIALLY_BOUND_BINDING_ARRAY â€” the textured GPU-driven path is DISABLED (view will \
-             be empty). Re-run with EFT_RENDER=m0 for the instanced path."
+             SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING â€” the textured \
+             GPU-driven path is DISABLED (view will be empty). Re-run with EFT_RENDER=m0 for \
+             the instanced path."
         );
         return; // no pipeline resources inserted â†’ entire gpu-driven path no-ops
     }

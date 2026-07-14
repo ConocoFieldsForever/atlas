@@ -137,7 +137,9 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
 
     // Cutout / alpha-test (role=cutout, alphaMode=MASK). Per-material cutoff. discard needs no
     // derivatives, so a non-uniform branch here is fine.
-    if (has_albedo && (m.flags & MAT_FLAG_CUTOUT) != 0u && albedo.a < m.alpha_cutoff) {
+    // Alpha-test on the COMPUTED albedo.a (tex.a*tint.a, or tint.a when untextured) so an
+    // untextured cutout with tint.a < cutoff still discards (Codex P2), not just textured ones.
+    if ((m.flags & MAT_FLAG_CUTOUT) != 0u && albedo.a < m.alpha_cutoff) {
         discard;
     }
 
