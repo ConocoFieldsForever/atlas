@@ -17,7 +17,7 @@
 pub mod gpu_driven;
 pub mod instancing;
 
-pub use gpu_driven::EftGpuDrivenPlugin;
+pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 
 /// A/B render-path selector. `EFT_RENDER=m0` picks the working M0 custom instanced

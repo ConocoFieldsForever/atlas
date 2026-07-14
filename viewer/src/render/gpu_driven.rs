@@ -206,6 +206,22 @@ impl ExtractResource for ExtractedCpuData {
     }
 }
 
+/// Marker for the camera whose frustum drives the GPU cull. Extracted so the render
+/// world can pick THE player view out of Bevy's multiple ExtractedViews — otherwise
+/// `views.iter().next()` grabs a prepass/default view nondeterministically and the cull
+/// runs against a static wrong frustum (half the map wrongly culled, no camera tracking).
+#[derive(Component, Clone, Default)]
+pub struct CullCamera;
+
+impl ExtractComponent for CullCamera {
+    type QueryData = &'static CullCamera;
+    type QueryFilter = ();
+    type Out = CullCamera;
+    fn extract_component(_: QueryItem<'_, '_, Self::QueryData>) -> Option<Self> {
+        Some(CullCamera)
+    }
+}
+
 /// Marker for the single render-world entity that carries the GPU-driven draw phase
 /// item. Extracted so it has a `MainEntity` in the render world.
 #[derive(Component, Clone, Default)]
@@ -229,6 +245,7 @@ impl Plugin for EftGpuDrivenPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins((
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
+            ExtractComponentPlugin::<CullCamera>::default(),
             ExtractResourcePlugin::<ExtractedCpuData>::default(),
         ))
         .add_systems(Startup, build_cpu_data)
@@ -443,13 +460,13 @@ fn init_gpu_pipelines(
     // and tell the user to fall back to the M0 path. We do NOT force-request it via
     // WgpuSettings because that would hard-panic device creation on adapters lacking it;
     // graceful disable is safer given GpuDriven is the default path.
-    if !render_device
-        .features()
-        .contains(bevy::render::settings::WgpuFeatures::INDIRECT_FIRST_INSTANCE)
-    {
+    let need = bevy::render::settings::WgpuFeatures::INDIRECT_FIRST_INSTANCE
+        | bevy::render::settings::WgpuFeatures::MULTI_DRAW_INDIRECT;
+    if !render_device.features().contains(need) {
         error!(
-            "gpu-driven: adapter lacks INDIRECT_FIRST_INSTANCE â€” the GPU-driven path is \
-             DISABLED (view will be empty). Re-run with EFT_RENDER=m0 for the instanced path."
+            "gpu-driven: adapter lacks INDIRECT_FIRST_INSTANCE | MULTI_DRAW_INDIRECT â€” the \
+             GPU-driven path is DISABLED (view will be empty). Re-run with EFT_RENDER=m0 for \
+             the instanced path."
         );
         return; // no pipeline resources inserted â†’ entire gpu-driven path no-ops
     }
@@ -618,12 +635,12 @@ fn prepare_gpu_buffers(
 fn upload_frustum(
     render_queue: Res<RenderQueue>,
     buffers: Option<Res<EftGpuBuffers>>,
-    views: Query<&ExtractedView>,
+    views: Query<&ExtractedView, With<CullCamera>>,
 ) {
     let Some(buffers) = buffers else {
         return;
     };
-    // single-camera assumption: take the first view with a clip matrix.
+    // Only the tagged player camera's view (Bevy has multiple ExtractedViews).
     let Some(view) = views.iter().next() else {
         return;
     };
@@ -875,11 +892,12 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
         pass.set_vertex_buffer(0, buffers.vertex.slice(..));
         pass.set_index_buffer(buffers.index.slice(..), 0, IndexFormat::Uint32);
 
-        // One indirect draw per mesh; the compute cull filled each entry's
-        // instance_count (0 for fully-culled meshes â†’ GPU draws nothing).
-        for m in 0..buffers.mesh_count {
-            pass.draw_indexed_indirect(&buffers.indirect, m as u64 * DRAW_ARG_STRIDE);
-        }
+        // ONE multi-draw for ALL meshes: the GPU reads every mesh's DrawIndexedIndirectArgs
+        // (index_count / first_index / base_vertex / instance_base + the cull-filled
+        // instance_count) straight from the indirect buffer â€” near-zero CPU submission
+        // (replaces a 6.5k-call loop). Fully-culled meshes have instance_count 0 â†’ nothing
+        // drawn. Requires MULTI_DRAW_INDIRECT (guarded at pipeline init).
+        pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count);
         RenderCommandResult::Success
     }
 }

@@ -19,7 +19,7 @@ use bevy::render::view::NoIndirectDrawing;
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 
 use eftpack::Pack;
-use render::{EftGpuDrivenPlugin, EftInstancingPlugin, LoadedPack, RenderPath};
+use render::{CullCamera, EftGpuDrivenPlugin, EftInstancingPlugin, LoadedPack, RenderPath};
 
 /// Fly camera state (WASD + mouse-look while RMB held; QE up/down; Shift = fast).
 #[derive(Component)]
@@ -170,6 +170,9 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         // The custom instancing path is incompatible with Bevy's GPU indirect
         // draw preprocessing; opt this view out (matches the bevy example).
         NoIndirectDrawing,
+        // Tag THIS camera as the cull-frustum source (Bevy has multiple ExtractedViews;
+        // the GPU cull must use the player view, not a prepass/default one).
+        CullCamera,
         FlyCam {
             yaw,
             pitch,
