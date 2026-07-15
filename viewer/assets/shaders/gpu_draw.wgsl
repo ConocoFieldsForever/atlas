@@ -145,6 +145,22 @@ struct ShVolume {
 @group(3) @binding(3) var sh_b: texture_3d<f32>;
 @group(3) @binding(4) var sh_samp: sampler;
 
+// --- #5 Dynamic sun shadows (added to the EXISTING SH/lighting group 3; NOT a 5th bind group) ----
+// A 2-cascade near-field contact CSM. The SH volume above already bakes the BROAD sun shadow; these
+// two near cascades only add the missing high-frequency contact edge, and the combination below is
+// gated + capped so it can only SUBTRACT a small, bounded amount of light (anti double-darkening).
+// Byte-identical to the Rust `SunShadowUniform` (192 bytes).
+struct SunShadowUniform {
+    view_proj: array<mat4x4<f32>, 2>, // per-cascade world->light-clip (0..1 depth ortho)
+    split_depths: vec4<f32>,          // x=far0(15) y=far1(80) z=overlap(0.10) w=enabled(1/0)
+    sun_dir_texel: vec4<f32>,         // xyz=Lsun (toward sun), w=1/shadow_map_size (PCF texel)
+    texel_world: vec4<f32>,           // x=cascade0 world texel, y=cascade1 world texel (bias units)
+    combine: vec4<f32>,               // x=diffuse cap(0.12) y=fade start(65) z=fade end(80) w=debug
+};
+@group(3) @binding(5) var<uniform> sun: SunShadowUniform;
+@group(3) @binding(6) var shadow_map: texture_depth_2d_array;
+@group(3) @binding(7) var shadow_cmp: sampler_comparison;
+
 // Reconstruct diffuse IRRADIANCE (÷π folded in: cosine-convolved A0=π, A1=2π/3; the
 // π cancels the Lambert 1/π) from the L1 radiance SH at `world_pos`, for surface
 // normal `n`. Per channel: E/π = 0.282095*c0 + 0.325735*(c1*n.y + c2*n.z + c3*n.x).
@@ -228,6 +244,9 @@ struct DomLight {
     dir: vec3<f32>,      // normalized dominant light direction L
     radiance: vec3<f32>, // SH radiance reconstructed toward L (>= 0), the light's rgb
     mag: f32,            // dominant magnitude; < 1e-4 => no dominant light (skip spec)
+    directionality: f32, // #5: L1/L0 ratio, normalized to [0,1]. ~1 => crisp directional (sun-lit),
+                         // ~0 => flat/isotropic (already-baked-shadow). Gates the shadow term so we
+                         // don't re-darken places the SH volume already shadowed (double-darkening).
 };
 fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     let uvw = (world_pos - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
@@ -243,6 +262,12 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     let dom  = vec3<f32>(lc3, lc1, lc2); // x from Y11, y from Y1-1, z from Y10
     let dmag = length(dom);
     out.mag  = dmag;
+    // #5: directionality = |L1| / (sqrt(3)*L0). For an ideal directional source the L1/L0 ratio
+    // approaches sqrt(3); diffuse/isotropic lighting approaches 0. l0 is the luminance of the
+    // constant (ambient) band. Used by the shadow gate so flat-lit (already baked-shadow) points
+    // receive little or no further attenuation.
+    let l0 = max(dot(vec3<f32>(cr.x, cg.x, cb.x), lw), 1e-4);
+    out.directionality = clamp(dmag / (1.73205 * l0), 0.0, 1.0);
     if (dmag < 1e-4) {
         out.dir = vec3<f32>(0.0, 1.0, 0.0); // sentinel; caller skips on mag
         out.radiance = vec3<f32>(0.0);
@@ -256,6 +281,65 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     let rb = 0.282095 * cb.x + 0.488603 * (cb.y * L.y + cb.z * L.z + cb.w * L.x);
     out.radiance = max(vec3<f32>(rr, rg, rb), vec3<f32>(0.0));
     return out;
+}
+
+// --- #5 sun-shadow PCF sampling ----------------------------------------------
+// Sample one cascade `c` for the receiver point `p` with GEOMETRIC normal `Ng`. Returns visibility
+// in [0,1] (1 = fully lit, 0 = fully shadowed). textureSampleCompareLevel samples at LOD 0 (no
+// derivatives) so this is safe in the non-uniform control flow of the cascade select below.
+fn sample_cascade(p: vec3<f32>, Ng: vec3<f32>, c: u32) -> f32 {
+    let world_texel = sun.texel_world[c];
+
+    // Receiver-plane offset (acne fix): push along the GEOMETRIC normal (normal maps must NOT wobble
+    // the receiver offset) plus a small nudge toward the sun.
+    let offset_p =
+        p
+        + Ng * (1.5 * world_texel)
+        + sun.sun_dir_texel.xyz * (0.25 * world_texel);
+
+    let q = sun.view_proj[c] * vec4<f32>(offset_p, 1.0);
+    let ndc = q.xyz / q.w;
+
+    // Outside this cascade's frustum -> treat as lit (the caller's cascade select / far fade owns
+    // the transition). ndc.z is the conventional 0..1 light-space depth.
+    if (any(ndc.xy < vec2<f32>(-1.0)) || any(ndc.xy > vec2<f32>(1.0))
+        || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    let dt = sun.sun_dir_texel.w; // 1/shadow_map_size
+
+    var sum = 0.0;
+    // Weighted 3x3 tent [1,2,1]^2, total weight 16.
+    for (var y = -1; y <= 1; y++) {
+        for (var x = -1; x <= 1; x++) {
+            let wx = select(1.0, 2.0, x == 0);
+            let wy = select(1.0, 2.0, y == 0);
+            sum += wx * wy * textureSampleCompareLevel(
+                shadow_map,
+                shadow_cmp,
+                uv + vec2<f32>(f32(x), f32(y)) * dt,
+                i32(c),
+                ndc.z
+            );
+        }
+    }
+    return sum / 16.0;
+}
+
+// Cascade select by VIEW-SPACE depth with a short blend across the overlap, then fade the whole
+// effect to fully lit over the far contact range. Returns visibility in [0,1].
+fn sun_shadow_visibility(p: vec3<f32>, Ng: vec3<f32>, view_depth: f32) -> f32 {
+    // Blend cascade 0 -> 1 across 13.5..15 m (just inside the split, per the 10% overlap fit).
+    if (view_depth < 13.5) {
+        return sample_cascade(p, Ng, 0u);
+    } else if (view_depth < 15.0) {
+        let v0 = sample_cascade(p, Ng, 0u);
+        let v1 = sample_cascade(p, Ng, 1u);
+        return mix(v0, v1, (view_depth - 13.5) / (15.0 - 13.5));
+    }
+    return sample_cascade(p, Ng, 1u);
 }
 
 struct Vertex {
@@ -365,6 +449,9 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     if (!front) {
         N = -N; // double-sided: flip for back faces (inward shells / mirrors)
     }
+    // #5: capture the GEOMETRIC (back-face-flipped) normal BEFORE normal mapping — the shadow
+    // receiver-plane bias uses it (a normal map must not wobble the depth-compare offset).
+    let Ng = N;
     let has_normal = m.normal_index != MAT_NORMAL_NONE;
     let nidx = select(0u, m.normal_index, has_normal); // untextured -> slot 0, result discarded
     let nt = textureSample(normal_tex[nidx], albedo_samp, o.uv).rgb;
@@ -434,7 +521,45 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // (The 0.25 test proved the invisible register is NOT a darkness issue — real render bug.)
     let ambient_floor = vec3<f32>(0.03);
     let gi = max(sh_irradiance(o.world_pos, N), ambient_floor);
-    let lit = albedo.rgb * gi * sh.vol_min.w; // vol_min.w = gi_intensity
+
+    // Dominant baked light dir/color/directionality — DERIVED once from the SH volume and shared by
+    // BOTH the #5 shadow gate (below) and the GGX spec lobe (further down).
+    let dom = sh_dominant_light(o.world_pos);
+
+    // --- #5 Dynamic sun shadow term (double-darkening-safe) ----------------------
+    // `shadow_event` in [0,1] is how strongly this fragment is in a NEW sun shadow that the baked SH
+    // does NOT already represent. It is the product of three gates so it can only fire where the
+    // baked lighting is genuinely direct-sun-lit:
+    //   * SH directionality  — flat/isotropic (already-shadowed) points are ~0.
+    //   * dom·Lsun alignment — the SH dominant light must actually BE the sun.
+    //   * N·Lsun             — the surface must face the sun.
+    // times a far contact fade, times the PCF occlusion (1 - visibility). Fully gated off (0) when
+    // the feature is disabled (sun_dir missing or not EFT_SHADOWS=1), so the render is identical to today.
+    var shadow_event = 0.0;
+    if (sun.split_depths.w > 0.5) {
+        let Lsun = sun.sun_dir_texel.xyz;
+        let align = dot(dom.dir, Lsun);
+        let NdotSun = dot(N, Lsun);
+        let sun_lit_gate =
+              smoothstep(0.10, 0.35, dom.directionality)
+            * smoothstep(0.75, 0.95, align)
+            * smoothstep(0.05, 0.35, NdotSun);
+        let view_depth = -(view.view_from_world * vec4<f32>(o.world_pos, 1.0)).z;
+        let contact_fade = 1.0 - smoothstep(sun.combine.y, sun.combine.z, view_depth); // 65..80 m
+        let shadow_vis = sun_shadow_visibility(o.world_pos, Ng, view_depth);
+        shadow_event = sun_lit_gate * contact_fade * (1.0 - shadow_vis);
+    }
+
+    // Anti double-darkening combination: the SH volume ALREADY integrates the broad sun shadow, so
+    // the contact term may only remove a BOUNDED fraction of the REMOVABLE diffuse (everything above
+    // the 0.03 ambient floor), never the floor itself. Cap = combine.x (0.12): a sunlit contact edge
+    // loses at most 12% of its above-floor diffuse; an already-dark SH region (low gate) is untouched
+    // (< ~1% change). `gi_shadowed >= ambient_floor` component-wise is preserved. combine.w==1
+    // (EFT_SHADOW_DEBUG=1) zeroes the diffuse coeff -> specular-only diagnostic.
+    let diffuse_cap = select(sun.combine.x, 0.0, sun.combine.w > 0.5);
+    let removable = max(gi - ambient_floor, vec3<f32>(0.0));
+    let gi_shadowed = gi - removable * (diffuse_cap * shadow_event);
+    let lit = albedo.rgb * gi_shadowed * sh.vol_min.w; // vol_min.w = gi_intensity
 
     // --- Specular: dielectric GGX / Cook-Torrance ON TOP of the SH diffuse (Phase 1.6) -----
     // Unity-Standard-style spec lobe lit from the SH volume's own dominant light dir + color,
@@ -442,7 +567,6 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // (every material is metallic≈0). Roughness is per-material (glass=0.05 -> a sharp glint).
     // N is the Phase-2b normal-mapped shading normal computed at the top (back-face-flipped
     // geometric normal, perturbed by the tangent-space normal map when the material has one).
-    let dom = sh_dominant_light(o.world_pos);
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {
         let V = normalize(view.world_position.xyz - o.world_pos);
@@ -466,6 +590,10 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
             spec_rgb = dom.radiance * (D * G * F / (4.0 * NdotV * NdotL + 1e-4)) * NdotL * SPEC_STRENGTH;
         }
     }
+    // #5: the GGX lobe is the ONLY real-time directional-looking term, and it is NOT baked into the
+    // SH volume, so it takes the FULL shadow (unlike the capped diffuse). Safe from double-darkening
+    // because sun_lit_gate already required SH directionality + sun alignment.
+    spec_rgb = spec_rgb * (1.0 - shadow_event);
 
 #ifdef BLEND_PASS
     // BLEND pass: emit the REAL computed opacity. Non-premultiplied to match the pipeline's

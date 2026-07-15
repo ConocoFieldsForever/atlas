@@ -53,19 +53,20 @@ use bevy::render::{
     render_resource::{
         binding_types::{
             sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
-            texture_3d, uniform_buffer_sized,
+            texture_2d_array, texture_3d, uniform_buffer_sized,
         },
         AddressMode, BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
         BlendState, Buffer,
         BufferDescriptor, BufferInitDescriptor, BufferUsages, CachedComputePipelineId,
-        ColorTargetState, ColorWrites, CompareFunction,
+        CachedRenderPipelineId, ColorTargetState, ColorWrites, CompareFunction,
         ComputePassDescriptor, ComputePipelineDescriptor, DepthBiasState, DepthStencilState,
-        Extent3d, FilterMode, FragmentState, IndexFormat, MultisampleState, PipelineCache,
-        PrimitiveState, PrimitiveTopology, RenderPipelineDescriptor, Sampler, SamplerBindingType,
+        Extent3d, FilterMode, FragmentState, IndexFormat, LoadOp, MultisampleState, Operations,
+        PipelineCache, PrimitiveState, PrimitiveTopology, RenderPassDepthStencilAttachment,
+        RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType,
         SamplerDescriptor, ShaderStages, SpecializedRenderPipeline, SpecializedRenderPipelines,
-        StencilState, Texture, TextureDataOrder, TextureDescriptor, TextureDimension,
+        StencilState, StoreOp, Texture, TextureDataOrder, TextureDescriptor, TextureDimension,
         TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
-        VertexAttribute, VertexFormat, VertexState, VertexStepMode,
+        TextureViewDimension, VertexAttribute, VertexFormat, VertexState, VertexStepMode,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
     sync_world::MainEntity,
@@ -73,7 +74,7 @@ use bevy::render::{
     Render, RenderApp, RenderStartup, RenderSystems,
 };
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Mat4, Vec3, Vec4};
 use serde::Deserialize;
 
 pub use crate::eftpack::{BoundingSphere, GpuInstance};
@@ -246,6 +247,100 @@ pub struct ShVolumeUniform {
 /// point is pushed this far along the surface normal before sampling the probe grid, so a
 /// point sitting on a slab doesn't sample the dark "inside-solid" probe directly beneath it.
 const SH_NORMAL_BIAS: f32 = 0.75;
+
+// ---------------------------------------------------------------------------
+// #5 Dynamic sun shadows — 2-cascade near-field contact CSM.
+// ---------------------------------------------------------------------------
+// A near-field, sun-aligned contact shadow map. The SH volume already bakes the BROAD sun shadow,
+// so this only adds the missing high-frequency contact edge and is combined in the shader under a
+// hard cap (anti double-darkening). Rendered into a 2-layer Depth32Float array by reusing the
+// camera-culled `visible[]`/`indirect` stream READ-ONLY (never re-culls it). All shadow work is a
+// strict no-op when the feature is disabled (sun_dir missing or not EFT_SHADOWS=1): `enabled=0` in the
+// uniform, and the depth array — always allocated so the group(3) layout stays stable — is ignored.
+
+/// Shadow-map resolution per cascade (square). 2048² * 2 layers * 4 bytes = 32 MiB.
+const SHADOW_MAP_SIZE: u32 = 2048;
+/// Cascade count (2 near cascades). The depth array has this many layers.
+const SHADOW_CASCADES: usize = 2;
+/// Practical/log split distances (metres): cascade i covers [SHADOW_SPLITS[i], SHADOW_SPLITS[i+1]].
+const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.5, 15.0, 80.0];
+/// Cascade overlap fraction (reported in the uniform; the shader blends 13.5..15 m).
+const SHADOW_CASCADE_OVERLAP: f32 = 0.10;
+/// How far a caster may sit toward the sun and still project into the slice (light-space Z fit).
+const SHADOW_CASTER_EXTRUDE: f32 = 80.0;
+/// Receiver-side margin pulled away from the sun in the light-space Z fit.
+const SHADOW_RECEIVER_MARGIN: f32 = 10.0;
+/// Max fraction of REMOVABLE (above-floor) baked diffuse the contact term may subtract. Hard-capped.
+const SHADOW_DIFFUSE_CAP: f32 = 0.12;
+/// Far contact fade band (metres): the whole shadow effect fades to fully lit across this range.
+const SHADOW_FADE_START: f32 = 65.0;
+const SHADOW_FADE_END: f32 = 80.0;
+
+/// group(1) per-cascade uniform for the shadow depth pass. Byte-identical to the WGSL
+/// `ShadowCascadeUniform` (80 bytes, 16-aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct ShadowCascadeUniform {
+    /// world -> sun light clip (conventional 0..1-depth ortho). Column-major Mat4 upload.
+    view_proj: [[f32; 4]; 4],
+    /// xyz = Lsun (toward the sun), w = 1/SHADOW_MAP_SIZE (PCF texel).
+    dir_texel: [f32; 4],
+}
+
+/// group(3) binding(5) main sun-shadow uniform read by gpu_draw.wgsl. Byte-identical to the WGSL
+/// `SunShadowUniform` (192 bytes: 2×64 + 4×16).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct SunShadowUniform {
+    /// Per-cascade world->light-clip matrices (column-major).
+    view_proj: [[[f32; 4]; 4]; SHADOW_CASCADES],
+    /// x = far0 (15), y = far1 (80), z = overlap (0.10), w = enabled (1/0).
+    split_depths: [f32; 4],
+    /// xyz = Lsun (toward the sun), w = 1/SHADOW_MAP_SIZE (PCF texel).
+    sun_dir_texel: [f32; 4],
+    /// x = cascade0 world texel, y = cascade1 world texel (world-space bias units), z,w reserved.
+    texel_world: [f32; 4],
+    /// x = diffuse cap (0.12), y = fade start (65), z = fade end (80), w = debug mode (1 = spec-only).
+    combine: [f32; 4],
+}
+
+/// Runtime shadow feature switch + the pack's sun direction (already X-flipped into pack space).
+/// `enabled=false` (missing sun_dir or `not EFT_SHADOWS=1`) makes the whole pass a no-op.
+#[derive(Resource)]
+struct EftShadowConfig {
+    /// Lsun: points TOWARD the sun (light travels along -Lsun). Unit. Y-up sentinel when disabled.
+    lsun: Vec3,
+    enabled: bool,
+    /// `EFT_SHADOW_DEBUG=1`: specular-only diagnostic (diffuse cap forced to 0 in the shader).
+    debug: bool,
+}
+
+/// The queued shadow depth pipeline + its group(1) cascade-uniform layout.
+#[derive(Resource)]
+struct EftShadowPipeline {
+    pipeline_id: CachedRenderPipelineId,
+    #[allow(dead_code)] // kept for symmetry / potential rebuilds; the bind groups already own it
+    cascade_layout: BindGroupLayout,
+}
+
+/// Owns the shadow GPU resources so the depth views + uniforms outlive their bind groups.
+#[derive(Resource)]
+struct EftShadowResources {
+    #[allow(dead_code)] // kept alive so all the views stay valid
+    depth_texture: Texture,
+    #[allow(dead_code)] // D2Array sampling view — bound in the main draw's group(3) binding(6)
+    array_view: TextureView,
+    /// One D2 render view per cascade layer (the shadow node's depth attachment).
+    layer_views: [TextureView; SHADOW_CASCADES],
+    /// Per-cascade group(1) uniform buffers (world->light-clip), rewritten each frame.
+    cascade_uniforms: [Buffer; SHADOW_CASCADES],
+    /// Per-cascade group(1) bind groups over `cascade_uniforms`.
+    cascade_bind_groups: [BindGroup; SHADOW_CASCADES],
+    /// The main SunShadowUniform (bound in the main draw's group(3) binding(5)), rewritten each frame.
+    main_uniform: Buffer,
+    #[allow(dead_code)] // comparison sampler — bound in the main draw's group(3) binding(7)
+    comparison_sampler: Sampler,
+}
 
 /// volume.json layout descriptor (read at load; NEVER hardcoded — the emitter is authority).
 #[derive(Debug, Clone, Deserialize)]
@@ -495,6 +590,10 @@ pub struct CpuData {
     sh_volume: Option<ShVolumeCpu>,
     /// #1 MicroSplat: the terrain splat table (layer/control bindless indices + per-layer rep).
     terrain: TerrainSplatGpu,
+    /// #5 shadows: sun direction (points TOWARD the sun) X-flipped into pack space, or `None` when
+    /// the volume sidecar has no valid `sun_dir` (the shadow feature then disables itself; no
+    /// invented fallback direction). Mirrors standard.rs's exact access + flip.
+    sun_dir: Option<Vec3>,
     instance_total: u32,
     mesh_count: u32,
 }
@@ -566,11 +665,23 @@ impl Plugin for EftGpuDrivenPlugin {
                     upload_frustum
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
+                    // #5 shadows: fit + upload the cascade matrices AFTER the buffers exist (the
+                    // shadow resources are built in prepare_gpu_buffers).
+                    prepare_shadow_uniforms
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
                     queue_gpu_driven.in_set(RenderSystems::QueueMeshes),
                 ),
             )
+            // #5: EftCull (writes visible/indirect) -> EftShadow (reads them, writes the depth
+            // atlas) -> StartMainPass (main draw samples the atlas). The shadow node NEVER re-culls
+            // or resets the shared stream.
             .add_render_graph_node::<EftCullNode>(Core3d, EftCullLabel)
-            .add_render_graph_edges(Core3d, (EftCullLabel, Node3d::StartMainPass));
+            .add_render_graph_node::<EftShadowNode>(Core3d, EftShadowLabel)
+            .add_render_graph_edges(
+                Core3d,
+                (EftCullLabel, EftShadowLabel, Node3d::StartMainPass),
+            );
     }
 }
 
@@ -1068,6 +1179,31 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     // Phase 1 SH-GI: load + repack the baked irradiance volume (volume.bin + volume.json).
     let sh_volume = load_sh_volume(pack);
 
+    // #5 shadows: source the sun direction from the SAME volume.json sidecar the SH bake used, with
+    // the SAME X-flip standard.rs applies (Lsun = normalize(-raw.x, raw.y, raw.z), pointing TOWARD
+    // the sun). `None` (missing/degenerate) => the shadow feature disables itself downstream.
+    let sun_dir = pack
+        .manifest
+        .sidecars
+        .volume_meta
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+        .and_then(|v| {
+            v.get("sun_dir").and_then(|s| s.as_array()).and_then(|a| {
+                let raw = Vec3::new(
+                    -(a.first()?.as_f64()? as f32),
+                    a.get(1)?.as_f64()? as f32,
+                    a.get(2)?.as_f64()? as f32,
+                );
+                (raw.length_squared() > 1e-6).then(|| raw.normalize())
+            })
+        });
+    match sun_dir {
+        Some(d) => info!("gpu-driven #5 shadows: sun_dir (pack space, X-flipped) = {d:?}"),
+        None => info!("gpu-driven #5 shadows: no valid sun_dir in volume.json — shadows disabled"),
+    }
+
     commands.insert_resource(ExtractedCpuData(Arc::new(CpuData {
         vertex_data,
         index_data,
@@ -1078,6 +1214,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         normal_paths,
         sh_volume,
         terrain,
+        sun_dir,
         instance_total,
         mesh_count,
     })));
@@ -1098,6 +1235,10 @@ struct EftComputePipelines {
 #[derive(Resource, Clone)]
 struct EftDrawPipeline {
     shader: Handle<Shader>,
+    /// #5 shadows: the depth-only shadow-caster shader (`gpu_shadow.wgsl`). Loaded at RenderStartup;
+    /// the shadow render pipeline (which also needs the material_layout) is queued in
+    /// `prepare_gpu_buffers` once that layout exists.
+    shadow_shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
     ssbo_layout: BindGroupLayout,
     /// group(2) bindless material layout: material-table SSBO + albedo `binding_array` +
@@ -1241,6 +1382,7 @@ fn init_gpu_pipelines(
 
     let cull_shader = asset_server.load("shaders/gpu_cull.wgsl");
     let draw_shader = asset_server.load("shaders/gpu_draw.wgsl");
+    let shadow_shader = asset_server.load("shaders/gpu_shadow.wgsl"); // #5 depth-only caster
 
     let reset_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("eft_cull_reset".into()),
@@ -1268,6 +1410,7 @@ fn init_gpu_pipelines(
     });
     commands.insert_resource(EftDrawPipeline {
         shader: draw_shader,
+        shadow_shader,
         mesh_pipeline: mesh_pipeline.clone(),
         ssbo_layout,
         material_layout: None, // filled in prepare_gpu_buffers once the albedo count is known
@@ -1281,6 +1424,7 @@ fn prepare_gpu_buffers(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    pipeline_cache: Res<PipelineCache>, // #5 shadows: queue the shadow depth pipeline once here
     cpu: Option<Res<ExtractedCpuData>>,
     already: Option<Res<EftGpuBuffers>>,
     compute: Option<Res<EftComputePipelines>>,
@@ -1547,8 +1691,200 @@ fn prepare_gpu_buffers(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     });
 
-    // group(3): ShVolume uniform (0) + 3 SH 3D textures (1,2,3) + filtering sampler (4). SHARED
-    // by both the opaque and BLEND pipeline specializations (like the group(2) material layout).
+    // ---- #5 Dynamic sun shadows: depth array + sampler + per-cascade uniforms + pipeline --------
+    // Built BEFORE the group(3) layout/bind-group below because the main draw's group(3) samples the
+    // shadow depth array (binding 6) + comparison sampler (binding 7) and reads the SunShadowUniform
+    // (binding 5). Everything here is allocated unconditionally so the group(3) LAYOUT is stable
+    // whether or not shadows are enabled; the runtime switch lives in the SunShadowUniform (enabled)
+    // and `EftShadowConfig`.
+    // #5 sun shadows are OPT-IN, default OFF: the baked SH volume already contains the sun's
+    // static shadows, so the real-time contact term is a marginal add that still needs bias/gate
+    // tuning. Enable explicitly with EFT_SHADOWS=1; otherwise the pass is a strict no-op.
+    let shadows_env_on = std::env::var("EFT_SHADOWS")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let shadow_debug = std::env::var("EFT_SHADOW_DEBUG")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let (lsun, shadows_enabled) = match cpu.sun_dir {
+        Some(d) if shadows_env_on => (d, true), // opt-in via EFT_SHADOWS=1
+        Some(d) => (d, false),                  // sun present but not requested -> default OFF
+        None => (Vec3::Y, false),               // no sun_dir -> disabled (Y-up sentinel; never sampled)
+    };
+    info!(
+        "gpu-driven #5 shadows: enabled={shadows_enabled} debug={shadow_debug} Lsun={lsun:?} \
+         (2 cascades, {sz}²×{n} Depth32Float; opt-in EFT_SHADOWS=1, diag EFT_SHADOW_DEBUG=1)",
+        sz = SHADOW_MAP_SIZE,
+        n = SHADOW_CASCADES,
+    );
+
+    // The 2-layer depth atlas. RENDER_ATTACHMENT (the shadow pass writes it) | TEXTURE_BINDING (the
+    // main pass samples it). One D2Array sampling view + one D2 render view per layer.
+    let shadow_depth = render_device.create_texture(&TextureDescriptor {
+        label: Some("eft_shadow_depth"),
+        size: Extent3d {
+            width: SHADOW_MAP_SIZE,
+            height: SHADOW_MAP_SIZE,
+            depth_or_array_layers: SHADOW_CASCADES as u32,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let shadow_array_view = shadow_depth.create_view(&TextureViewDescriptor {
+        label: Some("eft_shadow_array_view"),
+        dimension: Some(TextureViewDimension::D2Array),
+        ..default()
+    });
+    let shadow_layer_view = |layer: u32| {
+        shadow_depth.create_view(&TextureViewDescriptor {
+            label: Some("eft_shadow_layer_view"),
+            dimension: Some(TextureViewDimension::D2),
+            base_array_layer: layer,
+            array_layer_count: Some(1),
+            ..default()
+        })
+    };
+    let shadow_layer_views: [TextureView; SHADOW_CASCADES] =
+        [shadow_layer_view(0), shadow_layer_view(1)];
+
+    // Comparison sampler: LessEqual (fragment lit when its light-space depth <= stored occluder).
+    let shadow_cmp_sampler = render_device.create_sampler(&SamplerDescriptor {
+        label: Some("eft_shadow_cmp"),
+        address_mode_u: AddressMode::ClampToEdge,
+        address_mode_v: AddressMode::ClampToEdge,
+        address_mode_w: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mipmap_filter: FilterMode::Nearest,
+        compare: Some(CompareFunction::LessEqual),
+        ..default()
+    });
+
+    // group(1) cascade-uniform layout for the shadow pipeline (vertex-stage world->light-clip).
+    let cascade_layout = render_device.create_bind_group_layout(
+        "eft_shadow_cascade_layout",
+        &BindGroupLayoutEntries::single(ShaderStages::VERTEX, uniform_buffer_sized(false, None)),
+    );
+    // Two per-cascade uniform buffers (+ bind groups). Filled per frame by prepare_shadow_uniforms;
+    // sized to the POD so the initial (zeroed) content is a valid, inert matrix until then.
+    let make_cascade_uniform = || {
+        render_device.create_buffer(&BufferDescriptor {
+            label: Some("eft_shadow_cascade_uniform"),
+            size: std::mem::size_of::<ShadowCascadeUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+    let cascade_uniforms: [Buffer; SHADOW_CASCADES] =
+        [make_cascade_uniform(), make_cascade_uniform()];
+    let cascade_bind_groups: [BindGroup; SHADOW_CASCADES] = [
+        render_device.create_bind_group(
+            "eft_shadow_cascade_bg0",
+            &cascade_layout,
+            &BindGroupEntries::single(cascade_uniforms[0].as_entire_binding()),
+        ),
+        render_device.create_bind_group(
+            "eft_shadow_cascade_bg1",
+            &cascade_layout,
+            &BindGroupEntries::single(cascade_uniforms[1].as_entire_binding()),
+        ),
+    ];
+
+    // The main SunShadowUniform (group(3) binding(5)). Initialize enabled=0 so the very first frame
+    // — before prepare_shadow_uniforms runs — is a strict no-op; per-frame fill flips it on.
+    let shadow_main_seed = SunShadowUniform {
+        combine: [
+            SHADOW_DIFFUSE_CAP,
+            SHADOW_FADE_START,
+            SHADOW_FADE_END,
+            if shadow_debug { 1.0 } else { 0.0 },
+        ],
+        sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+        ..default()
+    };
+    let shadow_main_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_sun_shadow_uniform"),
+        contents: bytemuck::bytes_of(&shadow_main_seed),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+
+    // Queue the shadow depth pipeline: groups [ssbo(0), cascade(1), material(2)]; empty color target;
+    // Depth32Float write + LessEqual; cull None (double-sided); raster bias 2 / slope 2.0.
+    let shadow_pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("eft_shadow_depth".into()),
+        layout: vec![
+            draw.ssbo_layout.clone(),
+            cascade_layout.clone(),
+            material_layout.clone(),
+        ],
+        push_constant_ranges: vec![],
+        vertex: VertexState {
+            shader: draw.shadow_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vertex".into()),
+            buffers: vec![VertexBufferLayout {
+                array_stride: DRAW_VERTEX_STRIDE,
+                step_mode: VertexStepMode::Vertex,
+                // pos @0 (loc0), uv @24 (loc2), material @32 (loc3). normal/color are skipped.
+                attributes: vec![
+                    VertexAttribute {
+                        format: VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    VertexAttribute {
+                        format: VertexFormat::Float32x2,
+                        offset: 24,
+                        shader_location: 2,
+                    },
+                    VertexAttribute {
+                        format: VertexFormat::Uint32,
+                        offset: 32,
+                        shader_location: 3,
+                    },
+                ],
+            }],
+        },
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            cull_mode: None, // double-sided casters, like the main pass
+            ..default()
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            // Conventional 0..1 shadow depth (NOT the main pass's reverse-z GreaterEqual).
+            depth_compare: CompareFunction::LessEqual,
+            stencil: StencilState::default(),
+            // Constant + slope-scaled raster bias to fight shadow acne (tuned by the human next).
+            bias: DepthBiasState {
+                constant: 2,
+                slope_scale: 2.0,
+                clamp: 0.0,
+            },
+        }),
+        multisample: MultisampleState {
+            count: 1, // the depth atlas is single-sampled regardless of the main view's MSAA
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        // Fragment with NO color target: it only discards (BLEND) / alpha-tests (CUTOUT) casters.
+        fragment: Some(FragmentState {
+            shader: draw.shadow_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fragment".into()),
+            targets: vec![],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
+
+    // group(3): ShVolume uniform (0) + 3 SH 3D textures (1,2,3) + filtering sampler (4) + #5 shadow
+    // additions: SunShadowUniform (5) + depth-2d-array (6) + comparison sampler (7). SHARED by both
+    // the opaque and BLEND pipeline specializations (like the group(2) material layout).
     let sh_layout = render_device.create_bind_group_layout(
         "eft_sh_layout",
         &BindGroupLayoutEntries::with_indices(
@@ -1559,6 +1895,9 @@ fn prepare_gpu_buffers(
                 (2, texture_3d(TextureSampleType::Float { filterable: true })),
                 (3, texture_3d(TextureSampleType::Float { filterable: true })),
                 (4, sampler(SamplerBindingType::Filtering)),
+                (5, uniform_buffer_sized(false, None)),          // #5 SunShadowUniform
+                (6, texture_2d_array(TextureSampleType::Depth)), // #5 texture_depth_2d_array
+                (7, sampler(SamplerBindingType::Comparison)),    // #5 sampler_comparison
             ),
         ),
     );
@@ -1571,6 +1910,9 @@ fn prepare_gpu_buffers(
             (2, &sh_g_view),
             (3, &sh_b_view),
             (4, &sh_sampler),
+            (5, shadow_main_uniform.as_entire_binding()),
+            (6, &shadow_array_view),
+            (7, &shadow_cmp_sampler),
         )),
     );
 
@@ -1578,6 +1920,7 @@ fn prepare_gpu_buffers(
     // build the 4-group pipeline layout (view / ssbo / material / sh-gi).
     commands.insert_resource(EftDrawPipeline {
         shader: draw.shader.clone(),
+        shadow_shader: draw.shadow_shader.clone(),
         mesh_pipeline: draw.mesh_pipeline.clone(),
         ssbo_layout: draw.ssbo_layout.clone(),
         material_layout: Some(material_layout),
@@ -1599,6 +1942,25 @@ fn prepare_gpu_buffers(
         sampler: sh_sampler,
     });
     commands.insert_resource(EftShBindGroup(sh_bg));
+    // #5 shadows: the runtime switch, the queued pipeline + cascade layout, and the GPU resources.
+    commands.insert_resource(EftShadowConfig {
+        lsun,
+        enabled: shadows_enabled,
+        debug: shadow_debug,
+    });
+    commands.insert_resource(EftShadowPipeline {
+        pipeline_id: shadow_pipeline_id,
+        cascade_layout,
+    });
+    commands.insert_resource(EftShadowResources {
+        depth_texture: shadow_depth,
+        array_view: shadow_array_view,
+        layer_views: shadow_layer_views,
+        cascade_uniforms,
+        cascade_bind_groups,
+        main_uniform: shadow_main_uniform,
+        comparison_sampler: shadow_cmp_sampler,
+    });
     info!(
         "gpu-driven M3: {} albedo textures uploaded, material table + bindless bind group built",
         tex_count
@@ -1754,6 +2116,10 @@ fn upload_rgba8_linear(
 fn upload_frustum(
     render_queue: Res<RenderQueue>,
     buffers: Option<Res<EftGpuBuffers>>,
+    // #5 shadows: when enabled, extrude the frustum toward the sun so off-screen casters survive
+    // the SHARED cull and appear in the shadow map. `None`/disabled -> the cull is byte-identical
+    // to before (perfect A/B against not EFT_SHADOWS=1).
+    shadow: Option<Res<EftShadowConfig>>,
     views: Query<&ExtractedView, With<CullCamera>>,
 ) {
     let Some(buffers) = buffers else {
@@ -1766,7 +2132,20 @@ fn upload_frustum(
     let clip_from_world = view.clip_from_world.unwrap_or_else(|| {
         view.clip_from_view * view.world_from_view.to_matrix().inverse()
     });
-    let planes = build_frustum_planes(clip_from_world);
+    let mut planes = build_frustum_planes(clip_from_world);
+    // Conservatively extrude toward the sun: a possible caster sits at `receiver + Lsun*t`, so push
+    // only the planes it could cross by `t*max(0, -n·Lsun)`. This ONLY loosens the frustum (never
+    // wrongly culls a visible instance); the main pass then processes some extra off-screen
+    // instances but its image is unchanged (they clip). See the plan's Visibility/indirect reuse.
+    if let Some(shadow) = shadow.as_ref() {
+        if shadow.enabled {
+            let lsun = shadow.lsun;
+            for p in planes.iter_mut() {
+                let n = Vec3::new(p.x, p.y, p.z);
+                p.w += SHADOW_CASTER_EXTRUDE * (-n.dot(lsun)).max(0.0);
+            }
+        }
+    }
     let uniform = CullUniform {
         frustum: [
             planes[0].to_array(),
@@ -1779,6 +2158,148 @@ fn upload_frustum(
         counts: [buffers.instance_total, buffers.mesh_count, 0, 0],
     };
     render_queue.write_buffer(&buffers.cull_uniform, 0, bytemuck::bytes_of(&uniform));
+}
+
+// ---- PrepareResources: #5 fit + upload the 2 cascade matrices each frame ----
+// For each cascade slice [n_i, f_i] this reconstructs the camera sub-frustum's 8 world corners,
+// fits a rotation-invariant (bounding-sphere) SQUARE in the sun's light space, texel-snaps its
+// centre (kills shimmer), fits the light-space Z over the caster-extruded + receiver-margin corner
+// set, and builds a conventional 0..1-depth orthographic `view_proj = ortho * light_view`. Uploads
+// the per-cascade uniforms (shadow pass) + the combined SunShadowUniform (main pass). No-op cost
+// when disabled is trivial (still uploads, but the main shader gates everything on enabled).
+fn prepare_shadow_uniforms(
+    render_queue: Res<RenderQueue>,
+    config: Option<Res<EftShadowConfig>>,
+    resources: Option<Res<EftShadowResources>>,
+    views: Query<&ExtractedView, With<CullCamera>>,
+) {
+    let (Some(config), Some(res)) = (config, resources) else {
+        return;
+    };
+    let Some(view) = views.iter().next() else {
+        return;
+    };
+    let lsun = config.lsun;
+    let clip_from_view = view.clip_from_view;
+    let world_from_view = view.world_from_view.to_matrix();
+    let world_from_clip = world_from_view * clip_from_view.inverse();
+
+    // NDC z for a point at positive view-space distance `d` in front of the camera (view looks down
+    // -Z). Works for any projection (incl. Bevy reverse-z) since it re-projects through the camera.
+    let ndc_z_at = |d: f32| -> f32 {
+        let clip = clip_from_view * Vec4::new(0.0, 0.0, -d, 1.0);
+        clip.z / clip.w
+    };
+    // Stable up axis: Y unless Lsun is nearly vertical, then Z.
+    let up = if lsun.dot(Vec3::Y).abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+
+    let mut main = SunShadowUniform {
+        split_depths: [
+            SHADOW_SPLITS[1],
+            SHADOW_SPLITS[2],
+            SHADOW_CASCADE_OVERLAP,
+            if config.enabled { 1.0 } else { 0.0 },
+        ],
+        sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+        combine: [
+            SHADOW_DIFFUSE_CAP,
+            SHADOW_FADE_START,
+            SHADOW_FADE_END,
+            if config.debug { 1.0 } else { 0.0 },
+        ],
+        ..default()
+    };
+
+    for c in 0..SHADOW_CASCADES {
+        let near = SHADOW_SPLITS[c];
+        let far = SHADOW_SPLITS[c + 1];
+        let zn = ndc_z_at(near);
+        let zf = ndc_z_at(far);
+
+        // 8 world-space corners of this slice.
+        let mut corners = [Vec3::ZERO; 8];
+        let mut k = 0usize;
+        for &z in &[zn, zf] {
+            for &y in &[-1.0f32, 1.0] {
+                for &x in &[-1.0f32, 1.0] {
+                    let p = world_from_clip * Vec4::new(x, y, z, 1.0);
+                    corners[k] = p.truncate() / p.w;
+                    k += 1;
+                }
+            }
+        }
+
+        // Centroid + rotation-invariant bounding-sphere radius (constant cascade size under camera
+        // rotation -> no size shimmer). SQUARE fit uses this radius on both axes.
+        let mut center = Vec3::ZERO;
+        for cc in &corners {
+            center += *cc;
+        }
+        center /= 8.0;
+        let mut radius = 0.0f32;
+        for cc in &corners {
+            radius = radius.max((*cc - center).length());
+        }
+        radius = radius.max(0.05);
+
+        // Light view: eye on the sun side looking at the slice centre.
+        let eye = center + lsun * (radius + SHADOW_CASTER_EXTRUDE);
+        let light_view = Mat4::look_at_rh(eye, center, up);
+
+        // Texel-snap the light-space XY centre so the cascade doesn't crawl as the camera moves.
+        let world_texel = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+        let center_ls = light_view.transform_point3(center);
+        let snapped_x = (center_ls.x / world_texel).round() * world_texel;
+        let snapped_y = (center_ls.y / world_texel).round() * world_texel;
+
+        // Light-space Z fit over the receiver corners + caster extrusion (toward the sun) + receiver
+        // margin (away from the sun). In RH light space, in-front points have negative z.
+        let mut zmin = f32::MAX;
+        let mut zmax = f32::MIN;
+        for cc in &corners {
+            for p in &[
+                *cc,
+                *cc + lsun * SHADOW_CASTER_EXTRUDE,
+                *cc - lsun * SHADOW_RECEIVER_MARGIN,
+            ] {
+                let z = light_view.transform_point3(*p).z;
+                zmin = zmin.min(z);
+                zmax = zmax.max(z);
+            }
+        }
+        let ortho_near = (-zmax).max(0.0);
+        let ortho_far = (-zmin).max(ortho_near + 0.1);
+
+        let proj = Mat4::orthographic_rh(
+            snapped_x - radius,
+            snapped_x + radius,
+            snapped_y - radius,
+            snapped_y + radius,
+            ortho_near,
+            ortho_far,
+        );
+        let view_proj = proj * light_view;
+        let vp_cols = view_proj.to_cols_array_2d();
+
+        main.view_proj[c] = vp_cols;
+        main.texel_world[c] = world_texel;
+
+        let cascade = ShadowCascadeUniform {
+            view_proj: vp_cols,
+            dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+        };
+        render_queue.write_buffer(
+            &res.cascade_uniforms[c],
+            0,
+            bytemuck::bytes_of(&cascade),
+        );
+    }
+
+    render_queue.write_buffer(&res.main_uniform, 0, bytemuck::bytes_of(&main));
 }
 
 // ---- QueueMeshes: specialize both passes + add the TWO phase items ----------
@@ -2050,10 +2571,15 @@ impl FromWorld for EftCullNode {
 impl Node for EftCullNode {
     fn run<'w>(
         &self,
-        _graph: &mut RenderGraphContext,
+        graph: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
+        // Only run for the tagged player view (Core3d may run for several views); the cull writes
+        // GLOBAL buffers from that view's frustum, so running it for other views is redundant work.
+        if world.get::<CullCamera>(graph.view_entity()).is_none() {
+            return Ok(());
+        }
         let (Some(buffers), Some(bind), Some(pipelines)) = (
             world.get_resource::<EftGpuBuffers>(),
             world.get_resource::<EftCullBindGroup>(),
@@ -2092,6 +2618,81 @@ impl Node for EftCullNode {
             pass.set_pipeline(cull);
             pass.set_bind_group(0, &**bg, &[]);
             pass.dispatch_workgroups(cull_groups, 1, 1);
+        }
+        Ok(())
+    }
+}
+
+// ===========================================================================
+// #5 Shadow node: render the 2 cascade depth layers, reusing the camera-culled
+// visible[]/indirect stream READ-ONLY. Runs after EftCull, before StartMainPass.
+// ===========================================================================
+#[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
+struct EftShadowLabel;
+
+struct EftShadowNode;
+
+impl FromWorld for EftShadowNode {
+    fn from_world(_: &mut World) -> Self {
+        Self
+    }
+}
+
+impl Node for EftShadowNode {
+    fn run<'w>(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext<'w>,
+        world: &'w World,
+    ) -> Result<(), NodeRunError> {
+        // Only run for the tagged player view (avoids duplicate atlas clears/draws on other views).
+        if world.get::<CullCamera>(graph.view_entity()).is_none() {
+            return Ok(());
+        }
+        let (Some(config), Some(buffers), Some(draw_bg), Some(material_bg), Some(res), Some(pipe)) = (
+            world.get_resource::<EftShadowConfig>(),
+            world.get_resource::<EftGpuBuffers>(),
+            world.get_resource::<EftDrawBindGroup>(),
+            world.get_resource::<EftMaterialBindGroup>(),
+            world.get_resource::<EftShadowResources>(),
+            world.get_resource::<EftShadowPipeline>(),
+        ) else {
+            return Ok(()); // resources not built yet (or feature-disabled path)
+        };
+        // Disabled (no sun_dir or not EFT_SHADOWS=1): skip entirely. The main shader has enabled=0 and
+        // never samples the (then-undefined) depth atlas, so this is a strict no-op.
+        if !config.enabled {
+            return Ok(());
+        }
+        let cache = world.resource::<PipelineCache>();
+        let Some(pipeline) = cache.get_render_pipeline(pipe.pipeline_id) else {
+            return Ok(()); // shadow pipeline still compiling
+        };
+
+        // One depth-only render pass per cascade layer: clear to 1.0, then the SAME multidraw the
+        // main pass uses (indirect buffer READ-ONLY — never reset/reculled here).
+        for c in 0..SHADOW_CASCADES {
+            let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+                label: Some("eft_shadow_cascade"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &res.layer_views[c],
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_render_pipeline(pipeline);
+            pass.set_bind_group(0, &draw_bg.0, &[]); // instances + visible (shared)
+            pass.set_bind_group(1, &res.cascade_bind_groups[c], &[]); // this cascade's view_proj
+            pass.set_bind_group(2, &material_bg.0, &[]); // material table + albedo (alpha test)
+            pass.set_vertex_buffer(0, buffers.vertex.slice(..));
+            pass.set_index_buffer(buffers.index.slice(..), 0, IndexFormat::Uint32);
+            pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count);
         }
         Ok(())
     }
