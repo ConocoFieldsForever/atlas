@@ -571,6 +571,7 @@ fn spawn_pois(
     // Set when loot.json ships clean faction-tagged extracts; those supersede the semantics
     // `extract` layer below.
     let mut have_dev_extracts = false;
+    let mut have_dev_stationary = false;
     let key = map_key(&lp.0.manifest.dataset);
     if let Some(mn) = std::fs::read_to_string(root.join("loot.json"))
         .ok()
@@ -599,6 +600,7 @@ fn spawn_pois(
         for hz in &mn.hazards {
             spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz));
         }
+        have_dev_stationary = !mn.stationary.is_empty();
         for st in &mn.stationary {
             spawn(&mut commands, PoiLayer::Stationary, st.pos, stationary_info(st));
         }
@@ -653,6 +655,58 @@ fn spawn_pois(
                     }
                 }
             }
+        }
+    }
+
+    // ---- STATIONARY weapons from GAME GEOMETRY (fills the tarkov.dev gap) ----
+    // tarkov.dev's `stationaryWeapons` is empty for many maps (incl. Interchange), yet the map
+    // HAS mounted MGs — in the pack they're `reciever_*` (and NSV/Kord/DShK/Utes) meshes. When
+    // loot.json gave us no stationary data, scan the pack instances and dedupe co-located
+    // receiver parts (one gun = several meshes at ~one spot) into one marker per gun.
+    if !have_dev_stationary {
+        let pack = &lp.0;
+        let is_mg = |name: &str| {
+            let s = name.to_ascii_lowercase();
+            !s.contains("sandbag")
+                && (s.contains("reciever")
+                    || s.contains("receiver")
+                    || s.contains("dshk")
+                    || s.contains("nsv")
+                    || s.contains("kord")
+                    || s.contains("utes")
+                    || s.contains("pkm")
+                    || s.contains("pulemet"))
+        };
+        let mut seen: Vec<Vec3> = Vec::new();
+        for inst in &pack.instances {
+            let mid = inst.mesh_id as usize;
+            let Some(m) = pack.manifest.meshes.get(mid) else {
+                continue;
+            };
+            if !is_mg(&m.name) {
+                continue;
+            }
+            let t = inst.affine3a().translation;
+            let p = Vec3::new(t.x, t.y, t.z);
+            // one gun spans several receiver meshes at ~the same spot — collapse them.
+            if seen.iter().any(|q| (q.x - p.x).abs() < 3.0 && (q.z - p.z).abs() < 3.0) {
+                continue;
+            }
+            seen.push(p);
+            spawn(
+                &mut commands,
+                PoiLayer::Stationary,
+                [p.x, p.y, p.z],
+                MarkerInfo {
+                    title: "Stationary gun".into(),
+                    subtitle: "Mounted MG".into(),
+                    detail: vec!["From map geometry".into()],
+                    accent: poi_look(PoiLayer::Stationary).0,
+                },
+            );
+        }
+        if !seen.is_empty() {
+            info!("poi: +{} stationary guns mined from geometry", seen.len());
         }
     }
 
