@@ -40,12 +40,27 @@ tanked its 102k-entity scene:
   recovered by scanning the shared bundles). e.g. `Grass_summer_D tileX=137.3`,
   `Gravel_Road_A_summer_D tileX=179.5`.
 - **Solution:** MicroSplat splat shader for `FLAG_TERRAIN` tiles: sample the 3 control maps →
-  12 weights; sample each layer albedo (+normal) at its `tileX` tiling; weight-blend +
-  normalize. Sharp at any zoom. Pipe layer albedo/normal paths + tileX into the pack for the
-  terrain tiles.
+  12 weights; sample each layer albedo (+normal) at its tiling; weight-blend + normalize.
+- **CONFIRMED DATA (2026-07-15), all present under `terrain_layers/`:**
+  - 4 tiles: `Slice_1_1/1_2/2_1/2_2`, each 700×700 m, each with 3 control maps
+    (`ctrl_<slice>_{0,1,2}.png`, RGBA = 12 layer weights).
+  - 12 layers, each `{idx, name, ctrl(0..2), chan(0..3=RGBA), tileX, rep}`; all 12 albedos
+    `layer_<name>.png` + most normals `layer_<name>_N.png` on disk.
+  - **TILING (verified via `microsplat_uv_scales`):** MicroSplat = `tiledUV = terrainUV01 ×
+    _UVScale × perTexScale[i]`; manifest `rep = _UVScale·perTexScale` ⇒ **`layer_uv =
+    terrainUV01 × rep`** (Repeat wrap). NEVER use `tileX`/`m_TileSize` (garbage `y=inf`).
+    Grass rep≈397 → ~1.8 m repeat ✓; tileX=137 → 137 m repeat = the "massive grass" bug.
+- **IMPLEMENTATION PLAN (custom path):**
+  1. Pipeline (assemble_bevy): for each `FLAG_TERRAIN` tile, tag which Slice it is + emit a
+     terrain-material record (3 ctrl-map paths, 12× {albedo path, ctrl, chan, rep}). Need to
+     confirm the terrain mesh's UV convention (raw uv01 vs baked ×uvscale).
+  2. Rust (gpu_driven): load the 3 ctrl maps (per slice) + 12 layer albedos into the bindless
+     set; add a terrain uniform (rep[12], ctrl/chan indices) + a terrain flag path.
+  3. Shader (gpu_draw.wgsl): terrain branch — sample 3 ctrl maps → w[12]; `acc = Σ w[i]·
+     texture(layer[i], uv·rep[i])`; normalize by Σw. Matte roughness.
 - **Refs:** `tarkmap-terrain-microsplat-tiling`, `tarkmap-road-terrain-matte-and-hole-bake`
 
-### 2. Decals render as "big sheets"  —  STATUS: DONE on custom path / broken on standard
+### 2. Decals render as "big sheets"  —  STATUS: ✅ VERIFIED fixed on custom path (2026-07-15)
 - **Symptom:** tire tracks / drips / posters render as full semi-transparent quads.
 - **Root cause:** decal coverage is either **vertex paint `COLOR_0.a`** (SoftCutout family)
   or **albedo alpha** (`decal_surface`); the standard path ignores both and just blends the
@@ -58,7 +73,7 @@ tanked its 102k-entity scene:
   targeting the custom path. VERIFY on it.
 - **Refs:** `tarkmap-decal-alpha-coverage`, `tarkmap-vp-shader-variants`
 
-### 3. Road splines torn / floating tire-track sheets  —  STATUS: DONE on custom path (verify)
+### 3. Road splines torn / floating tire-track sheets  —  STATUS: ✅ VERIFIED fixed on custom path (2026-07-15)
 - **Symptom:** `RoadSplineGenerator_GenerateLods` decals render as torn, floating sheets.
 - **Root cause:** same SoftCutout coverage not applied (standard path).
 - **Solution:** same as #2. The road is a **decal that FEATHERS into the terrain** via
@@ -78,7 +93,10 @@ tanked its 102k-entity scene:
   hand-authored**. Grass Texture2D PPtr + min/max scale in the ~692 B header. (The pack's
   `grass.json` currently only has per-slice tint/amount/strength — the density grids still
   need extracting.)
-- **Solution:** extract the density grids; per nonzero cell scatter grass instances (fixed
+- **CONFIRMED (2026-07-15): density grids ALREADY extracted** — `terrain_layers/
+  grass_density_Slice_{1_1,1_2,2_1,2_2}.bin`, each 1,048,576 B = 1024² uint8. Grass albedos
+  present (`grass_Grass3_D.png`, `grass_Grass5_512_D.png` + `_N`). → render-only task now.
+- **Solution:** place instances from the density grids; per nonzero cell scatter grass (fixed
   per-cell hash) at the cell's world XZ via terrain UV space; render GPU-instanced billboards/
   cross-quads; per-slice tint. **DETERMINISTIC** — never client-scatter from splat weight
   (competitive-shooter visibility surface; also fixes grass-through-concrete for free).
