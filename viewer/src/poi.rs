@@ -5,7 +5,9 @@
 //! (extract_semantics.py, name-classified GameObjects). loot.json v2 also carries a MAP-INTEL
 //! set — locks & keys, hazards, switches, transits, stationary weapons, loose loot, plus a
 //! clean faction-tagged extract list (`extracts_dev`) that supersedes the semantics extracts
-//! when present. Every marker carries a `PoiLayer` component; the layer panel
+//! when present. A QUEST layer comes from `tasks.json` (build_tasks.py) — the global task
+//! catalog, filtered to the current map's objective zones. Every marker carries a `PoiLayer`
+//! component; the layer panel
 //! (`ui::LayerToggles`) drives its visibility. All positions are already pack space (the same
 //! diag(-1,1,1) X-flip as the geometry). Both sidecars resolve next to the pack (portable).
 
@@ -31,6 +33,8 @@ pub enum PoiLayer {
     Transit,
     Stationary,
     LooseLoot,
+    // ---- QUESTS (tasks.json) ----
+    Quest,
 }
 
 pub struct PoiPlugin;
@@ -56,6 +60,7 @@ pub fn poi_look(l: PoiLayer) -> (Color, f32, f32) {
         PoiLayer::Transit => (Color::srgb(0.20, 0.85, 0.62), 1.2, 1.3),
         PoiLayer::Stationary => (Color::srgb(0.66, 0.62, 0.35), 0.6, 0.8),
         PoiLayer::LooseLoot => (Color::srgb(0.86, 0.80, 0.55), 0.32, 0.5),
+        PoiLayer::Quest => (Color::srgb(0.52, 0.48, 0.96), 0.85, 1.0),
     }
 }
 
@@ -208,6 +213,66 @@ struct Poi {
     /// Raw GameObject name (prettified for the card title).
     #[serde(default)]
     name: String,
+}
+
+/// tasks.json (build_tasks.py) — the global quest catalog. One entry per task; each task's
+/// objectives carry map-located `zones` (positions already bridged to viewer space).
+#[derive(Deserialize)]
+struct QuestFile {
+    tasks: Vec<QuestTask>,
+}
+#[derive(Deserialize)]
+struct QuestTask {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    trader: String,
+    #[serde(default, rename = "minLevel")]
+    min_level: Option<u32>,
+    #[serde(default)]
+    kappa: bool,
+    #[serde(default)]
+    objectives: Vec<QuestObjective>,
+}
+#[derive(Deserialize)]
+struct QuestObjective {
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    zones: Vec<QuestZone>,
+}
+#[derive(Deserialize)]
+struct QuestZone {
+    /// Map id this zone belongs to (a task can span maps).
+    #[serde(default)]
+    map: String,
+    /// Bridged viewer-space position, or absent (outline-only zone — skipped).
+    #[serde(default)]
+    pos: Option<[f32; 3]>,
+}
+
+/// Card for a quest objective located on this map (tasks.json).
+fn quest_info(t: &QuestTask, o: &QuestObjective) -> MarkerInfo {
+    let mut detail = Vec::new();
+    if !o.desc.is_empty() {
+        detail.push(o.desc.clone());
+    }
+    let mut tags = Vec::new();
+    if let Some(lv) = t.min_level.filter(|&l| l > 0) {
+        tags.push(format!("Lvl {lv}"));
+    }
+    if t.kappa {
+        tags.push("Kappa".into());
+    }
+    if !tags.is_empty() {
+        detail.push(tags.join("  \u{00B7}  "));
+    }
+    MarkerInfo {
+        title: if t.name.is_empty() { "Task".into() } else { t.name.clone() },
+        subtitle: if t.trader.is_empty() { "Task".into() } else { format!("Task \u{00B7} {}", t.trader) },
+        detail,
+        accent: poi_look(PoiLayer::Quest).0,
+    }
 }
 
 /// Card contents for a loot.json spawn node (pmc/scav/boss).
@@ -467,6 +532,7 @@ fn spawn_pois(
         PoiLayer::Transit,
         PoiLayer::Stationary,
         PoiLayer::LooseLoot,
+        PoiLayer::Quest,
     ];
     let mut mats: HashMap<u8, Handle<StandardMaterial>> = HashMap::new();
     for &l in &all {
@@ -572,7 +638,25 @@ fn spawn_pois(
         }
     }
 
-    info!("poi: {n} POI markers spawned (spawns/extracts/doors/interactables + map intel)");
+    // ---- quest objectives from tasks.json (global catalog, filtered to THIS map's zones) ----
+    if let Some(qf) = std::fs::read_to_string(root.join("tasks.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<QuestFile>(&s).ok())
+    {
+        for t in &qf.tasks {
+            for o in &t.objectives {
+                for z in &o.zones {
+                    if z.map == key {
+                        if let Some(p) = z.pos {
+                            spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!("poi: {n} POI markers spawned (spawns/extracts/doors/interactables + map intel + quests)");
 }
 
 fn apply_poi_visibility(toggles: Res<LayerToggles>, mut q: Query<(&PoiLayer, &mut Visibility)>) {
@@ -593,6 +677,7 @@ fn apply_poi_visibility(toggles: Res<LayerToggles>, mut q: Query<(&PoiLayer, &mu
             PoiLayer::Transit => toggles.transits,
             PoiLayer::Stationary => toggles.stationary,
             PoiLayer::LooseLoot => toggles.loose,
+            PoiLayer::Quest => toggles.quests,
         };
         *vis = if show {
             Visibility::Visible

@@ -35,6 +35,8 @@ pub struct LayerToggles {
     pub transits: bool,
     pub stationary: bool,
     pub loose: bool,
+    // ---- QUESTS (tasks.json) ----
+    pub quests: bool,
 }
 
 impl Default for LayerToggles {
@@ -62,6 +64,7 @@ impl Default for LayerToggles {
             transits: has("transit"),
             stationary: has("stationary"),
             loose: has("loose"),
+            quests: has("quest"),
         }
     }
 }
@@ -201,6 +204,7 @@ fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<Layer
             poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit);
             poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary);
             poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot);
+            poi_row(ui, &mut toggles.quests, "Tasks / quests", PoiLayer::Quest);
         });
 }
 
