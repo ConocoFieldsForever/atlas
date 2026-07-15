@@ -7,6 +7,7 @@
 //! already pack space (the same diag(-1,1,1) X-flip as the geometry). Both sidecars resolve
 //! next to the pack (portable).
 
+use crate::inspect::{money, prettify, titlecase, MarkerInfo, PickRadius};
 use crate::render::LoadedPack;
 use crate::ui::LayerToggles;
 use bevy::prelude::*;
@@ -59,6 +60,18 @@ struct MapNodes {
 #[derive(Deserialize)]
 struct Node {
     pos: [f32; 3],
+    /// Spawn group size / count.
+    #[serde(default)]
+    n: Option<u32>,
+    /// Expected ruble value of loot reachable from this spawn.
+    #[serde(default)]
+    ev: Option<i64>,
+    /// Boss name (boss_nodes only).
+    #[serde(default)]
+    boss: Option<String>,
+    /// Boss spawn chance 0..1 (boss_nodes only).
+    #[serde(default)]
+    chance: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +81,92 @@ struct SemFile {
 #[derive(Deserialize)]
 struct Poi {
     p: [f32; 3],
+    /// Raw GameObject name (prettified for the card title).
+    #[serde(default)]
+    name: String,
+}
+
+/// Card contents for a loot.json spawn node (pmc/scav/boss).
+fn node_info(l: PoiLayer, nd: &Node) -> MarkerInfo {
+    let accent = poi_look(l).0;
+    match l {
+        PoiLayer::PmcSpawn => {
+            let mut detail = Vec::new();
+            if let Some(n) = nd.n {
+                detail.push(format!("Group \u{00D7}{n}"));
+            }
+            if let Some(ev) = nd.ev {
+                detail.push(format!("Est. loot  {}", money(ev)));
+            }
+            MarkerInfo {
+                title: "PMC spawn".into(),
+                subtitle: "Spawn point".into(),
+                detail,
+                accent,
+            }
+        }
+        PoiLayer::ScavSpawn => {
+            let mut detail = Vec::new();
+            if let Some(n) = nd.n {
+                detail.push(format!("Group \u{00D7}{n}"));
+            }
+            MarkerInfo {
+                title: "Scav spawn".into(),
+                subtitle: "Spawn point".into(),
+                detail,
+                accent,
+            }
+        }
+        PoiLayer::Boss => {
+            let title = nd
+                .boss
+                .as_deref()
+                .map(titlecase)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Boss".into());
+            let mut detail = Vec::new();
+            if let Some(ch) = nd.chance {
+                detail.push(format!("Chance {:.0}%", ch * 100.0));
+            }
+            if let Some(ev) = nd.ev {
+                detail.push(format!("Est. loot  {}", money(ev)));
+            }
+            MarkerInfo {
+                title,
+                subtitle: "Boss spawn".into(),
+                detail,
+                accent,
+            }
+        }
+        _ => MarkerInfo {
+            title: "Spawn".into(),
+            subtitle: "Spawn point".into(),
+            detail: Vec::new(),
+            accent,
+        },
+    }
+}
+
+/// Card contents for a semantics.json POI (extract/door/interactable).
+fn sem_info(l: PoiLayer, poi: &Poi) -> MarkerInfo {
+    let accent = poi_look(l).0;
+    let pretty = prettify(&poi.name);
+    let (fallback, subtitle) = match l {
+        PoiLayer::Extract => ("Extract", "Extract"),
+        PoiLayer::Door => ("Door", "Door"),
+        _ => ("Interactable", "Interactable"),
+    };
+    let title = if pretty.is_empty() {
+        fallback.to_string()
+    } else {
+        pretty
+    };
+    MarkerInfo {
+        title,
+        subtitle: subtitle.to_string(),
+        detail: Vec::new(),
+        accent,
+    }
 }
 
 /// dataset "interchange_v2" -> loot/semantics map key "interchange" (strip a `_vN` suffix).
@@ -116,13 +215,17 @@ fn spawn_pois(
 
     // helper closure captured by the spawn loop below (all shared handles are Clone).
     let mut n = 0u32;
-    let mut spawn = |commands: &mut Commands, l: PoiLayer, p: [f32; 3]| {
+    let mut spawn = |commands: &mut Commands, l: PoiLayer, p: [f32; 3], info: MarkerInfo| {
         let (_, r, lift) = poi_look(l);
+        // Clamp the click radius up so tiny door/interactable markers stay hittable.
+        let pick_r = r.max(0.9);
         commands.spawn((
             Mesh3d(sphere.clone()),
             MeshMaterial3d(mats[&(l as u8)].clone()),
             Transform::from_xyz(p[0], p[1] + lift, p[2]).with_scale(Vec3::splat(r)),
             l,
+            PickRadius(pick_r),
+            info,
             Visibility::Hidden, // POI layers default OFF; the panel toggles them on
         ));
         n += 1;
@@ -136,13 +239,13 @@ fn spawn_pois(
         .and_then(|mut f| f.maps.remove(&key))
     {
         for nd in &mn.pmc_nodes {
-            spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos);
+            spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd));
         }
         for nd in &mn.scav_nodes {
-            spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos);
+            spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd));
         }
         for nd in &mn.boss_nodes {
-            spawn(&mut commands, PoiLayer::Boss, nd.pos);
+            spawn(&mut commands, PoiLayer::Boss, nd.pos, node_info(PoiLayer::Boss, nd));
         }
     }
 
@@ -160,7 +263,7 @@ fn spawn_pois(
         for (lname, ly) in map {
             if let Some(v) = layers.get(lname) {
                 for poi in v {
-                    spawn(&mut commands, ly, poi.p);
+                    spawn(&mut commands, ly, poi.p, sem_info(ly, poi));
                 }
             }
         }

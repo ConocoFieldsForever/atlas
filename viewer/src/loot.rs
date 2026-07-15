@@ -15,6 +15,7 @@
 //! mesh path, alongside the custom GPU-driven .eftpack draw. Every marker is emissive
 //! so it reads even in a dark interior.
 
+use crate::inspect::{money, titlecase, MarkerInfo, PickRadius};
 use crate::render::LoadedPack;
 use bevy::prelude::*;
 use serde::Deserialize;
@@ -41,6 +42,15 @@ struct MapLoot {
 struct Container {
     pos: [f32; 3],
     cls: String,
+    /// Human-readable container type (JSON key `type`), e.g. "Weapon box (5x2)".
+    #[serde(default, rename = "type")]
+    type_: String,
+    /// Expected ruble value of the container's loot.
+    #[serde(default)]
+    ev: i64,
+    /// Spawn probability 0..1.
+    #[serde(default)]
+    spawn: f32,
 }
 
 /// Container class -> (base color, half-extents in metres). Weapon boxes are dark
@@ -167,6 +177,23 @@ fn spawn_loot(
                 })
             })
             .clone();
+        // Card copy: title from the human `type` (fall back to the title-cased class),
+        // value/spawn-chance details only when present.
+        let title = if c.type_.is_empty() {
+            titlecase(&c.cls)
+        } else {
+            c.type_.clone()
+        };
+        let mut detail = Vec::new();
+        if c.ev > 0 {
+            detail.push(format!("Value  {}", money(c.ev)));
+        }
+        if c.spawn > 0.0 {
+            detail.push(format!("Spawn {:.0}%", c.spawn * 100.0));
+        }
+        // Bounding sphere of the scaled cube (half-diagonal of the full extent),
+        // clamped up so small markers stay easy to click.
+        let pick_r = ((half * 2.0).length() * 0.5).max(0.9);
         // pos is the container's floor point; lift by half-height so the box sits ON the floor.
         commands.spawn((
             Mesh3d(unit_cube.clone()),
@@ -174,6 +201,13 @@ fn spawn_loot(
             Transform::from_xyz(c.pos[0], c.pos[1] + half.y, c.pos[2]).with_scale(half * 2.0),
             LootMarker,
             LootClass(c.cls.clone()),
+            PickRadius(pick_r),
+            MarkerInfo {
+                title,
+                subtitle: format!("Loot \u{00B7} {}", c.cls),
+                detail,
+                accent: color,
+            },
         ));
     }
     info!(
