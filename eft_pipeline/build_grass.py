@@ -13,11 +13,56 @@ Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 (20 B), pack s
 
   python -m eft_pipeline.build_grass --pack packs/interchange.eftpack
 """
-import os, sys, json, struct, argparse
+import os, sys, json, struct, argparse, re
 import numpy as np
 
 TL = r"C:/Users/user/beamng_blender_pipeline/eft_assets/interchange_v2/terrain_layers"
 FLAG_TERRAIN = 1 << 1
+# Road/asphalt SURFACE meshes (laid ON the grass terrain, so the density grid still has grass
+# under them -> grass pokes through). Their XZ footprint masks grass. Exclude non-surface props
+# that happen to be named road_* (signs, lamps, fences, barriers).
+ROAD_RE = re.compile(r"road|asphalt|spline|tarcola|parking|sidewalk|\bcurb", re.I)
+ROAD_NOT_RE = re.compile(r"sign|lamp|light|fence|barrier|pole|rail|wall|cone|bollard", re.I)
+
+
+def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
+    """World-XZ coverage set (cell-quantized) of road/asphalt mesh footprints. Grass clumps that
+    land inside are skipped. Footprint is sampled from the road meshes' world-space vertices (dense
+    along the splines) plus a small dilation to close gaps and cover the surface width."""
+    id2mesh = {m["id"]: m for m in mani["meshes"]}
+    road_ids = {mid for mid, m in id2mesh.items()
+                if ROAD_RE.search(m["name"]) and not ROAD_NOT_RE.search(m["name"])}
+    vl = mani["vertex"]; vs = vl["stride"]
+    poff = next(a for a in vl["attrs"] if a["name"] == "position")["offset"]
+    inst = mani["instance"]; istride = inst["stride"]
+    fo = {f["name"]: f["offset"] for f in inst["fields"]}
+    n = len(ib) // istride
+    cells = set()
+    ninst = 0
+    for i in range(n):
+        b = i * istride
+        mid = struct.unpack_from("<I", ib, b + fo["meshId"])[0]
+        if mid not in road_ids:
+            continue
+        ninst += 1
+        a = struct.unpack_from("<12f", ib, b + fo["affine"])
+        me = id2mesh[mid]; N = me["vtxCount"]; off = me["vtxOffset"]
+        step = max(1, N // 4000)                                    # cap verts/mesh for speed
+        for k in range(0, N, step):
+            o = off + k * vs
+            lx, ly, lz = struct.unpack_from("<3f", mb, o + poff)
+            wx = a[0] * lx + a[1] * ly + a[2] * lz + a[3]
+            wz = a[8] * lx + a[9] * ly + a[10] * lz + a[11]
+            cells.add((int(round(wx / cell)), int(round(wz / cell))))
+    if dilate:
+        d = set()
+        for (cx, cz) in cells:
+            for dx in range(-dilate, dilate + 1):
+                for dz in range(-dilate, dilate + 1):
+                    d.add((cx + dx, cz + dz))
+        cells = d
+    print(f"[grass] road mask: {len(road_ids)} road meshes, {ninst} instances -> {len(cells)} masked {cell}m cells")
+    return cells, cell
 # density cell -> #instances by value band (sparse map is already road-excluding).
 # 1 clump per non-empty cell keeps it dense but bounded (~300k total on Interchange).
 
@@ -90,8 +135,12 @@ def main():
                 slices[s] = (aff, me)
     print(f"[grass] {len(slices)} terrain slices")
 
+    # road/asphalt footprint mask (grass under road SURFACE meshes -> pokes through, skip it).
+    road_cells, rcell = build_road_mask(mani, mb, ib)
+
     recs = bytearray()
     total = 0
+    skipped_road = 0
     for sname, (aff, me) in slices.items():
         dpath = os.path.join(TL, f"grass_density_{sname}.bin")
         if not os.path.exists(dpath):
@@ -108,6 +157,10 @@ def main():
             v = (cy + 0.5) / 1024.0
             w = bilinear(grid, u, v)
             if not np.all(np.isfinite(w)):
+                continue
+            # skip clumps that land under a road/asphalt surface mesh
+            if (int(round(w[0] / rcell)), int(round(w[2] / rcell))) in road_cells:
+                skipped_road += 1
                 continue
             # deterministic per-cell hash -> rotation + scale (never client-random)
             h = (int(cx) * 73856093) ^ (int(cy) * 19349663)
@@ -130,7 +183,7 @@ def main():
         pass
     json.dump({"count": total, "albedo": alb.replace("\\", "/"), "tint": tint},
               open(os.path.join(pack, "grass_sidecar.json"), "w"), indent=1)
-    print(f"[grass] TOTAL {total} clumps -> {pack}/grass.bin ({len(recs)//20} recs, {len(recs)/1e6:.1f} MB)")
+    print(f"[grass] TOTAL {total} clumps ({skipped_road} skipped under roads) -> {pack}/grass.bin ({len(recs)//20} recs, {len(recs)/1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
