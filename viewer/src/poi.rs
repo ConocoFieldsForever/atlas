@@ -2,10 +2,12 @@
 //!
 //! PMC / scav / boss spawns come from `loot.json` (tarkov.dev `maps.spawns`, clustered by
 //! build_loot.py); extracts / doors / interactables come from `semantics.json`
-//! (extract_semantics.py, name-classified GameObjects). Every marker carries a `PoiLayer`
-//! component; the layer panel (`ui::LayerToggles`) drives its visibility. All positions are
-//! already pack space (the same diag(-1,1,1) X-flip as the geometry). Both sidecars resolve
-//! next to the pack (portable).
+//! (extract_semantics.py, name-classified GameObjects). loot.json v2 also carries a MAP-INTEL
+//! set — locks & keys, hazards, switches, transits, stationary weapons, loose loot, plus a
+//! clean faction-tagged extract list (`extracts_dev`) that supersedes the semantics extracts
+//! when present. Every marker carries a `PoiLayer` component; the layer panel
+//! (`ui::LayerToggles`) drives its visibility. All positions are already pack space (the same
+//! diag(-1,1,1) X-flip as the geometry). Both sidecars resolve next to the pack (portable).
 
 use crate::inspect::{money, prettify, titlecase, MarkerInfo, PickRadius};
 use crate::render::LoadedPack;
@@ -22,6 +24,13 @@ pub enum PoiLayer {
     Extract,
     Door,
     Interactable,
+    // ---- MAP INTEL (loot.json v2) ----
+    Lock,
+    Hazard,
+    Switch,
+    Transit,
+    Stationary,
+    LooseLoot,
 }
 
 pub struct PoiPlugin;
@@ -41,6 +50,12 @@ pub fn poi_look(l: PoiLayer) -> (Color, f32, f32) {
         PoiLayer::Extract => (Color::srgb(0.26, 0.90, 0.38), 1.3, 1.4),
         PoiLayer::Door => (Color::srgb(0.95, 0.56, 0.16), 0.35, 0.6),
         PoiLayer::Interactable => (Color::srgb(0.32, 0.85, 0.92), 0.32, 0.5),
+        PoiLayer::Lock => (Color::srgb(0.93, 0.78, 0.30), 0.45, 0.7),
+        PoiLayer::Hazard => (Color::srgb(0.95, 0.26, 0.20), 1.0, 1.0),
+        PoiLayer::Switch => (Color::srgb(0.30, 0.85, 0.92), 0.45, 0.7),
+        PoiLayer::Transit => (Color::srgb(0.20, 0.85, 0.62), 1.2, 1.3),
+        PoiLayer::Stationary => (Color::srgb(0.66, 0.62, 0.35), 0.6, 0.8),
+        PoiLayer::LooseLoot => (Color::srgb(0.86, 0.80, 0.55), 0.32, 0.5),
     }
 }
 
@@ -56,6 +71,21 @@ struct MapNodes {
     scav_nodes: Vec<Node>,
     #[serde(default)]
     boss_nodes: Vec<Node>,
+    // ---- MAP INTEL (loot.json v2) — every array `default` so old packs are fine ----
+    #[serde(default)]
+    locks: Vec<Lock>,
+    #[serde(default)]
+    switches: Vec<Switch>,
+    #[serde(default)]
+    transits: Vec<Transit>,
+    #[serde(default)]
+    hazards: Vec<Hazard>,
+    #[serde(default)]
+    stationary: Vec<Stationary>,
+    #[serde(default)]
+    extracts_dev: Vec<ExtractDev>,
+    #[serde(default)]
+    loose: Vec<Loose>,
 }
 #[derive(Deserialize)]
 struct Node {
@@ -72,6 +102,100 @@ struct Node {
     /// Boss spawn chance 0..1 (boss_nodes only).
     #[serde(default)]
     chance: Option<f32>,
+}
+
+/// A locked door/container/trunk and the key(s) that open it.
+#[derive(Deserialize)]
+struct Lock {
+    pos: [f32; 3],
+    /// Lock type: "door" / "container" / "trunk".
+    #[serde(default)]
+    lt: String,
+    /// Needs power (0/1).
+    #[serde(default)]
+    pw: i64,
+    /// Usually one key. `{n, s, card, pr}`.
+    #[serde(default)]
+    keys: Vec<Key>,
+}
+#[derive(Deserialize)]
+struct Key {
+    /// Full item name.
+    #[serde(default)]
+    n: String,
+    /// shortName (unused in the card, kept for schema fidelity).
+    #[serde(default)]
+    #[allow(dead_code)]
+    s: String,
+    /// 0/1 — 1 means a keycard.
+    #[serde(default)]
+    card: i64,
+    /// Roubles, or null.
+    #[serde(default)]
+    pr: Option<i64>,
+}
+/// A power/lever switch.
+#[derive(Deserialize)]
+struct Switch {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: String,
+    /// Switch state / type label (e.g. "Close").
+    #[serde(default)]
+    st: String,
+}
+/// A transit exit to another map.
+#[derive(Deserialize)]
+struct Transit {
+    pos: [f32; 3],
+    /// Destination map key.
+    #[serde(default)]
+    to: String,
+    #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    cond: String,
+}
+/// An environmental hazard (minefield, radiation, ...).
+#[derive(Deserialize)]
+struct Hazard {
+    pos: [f32; 3],
+    /// Hazard type.
+    #[serde(default)]
+    ht: String,
+    #[serde(default)]
+    name: String,
+}
+/// A mounted / stationary weapon.
+#[derive(Deserialize)]
+struct Stationary {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: String,
+}
+/// A clean, faction-tagged extract (supersedes the semantics extracts when present).
+#[derive(Deserialize)]
+struct ExtractDev {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: String,
+    /// Faction: "pmc" / "scav" / "shared".
+    #[serde(default)]
+    fac: String,
+}
+/// A single valuable loose-loot point (already price-filtered upstream).
+#[derive(Deserialize)]
+struct Loose {
+    pos: [f32; 3],
+    /// Top item shortName.
+    #[serde(default)]
+    s: String,
+    /// Top item full name.
+    #[serde(default)]
+    n: String,
+    /// Its price in roubles, or null.
+    #[serde(default)]
+    pr: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +293,146 @@ fn sem_info(l: PoiLayer, poi: &Poi) -> MarkerInfo {
     }
 }
 
+/// Human faction label for an extract card ("pmc"->"PMC", "scav"->"Scav", "shared"->"All").
+fn faction_label(fac: &str) -> String {
+    match fac {
+        "pmc" => "PMC".into(),
+        "scav" => "Scav".into(),
+        "shared" => "All".into(),
+        _ => titlecase(fac),
+    }
+}
+
+/// Card for a clean faction-tagged extract (loot.json `extracts_dev`).
+fn extract_dev_info(ex: &ExtractDev) -> MarkerInfo {
+    let accent = poi_look(PoiLayer::Extract).0;
+    let title = if ex.name.is_empty() {
+        "Extract".into()
+    } else {
+        ex.name.clone()
+    };
+    MarkerInfo {
+        title,
+        subtitle: "Extract".into(),
+        detail: vec![format!("Faction: {}", faction_label(&ex.fac))],
+        accent,
+    }
+}
+
+/// Card for a locked door/container/trunk (loot.json `locks`).
+fn lock_info(lk: &Lock) -> MarkerInfo {
+    // Keycard locks read violet; ordinary locks keep the gold layer colour.
+    let keycard = lk.keys.first().is_some_and(|k| k.card == 1);
+    let accent = if keycard {
+        Color::srgb(0.72, 0.45, 0.92)
+    } else {
+        poi_look(PoiLayer::Lock).0
+    };
+    let detail = if let Some(k) = lk.keys.first() {
+        let mut d = Vec::new();
+        let mut needs = format!("Needs: {}", k.n);
+        if k.card == 1 {
+            needs.push_str("  [keycard]");
+        }
+        d.push(needs);
+        if let Some(pr) = k.pr {
+            if pr > 0 {
+                d.push(format!("Value  {}", money(pr)));
+            }
+        }
+        if lk.pw == 1 {
+            d.push("Power required".into());
+        }
+        d
+    } else {
+        vec!["No key listed".into()]
+    };
+    MarkerInfo {
+        title: "Locked".into(),
+        subtitle: titlecase(&lk.lt),
+        detail,
+        accent,
+    }
+}
+
+/// Card for a switch (loot.json `switches`).
+fn switch_info(sw: &Switch) -> MarkerInfo {
+    let mut detail = Vec::new();
+    if !sw.st.is_empty() {
+        detail.push(format!("Type: {}", sw.st));
+    }
+    MarkerInfo {
+        title: sw.name.clone(),
+        subtitle: "Switch".into(),
+        detail,
+        accent: poi_look(PoiLayer::Switch).0,
+    }
+}
+
+/// Card for a transit to another map (loot.json `transits`).
+fn transit_info(tr: &Transit) -> MarkerInfo {
+    let mut detail = Vec::new();
+    if !tr.desc.is_empty() {
+        detail.push(tr.desc.clone());
+    }
+    if !tr.cond.is_empty() {
+        detail.push(tr.cond.clone());
+    }
+    MarkerInfo {
+        title: format!("Transit \u{2192} {}", titlecase(&tr.to)),
+        subtitle: "Transit".into(),
+        detail,
+        accent: poi_look(PoiLayer::Transit).0,
+    }
+}
+
+/// Card for an environmental hazard (loot.json `hazards`).
+fn hazard_info(hz: &Hazard) -> MarkerInfo {
+    let ht_pretty = titlecase(&hz.ht);
+    let title = if hz.name.is_empty() {
+        ht_pretty.clone()
+    } else {
+        hz.name.clone()
+    };
+    let mut detail = Vec::new();
+    if ht_pretty != title {
+        detail.push(ht_pretty);
+    }
+    MarkerInfo {
+        title,
+        subtitle: "Hazard".into(),
+        detail,
+        accent: poi_look(PoiLayer::Hazard).0,
+    }
+}
+
+/// Card for a mounted/stationary weapon (loot.json `stationary`).
+fn stationary_info(st: &Stationary) -> MarkerInfo {
+    MarkerInfo {
+        title: st.name.clone(),
+        subtitle: "Stationary weapon".into(),
+        detail: Vec::new(),
+        accent: poi_look(PoiLayer::Stationary).0,
+    }
+}
+
+/// Card for a valuable loose-loot point (loot.json `loose`).
+fn loose_info(lo: &Loose) -> MarkerInfo {
+    let title = if lo.n.is_empty() { lo.s.clone() } else { lo.n.clone() };
+    let mut detail = Vec::new();
+    if let Some(pr) = lo.pr {
+        if pr > 0 {
+            detail.push(format!("Value  {}", money(pr)));
+        }
+    }
+    MarkerInfo {
+        title,
+        subtitle: "Loose loot".into(),
+        detail,
+        accent: poi_look(PoiLayer::LooseLoot).0,
+    }
+}
+
 /// dataset "interchange_v2" -> loot/semantics map key "interchange" (strip a `_vN` suffix).
 fn map_key(dataset: &str) -> String {
     if let Some((base, ver)) = dataset.rsplit_once("_v") {
@@ -197,6 +461,12 @@ fn spawn_pois(
         PoiLayer::Extract,
         PoiLayer::Door,
         PoiLayer::Interactable,
+        PoiLayer::Lock,
+        PoiLayer::Hazard,
+        PoiLayer::Switch,
+        PoiLayer::Transit,
+        PoiLayer::Stationary,
+        PoiLayer::LooseLoot,
     ];
     let mut mats: HashMap<u8, Handle<StandardMaterial>> = HashMap::new();
     for &l in &all {
@@ -231,7 +501,10 @@ fn spawn_pois(
         n += 1;
     };
 
-    // ---- spawns from loot.json (pmc/scav/boss nodes) ----
+    // ---- spawns + map intel from loot.json (pmc/scav/boss nodes, locks, hazards, ...) ----
+    // Set when loot.json ships clean faction-tagged extracts; those supersede the semantics
+    // `extract` layer below.
+    let mut have_dev_extracts = false;
     let key = map_key(&lp.0.manifest.dataset);
     if let Some(mn) = std::fs::read_to_string(root.join("loot.json"))
         .ok()
@@ -247,9 +520,36 @@ fn spawn_pois(
         for nd in &mn.boss_nodes {
             spawn(&mut commands, PoiLayer::Boss, nd.pos, node_info(PoiLayer::Boss, nd));
         }
+        // ---- map intel ----
+        for lk in &mn.locks {
+            spawn(&mut commands, PoiLayer::Lock, lk.pos, lock_info(lk));
+        }
+        for sw in &mn.switches {
+            spawn(&mut commands, PoiLayer::Switch, sw.pos, switch_info(sw));
+        }
+        for tr in &mn.transits {
+            spawn(&mut commands, PoiLayer::Transit, tr.pos, transit_info(tr));
+        }
+        for hz in &mn.hazards {
+            spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz));
+        }
+        for st in &mn.stationary {
+            spawn(&mut commands, PoiLayer::Stationary, st.pos, stationary_info(st));
+        }
+        for lo in &mn.loose {
+            spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo));
+        }
+        // Prefer the clean faction-tagged extract list when it's present.
+        if !mn.extracts_dev.is_empty() {
+            have_dev_extracts = true;
+            for ex in &mn.extracts_dev {
+                spawn(&mut commands, PoiLayer::Extract, ex.pos, extract_dev_info(ex));
+            }
+        }
     }
 
     // ---- extracts / doors / interactables from semantics.json ----
+    // Skip the semantics `extract` layer if loot.json already gave us clean extracts.
     if let Some(layers) = std::fs::read_to_string(root.join("semantics.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<SemFile>(&s).ok())
@@ -261,6 +561,9 @@ fn spawn_pois(
             ("loot", PoiLayer::Interactable),
         ];
         for (lname, ly) in map {
+            if lname == "extract" && have_dev_extracts {
+                continue;
+            }
             if let Some(v) = layers.get(lname) {
                 for poi in v {
                     spawn(&mut commands, ly, poi.p, sem_info(ly, poi));
@@ -269,7 +572,7 @@ fn spawn_pois(
         }
     }
 
-    info!("poi: {n} POI markers spawned (spawns/extracts/doors/interactables)");
+    info!("poi: {n} POI markers spawned (spawns/extracts/doors/interactables + map intel)");
 }
 
 fn apply_poi_visibility(toggles: Res<LayerToggles>, mut q: Query<(&PoiLayer, &mut Visibility)>) {
@@ -284,6 +587,12 @@ fn apply_poi_visibility(toggles: Res<LayerToggles>, mut q: Query<(&PoiLayer, &mu
             PoiLayer::Extract => toggles.extracts,
             PoiLayer::Door => toggles.doors,
             PoiLayer::Interactable => toggles.interactables,
+            PoiLayer::Lock => toggles.locks,
+            PoiLayer::Hazard => toggles.hazards,
+            PoiLayer::Switch => toggles.switches,
+            PoiLayer::Transit => toggles.transits,
+            PoiLayer::Stationary => toggles.stationary,
+            PoiLayer::LooseLoot => toggles.loose,
         };
         *vis = if show {
             Visibility::Visible

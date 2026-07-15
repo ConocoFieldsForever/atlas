@@ -28,12 +28,20 @@ pub struct LayerToggles {
     pub extracts: bool,
     pub doors: bool,
     pub interactables: bool,
+    // ---- MAP INTEL (loot.json v2) ----
+    pub locks: bool,
+    pub hazards: bool,
+    pub switches: bool,
+    pub transits: bool,
+    pub stationary: bool,
+    pub loose: bool,
 }
 
 impl Default for LayerToggles {
     fn default() -> Self {
-        // `EFT_LAYERS=pmc,scav,boss,extract,door,interact` pre-enables layers (dev/testing);
-        // normally only loot is on and the rest are toggled in the panel.
+        // `EFT_LAYERS=pmc,scav,boss,extract,door,interact,lock,hazard,switch,transit,stationary,loose`
+        // pre-enables layers (dev/testing); normally only loot is on and the rest are toggled in
+        // the panel.
         let on: std::collections::HashSet<String> = std::env::var("EFT_LAYERS")
             .ok()
             .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
@@ -48,6 +56,12 @@ impl Default for LayerToggles {
             extracts: has("extract"),
             doors: has("door"),
             interactables: has("interact"),
+            locks: has("lock"),
+            hazards: has("hazard"),
+            switches: has("switch"),
+            transits: has("transit"),
+            stationary: has("stationary"),
+            loose: has("loose"),
         }
     }
 }
@@ -175,6 +189,18 @@ fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<Layer
                     .italics()
                     .color(MUTED),
             );
+
+            ui.add_space(12.0);
+            ui.label(RichText::new("MAP  INTEL").color(HDR).size(11.0).strong());
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+            poi_row(ui, &mut toggles.locks, "Locks & keys", PoiLayer::Lock);
+            poi_row(ui, &mut toggles.hazards, "Hazards", PoiLayer::Hazard);
+            poi_row(ui, &mut toggles.switches, "Switches", PoiLayer::Switch);
+            poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit);
+            poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary);
+            poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot);
         });
 }
 
