@@ -136,7 +136,8 @@ fn main() {
         .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
         .add_systems(Startup, setup)
-        .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain());
+        .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain())
+        .add_systems(Update, auto_screenshot);
 
     #[cfg(feature = "egui")]
     {
@@ -324,6 +325,24 @@ fn flycam_move(
             }
             tf.translation += v.normalize() * speed * dt;
         }
+    }
+}
+
+/// Reliable frame capture: with `EFT_SHOT=<path>` set, save ONE screenshot of the primary
+/// window ~90 Update-frames in (a beat after the heavy Startup finishes) via Bevy's own GPU
+/// screenshot — this bypasses the DWM/flip-model capture that makes external CopyFromScreen
+/// grab a blank white frame.
+fn auto_screenshot(mut commands: Commands, mut frames: Local<u32>) {
+    *frames += 1;
+    if *frames != 90 {
+        return;
+    }
+    if let Ok(path) = std::env::var("EFT_SHOT") {
+        use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path.clone()));
+        info!("auto-screenshot -> {path}");
     }
 }
 
