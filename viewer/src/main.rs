@@ -10,12 +10,15 @@
 //! designed in `render::gpu_driven` (M1).
 
 mod eftpack;
+mod loot;
+mod pick;
 mod render;
 
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
-use bevy::render::view::NoIndirectDrawing;
+use bevy::core_pipeline::tonemapping::Tonemapping;
+use bevy::render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, NoIndirectDrawing};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 
 use eftpack::Pack;
@@ -110,13 +113,16 @@ fn main() {
         LogDiagnosticsPlugin::default(),
     ));
 
-    // Install exactly ONE render path so the two can be FPS-compared cleanly.
+    // Install exactly ONE render path so they can be FPS-compared cleanly.
     match render_path {
         RenderPath::M0Instanced => {
             app.add_plugins(EftInstancingPlugin);
         }
         RenderPath::GpuDriven => {
             app.add_plugins(EftGpuDrivenPlugin);
+        }
+        RenderPath::Standard => {
+            app.add_plugins(render::EftStandardPlugin);
         }
     }
 
@@ -125,6 +131,8 @@ fn main() {
     }
 
     app.insert_resource(ClearColor(Color::srgb(0.55, 0.58, 0.58))) // overcast horizon stand-in
+        .add_plugins(pick::PickPlugin) // double-LEFT-click raycast-vs-pack-data debug pick
+        .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
         .add_systems(Startup, setup)
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain());
 
@@ -142,19 +150,30 @@ fn main() {
 /// Spawn camera + a key light, framed on the pack bounds if one is loaded.
 fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     // Frame the world AABB: stand back along +Y/+Z by the half-diagonal.
-    let (target, cam_pos, far) = match pack.as_ref() {
-        Some(p) => {
-            let c = p.0.bounds_center();
-            let ext = p.0.bounds_extent().max(1.0);
-            // Stand back ~1.34*ext; the far plane must clear the cam->far-corner
-            // distance (~3*ext) with margin or the map center clips (Codex P1).
-            (
-                c,
-                c + Vec3::new(0.0, ext * 0.6, ext * 1.2),
-                (ext * 6.0).max(2000.0),
-            )
+    // Debug: EFT_LOOK="x,y,z" frames the camera CLOSE on that world point (e.g. a coordinate from
+    // the double-click pick) instead of the whole-map overview — to confirm a specific mesh renders
+    // where the data says it is.
+    let look_override = std::env::var("EFT_LOOK").ok().and_then(|s| {
+        let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        (p.len() == 3).then(|| Vec3::new(p[0], p[1], p[2]))
+    });
+    let (target, cam_pos, far) = if let Some(t) = look_override {
+        (t, t + Vec3::new(4.0, 6.0, 14.0), 4000.0)
+    } else {
+        match pack.as_ref() {
+            Some(p) => {
+                let c = p.0.bounds_center();
+                let ext = p.0.bounds_extent().max(1.0);
+                // Stand back ~1.34*ext; the far plane must clear the cam->far-corner
+                // distance (~3*ext) with margin or the map center clips (Codex P1).
+                (
+                    c,
+                    c + Vec3::new(0.0, ext * 0.6, ext * 1.2),
+                    (ext * 6.0).max(2000.0),
+                )
+            }
+            None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0), 2000.0),
         }
-        None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0), 2000.0),
     };
 
     let dir = (target - cam_pos).normalize_or_zero();
@@ -163,6 +182,29 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
 
     commands.spawn((
         Camera3d::default(),
+        // Phase 3 — EFT display grade. AgX filmic base (muted, desaturates highlights toward
+        // the game's washed palette) + a subtle grade: cool shadows, slight green tint, reduced
+        // saturation, and a small shadow lift for EFT's milky (not crushed) blacks. Exposure is
+        // the shared brightness knob — it pairs with gi_intensity in the SH volume uniform.
+        Tonemapping::TonyMcMapface,
+        ColorGrading {
+            global: ColorGradingGlobal {
+                exposure: 0.4,             // brighten — prior grade came out too dark
+                temperature: -0.03,        // barely cool
+                tint: -0.02,
+                post_saturation: 1.08,     // keep color (0.90 was washed; ~1.08 reads right)
+                ..default()
+            },
+            shadows: ColorGradingSection {
+                lift: 0.03,                // raise blacks so shadows aren't crushed
+                ..default()
+            },
+            midtones: ColorGradingSection {
+                saturation: 1.06,          // color without the contrast that darkened it
+                ..default()
+            },
+            ..default()
+        },
         // Far plane derived from pack bounds so the whole map is visible; the
         // default 1000 m clipped Interchange (extent >745 m) — Codex P1.
         Projection::Perspective(PerspectiveProjection {

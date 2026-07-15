@@ -53,6 +53,12 @@ class Culls:
         # hierarchy), recorded per-instance by the extractor as it['drop']. Default ON; TARKMAP_KEEP_HIDDEN=1 keeps
         # them for A/B inspection. Map-agnostic (pure Unity flags). See tarkmap/UNITY_VISIBILITY_GATE.md.
         self.drop_hidden = c.get("drop_unity_hidden", True) and os.environ.get("TARKMAP_KEEP_HIDDEN") != "1"
+        # inactive-in-hierarchy (aih==False) is NOT "never drawn": EFT activates much of this geometry at
+        # RAID LOAD (checkout counters/registers, per-lane units, alt-state props), so the static-scene
+        # 'inactive' flag hides real in-raid geometry -> floating baskets over vanished counters, missing
+        # registers. KEEP inactive geometry by default; only ShadowsOnly/disabled are truly never drawn.
+        # TARKMAP_DROP_INACTIVE=1 restores the old aggressive drop for A/B.
+        self.drop_inactive = os.environ.get("TARKMAP_DROP_INACTIVE") == "1"
         # OFF-MAP BACKDROP cull: EFT scenes carry a distant city-skyline cluster (e.g. Interchange's build03_part*/
         # bulding_city_LOD0/concrete2 under SBG_Shopping_Mall_2) placed ~1-2km OUTSIDE the terrain footprint. Nothing culls
         # them by name (they sit under an allowlisted root), so they render as giant intrusive silhouettes over the map.
@@ -69,8 +75,19 @@ class Culls:
             return False
         if it.get("kind") == "terrain":
             return True
-        if self.drop_hidden and it.get("drop"):       # Unity ShadowsOnly / disabled / inactive-in-hierarchy -> not drawn to camera
-            return False
+        if self.drop_hidden:
+            # ShadowsOnly (cast==3) + disabled (renON==False) renderers are NEVER drawn by Unity -> always drop.
+            # inactive-in-hierarchy (aih==False) -> KEEP (EFT raid-activates it) unless TARKMAP_DROP_INACTIVE=1.
+            if it.get("cast") == 3 or it.get("renON") is False:
+                return False
+            if it.get("aih") is False:
+                # Keep inactive geometry (EFT raid-activates loot boxes / crates / containers /
+                # counters), EXCEPT redundant purely-numeric lane-number labels ("1".."20") that
+                # duplicate the active IDEA_checkout_numbers signage and z-fight it. Full drop via
+                # TARKMAP_DROP_INACTIVE=1.
+                mname = str(it.get("mesh") or "").split("/")[-1].split("__")[0]
+                if self.drop_inactive or mname.isdigit():
+                    return False
         root = it.get("root") or ""
         # ALLOWLIST = PROTECTION, NOT EXCLUSION (2026-07-13). The allowlist's one legitimate job is to shield
         # declared-content roots from the generic name denylist (DEFAULT_DROP_ROOT_RE's '.*light' would nuke

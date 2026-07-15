@@ -16,9 +16,11 @@
 
 pub mod gpu_driven;
 pub mod instancing;
+pub mod standard;
 
 pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
+pub use standard::EftStandardPlugin;
 
 /// A/B render-path selector. `EFT_RENDER=m0` picks the working M0 custom instanced
 /// path (`instancing.rs`, zero culling); anything else (default) picks the M2
@@ -29,6 +31,9 @@ pub enum RenderPath {
     M0Instanced,
     /// M2: GPU-resident buffers + compute frustum cull + indirect multidraw (default).
     GpuDriven,
+    /// Bevy STANDARD PBR mesh path (Mesh3d + StandardMaterial per instance×submesh).
+    /// Slower, but unlocks Bevy's full lighting stack (shadows/SSAO/SSR/Solari RTX).
+    Standard,
 }
 
 impl RenderPath {
@@ -40,6 +45,7 @@ impl RenderPath {
             .or_else(|| cli.map(str::to_string));
         match pick.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
             Some(ref s) if s == "m0" || s == "instanced" => RenderPath::M0Instanced,
+            Some(ref s) if s == "std" || s == "standard" || s == "pbr" => RenderPath::Standard,
             _ => RenderPath::GpuDriven,
         }
     }

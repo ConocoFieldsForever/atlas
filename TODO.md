@@ -32,12 +32,25 @@ Tracking issues deferred during M0–M2. Updated 2026-07-14.
   (a) back-to-front **sorting / OIT** for overlapping transparents (glass-behind-glass, stacked decals) — the blend pass is one unsorted multi-draw, so overlapping blend order is undefined;
   (b) **restrict the decal depth-bias to decals only** — glass/water currently share the positive bias and can bleed through geometry near opaque intersections (split decal vs non-decal blend pipeline, or a MAT_FLAG_DECAL sub-pass);
   (c) full **`vp` 3-layer splat** for tire-track/road detail; (d) **animated water** (flow/normal — needs new material params).
+- [ ] **Volumetric lighting** (EFT haze + god-ray shafts — high wow-factor for interiors). Froxel
+  (frustum-voxel) fog: a camera-aligned 3D texture (~160×90×64), compute-filled per froxel with
+  in-scattered light = **ambient from the SH-GI volume** (already spatially shadowed by the bake →
+  soft shafts near skylights/windows for FREE, no shadow map) + **sun HG forward-scatter** (g≈0.7,
+  `sun_dir` from volume.json) × height-falloff fog density; raymarch front-to-back → (scatter,
+  transmittance); composite over the scene by depth. Reuses the SH volume + the opaque pass's depth
+  buffer (already written). CRISP shafts (hard sun occlusion) need a sun shadow map or the RT track
+  — deferred; the SH-scatter gives soft shafts first. SEQUENCE: after surface shading (GI/spec/
+  normals/grade), since it composites on top of the lit frame.
 - [ ] **On-screen FPS / HUD**. FPS is console-only (`LogDiagnosticsPlugin`). Add an on-screen counter
   (the `egui` overlay is behind the non-default `egui` feature).
 - [ ] **All 38 maps**. Only the Interchange `.eftpack` is built; wire per-map pack builds (one at a
   time — disk).
 - [ ] **M4 raid planner**. Semantic overlays (`semantics.json`), ruler/measure, markers, routes via
   the `:8091` GPU pathfind server.
+
+## Portability / distribution (TABLED — after the renderer "look" work)
+- [ ] **In-GUI EFT extraction library + status UI**: fold the EFT extraction into the GUI as a separate library, with an informative in-app UI showing extract status/progress — so friends extract from their OWN game files without touching the CLI pipeline (portability model A: operate off game files).
+- [ ] **Portable relative paths**: the `.eftpack` bakes ABSOLUTE machine-specific paths (`datasetPath` + every sidecar = `C:/Users/user/...`). Make `assemble_bevy.py` write paths RELATIVE to a configurable `EFT_ASSETS` root and resolve them at viewer load, so pack + `eft_assets` relocate cleanly. NOTE: all three viewers already share the `eft_assets` source-of-truth extraction from the game files — this is only about relocatable paths, not a data-source change.
 
 ## Cleanup
 - [ ] 13 dead-code warnings in `eftpack.rs` (unused Manifest/Material fields, TERRAIN/BAKED flags,

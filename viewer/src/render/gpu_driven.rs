@@ -53,7 +53,7 @@ use bevy::render::{
     render_resource::{
         binding_types::{
             sampler, storage_buffer_read_only_sized, storage_buffer_sized, texture_2d,
-            uniform_buffer_sized,
+            texture_3d, uniform_buffer_sized,
         },
         AddressMode, BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
         BlendState, Buffer,
@@ -74,8 +74,10 @@ use bevy::render::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Vec3};
+use serde::Deserialize;
 
 pub use crate::eftpack::{BoundingSphere, GpuInstance};
+use crate::eftpack::Pack;
 use crate::render::LoadedPack;
 
 // ===========================================================================
@@ -139,7 +141,7 @@ pub const DRAW_ARG_STRIDE: u64 = 20;
 /// vert-paint weight (interpolated); the SoftCutout road/track feather rides on color.a.
 pub const DRAW_VERTEX_STRIDE: u64 = 52;
 
-/// Per-material GPU record (M3). 48 bytes, 16-aligned. Indexed DIRECTLY by the global
+/// Per-material GPU record (M3; 80 bytes after Phase 2b normal mapping), 16-aligned. Indexed DIRECTLY by the global
 /// materialId (SubMesh.material_id == materials.json array index for this pack), which the
 /// per-vertex `material_index` carries into the fragment shader.
 ///
@@ -159,15 +161,32 @@ pub struct GpuMaterial {
     pub albedo_index: u32,
     pub flags: u32,
     pub alpha_cutoff: f32,
-    pub _pad: u32,
+    /// Phase 1.6 GGX spec: repurposed from `_pad` (offset 12, NO size change) — per-material
+    /// roughness for the dielectric spec lobe, clamped to [0.03, 1.0]. Glass carries ~0.05 so
+    /// it comes through sharp; default 0.55 for materials with no authored roughness.
+    pub roughness: f32,
     pub uv_xform: [f32; 4],
     pub tint: [f32; 4],
-    /// SoftCutout params [_AlphaStrength, _Cutoff, _AlphaHeight, 0]. @48 (16-aligned, size -> 64).
+    /// SoftCutout params [_AlphaStrength, _Cutoff, _AlphaHeight, 0]. @48 (16-aligned).
     pub vp: [f32; 4],
+    /// Phase 2b normal mapping: 4th 16-byte block @64 (size 64 -> 80).
+    /// `normal_index` = index into the bindless `normal_tex` array, or `NO_NORMAL`
+    /// (0xFFFFFFFF) for materials with no normal map -> shade with the geometric normal.
+    pub normal_index: u32,
+    /// bit0 = green-flip (DirectX-convention Y down; negate sampled n.y). Set from
+    /// Material.normalGreenFlip OR the pack Conventions.normalMapGreenFlip.
+    pub normal_flags: u32,
+    /// Material.normalScale (tangent xy multiplier; default 1.0).
+    pub normal_scale: f32,
+    pub _pad2: u32,
 }
 
 /// `GpuMaterial::albedo_index` sentinel: material has no albedo texture.
 pub const NO_ALBEDO: u32 = 0xFFFF_FFFF;
+/// `GpuMaterial::normal_index` sentinel: material has no normal map (Phase 2b).
+pub const NO_NORMAL: u32 = 0xFFFF_FFFF;
+/// `GpuMaterial::normal_flags` bit0: DirectX-convention normal (green points down) -> negate n.y.
+pub const MAT_NORMAL_FLAG_GREEN_FLIP: u32 = 1 << 0;
 /// `GpuMaterial::flags` bit: cutout (alpha-test discard).
 pub const MAT_FLAG_CUTOUT: u32 = 1 << 0;
 /// `GpuMaterial::flags` bit: BLEND transparency (role decal/glass/water or alphaMode=BLEND).
@@ -182,6 +201,201 @@ pub const MAT_FLAG_SOFTCUTOUT: u32 = 1 << 2;
 /// translucent dark wet sheen instead of the white tint fallback (untextured water was WHITE).
 /// Implies BLEND.
 pub const MAT_FLAG_WATER: u32 = 1 << 3;
+
+// ---------------------------------------------------------------------------
+// Phase 1 SH-GI: baked spherical-harmonics irradiance volume.
+// ---------------------------------------------------------------------------
+
+/// group(3) @binding(0) uniform. 64 bytes (16-aligned, four vec4s). Maps a world position
+/// into the probe grid, carries the GI intensity + normal-bias, and (for the manual 8-tap
+/// leak fix) the probe grid dims + spacing. Byte-identical to the WGSL `ShVolume`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct ShVolumeUniform {
+    /// xyz = world-space min corner of the probe AABB, w = gi_intensity (default 1.0).
+    pub vol_min: [f32; 4],
+    /// xyz = 1/(max-min) (world -> [0,1] uvw, hardware-trilinear fallback path),
+    /// w = normal_bias in meters (default 0.75) for the manual 8-tap.
+    pub vol_inv_extent: [f32; 4],
+    /// xyz = (nx, ny, nz) probe grid dims (as f32), w unused.
+    pub dims: [f32; 4],
+    /// xyz = (sx, sy, sz) probe spacing in meters, w unused.
+    pub spacing: [f32; 4],
+}
+
+/// Default normal-bias (meters) written to `ShVolumeUniform::vol_inv_extent.w`: the shading
+/// point is pushed this far along the surface normal before sampling the probe grid, so a
+/// point sitting on a slab doesn't sample the dark "inside-solid" probe directly beneath it.
+const SH_NORMAL_BIAS: f32 = 0.75;
+
+/// volume.json layout descriptor (read at load; NEVER hardcoded — the emitter is authority).
+#[derive(Debug, Clone, Deserialize)]
+struct VolumeMeta {
+    min: [f32; 3],
+    max: [f32; 3],
+    /// [nx, ny, nz] probe grid dims.
+    dims: [u32; 3],
+    /// [sx, sy, sz] probe spacing (meters). Emitter authority; if the sidecar omits it we
+    /// derive it from (max-min)/(dims-1) so the manual 8-tap still has a valid grid step.
+    #[serde(default)]
+    spacing: Option<[f32; 3]>,
+    coeffs: u32,
+    channels: u32,
+}
+
+/// CPU-staged SH irradiance volume, ready for a ONE-TIME GPU upload as three RGBA16Float 3D
+/// textures (one per color channel). `tex_{r,g,b}` are the raw f16 LE bytes already shuffled
+/// into per-channel texel order (c0,c1,c2,c3), so the render world just `write_texture`s them.
+/// Rides in `CpuData` (Arc-extracted, then freed with the rest of the staging blob).
+struct ShVolumeCpu {
+    /// [nx, ny, nz].
+    dims: [u32; 3],
+    min: [f32; 3],
+    max: [f32; 3],
+    /// [sx, sy, sz] probe spacing (meters) — for the manual 8-tap leak-fix grid step.
+    spacing: [f32; 3],
+    tex_r: Vec<u8>,
+    tex_g: Vec<u8>,
+    tex_b: Vec<u8>,
+}
+
+impl ShVolumeCpu {
+    /// 1x1x1 fallback used when the pack ships no volume sidecar: c0 = 1.0 (half), c1..c3 = 0,
+    /// so E/π = 0.282095 -> a flat ~0.28 gray ambient (roughly the old `ambient` constant),
+    /// keeping group(3) valid rather than crashing the draw on a missing bind group.
+    fn dummy() -> Self {
+        // half(1.0) = 0x3C00, half(0.0) = 0x0000 (LE bytes). texel = (c0=1, c1=0, c2=0, c3=0).
+        let texel: [u8; 8] = [0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        Self {
+            dims: [1, 1, 1],
+            min: [0.0, 0.0, 0.0],
+            max: [1.0, 1.0, 1.0],
+            spacing: [1.0, 1.0, 1.0], // single probe: grid clamps to 0, any nonzero step is inert
+            tex_r: texel.to_vec(),
+            tex_g: texel.to_vec(),
+            tex_b: texel.to_vec(),
+        }
+    }
+}
+
+/// Load + repack the SH irradiance volume from the pack's `volume`/`volumeMeta` sidecars.
+/// Returns `None` (caller falls back to `ShVolumeCpu::dummy`) on any missing/invalid input.
+///
+/// volume.bin is float16 LE, probe-major: probe index pi = ((z*ny)+y)*nx + x, each probe = 12
+/// halfs [c0.r,c0.g,c0.b, c1.r..c3.b]. We shuffle into 3 per-channel buffers whose texel is
+/// (c0,c1,c2,c3) for that channel — hardware trilinear then interpolates each SH coeff across
+/// probes for free (correct: SH interpolates linearly). No float conversion: just move the
+/// 2-byte halfs. Probe order (x-fastest -> y -> z) == wgpu 3D texel order, so pi -> texel copies.
+fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
+    let meta_path = pack.manifest.sidecars.volume_meta.as_deref()?;
+    let bin_path = pack.manifest.sidecars.volume.as_deref()?;
+
+    let meta_str = match std::fs::read_to_string(meta_path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("SH-GI: volume.json '{meta_path}' unreadable ({e}); flat-ambient fallback");
+            return None;
+        }
+    };
+    let meta: VolumeMeta = match serde_json::from_str(&meta_str) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("SH-GI: volume.json '{meta_path}' parse failed ({e}); flat-ambient fallback");
+            return None;
+        }
+    };
+    if meta.coeffs != 4 || meta.channels != 3 {
+        warn!(
+            "SH-GI: unsupported volume (coeffs={}, channels={}; expected 4/3); fallback",
+            meta.coeffs, meta.channels
+        );
+        return None;
+    }
+    let [nx, ny, nz] = meta.dims;
+    let n_probes = nx as usize * ny as usize * nz as usize;
+    if n_probes == 0 {
+        warn!("SH-GI: volume dims {:?} degenerate; fallback", meta.dims);
+        return None;
+    }
+
+    let bin = match std::fs::read(bin_path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("SH-GI: volume.bin '{bin_path}' unreadable ({e}); flat-ambient fallback");
+            return None;
+        }
+    };
+    // 12 halfs * 2 bytes = 24 bytes/probe.
+    let need = n_probes * 24;
+    if bin.len() < need {
+        warn!(
+            "SH-GI: volume.bin '{bin_path}' too short ({} bytes, need {}); fallback",
+            bin.len(),
+            need
+        );
+        return None;
+    }
+
+    // Per-channel texel = (c0,c1,c2,c3); each coeff is one f16 (2 bytes). Source half indices:
+    //   R: 0,3,6,9   G: 1,4,7,10   B: 2,5,8,11
+    let mut tex_r = Vec::with_capacity(n_probes * 8);
+    let mut tex_g = Vec::with_capacity(n_probes * 8);
+    let mut tex_b = Vec::with_capacity(n_probes * 8);
+    let copy_half = |dst: &mut Vec<u8>, base: usize, h: usize| {
+        let o = base + h * 2;
+        dst.extend_from_slice(&bin[o..o + 2]);
+    };
+    for pi in 0..n_probes {
+        let base = pi * 24;
+        for &h in &[0usize, 3, 6, 9] {
+            copy_half(&mut tex_r, base, h);
+        }
+        for &h in &[1usize, 4, 7, 10] {
+            copy_half(&mut tex_g, base, h);
+        }
+        for &h in &[2usize, 5, 8, 11] {
+            copy_half(&mut tex_b, base, h);
+        }
+    }
+
+    // Probe spacing (meters) for the manual 8-tap leak fix. Prefer the emitter's authored
+    // `spacing`; if the sidecar omits it, derive it from (max-min)/(dims-1) (probe i sits at
+    // min + i*spacing, so a dim of 1 falls back to the full extent to avoid a divide-by-zero).
+    let derive_spacing = |axis: usize| -> f32 {
+        let extent = meta.max[axis] - meta.min[axis];
+        let d = meta.dims[axis];
+        if d > 1 {
+            extent / (d - 1) as f32
+        } else {
+            extent.max(1e-6)
+        }
+    };
+    let spacing = match meta.spacing {
+        Some(s) => s,
+        None => [derive_spacing(0), derive_spacing(1), derive_spacing(2)],
+    };
+
+    info!(
+        "SH-GI: loaded irradiance volume {}x{}x{} ({} probes, {:.1} MB) min={:?} max={:?} spacing={:?}",
+        nx,
+        ny,
+        nz,
+        n_probes,
+        need as f32 / (1024.0 * 1024.0),
+        meta.min,
+        meta.max,
+        spacing
+    );
+    Some(ShVolumeCpu {
+        dims: meta.dims,
+        min: meta.min,
+        max: meta.max,
+        spacing,
+        tex_r,
+        tex_g,
+        tex_b,
+    })
+}
 
 // ===========================================================================
 // Frustum plane extraction (Gribbâ€“Hartmann). Planes point INWARD; a sphere is
@@ -253,6 +467,13 @@ pub struct CpuData {
     /// Unique albedo texture paths in bindless-array-index order. `GpuMaterial.albedo_index`
     /// indexes THIS list. Built in the SAME single pass as `materials` so indices can't drift.
     albedo_paths: Vec<String>,
+    /// Phase 2b: unique normal-map texture paths in bindless-array-index order.
+    /// `GpuMaterial.normal_index` indexes THIS list. Built in the SAME pass as `materials`.
+    normal_paths: Vec<String>,
+    /// Phase 1 SH-GI: the baked irradiance volume, repacked into per-channel f16 texel buffers.
+    /// `None` if the pack shipped no volume sidecar (render world synthesizes a flat-ambient
+    /// dummy so group(3) stays valid).
+    sh_volume: Option<ShVolumeCpu>,
     instance_total: u32,
     mesh_count: u32,
 }
@@ -394,6 +615,11 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let mut materials_gpu: Vec<GpuMaterial> = Vec::with_capacity(pack.materials.len());
     let mut albedo_paths: Vec<String> = Vec::new();
     let mut path_to_index: HashMap<String, u32> = HashMap::new();
+    // Phase 2b: dedup normal-map paths in the SAME pass (bindless index consistency, like albedo).
+    let mut normal_paths: Vec<String> = Vec::new();
+    let mut normal_path_to_index: HashMap<String, u32> = HashMap::new();
+    // Pack-wide green-flip convention (DirectX Y-down): OR'd with each material's own flag.
+    let conv_green_flip = pack.manifest.conventions.normal_map_green_flip;
     for mat in &pack.materials {
         let albedo_index = match mat.albedo.as_deref() {
             Some(p) if !p.is_empty() => *path_to_index.entry(p.to_string()).or_insert_with(|| {
@@ -403,6 +629,22 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             }),
             _ => NO_ALBEDO,
         };
+        // Phase 2b: bindless normal-map index (dedup first-seen, mirrors albedo). null -> sentinel.
+        let normal_index = match mat.normal.as_deref() {
+            Some(p) if !p.is_empty() => {
+                *normal_path_to_index.entry(p.to_string()).or_insert_with(|| {
+                    let idx = normal_paths.len() as u32;
+                    normal_paths.push(p.to_string());
+                    idx
+                })
+            }
+            _ => NO_NORMAL,
+        };
+        // normal_flags bit0 = green-flip: the material's own flag OR the pack-wide convention.
+        let mut normal_flags = 0u32;
+        if mat.normal_green_flip || conv_green_flip {
+            normal_flags |= MAT_NORMAL_FLAG_GREEN_FLIP;
+        }
         // Material class flags. CUTOUT (role=cutout / alphaMode=MASK) -> alpha-test discard,
         // stays in the OPAQUE (P1) pass. BLEND (M3b1: role decal/glass/water OR alphaMode=BLEND)
         // -> the P2 alpha-blended pass (depth-write off). The two bits are disjoint: the P1
@@ -437,10 +679,17 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             albedo_index,
             flags,
             alpha_cutoff: mat.alpha_cutoff,
-            _pad: 0,
+            // Phase 1.6 GGX spec: per-material roughness (was _pad). Glass ships ~0.05 (sharp);
+            // default 0.55 for unspecified. Clamp [0.03,1.0] so the NDF can't blow up / go mirror-hard.
+            roughness: mat.roughness.unwrap_or(0.55).clamp(0.03, 1.0),
             uv_xform: mat.uv_xform, // reference only (uvTilingBaked=true); shader must NOT apply
             tint: mat.tint,
             vp: vp_params.unwrap_or([0.0; 4]),
+            // Phase 2b normal mapping.
+            normal_index,
+            normal_flags,
+            normal_scale: mat.normal_scale,
+            _pad2: 0,
         });
     }
     info!(
@@ -450,6 +699,14 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         materials_gpu
             .iter()
             .filter(|m| m.albedo_index == NO_ALBEDO)
+            .count(),
+    );
+    info!(
+        "gpu-driven Phase2b: {} unique normal-map textures ({} materials with no normal map)",
+        normal_paths.len(),
+        materials_gpu
+            .iter()
+            .filter(|m| m.normal_index == NO_NORMAL)
             .count(),
     );
     info!(
@@ -583,6 +840,9 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         index_data.len()
     );
 
+    // Phase 1 SH-GI: load + repack the baked irradiance volume (volume.bin + volume.json).
+    let sh_volume = load_sh_volume(pack);
+
     commands.insert_resource(ExtractedCpuData(Arc::new(CpuData {
         vertex_data,
         index_data,
@@ -590,6 +850,8 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         mesh_meta,
         materials: materials_gpu,
         albedo_paths,
+        normal_paths,
+        sh_volume,
         instance_total,
         mesh_count,
     })));
@@ -617,6 +879,10 @@ struct EftDrawPipeline {
     /// `binding_array` size) and the pipeline is re-inserted with it set. `None` until then;
     /// `queue_gpu_driven` gates specialization on it being `Some` (M3).
     material_layout: Option<BindGroupLayout>,
+    /// group(3) SH-GI layout: ShVolume uniform + 3 SH 3D textures + sampler (Phase 1). Shared by
+    /// BOTH the opaque and BLEND specializations. Built in `prepare_gpu_buffers` alongside the
+    /// material layout; `queue_gpu_driven` gates specialization on it being `Some`.
+    sh_layout: Option<BindGroupLayout>,
 }
 
 #[derive(Resource)]
@@ -643,12 +909,34 @@ struct EftMaterialResources {
     #[allow(dead_code)] // kept alive so the views/bind group stay valid
     textures: Vec<Texture>,
     views: Vec<TextureView>,
+    /// Phase 2b: bindless normal-map textures + views, kept alive alongside the albedo set.
+    #[allow(dead_code)]
+    normal_textures: Vec<Texture>,
+    #[allow(dead_code)]
+    normal_views: Vec<TextureView>,
     #[allow(dead_code)]
     sampler: Sampler,
 }
 
 #[derive(Resource)]
 struct EftMaterialBindGroup(BindGroup);
+
+/// Owns the Phase-1 SH-GI GPU resources so the 3D texture views + uniform outlive
+/// `EftShBindGroup`. Built once in `prepare_gpu_buffers`.
+#[derive(Resource)]
+struct EftShResources {
+    #[allow(dead_code)] // kept alive so the views/bind group stay valid
+    uniform: Buffer,
+    #[allow(dead_code)]
+    textures: Vec<Texture>,
+    #[allow(dead_code)]
+    views: Vec<TextureView>,
+    #[allow(dead_code)]
+    sampler: Sampler,
+}
+
+#[derive(Resource)]
+struct EftShBindGroup(BindGroup);
 
 // ---- RenderStartup: bind group layouts, shaders, compute pipelines ----------
 fn init_gpu_pipelines(
@@ -757,6 +1045,7 @@ fn init_gpu_pipelines(
         mesh_pipeline: mesh_pipeline.clone(),
         ssbo_layout,
         material_layout: None, // filled in prepare_gpu_buffers once the albedo count is known
+        sh_layout: None,       // filled in prepare_gpu_buffers alongside the material layout
     });
 }
 
@@ -876,6 +1165,25 @@ fn prepare_gpu_buffers(
     }
     let tex_count = views.len() as u32;
 
+    // Phase 2b: decode + upload every UNIQUE normal map, MIRRORING the albedo load but with a
+    // LINEAR format (Rgba8Unorm) — normal maps are LINEAR data, NOT sRGB; the sRGB format would
+    // gamma-wash the tangent vectors and flatten the perturbation. Same order as cpu.normal_paths
+    // so GpuMaterial.normal_index stays aligned; a failed decode pushes a flat-normal placeholder.
+    let mut normal_textures: Vec<Texture> = Vec::with_capacity(cpu.normal_paths.len());
+    let mut normal_views: Vec<TextureView> = Vec::with_capacity(cpu.normal_paths.len());
+    for path in &cpu.normal_paths {
+        let (tex, view) = load_normal_texture(&render_device, &render_queue, path);
+        normal_textures.push(tex);
+        normal_views.push(view);
+    }
+    // binding_array needs >= 1 element; synth a 1x1 flat normal if this pack has no normal maps.
+    if normal_views.is_empty() {
+        let (tex, view) = make_dummy_normal_texture(&render_device, &render_queue);
+        normal_textures.push(tex);
+        normal_views.push(view);
+    }
+    let normal_count = normal_views.len() as u32;
+
     let albedo_sampler = render_device.create_sampler(&SamplerDescriptor {
         label: Some("eft_albedo_sampler"),
         // Tiling is baked into the vertex UVs (uvTilingBaked=true) so UVs can exceed [0,1] ->
@@ -889,7 +1197,9 @@ fn prepare_gpu_buffers(
         ..default()
     });
 
-    // group(2): material-table SSBO (0) + albedo binding_array of size tex_count (1) + sampler (2).
+    // group(2): material-table SSBO (0) + albedo binding_array size tex_count (1) + sampler (2)
+    // + Phase 2b normal-map binding_array size normal_count (3). The normal array reuses the
+    // albedo sampler and the same non-uniform-indexing device feature.
     let material_layout = render_device.create_bind_group_layout(
         "eft_material_layout",
         &BindGroupLayoutEntries::with_indices(
@@ -902,12 +1212,18 @@ fn prepare_gpu_buffers(
                         .count(NonZeroU32::new(tex_count).unwrap()),
                 ),
                 (2, sampler(SamplerBindingType::Filtering)),
+                (
+                    3,
+                    texture_2d(TextureSampleType::Float { filterable: true })
+                        .count(NonZeroU32::new(normal_count).unwrap()),
+                ),
             ),
         ),
     );
 
     // TextureViewArray wants raw &[&wgpu::TextureView]; Bevy's TextureView derefs to it.
     let view_refs: Vec<_> = views.iter().map(|v| &**v).collect();
+    let normal_view_refs: Vec<_> = normal_views.iter().map(|v| &**v).collect();
     let material_bg = render_device.create_bind_group(
         "eft_material_bg",
         &material_layout,
@@ -915,27 +1231,151 @@ fn prepare_gpu_buffers(
             (0, material_buf.as_entire_binding()),
             (1, &view_refs[..]),
             (2, &albedo_sampler),
+            (3, &normal_view_refs[..]),
         )),
     );
 
-    // Re-insert the draw pipeline WITH the material layout now that tex_count is known, so
-    // specialize() can build the 3-group pipeline layout (view / ssbo / material).
+    // ---- Phase 1 SH-GI: 3 RGBA16Float 3D textures (one per color channel) + uniform ----------
+    // Each texel = (c0,c1,c2,c3) for that channel; hardware trilinear interpolates each SH coeff
+    // across probes for free. The fragment reconstructs diffuse irradiance per fragment. If the
+    // pack shipped no volume sidecar, synthesize a 1x1x1 flat-ambient dummy so group(3) stays
+    // valid (a missing bind group would fail the draw at validation).
+    let dummy_sh;
+    let sh: &ShVolumeCpu = match &cpu.sh_volume {
+        Some(v) => v,
+        None => {
+            warn!("gpu-driven SH-GI: no volume sidecar; using 1x1x1 flat-ambient fallback");
+            dummy_sh = ShVolumeCpu::dummy();
+            &dummy_sh
+        }
+    };
+    let [sh_nx, sh_ny, sh_nz] = sh.dims;
+    let sh_extent = Extent3d {
+        width: sh_nx,
+        height: sh_ny,
+        depth_or_array_layers: sh_nz,
+    };
+    // create_texture_with_data handles staging + row-padding; probe order (x-fastest -> y -> z)
+    // is exactly wgpu 3D texel order, so the shuffled bytes upload as a direct copy.
+    let make_sh_tex = |bytes: &[u8], label: &'static str| -> (Texture, TextureView) {
+        let tex = render_device.create_texture_with_data(
+            &render_queue,
+            &TextureDescriptor {
+                label: Some(label),
+                size: sh_extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D3,
+                format: TextureFormat::Rgba16Float,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            TextureDataOrder::default(),
+            bytes,
+        );
+        let view = tex.create_view(&TextureViewDescriptor::default()); // infers D3 from the texture
+        (tex, view)
+    };
+    let (sh_r_tex, sh_r_view) = make_sh_tex(&sh.tex_r, "eft_sh_r");
+    let (sh_g_tex, sh_g_view) = make_sh_tex(&sh.tex_g, "eft_sh_g");
+    let (sh_b_tex, sh_b_view) = make_sh_tex(&sh.tex_b, "eft_sh_b");
+
+    let sh_sampler = render_device.create_sampler(&SamplerDescriptor {
+        label: Some("eft_sh_sampler"),
+        // ClampToEdge: a fragment just outside the probe AABB reuses the boundary probe rather
+        // than wrapping to the far side of the map.
+        address_mode_u: AddressMode::ClampToEdge,
+        address_mode_v: AddressMode::ClampToEdge,
+        address_mode_w: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        mipmap_filter: FilterMode::Nearest, // single-level (no mips)
+        ..default()
+    });
+
+    let sh_inv_extent = [
+        1.0 / (sh.max[0] - sh.min[0]).max(1e-6),
+        1.0 / (sh.max[1] - sh.min[1]).max(1e-6),
+        1.0 / (sh.max[2] - sh.min[2]).max(1e-6),
+    ];
+    let sh_uniform_data = ShVolumeUniform {
+        vol_min: [sh.min[0], sh.min[1], sh.min[2], 1.0], // w = gi_intensity (default 1.0)
+        // w = normal_bias (meters) for the manual 8-tap leak fix.
+        vol_inv_extent: [sh_inv_extent[0], sh_inv_extent[1], sh_inv_extent[2], SH_NORMAL_BIAS],
+        // xyz = probe grid dims (as f32), for the manual 8-tap corner enumeration.
+        dims: [sh_nx as f32, sh_ny as f32, sh_nz as f32, 0.0],
+        // xyz = probe spacing (meters); probe i sits at vol_min + i*spacing.
+        spacing: [sh.spacing[0], sh.spacing[1], sh.spacing[2], 0.0],
+    };
+    let sh_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_sh_uniform"),
+        contents: bytemuck::bytes_of(&sh_uniform_data),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+
+    // group(3): ShVolume uniform (0) + 3 SH 3D textures (1,2,3) + filtering sampler (4). SHARED
+    // by both the opaque and BLEND pipeline specializations (like the group(2) material layout).
+    let sh_layout = render_device.create_bind_group_layout(
+        "eft_sh_layout",
+        &BindGroupLayoutEntries::with_indices(
+            ShaderStages::FRAGMENT,
+            (
+                (0, uniform_buffer_sized(false, None)),
+                (1, texture_3d(TextureSampleType::Float { filterable: true })),
+                (2, texture_3d(TextureSampleType::Float { filterable: true })),
+                (3, texture_3d(TextureSampleType::Float { filterable: true })),
+                (4, sampler(SamplerBindingType::Filtering)),
+            ),
+        ),
+    );
+    let sh_bg = render_device.create_bind_group(
+        "eft_sh_bg",
+        &sh_layout,
+        &BindGroupEntries::with_indices((
+            (0, sh_uniform.as_entire_binding()),
+            (1, &sh_r_view),
+            (2, &sh_g_view),
+            (3, &sh_b_view),
+            (4, &sh_sampler),
+        )),
+    );
+
+    // Re-insert the draw pipeline WITH the material + SH layouts now known, so specialize() can
+    // build the 4-group pipeline layout (view / ssbo / material / sh-gi).
     commands.insert_resource(EftDrawPipeline {
         shader: draw.shader.clone(),
         mesh_pipeline: draw.mesh_pipeline.clone(),
         ssbo_layout: draw.ssbo_layout.clone(),
         material_layout: Some(material_layout),
+        sh_layout: Some(sh_layout),
     });
     commands.insert_resource(EftMaterialResources {
         material_buf,
         textures,
         views,
+        normal_textures,
+        normal_views,
         sampler: albedo_sampler,
     });
     commands.insert_resource(EftMaterialBindGroup(material_bg));
+    commands.insert_resource(EftShResources {
+        uniform: sh_uniform,
+        textures: vec![sh_r_tex, sh_g_tex, sh_b_tex],
+        views: vec![sh_r_view, sh_g_view, sh_b_view],
+        sampler: sh_sampler,
+    });
+    commands.insert_resource(EftShBindGroup(sh_bg));
     info!(
         "gpu-driven M3: {} albedo textures uploaded, material table + bindless bind group built",
         tex_count
+    );
+    info!(
+        "gpu-driven Phase2b: {} normal-map textures uploaded (LINEAR Rgba8Unorm), normal_tex @group(2) binding(3)",
+        normal_count
+    );
+    info!(
+        "gpu-driven SH-GI: irradiance volume uploaded ({}x{}x{}), group(3) bind group built",
+        sh_nx, sh_ny, sh_nz
     );
 
     commands.insert_resource(EftGpuBuffers {
@@ -981,6 +1421,35 @@ fn make_dummy_texture(device: &RenderDevice, queue: &RenderQueue) -> (Texture, T
     upload_rgba8_srgb(device, queue, 1, 1, &[255u8, 255, 255, 255], "eft_albedo_dummy")
 }
 
+/// Phase 2b: decode one normal-map PNG and upload it as a LINEAR Rgba8Unorm GPU texture (+ view).
+/// Normal maps encode tangent-space vectors, NOT color — they are LINEAR data, so we must use the
+/// non-sRGB format (an sRGB view would gamma-decode the vectors and wash out the perturbation).
+/// On any read/decode failure returns a 1x1 flat tangent normal (128,128,255 -> +Z) so the
+/// bindless index stays aligned with materials.json (a shifted index would normal-map the map wrong).
+fn load_normal_texture(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    path: &str,
+) -> (Texture, TextureView) {
+    match image::open(path) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            upload_rgba8_linear(device, queue, w.max(1), h.max(1), &rgba, "eft_normal")
+        }
+        Err(e) => {
+            warn!("gpu-driven Phase2b: normal '{path}' failed to load ({e}); using flat placeholder");
+            upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing")
+        }
+    }
+}
+
+/// 1x1 flat tangent normal (128,128,255 -> +Z) for a pack that referenced no normal maps at all
+/// (keeps the `normal_tex` binding_array non-empty).
+fn make_dummy_normal_texture(device: &RenderDevice, queue: &RenderQueue) -> (Texture, TextureView) {
+    upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_dummy")
+}
+
 fn upload_rgba8_srgb(
     device: &RenderDevice,
     queue: &RenderQueue,
@@ -1003,6 +1472,40 @@ fn upload_rgba8_srgb(
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::default(),
+        rgba,
+    );
+    let view = tex.create_view(&TextureViewDescriptor::default());
+    (tex, view)
+}
+
+/// Phase 2b: upload RGBA8 bytes as a LINEAR (Rgba8Unorm) texture — for normal maps, whose texels
+/// are tangent-space vectors, not sRGB color. Identical to `upload_rgba8_srgb` but for the format.
+fn upload_rgba8_linear(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    label: &'static str,
+) -> (Texture, TextureView) {
+    // create_texture_with_data handles the 256-byte row-padding for the staging copy.
+    let tex = device.create_texture_with_data(
+        queue,
+        &TextureDescriptor {
+            label: Some(label),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm, // LINEAR — NOT sRGB (normal vectors, not color)
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         },
@@ -1067,8 +1570,9 @@ fn queue_gpu_driven(
     // the albedo count is known). specialize() needs it for the group(2) pipeline layout, and
     // DrawGpuDrivenInner needs the matching EftMaterialBindGroup â€” both land in the same prepare
     // that builds the (already-gated) buffers, so this is a belt-and-suspenders skip, never a
-    // panic on a None layout.
-    if draw_pipeline.material_layout.is_none() {
+    // panic on a None layout. Phase 1: the group(3) SH-GI layout lands in the SAME prepare, so
+    // gate on it too (specialize() builds the 4-group layout; the draw sets the SH bind group).
+    if draw_pipeline.material_layout.is_none() || draw_pipeline.sh_layout.is_none() {
         return;
     }
     let draw_fn = draw_functions.read().id::<DrawGpuDriven>();
@@ -1161,6 +1665,12 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             .material_layout
             .clone()
             .expect("EftDrawPipeline.material_layout must be set before specialize (M3)");
+        // group(3): SH-GI irradiance-volume layout (Phase 1). Same gate as material_layout, and
+        // SHARED by both the opaque and BLEND specializations.
+        let sh_layout = self
+            .sh_layout
+            .clone()
+            .expect("EftDrawPipeline.sh_layout must be set before specialize (SH-GI)");
 
         // --- M3b1 pass-dependent state -----------------------------------------------
         // P2 (blend_pass) uses non-premultiplied alpha blending (matches Unity _Color*_MainTex),
@@ -1205,7 +1715,12 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             } else {
                 "eft_gpu_draw_opaque".into()
             }),
-            layout: vec![view_layout, self.ssbo_layout.clone(), material_layout],
+            layout: vec![
+                view_layout,
+                self.ssbo_layout.clone(),
+                material_layout,
+                sh_layout,
+            ],
             push_constant_ranges: vec![],
             vertex: VertexState {
                 shader: self.shader.clone(),
@@ -1363,6 +1878,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
         Option<SRes<EftGpuBuffers>>,
         Option<SRes<EftDrawBindGroup>>,
         Option<SRes<EftMaterialBindGroup>>,
+        Option<SRes<EftShBindGroup>>,
     );
     type ViewQuery = ();
     type ItemQuery = ();
@@ -1372,19 +1888,22 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
         _item: &P,
         _view: (),
         _entity: Option<()>,
-        (buffers, draw_bg, material_bg): SystemParamItem<'w, '_, Self::Param>,
+        (buffers, draw_bg, material_bg, sh_bg): SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
-        let (Some(buffers), Some(draw_bg), Some(material_bg)) = (buffers, draw_bg, material_bg)
+        let (Some(buffers), Some(draw_bg), Some(material_bg), Some(sh_bg)) =
+            (buffers, draw_bg, material_bg, sh_bg)
         else {
             return RenderCommandResult::Skip;
         };
         let buffers = buffers.into_inner();
         let draw_bg = draw_bg.into_inner();
         let material_bg = material_bg.into_inner();
+        let sh_bg = sh_bg.into_inner();
 
         pass.set_bind_group(1, &draw_bg.0, &[]);
         pass.set_bind_group(2, &material_bg.0, &[]); // M3: bindless materials/textures/sampler
+        pass.set_bind_group(3, &sh_bg.0, &[]); // Phase 1: SH-GI irradiance volume + uniform
         pass.set_vertex_buffer(0, buffers.vertex.slice(..));
         pass.set_index_buffer(buffers.index.slice(..), 0, IndexFormat::Uint32);
 
