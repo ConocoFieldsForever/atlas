@@ -162,20 +162,37 @@ fn layers_panel(
     mut tracker: ResMut<QuestTracker>,
     quest_data: Res<crate::poi::QuestData>,
     markers: Query<(&crate::inspect::MarkerInfo, &GlobalTransform)>,
+    poi_q: Query<&crate::poi::PoiLayer>,
+    loot_q: Query<&crate::loot::LootClass>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
+    mut server_cmd: MessageWriter<crate::pathfind::ServerCmd>,
     route_result: Res<crate::pathfind::RouteResult>,
+    server: Res<crate::pathfind::PathfindServer>,
 ) {
-    use bevy_egui::egui::{self, Color32, RichText};
-    use crate::pathfind::{RouteRequest, RouteStatus};
+    use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
+    use crate::pathfind::{RouteRequest, RouteStatus, ServerCmd, ServerStatus};
     use crate::poi::PoiLayer;
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
     const ACCENT: Color32 = Color32::from_rgb(232, 194, 122); // warm tactical amber
-    const HDR: Color32 = Color32::from_rgb(150, 154, 150);
+    const HDR: Color32 = Color32::from_rgb(160, 164, 160);
     const MUTED: Color32 = Color32::from_rgb(120, 122, 120);
+    const DIMCOUNT: Color32 = Color32::from_rgb(110, 112, 110);
     const PANEL_BG: Color32 = Color32::from_rgb(20, 22, 23);
+
+    // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
+    // dim number after each row so the planner can gauge density without enabling the layer.
+    let mut poi_counts = [0usize; 16];
+    for l in &poi_q {
+        poi_counts[*l as usize] += 1;
+    }
+    let mut loot_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for c in &loot_q {
+        *loot_counts.entry(c.0.clone()).or_default() += 1;
+    }
+    let loot_total: usize = loot_counts.values().sum();
 
     // Style ONLY this panel's frame (a global ctx.set_style() was painting a fullscreen white
     // layer over the 3D scene). Per-widget RichText below carries the rest of the look.
@@ -185,16 +202,25 @@ fn layers_panel(
     egui::SidePanel::right("map_layers")
         .resizable(false)
         .frame(frame)
-        .default_width(232.0)
+        .default_width(248.0)
         .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 7.0);
-            ui.add_space(4.0);
-            ui.label(RichText::new("MAP  LAYERS").color(ACCENT).size(17.0).strong());
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
 
-            // ---- Marker search (finds any marker by name -> fly the camera to it) ----
+            // ---- STICKY header + search (stay put while the sections scroll) ----
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("MAP  LAYERS").color(ACCENT).size(17.0).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("hide all")
+                        .on_hover_text("turn every overlay off")
+                        .clicked()
+                    {
+                        hide_all(&mut toggles);
+                    }
+                });
+            });
+            ui.add_space(4.0);
             ui.add(
                 egui::TextEdit::singleline(&mut search.query)
                     .desired_width(f32::INFINITY)
@@ -202,7 +228,6 @@ fn layers_panel(
             );
             let q = search.query.trim().to_lowercase();
             if !q.is_empty() {
-                // Case-insensitive substring over title (and subtitle) of every marker.
                 let mut hits: Vec<(&crate::inspect::MarkerInfo, Vec3)> = Vec::new();
                 for (info, gt) in &markers {
                     if info.title.to_lowercase().contains(&q)
@@ -216,13 +241,11 @@ fn layers_panel(
                 ui.label(RichText::new(format!("{total} results")).size(10.0).color(MUTED));
                 egui::ScrollArea::vertical()
                     .id_salt("marker_search")
-                    .max_height(220.0)
+                    .max_height(200.0)
                     .show(ui, |ui| {
                         for (info, pos) in hits.iter().take(25) {
-                            let label = RichText::new(format!(
-                                "{}  \u{00B7}  {}",
-                                info.title, info.subtitle
-                            ));
+                            let label =
+                                RichText::new(format!("{}  \u{00B7}  {}", info.title, info.subtitle));
                             if ui.selectable_label(false, label).clicked() {
                                 cam_cmd.fly_to = Some(*pos);
                             }
@@ -235,212 +258,330 @@ fn layers_panel(
                             );
                         }
                     });
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(2.0);
             }
-
-            // ---- Loot layer (functional) ----
-            ui.checkbox(&mut toggles.loot, RichText::new("Raw loot").size(15.0).strong());
-            let loot_on = toggles.loot;
-            ui.add_space(2.0);
-            for (cls, on) in toggles.loot_classes.iter_mut() {
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    let swatch = if loot_on { class_color(cls) } else { Color32::from_gray(70) };
-                    ui.label(RichText::new("\u{25CF}").color(swatch).size(12.0)); // ●
-                    ui.add_enabled_ui(loot_on, |ui| {
-                        ui.checkbox(on, titlecase(cls));
-                    });
-                });
-            }
-
-            ui.add_space(12.0);
-            ui.label(RichText::new("SPAWNS  &  POIS").color(HDR).size(11.0).strong());
-            ui.add_space(2.0);
-            ui.separator();
-            ui.add_space(2.0);
-            poi_row(ui, &mut toggles.pmc_spawns, "PMC spawns", PoiLayer::PmcSpawn);
-            poi_row(ui, &mut toggles.scav_spawns, "Scav spawns", PoiLayer::ScavSpawn);
-            poi_row(ui, &mut toggles.bosses, "Bosses", PoiLayer::Boss);
-            poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract);
-            poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door);
-            poi_row(ui, &mut toggles.interactables, "Interactables", PoiLayer::Interactable);
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("PMC/scav/boss: tarkov.dev  \u{2022}  extracts/doors: game data")
-                    .size(10.0)
-                    .italics()
-                    .color(MUTED),
-            );
-
-            ui.add_space(12.0);
-            ui.label(RichText::new("MAP  INTEL").color(HDR).size(11.0).strong());
-            ui.add_space(2.0);
-            ui.separator();
-            ui.add_space(2.0);
-            poi_row(ui, &mut toggles.locks, "Locks & keys", PoiLayer::Lock);
-            poi_row(ui, &mut toggles.hazards, "Hazards", PoiLayer::Hazard);
-            poi_row(ui, &mut toggles.switches, "Switches", PoiLayer::Switch);
-            poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit);
-            poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary);
-            poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot);
-            poi_row(ui, &mut toggles.quests, "Tasks / quests", PoiLayer::Quest);
-
-            // ---- TASK TRACKER (checklist + filters + on-demand route) ----
-            // The `quests` poi_row above stays the master on/off; this section refines WHICH tasks
-            // are shown/routed. Selecting tasks focuses the quest markers to them (poi.rs) and
-            // draws their objective-zone outlines.
-            ui.add_space(12.0);
-            ui.label(RichText::new("TASKS  /  QUESTS").color(HDR).size(11.0).strong());
-            ui.add_space(2.0);
-            ui.separator();
-            ui.add_space(2.0);
-
-            // Filter row: Kappa / Lightkeeper toggles + a max-level cap (0 = any).
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut tracker.kappa_only, "Kappa");
-                ui.checkbox(&mut tracker.lk_only, "Lightkeeper");
-            });
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut tracker.max_level).range(0..=79));
-                ui.label(RichText::new("\u{2264} Lvl").size(12.0).color(MUTED));
-            });
-
-            // This map's tasks passing the filters (borrows QuestData; filter reads copied out so
-            // the checklist can still mutate `tracker.active` below).
-            let (kappa_only, lk_only, max_level) =
-                (tracker.kappa_only, tracker.lk_only, tracker.max_level);
-            let shown: Vec<&crate::poi::QuestEntry> = quest_data
-                .tasks
-                .iter()
-                .filter(|t| {
-                    if kappa_only && !t.kappa {
-                        return false;
-                    }
-                    if lk_only && !t.lk {
-                        return false;
-                    }
-                    if max_level > 0 {
-                        if let Some(ml) = t.min_level {
-                            if ml > max_level {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                })
-                .collect();
             ui.add_space(4.0);
-            ui.label(RichText::new(format!("({} tasks)", shown.len())).size(10.0).color(MUTED));
-            egui::ScrollArea::vertical()
-                .id_salt("quest_list")
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    for t in &shown {
-                        ui.horizontal(|ui| {
-                            // Checkbox synced to the tracker's active set (temp bool + apply-on-change).
-                            let mut on = tracker.active.contains(&t.id);
-                            if ui.checkbox(&mut on, "").changed() {
-                                if on {
-                                    tracker.active.insert(t.id.clone());
-                                } else {
-                                    tracker.active.remove(&t.id);
-                                }
-                            }
-                            // Click the name to fly to the first objective's first zone.
-                            let name = if t.name.is_empty() { "Task" } else { t.name.as_str() };
-                            if ui
-                                .selectable_label(false, RichText::new(name).size(13.0))
-                                .clicked()
-                            {
-                                if let Some(pos) = t
-                                    .objectives
-                                    .first()
-                                    .and_then(|o| o.zones.first())
-                                    .map(|z| z.pos)
-                                {
-                                    cam_cmd.fly_to = Some(pos);
-                                }
-                            }
-                        });
-                        // Dim "{trader} \u{00B7} Lvl {min} \u{00B7} Kappa" tag line.
-                        let mut tags =
-                            if t.trader.is_empty() { String::new() } else { t.trader.clone() };
-                        if let Some(ml) = t.min_level.filter(|&l| l > 0) {
-                            if !tags.is_empty() {
-                                tags.push_str("  \u{00B7}  ");
-                            }
-                            tags.push_str(&format!("Lvl {ml}"));
-                        }
-                        if t.kappa {
-                            if !tags.is_empty() {
-                                tags.push_str("  \u{00B7}  ");
-                            }
-                            tags.push_str("Kappa");
-                        }
-                        if !tags.is_empty() {
-                            ui.label(RichText::new(tags).size(10.0).color(MUTED));
-                        }
-                    }
-                });
+            ui.separator();
 
-            // Route buttons: chain through every active task's objectives' first zones (server
-            // optimizes the order); an empty request clears the polyline.
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                if ui.button("Route active").clicked() {
-                    let dests: Vec<Vec3> = quest_data
-                        .tasks
-                        .iter()
-                        .filter(|t| tracker.active.contains(&t.id))
-                        .flat_map(|t| {
-                            t.objectives.iter().filter_map(|o| o.zones.first().map(|z| z.pos))
-                        })
-                        .collect();
-                    if !dests.is_empty() {
-                        route_writer.write(RouteRequest {
-                            start: None,
-                            dests,
-                            optimize_order: true,
+            // ---- SCROLLABLE body: all sections in collapsible groups so the panel never overflows ----
+            egui::ScrollArea::vertical()
+                .id_salt("panel_body")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // ===== LOOT =====
+                    CollapsingHeader::new(section_hdr("Loot", loot_total, HDR))
+                        .id_salt("sec_loot")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.checkbox(
+                                &mut toggles.loot,
+                                RichText::new("Raw loot").size(14.0).strong(),
+                            );
+                            let loot_on = toggles.loot;
+                            for (cls, on) in toggles.loot_classes.iter_mut() {
+                                let n = loot_counts.get(cls).copied().unwrap_or(0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(10.0);
+                                    let swatch =
+                                        if loot_on { class_color(cls) } else { Color32::from_gray(70) };
+                                    ui.label(RichText::new("\u{25CF}").color(swatch).size(12.0));
+                                    ui.add_enabled_ui(loot_on, |ui| {
+                                        ui.checkbox(on, titlecase(cls));
+                                    });
+                                    count_tag(ui, n, DIMCOUNT);
+                                });
+                            }
                         });
-                    }
-                }
-                if ui.button("Clear route").clicked() {
-                    route_writer.write(RouteRequest {
-                        start: None,
-                        dests: Vec::new(),
-                        optimize_order: false,
+
+                    // ===== SPAWNS & POIS =====
+                    let spawn_total = poi_counts[PoiLayer::PmcSpawn as usize]
+                        + poi_counts[PoiLayer::ScavSpawn as usize]
+                        + poi_counts[PoiLayer::Boss as usize]
+                        + poi_counts[PoiLayer::Extract as usize]
+                        + poi_counts[PoiLayer::Door as usize]
+                        + poi_counts[PoiLayer::Interactable as usize];
+                    CollapsingHeader::new(section_hdr("Spawns & POIs", spawn_total, HDR))
+                        .id_salt("sec_spawns")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            poi_row(ui, &mut toggles.pmc_spawns, "PMC spawns", PoiLayer::PmcSpawn, &poi_counts);
+                            poi_row(ui, &mut toggles.scav_spawns, "Scav spawns", PoiLayer::ScavSpawn, &poi_counts);
+                            poi_row(ui, &mut toggles.bosses, "Bosses", PoiLayer::Boss, &poi_counts);
+                            poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract, &poi_counts);
+                            poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door, &poi_counts);
+                            poi_row(ui, &mut toggles.interactables, "Interactables", PoiLayer::Interactable, &poi_counts);
+                        });
+
+                    // ===== MAP INTEL =====
+                    let intel_total = poi_counts[PoiLayer::Lock as usize]
+                        + poi_counts[PoiLayer::Hazard as usize]
+                        + poi_counts[PoiLayer::Switch as usize]
+                        + poi_counts[PoiLayer::Transit as usize]
+                        + poi_counts[PoiLayer::Stationary as usize]
+                        + poi_counts[PoiLayer::LooseLoot as usize];
+                    CollapsingHeader::new(section_hdr("Map Intel", intel_total, HDR))
+                        .id_salt("sec_intel")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            poi_row(ui, &mut toggles.locks, "Locks & keys", PoiLayer::Lock, &poi_counts);
+                            poi_row(ui, &mut toggles.hazards, "Hazards", PoiLayer::Hazard, &poi_counts);
+                            poi_row(ui, &mut toggles.switches, "Switches", PoiLayer::Switch, &poi_counts);
+                            poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit, &poi_counts);
+                            poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary, &poi_counts);
+                            poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot, &poi_counts);
+                        });
+
+                    // ===== TASKS / QUESTS =====
+                    CollapsingHeader::new(section_hdr(
+                        "Tasks / Quests",
+                        poi_counts[PoiLayer::Quest as usize],
+                        HDR,
+                    ))
+                    .id_salt("sec_quests")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        poi_row(ui, &mut toggles.quests, "Show quest markers", PoiLayer::Quest, &poi_counts);
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut tracker.kappa_only, "Kappa");
+                            ui.checkbox(&mut tracker.lk_only, "Lightkeeper");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut tracker.max_level).range(0..=79));
+                            ui.label(RichText::new("\u{2264} Lvl").size(12.0).color(MUTED));
+                        });
+
+                        let (kappa_only, lk_only, max_level) =
+                            (tracker.kappa_only, tracker.lk_only, tracker.max_level);
+                        let shown: Vec<&crate::poi::QuestEntry> = quest_data
+                            .tasks
+                            .iter()
+                            .filter(|t| {
+                                if kappa_only && !t.kappa {
+                                    return false;
+                                }
+                                if lk_only && !t.lk {
+                                    return false;
+                                }
+                                if max_level > 0 {
+                                    if let Some(ml) = t.min_level {
+                                        if ml > max_level {
+                                            return false;
+                                        }
+                                    }
+                                }
+                                true
+                            })
+                            .collect();
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(format!("{} tasks", shown.len())).size(10.0).color(MUTED),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("quest_list")
+                            .max_height(240.0)
+                            .show(ui, |ui| {
+                                for t in &shown {
+                                    ui.horizontal(|ui| {
+                                        let mut on = tracker.active.contains(&t.id);
+                                        if ui.checkbox(&mut on, "").changed() {
+                                            if on {
+                                                tracker.active.insert(t.id.clone());
+                                            } else {
+                                                tracker.active.remove(&t.id);
+                                            }
+                                        }
+                                        let name =
+                                            if t.name.is_empty() { "Task" } else { t.name.as_str() };
+                                        if ui
+                                            .selectable_label(false, RichText::new(name).size(13.0))
+                                            .clicked()
+                                        {
+                                            if let Some(pos) = t
+                                                .objectives
+                                                .first()
+                                                .and_then(|o| o.zones.first())
+                                                .map(|z| z.pos)
+                                            {
+                                                cam_cmd.fly_to = Some(pos);
+                                            }
+                                        }
+                                    });
+                                    let mut tags = if t.trader.is_empty() {
+                                        String::new()
+                                    } else {
+                                        t.trader.clone()
+                                    };
+                                    if let Some(ml) = t.min_level.filter(|&l| l > 0) {
+                                        if !tags.is_empty() {
+                                            tags.push_str("  \u{00B7}  ");
+                                        }
+                                        tags.push_str(&format!("Lvl {ml}"));
+                                    }
+                                    if t.kappa {
+                                        if !tags.is_empty() {
+                                            tags.push_str("  \u{00B7}  ");
+                                        }
+                                        tags.push_str("Kappa");
+                                    }
+                                    if !tags.is_empty() {
+                                        ui.label(RichText::new(tags).size(10.0).color(MUTED));
+                                    }
+                                }
+                            });
+
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Route active").clicked() {
+                                let dests: Vec<Vec3> = quest_data
+                                    .tasks
+                                    .iter()
+                                    .filter(|t| tracker.active.contains(&t.id))
+                                    .flat_map(|t| {
+                                        t.objectives
+                                            .iter()
+                                            .filter_map(|o| o.zones.first().map(|z| z.pos))
+                                    })
+                                    .collect();
+                                if !dests.is_empty() {
+                                    route_writer.write(RouteRequest {
+                                        start: None,
+                                        dests,
+                                        optimize_order: true,
+                                    });
+                                }
+                            }
+                            if ui.button("Clear route").clicked() {
+                                route_writer.write(RouteRequest {
+                                    start: None,
+                                    dests: Vec::new(),
+                                    optimize_order: false,
+                                });
+                            }
+                        });
+                        ui.add_space(2.0);
+                        match &route_result.status {
+                            RouteStatus::Pending => {
+                                ui.label(RichText::new("routing\u{2026}").size(11.0).color(ACCENT));
+                            }
+                            RouteStatus::Ok => {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Route  {:.0} m  ({} stops)",
+                                        route_result.dist,
+                                        route_result.points.len()
+                                    ))
+                                    .size(11.0)
+                                    .color(Color32::from_gray(210)),
+                                );
+                            }
+                            RouteStatus::Error(e) => {
+                                ui.label(
+                                    RichText::new(e.as_str())
+                                        .size(10.0)
+                                        .color(Color32::from_rgb(210, 96, 84)),
+                                );
+                            }
+                            RouteStatus::Idle => {}
+                        }
                     });
-                }
-            });
-            // Route status (from pathfind.rs) — a single dim line under the buttons.
-            ui.add_space(2.0);
-            match &route_result.status {
-                RouteStatus::Pending => {
-                    ui.label(RichText::new("routing\u{2026}").size(11.0).color(ACCENT));
-                }
-                RouteStatus::Ok => {
+
+                    // ===== PATHFINDING (server start/stop) =====
+                    CollapsingHeader::new(RichText::new("Pathfinding").color(HDR).size(12.0).strong())
+                        .id_salt("sec_pathfind")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            let (dot, txt, col) = match server.status {
+                                ServerStatus::Running => {
+                                    ("\u{25CF}", "server running", Color32::from_rgb(120, 210, 130))
+                                }
+                                ServerStatus::Starting => {
+                                    ("\u{25CF}", "server starting\u{2026}", ACCENT)
+                                }
+                                ServerStatus::Stopped => {
+                                    ("\u{25CF}", "server stopped", Color32::from_gray(130))
+                                }
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(dot).color(col).size(11.0));
+                                ui.label(RichText::new(txt).color(col).size(12.0));
+                            });
+                            ui.horizontal(|ui| {
+                                let running = server.status == ServerStatus::Running;
+                                let starting = server.status == ServerStatus::Starting;
+                                if ui
+                                    .add_enabled(!running && !starting, egui::Button::new("Start server"))
+                                    .clicked()
+                                {
+                                    server_cmd.write(ServerCmd::Start);
+                                }
+                                if ui
+                                    .add_enabled(running || starting, egui::Button::new("Stop server"))
+                                    .clicked()
+                                {
+                                    server_cmd.write(ServerCmd::Stop);
+                                }
+                            });
+                            ui.label(
+                                RichText::new(
+                                    "on-demand routing via the local :8091 GPU server (first query loads the map \u{2248}30 s)",
+                                )
+                                .size(10.0)
+                                .italics()
+                                .color(MUTED),
+                            );
+                        });
+
+                    ui.add_space(6.0);
                     ui.label(
-                        RichText::new(format!(
-                            "Route  {:.0} m  ({} stops)",
-                            route_result.dist,
-                            route_result.points.len()
-                        ))
-                        .size(11.0)
-                        .color(Color32::from_gray(210)),
+                        RichText::new("PMC/scav/boss: tarkov.dev  \u{2022}  extracts/doors: game data")
+                            .size(9.0)
+                            .italics()
+                            .color(MUTED),
                     );
-                }
-                RouteStatus::Error(e) => {
-                    ui.label(
-                        RichText::new(e.as_str())
-                            .size(10.0)
-                            .color(Color32::from_rgb(210, 96, 84)),
-                    );
-                }
-                RouteStatus::Idle => {}
-            }
+                });
         });
+}
+
+/// Section header text: name + a dim count of markers in that section.
+#[cfg(feature = "egui")]
+fn section_hdr(name: &str, count: usize, col: bevy_egui::egui::Color32) -> bevy_egui::egui::RichText {
+    use bevy_egui::egui::RichText;
+    if count > 0 {
+        RichText::new(format!("{name}   \u{00B7} {count}")).color(col).size(12.0).strong()
+    } else {
+        RichText::new(name).color(col).size(12.0).strong()
+    }
+}
+
+/// Right-aligned dim marker count for a row.
+#[cfg(feature = "egui")]
+fn count_tag(ui: &mut bevy_egui::egui::Ui, n: usize, col: bevy_egui::egui::Color32) {
+    use bevy_egui::egui::{Align, Layout, RichText};
+    if n == 0 {
+        return;
+    }
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(RichText::new(n.to_string()).size(10.0).color(col));
+    });
+}
+
+/// Turn every overlay layer off (the panel's "hide all" quick action).
+#[cfg(feature = "egui")]
+fn hide_all(t: &mut LayerToggles) {
+    t.loot = false;
+    t.pmc_spawns = false;
+    t.scav_spawns = false;
+    t.bosses = false;
+    t.extracts = false;
+    t.doors = false;
+    t.interactables = false;
+    t.locks = false;
+    t.hazards = false;
+    t.switches = false;
+    t.transits = false;
+    t.stationary = false;
+    t.loose = false;
+    t.quests = false;
 }
 
 /// egui swatch colour for a POI layer (matches the on-map marker colour).
@@ -455,18 +596,20 @@ fn poi_swatch(l: crate::poi::PoiLayer) -> bevy_egui::egui::Color32 {
     )
 }
 
-/// One POI toggle row: colour swatch + checkbox.
+/// One POI toggle row: colour swatch + checkbox + a right-aligned dim marker count.
 #[cfg(feature = "egui")]
 fn poi_row(
     ui: &mut bevy_egui::egui::Ui,
     on: &mut bool,
     label: &str,
     l: crate::poi::PoiLayer,
+    counts: &[usize; 16],
 ) {
-    use bevy_egui::egui::RichText;
+    use bevy_egui::egui::{Color32, RichText};
     ui.horizontal(|ui| {
         ui.add_space(2.0);
         ui.label(RichText::new("\u{25CF}").color(poi_swatch(l)).size(12.0));
         ui.checkbox(on, label);
+        count_tag(ui, counts[l as usize], Color32::from_rgb(110, 112, 110));
     });
 }

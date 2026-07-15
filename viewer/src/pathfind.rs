@@ -58,6 +58,33 @@ struct PathfindConfig {
 #[derive(Resource, Default)]
 struct PathfindTask(Option<Task<Result<(Vec<Vec3>, f32), String>>>);
 
+/// Live state of the local :8091 pathfind server, so the UI can show it + Start/Stop it.
+#[derive(Clone, PartialEq, Default)]
+pub enum ServerStatus {
+    #[default]
+    Stopped,
+    Starting,
+    Running,
+}
+
+/// UI -> server control. The viewer can spawn/kill the pathfind server process itself.
+#[derive(Message)]
+pub enum ServerCmd {
+    Start,
+    Stop,
+}
+
+#[derive(Resource, Default)]
+pub struct PathfindServer {
+    pub status: ServerStatus,
+    /// The child process WE started (None if the server is external or stopped). Killed on Stop.
+    child: Option<std::process::Child>,
+    /// Seconds until the next /health poll.
+    check_timer: f32,
+    /// In-flight health-check task (GET /health -> bool reachable).
+    check: Option<Task<bool>>,
+}
+
 pub struct PathfindPlugin;
 impl Plugin for PathfindPlugin {
     fn build(&self, app: &mut App) {
@@ -68,10 +95,22 @@ impl Plugin for PathfindPlugin {
         let enabled = std::env::var("EFT_PATHFIND").map(|v| v.trim() == "1").unwrap_or(false)
             || std::env::var("EFT_ROUTE").is_ok();
         app.add_message::<RouteRequest>()
+            .add_message::<ServerCmd>()
             .insert_resource(PathfindConfig { url, enabled })
             .init_resource::<RouteResult>()
             .init_resource::<PathfindTask>()
-            .add_systems(Update, (debug_route, dispatch_route, poll_route, draw_route));
+            .init_resource::<PathfindServer>()
+            .add_systems(
+                Update,
+                (
+                    handle_server_cmd,
+                    poll_server_health,
+                    debug_route,
+                    dispatch_route,
+                    poll_route,
+                    draw_route,
+                ),
+            );
     }
 }
 
@@ -126,6 +165,7 @@ fn debug_route(
 fn dispatch_route(
     mut ev: MessageReader<RouteRequest>,
     cfg: Res<PathfindConfig>,
+    server: Res<PathfindServer>,
     pack: Option<Res<LoadedPack>>,
     cam: Query<&GlobalTransform, With<CullCamera>>,
     mut task: ResMut<PathfindTask>,
@@ -143,11 +183,14 @@ fn dispatch_route(
         result.status = RouteStatus::Idle;
         return;
     }
-    if !cfg.enabled {
-        // Pathfinding is off by default — tell the UI instead of silently hitting the server.
+    // Routing needs the server up. `cfg.enabled` (EFT_PATHFIND=1 / EFT_ROUTE) force-dispatches for
+    // scripted/testing runs; otherwise gate on the health-checked status so a down server gives a
+    // clear "start it" message (Start it from the Pathfinding panel) instead of a raw HTTP failure.
+    if server.status != ServerStatus::Running && !cfg.enabled {
         result.points.clear();
-        result.status =
-            RouteStatus::Error("pathfinding off \u{2014} relaunch with EFT_PATHFIND=1".to_string());
+        result.status = RouteStatus::Error(
+            "pathfind server not running \u{2014} Start it in the Pathfinding panel".to_string(),
+        );
         return;
     }
     let Some(pack) = pack else {
@@ -280,4 +323,89 @@ fn draw_route(mut gizmos: Gizmos, result: Res<RouteResult>) {
             Color::srgb(0.1, 1.0, 0.6),
         );
     }
+}
+
+/// Spawn the pathfind server process (`python pathfind_server.py`). Paths are env-overridable
+/// (`EFT_PATHFIND_PYTHON` / `EFT_PATHFIND_SCRIPT`) with the known local defaults; no console window.
+fn spawn_server() -> std::io::Result<std::process::Child> {
+    let python = std::env::var("EFT_PATHFIND_PYTHON")
+        .unwrap_or_else(|_| "C:/Users/user/anaconda3/python.exe".to_string());
+    let script = std::env::var("EFT_PATHFIND_SCRIPT").unwrap_or_else(|_| {
+        "C:/Users/user/beamng_blender_pipeline/tarkmap/pathfind_server.py".to_string()
+    });
+    let mut cmd = std::process::Command::new(&python);
+    cmd.arg(&script);
+    if let Some(dir) = std::path::Path::new(&script).parent() {
+        cmd.current_dir(dir);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — don't pop a console
+    }
+    cmd.spawn()
+}
+
+/// UI Start/Stop of the server process (the viewer owns the child it spawns).
+fn handle_server_cmd(mut ev: MessageReader<ServerCmd>, mut server: ResMut<PathfindServer>) {
+    for cmd in ev.read() {
+        match cmd {
+            ServerCmd::Start => {
+                if server.child.is_none() && server.status != ServerStatus::Running {
+                    match spawn_server() {
+                        Ok(child) => {
+                            info!("pathfind: started server (pid {})", child.id());
+                            server.child = Some(child);
+                            server.status = ServerStatus::Starting;
+                            server.check_timer = 0.0; // health-poll immediately
+                        }
+                        Err(e) => error!("pathfind: failed to start server: {e}"),
+                    }
+                }
+            }
+            ServerCmd::Stop => {
+                if let Some(mut c) = server.child.take() {
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
+                server.status = ServerStatus::Stopped;
+                server.check = None;
+            }
+        }
+    }
+}
+
+/// Periodically GET `/health` so the UI reflects the true server state — including an
+/// externally-started server or the ~30 s BVH-load window (process up, not yet answering).
+fn poll_server_health(
+    time: Res<Time>,
+    cfg: Res<PathfindConfig>,
+    mut server: ResMut<PathfindServer>,
+) {
+    if let Some(t) = server.check.as_mut() {
+        if let Some(reachable) = block_on(future::poll_once(t)) {
+            server.check = None;
+            server.status = if reachable {
+                ServerStatus::Running
+            } else if server.child.is_some() {
+                ServerStatus::Starting // our process is alive but not answering yet
+            } else {
+                ServerStatus::Stopped
+            };
+        }
+        return;
+    }
+    server.check_timer -= time.delta_secs();
+    if server.check_timer > 0.0 {
+        return;
+    }
+    server.check_timer = 1.5;
+    let health = cfg.url.replace("/graphql", "/health");
+    server.check = Some(AsyncComputeTaskPool::get().spawn(async move {
+        ureq::get(&health)
+            .timeout(std::time::Duration::from_secs(2))
+            .call()
+            .map(|r| r.status() == 200)
+            .unwrap_or(false)
+    }));
 }
