@@ -17,7 +17,6 @@ use bevy::asset::RenderAssetUsages;
 use bevy::image::{Image, ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::light::CascadeShadowConfigBuilder;
 use bevy::mesh::Indices;
-use bevy::pbr::ScreenSpaceAmbientOcclusion;
 use bevy::prelude::*;
 use bevy::render::render_resource::PrimitiveTopology;
 use bevy::render::view::NoIndirectDrawing;
@@ -29,14 +28,132 @@ use std::collections::HashMap;
 #[derive(Component)]
 pub struct EftGeom;
 
+/// Marker for the EFT interior lights loaded from the lights sidecar.
+#[derive(Component)]
+struct EftLight;
+
 pub struct EftStandardPlugin;
 impl Plugin for EftStandardPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_standard)
+        app.add_systems(Startup, (spawn_standard, spawn_ingame_lights))
             // PostStartup so the camera + sun (spawned in main's Startup `setup`)
             // already exist when we turn on shadows / attach effects.
             .add_systems(PostStartup, configure_lighting);
     }
+}
+
+/// One EFT light from the `lights_64.json` sidecar (game-authored point/spot lights).
+#[derive(serde::Deserialize)]
+struct GameLight {
+    #[serde(rename = "type")]
+    kind: String,
+    position: [f32; 3],
+    #[serde(default = "quat_ident")]
+    rotation: [f32; 4],
+    color: [f32; 4],
+    intensity: f32,
+    #[serde(default)]
+    range: f32,
+    #[serde(rename = "spotAngle", default)]
+    spot_angle: f32,
+}
+fn quat_ident() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
+/// Unity light intensity -> Bevy lumens. EFT stores small HDR-ish numbers (~40);
+/// Bevy wants lumens. Tuned by eye; `EFT_LIGHT_LUMENS` overrides for tuning.
+fn light_lumens_scale() -> f32 {
+    std::env::var("EFT_LIGHT_LUMENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600.0)
+}
+
+/// Spawn EFT's real interior point/spot lights so the mall is lit as in-game
+/// (previously both render paths faked a single key light). Positions/directions
+/// are X-flipped into pack space — the same diag(-1,1,1) conjugation the geometry
+/// and loot overlay use. No shadows (1285 shadowed lights would be far too costly);
+/// only the directional sun casts shadows.
+fn spawn_ingame_lights(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
+    // GATED: spawning all 1285 game lights as real-time Bevy lights tanks interiors
+    // to ~0.4 FPS (clustered-forward froxel overflow). Off by default; opt in with
+    // EFT_LIGHTS=1. The real in-game lighting belongs in the baked SH-GI volume.
+    if std::env::var("EFT_LIGHTS").ok().as_deref() != Some("1") {
+        return;
+    }
+    let Some(lp) = pack else { return };
+    let Some(path) = lp.0.manifest.sidecars.lights.as_deref() else {
+        warn!("standard: no lights sidecar — interiors rely on ambient only");
+        return;
+    };
+    let txt = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("standard: lights sidecar {path} unreadable ({e})");
+            return;
+        }
+    };
+    let lights: Vec<GameLight> = match serde_json::from_str(&txt) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("standard: lights sidecar parse failed: {e}");
+            return;
+        }
+    };
+
+    let scale = light_lumens_scale();
+    let (mut np, mut ns) = (0u32, 0u32);
+    for l in &lights {
+        let pos = Vec3::new(-l.position[0], l.position[1], l.position[2]);
+        let color = Color::srgb(l.color[0], l.color[1], l.color[2]);
+        let intensity = l.intensity * scale;
+        let range = if l.range > 0.0 { l.range } else { 15.0 };
+        if l.kind == "Spot" {
+            // Unity spot shines along +Z; conjugate the world forward via X-flip.
+            let q = Quat::from_xyzw(l.rotation[0], l.rotation[1], l.rotation[2], l.rotation[3]);
+            let fwd_u = q * Vec3::Z;
+            let fwd = Vec3::new(-fwd_u.x, fwd_u.y, fwd_u.z);
+            let fwd = if fwd.length_squared() > 1e-6 { fwd.normalize() } else { Vec3::NEG_Y };
+            let outer = (l.spot_angle.clamp(1.0, 179.0).to_radians()) * 0.5;
+            commands.spawn((
+                SpotLight {
+                    color,
+                    intensity,
+                    range,
+                    radius: 0.0,
+                    shadows_enabled: false,
+                    outer_angle: outer,
+                    inner_angle: outer * 0.85,
+                    ..default()
+                },
+                Transform::from_translation(pos).looking_to(fwd, Vec3::Y),
+                EftLight,
+            ));
+            ns += 1;
+        } else {
+            commands.spawn((
+                PointLight {
+                    color,
+                    intensity,
+                    range,
+                    radius: 0.0,
+                    shadows_enabled: false,
+                    ..default()
+                },
+                Transform::from_translation(pos),
+                EftLight,
+            ));
+            np += 1;
+        }
+    }
+    info!(
+        "standard: spawned {} EFT lights ({} point, {} spot) from {}",
+        np + ns,
+        np,
+        ns,
+        path
+    );
 }
 
 /// Phase 2: enable Bevy's real-time lighting on the migrated map — cascaded sun
@@ -46,16 +163,44 @@ impl Plugin for EftStandardPlugin {
 fn configure_lighting(
     mut commands: Commands,
     cam: Query<Entity, With<Camera3d>>,
-    mut lights: Query<(Entity, &mut DirectionalLight)>,
+    mut lights: Query<(Entity, &mut DirectionalLight, &mut Transform)>,
     mut ambient: ResMut<AmbientLight>,
+    pack: Option<Res<LoadedPack>>,
 ) {
-    // Cool sky-fill ambient so shadows aren't crushed to black.
-    ambient.color = Color::srgb(0.62, 0.70, 0.90);
+    // Neutral-cool sky-fill ambient (the SH bake used a NEUTRAL gray sky) so
+    // shadowed areas read without a heavy blue cast.
+    ambient.color = Color::srgb(0.72, 0.74, 0.80);
     ambient.brightness = 500.0;
 
-    for (e, mut dl) in &mut lights {
+    // EFT's real sun direction, read from the SH bake sidecar (volume.json) and
+    // X-flipped into pack space — so the shadows fall exactly as they do in-game
+    // instead of from an arbitrary angle. Data-driven; no hardcoded vector.
+    let sun_dir_pack = pack
+        .as_ref()
+        .and_then(|p| p.0.manifest.sidecars.volume_meta.as_deref())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+        .and_then(|v| {
+            v.get("sun_dir").and_then(|s| s.as_array()).and_then(|a| {
+                Some(Vec3::new(
+                    -(a.first()?.as_f64()? as f32),
+                    a.get(1)?.as_f64()? as f32,
+                    a.get(2)?.as_f64()? as f32,
+                ))
+            })
+        });
+
+    for (e, mut dl, mut tf) in &mut lights {
         dl.shadows_enabled = true;
         dl.illuminance = 11_000.0;
+        // Warm sun (the bake notes a "warm fallback sun") over the neutral ambient.
+        dl.color = Color::srgb(1.0, 0.96, 0.88);
+        if let Some(sd) = sun_dir_pack {
+            if sd.length_squared() > 1e-6 {
+                // sun_dir points TOWARD the sun; the light travels the opposite way.
+                *tf = tf.looking_to(-sd.normalize(), Vec3::Y);
+            }
+        }
         // Cascades sized for a large map: tight near cascade for crisp contact
         // shadows, out to 500 m so mid-range geometry still shadows.
         commands.entity(e).insert(
@@ -72,13 +217,8 @@ fn configure_lighting(
 
     // The camera was tagged NoIndirectDrawing for the custom path; the standard
     // path wants Bevy's GPU preprocessing (faster for 100k+ entities), so drop it.
-    // SSAO adds contact/crevice shadows for a grounded look (it auto-pulls in the
-    // depth + normal prepass it needs).
     for e in &cam {
-        commands
-            .entity(e)
-            .remove::<NoIndirectDrawing>()
-            .insert(ScreenSpaceAmbientOcclusion::default());
+        commands.entity(e).remove::<NoIndirectDrawing>();
     }
 }
 
