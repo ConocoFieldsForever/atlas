@@ -89,7 +89,12 @@ load control maps LINEAR not sRGB; detail maps #6.)
   (`terrain_cut.py` / `bake_roads_into_terrain`). User rejected it; terrain must stay whole.
 - **Refs:** `tarkmap-road-terrain-matte-and-hole-bake`
 
-### 4. No grass  —  STATUS: TODO
+### 4. No grass  —  STATUS: ✅ DONE on custom path (2026-07-15)
+Implemented: `build_grass.py` reads the 4 density grids + terrain meshes → `grass.bin`
+(N×[x,y,z,rotY,scale], deterministic per-cell hash, placed on the surface via a UV→world
+bilinear lookup, road-excluding). `gpu_driven` appends a cross-quad grass mesh + cutout
+material + the ~109k instances to the same cull+multidraw buffers. 400 FPS.
+
 - **Symptom:** terrain has no grass/foliage.
 - **Root cause:** EFT grass = **GPU-Instancer baked density grids**, NOT Unity terrain
   detail (that DB is a zeroed decoy). 88 `GPUInstancerDetailPrototype` MonoBehaviours

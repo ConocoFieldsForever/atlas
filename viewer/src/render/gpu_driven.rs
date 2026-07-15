@@ -939,6 +939,117 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         });
     }
 
+    // ---- #4 GRASS: append the density-placed grass clumps as a cross-quad mesh + N instances,
+    //      rendered by the SAME cull + multidraw + alpha-cutout path. grass.bin = N×[x,y,z,rotY,
+    //      scale] f32 from build_grass.py (deterministic, road-excluding GPU-Instancer density). ----
+    'grass: {
+        let bin = match std::fs::read(pack.root.join("grass.bin")) {
+            Ok(b) if !b.is_empty() => b,
+            _ => {
+                info!("gpu-driven grass: no grass.bin (run build_grass.py) — skipping grass");
+                break 'grass;
+            }
+        };
+        // grass albedo + tint from the sidecar.
+        let side = std::fs::read_to_string(pack.root.join("grass_sidecar.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+        let grass_albedo = side
+            .as_ref()
+            .and_then(|v| v.get("albedo").and_then(|a| a.as_str()))
+            .unwrap_or("")
+            .to_string();
+        if grass_albedo.is_empty() {
+            warn!("gpu-driven grass: no grass albedo in sidecar — skipping");
+            break 'grass;
+        }
+        let grass_tint = side
+            .as_ref()
+            .and_then(|v| v.get("tint").and_then(|a| a.as_array()))
+            .map(|a| {
+                let g = |i: usize, d: f32| a.get(i).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32;
+                [g(0, 0.7), g(1, 0.75), g(2, 0.55), 1.0]
+            })
+            .unwrap_or([0.7, 0.75, 0.55, 1.0]);
+
+        // Grass material: alpha-cutout (blade coverage in the texture alpha), matte.
+        let grass_albedo_idx = *path_to_index.entry(grass_albedo.clone()).or_insert_with(|| {
+            let idx = albedo_paths.len() as u32;
+            albedo_paths.push(grass_albedo.clone());
+            idx
+        });
+        let grass_mat_id = materials_gpu.len() as u32;
+        materials_gpu.push(GpuMaterial {
+            albedo_index: grass_albedo_idx,
+            flags: MAT_FLAG_CUTOUT,
+            alpha_cutoff: 0.35,
+            roughness: 0.9,
+            uv_xform: [1.0, 1.0, 0.0, 0.0],
+            tint: grass_tint,
+            vp: [0.0; 4],
+            normal_index: NO_NORMAL,
+            normal_flags: 0,
+            normal_scale: 1.0,
+            _pad2: 0,
+        });
+
+        // Cross-quad clump mesh: 3 quads at 0/60/120° around Y, base at y=0.
+        let base_vertex = vtx_cursor as i32;
+        let first_index = idx_cursor;
+        let mbits = f32::from_bits(grass_mat_id);
+        let (hw, gh) = (0.42f32, 0.9f32);
+        let (mut nverts, mut nidx) = (0u32, 0u32);
+        for q in 0..3u32 {
+            let ang = q as f32 * std::f32::consts::PI / 3.0;
+            let (s, c) = ang.sin_cos();
+            let (dx, dz) = (c * hw, s * hw);
+            let b = nverts;
+            let mk = |x: f32, y: f32, z: f32, u: f32, v: f32| {
+                [x, y, z, 0.0, 1.0, 0.0, u, v, mbits, 1.0, 1.0, 1.0, 1.0]
+            };
+            for vtx in [
+                mk(-dx, 0.0, -dz, 0.0, 1.0),
+                mk(dx, 0.0, dz, 1.0, 1.0),
+                mk(dx, gh, dz, 1.0, 0.0),
+                mk(-dx, gh, -dz, 0.0, 0.0),
+            ] {
+                vertex_data.extend_from_slice(&vtx);
+            }
+            index_data.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+            nverts += 4;
+            nidx += 6;
+        }
+        vtx_cursor += nverts;
+        idx_cursor += nidx;
+
+        // One instance per grass clump (deterministic transform from grass.bin).
+        let instance_base = inst_cursor;
+        let mut count = 0u32;
+        for ch in bin.chunks_exact(20) {
+            let f = |o: usize| f32::from_le_bytes([ch[o], ch[o + 1], ch[o + 2], ch[o + 3]]);
+            let (x, y, z, rot, sc) = (f(0), f(4), f(8), f(12), f(16));
+            let (s, c) = rot.sin_cos();
+            instances.push(InstanceGpuRecord {
+                m0: [c * sc, 0.0, s * sc, x],
+                m1: [0.0, sc, 0.0, y],
+                m2: [-s * sc, 0.0, c * sc, z],
+                ids: [mesh_meta.len() as u32, 0, 0, 0],
+                sphere: [x, y + gh * sc * 0.5, z, 1.3 * sc],
+            });
+            count += 1;
+        }
+        inst_cursor += count;
+        mesh_meta.push(MeshMeta {
+            index_count: nidx,
+            first_index,
+            base_vertex,
+            instance_base,
+            instance_count: count,
+            _pad: [0; 3],
+        });
+        info!("gpu-driven #4 grass: {count} clumps appended (cross-quad, alpha-cutout)");
+    }
+
     let mesh_count = mesh_meta.len() as u32;
     let instance_total = inst_cursor;
     if mesh_count == 0 || instance_total == 0 {
