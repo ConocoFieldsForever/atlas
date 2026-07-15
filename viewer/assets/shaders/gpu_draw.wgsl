@@ -103,6 +103,7 @@ const MAT_FLAG_CUTOUT: u32 = 1u;          // bit0: alpha-tested (MASK) surface
 const MAT_FLAG_BLEND: u32 = 2u;           // bit1: alpha-blended (decal/glass/water/BLEND) surface
 const MAT_FLAG_SOFTCUTOUT: u32 = 4u;      // bit2: Vert Paint SoftCutout decal (feather via color.a)
 const MAT_FLAG_WATER: u32 = 8u;           // bit3: water/mirror (dark wet sheen, not white fallback)
+const MAT_FLAG_TERRAIN: u32 = 16u;        // bit4: MicroSplat terrain (splat-blend 12 layers; slice in _pad2)
 
 @group(2) @binding(0) var<storage, read> materials: array<MaterialGpu>;
 @group(2) @binding(1) var albedo_tex: binding_array<texture_2d<f32>>;
@@ -110,6 +111,16 @@ const MAT_FLAG_WATER: u32 = 8u;           // bit3: water/mirror (dark wet sheen,
 // Phase 2b: bindless normal-map array (LINEAR data). Reuses `albedo_samp`; indexed non-uniformly
 // by m.normal_index (same device feature as albedo). Sentinel MAT_NORMAL_NONE = no normal map.
 @group(2) @binding(3) var normal_tex: binding_array<texture_2d<f32>>;
+
+// #1 MicroSplat terrain splat table (byte-identical to Rust `TerrainSplatGpu`). All indices are
+// into the SAME `albedo_tex` array. Layer i weight = control map (i/4) channel (i%4);
+// layer_uv = terrainUV01 * layer_rep[i]. ctrl_idx is 4 slices × 3 maps at [slice*3 + k].
+struct TerrainSplat {
+    layer_albedo: array<u32, 12>,
+    layer_rep: array<f32, 12>,
+    ctrl_idx: array<u32, 12>,
+};
+@group(2) @binding(4) var<storage, read> terrain_splat: TerrainSplat;
 
 // --- Phase 1: baked SH-GI irradiance volume (group 3) ------------------------
 // Replaces the flat `ambient + N·L` hack with the RTX-baked spherical-harmonics
@@ -313,6 +324,12 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
 fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     let m = materials[o.material_index];
 
+    // #1 terrain: UV derivatives computed here in UNIFORM control flow, so the per-layer
+    // textureSampleGrad calls inside the (non-uniform) terrain branch need no implicit
+    // derivatives and keep correct mipmapping.
+    let duv_dx = dpdx(o.uv);
+    let duv_dy = dpdy(o.uv);
+
     // The pass class-discard is done AFTER the albedo sample below (Codex P0): a non-uniform
     // `discard` placed BEFORE textureSample makes the sample's implicit derivatives non-uniform
     // and FAILS naga validation, so both pipelines would fail to create. Sample first (uniform
@@ -369,6 +386,29 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     var albedo = m.tint; // untextured (sentinel) -> tint over implicit white
     if (has_albedo) {
         albedo = tex * m.tint; // _MainTex * _Color
+    }
+
+    // #1 MicroSplat terrain: replace the single-texture albedo with the splat blend of the 12
+    // layers, weighted by this slice's 3 control maps (layer i weight = ctrl(i/4).chan(i%4)).
+    // textureSampleGrad takes explicit gradients, so the whole blend is safe in this branch.
+    if ((m.flags & MAT_FLAG_TERRAIN) != 0u) {
+        let base = m._pad2 * 3u;
+        let c0 = textureSampleGrad(albedo_tex[terrain_splat.ctrl_idx[base + 0u]], albedo_samp, o.uv, duv_dx, duv_dy);
+        let c1 = textureSampleGrad(albedo_tex[terrain_splat.ctrl_idx[base + 1u]], albedo_samp, o.uv, duv_dx, duv_dy);
+        let c2 = textureSampleGrad(albedo_tex[terrain_splat.ctrl_idx[base + 2u]], albedo_samp, o.uv, duv_dx, duv_dy);
+        var w = array<f32, 12>(c0.r, c0.g, c0.b, c0.a, c1.r, c1.g, c1.b, c1.a, c2.r, c2.g, c2.b, c2.a);
+        var acc = vec3<f32>(0.0);
+        var wsum = 0.0;
+        for (var i = 0u; i < 12u; i = i + 1u) {
+            let wi = w[i];
+            if (wi <= 0.002) { continue; }
+            let rep = terrain_splat.layer_rep[i];
+            let la = textureSampleGrad(albedo_tex[terrain_splat.layer_albedo[i]], albedo_samp,
+                                       o.uv * rep, duv_dx * rep, duv_dy * rep);
+            acc = acc + wi * la.rgb;
+            wsum = wsum + wi;
+        }
+        albedo = vec4<f32>(acc / max(wsum, 0.002), 1.0) * m.tint;
     }
 
     // Cutout / alpha-test (role=cutout, alphaMode=MASK). Per-material cutoff. discard needs no

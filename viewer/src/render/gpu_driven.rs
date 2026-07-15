@@ -201,6 +201,25 @@ pub const MAT_FLAG_SOFTCUTOUT: u32 = 1 << 2;
 /// translucent dark wet sheen instead of the white tint fallback (untextured water was WHITE).
 /// Implies BLEND.
 pub const MAT_FLAG_WATER: u32 = 1 << 3;
+/// `GpuMaterial::flags` bit (#1 MicroSplat): terrain tile. The fragment ignores `albedo_index`
+/// and instead splat-blends the 12 MicroSplat layers by the slice's 3 control maps. The slice
+/// index (0..3) rides in `_pad2`.
+pub const MAT_FLAG_TERRAIN: u32 = 1 << 4;
+
+/// MicroSplat splat table (group(2) binding(4), storage). All indices are into the SAME bindless
+/// `albedo_tex` array as normal materials (the terrain textures are appended to `albedo_paths`).
+/// Layer `i` weight = control map `i/4`, channel `i%4`. `layer_uv = terrainUV01 * rep` (the value
+/// recovered from the MicroSplat material; NEVER `m_TileSize`). 144 bytes (12·4·3), 16-aligned.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TerrainSplatGpu {
+    /// bindless albedo index of each of the 12 layers.
+    pub layer_albedo: [u32; 12],
+    /// per-layer UV repeat (`terrainUV01 * rep`).
+    pub layer_rep: [f32; 12],
+    /// 4 slices × 3 control-map bindless indices: slice `s` map `k` at `[s*3 + k]`.
+    pub ctrl_idx: [u32; 12],
+}
 
 // ---------------------------------------------------------------------------
 // Phase 1 SH-GI: baked spherical-harmonics irradiance volume.
@@ -474,6 +493,8 @@ pub struct CpuData {
     /// `None` if the pack shipped no volume sidecar (render world synthesizes a flat-ambient
     /// dummy so group(3) stays valid).
     sh_volume: Option<ShVolumeCpu>,
+    /// #1 MicroSplat: the terrain splat table (layer/control bindless indices + per-layer rep).
+    terrain: TerrainSplatGpu,
     instance_total: u32,
     mesh_count: u32,
 }
@@ -692,6 +713,99 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             _pad2: 0,
         });
     }
+
+    // ---- #1 MicroSplat terrain: append the 12 layer + 12 control textures to the SAME bindless
+    //      albedo set, build the splat table, and tag the 4 terrain materials (FLAG_TERRAIN +
+    //      slice index in _pad2, matte roughness). Layer i weight = control(i/4).chan(i%4);
+    //      layer_uv = terrainUV01*rep (the recovered MicroSplat tiling; NEVER m_TileSize). ----
+    let mut terrain = TerrainSplatGpu {
+        layer_albedo: [0; 12],
+        layer_rep: [1.0; 12],
+        ctrl_idx: [0; 12],
+    };
+    'terrain: {
+        let Some(tl_path) = pack.manifest.sidecars.terrain_layers.as_deref() else {
+            warn!("gpu-driven terrain: no terrainLayers sidecar — terrain stays single-layer");
+            break 'terrain;
+        };
+        let dir = std::path::Path::new(tl_path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let tl: serde_json::Value = match std::fs::read_to_string(tl_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+        {
+            Some(v) => v,
+            None => {
+                warn!("gpu-driven terrain: could not read/parse {tl_path}");
+                break 'terrain;
+            }
+        };
+        let Some(tiles) = tl.get("tiles").and_then(|v| v.as_object()) else {
+            break 'terrain;
+        };
+        // append a terrain texture (filename relative to the sidecar dir) to the bindless set.
+        let mut add_tex = |name: &str| -> u32 {
+            let full = dir.join(name).to_string_lossy().replace('\\', "/");
+            *path_to_index.entry(full.clone()).or_insert_with(|| {
+                let idx = albedo_paths.len() as u32;
+                albedo_paths.push(full);
+                idx
+            })
+        };
+        const SLICES: [&str; 4] = ["Slice_1_1", "Slice_1_2", "Slice_2_1", "Slice_2_2"];
+        let mut layers_done = false;
+        for (si, sname) in SLICES.iter().enumerate() {
+            let Some(tile) = tiles.get(*sname) else { continue };
+            if let Some(cm) = tile.get("ctrl_maps").and_then(|v| v.as_array()) {
+                for (k, c) in cm.iter().take(3).enumerate() {
+                    if let Some(cn) = c.as_str() {
+                        terrain.ctrl_idx[si * 3 + k] = add_tex(cn);
+                    }
+                }
+            }
+            // The 12 layers are shared across slices (same MicroSplat material); capture once.
+            if !layers_done {
+                if let Some(layers) = tile.get("layers").and_then(|v| v.as_array()) {
+                    for l in layers {
+                        let idx = l.get("idx").and_then(|v| v.as_u64()).unwrap_or(99) as usize;
+                        if idx >= 12 {
+                            continue;
+                        }
+                        let name = l.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let rep = l.get("rep").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                        terrain.layer_albedo[idx] = add_tex(&format!("layer_{name}.png"));
+                        terrain.layer_rep[idx] = rep;
+                    }
+                    layers_done = true;
+                }
+            }
+        }
+        // Tag the 4 terrain materials: FLAG_TERRAIN + slice index (0..3) in _pad2, matte roughness.
+        let mut tagged = 0u32;
+        for inst in &pack.instances {
+            if inst.flags & crate::eftpack::flags::TERRAIN == 0 {
+                continue;
+            }
+            let me = &pack.manifest.meshes[inst.mesh_id as usize];
+            let Some(slice) = SLICES.iter().position(|s| me.name.contains(s)) else {
+                continue;
+            };
+            let Some(sub) = me.submeshes.first() else { continue };
+            let mid = sub.material_id as usize;
+            if mid < materials_gpu.len() {
+                materials_gpu[mid].flags |= MAT_FLAG_TERRAIN;
+                materials_gpu[mid]._pad2 = slice as u32;
+                materials_gpu[mid].roughness = 0.95; // matte ground, no shiny slab
+                tagged += 1;
+            }
+        }
+        info!(
+            "gpu-driven #1 terrain: MicroSplat table built (12 layers × 4 slices, {tagged} tiles tagged)"
+        );
+    }
+
     info!(
         "gpu-driven M3: {} materials, {} unique albedo textures ({} untextured)",
         materials_gpu.len(),
@@ -852,6 +966,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         albedo_paths,
         normal_paths,
         sh_volume,
+        terrain,
         instance_total,
         mesh_count,
     })));
@@ -1145,6 +1260,12 @@ fn prepare_gpu_buffers(
         contents: bytemuck::cast_slice(&cpu.materials),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
+    // #1 MicroSplat terrain splat table (group(2) binding(4)).
+    let terrain_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_terrain_splat"),
+        contents: bytemuck::bytes_of(&cpu.terrain),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
 
     // Decode + upload every UNIQUE albedo (image crate -> Rgba8UnormSrgb). One texture per
     // entry, IN THE SAME order as cpu.albedo_paths, so GpuMaterial.albedo_index stays aligned;
@@ -1217,6 +1338,7 @@ fn prepare_gpu_buffers(
                     texture_2d(TextureSampleType::Float { filterable: true })
                         .count(NonZeroU32::new(normal_count).unwrap()),
                 ),
+                (4, storage_buffer_read_only_sized(false, None)), // #1 terrain splat table
             ),
         ),
     );
@@ -1232,6 +1354,7 @@ fn prepare_gpu_buffers(
             (1, &view_refs[..]),
             (2, &albedo_sampler),
             (3, &normal_view_refs[..]),
+            (4, terrain_buf.as_entire_binding()),
         )),
     );
 

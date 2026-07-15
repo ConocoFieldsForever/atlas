@@ -28,7 +28,13 @@ tanked its 102k-entity scene:
 
 ## ISSUES
 
-### 1. Terrain + asphalt: low-res + repeating noise  —  STATUS: TODO (both paths)
+### 1. Terrain + asphalt: low-res + repeating noise  —  STATUS: ✅ DONE on custom path (2026-07-15)
+Implemented: 12 layer albedos + 12 control maps appended to the bindless set; `TerrainSplatGpu`
+SSBO at group(2) binding(4); the 4 terrain materials tagged `MAT_FLAG_TERRAIN` + slice in `_pad2`
++ matte roughness; `gpu_draw.wgsl` splat branch blends 12 layers by control weights at
+`uv*rep` via `textureSampleGrad`. 521 FPS. (Follow-ups if needed: per-layer normal maps;
+load control maps LINEAR not sRGB; detail maps #6.)
+
 - **Symptom:** terrain/asphalt look low-res with obvious tiling/repeating noise.
 - **Root cause:** rendered as a single tiled albedo. Unity uses **MicroSplat**: N layers
   (grass/ground/gravel/forest/asphalt…) blended through control maps, each at its own UV
