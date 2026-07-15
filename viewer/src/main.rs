@@ -12,6 +12,7 @@
 mod eftpack;
 mod inspect;
 mod loot;
+mod pathfind;
 mod pick;
 mod poi;
 mod render;
@@ -47,6 +48,32 @@ impl Default for FlyCam {
             pitch: 0.0,
         }
     }
+}
+
+/// UI-driven camera command: set `fly_to` from any egui panel (marker search, quest jump, route
+/// start) and `apply_camera_command` frames the camera on that world point next frame. This keeps
+/// the panels (ui.rs) decoupled from the private `FlyCam` — they only touch this resource, mirroring
+/// the `LayerToggles` -> reactive-apply pattern.
+#[derive(Resource, Default)]
+pub struct CameraCommand {
+    pub fly_to: Option<Vec3>,
+}
+
+/// Consume a pending `CameraCommand::fly_to`: place the fly-cam at a framing offset above the target,
+/// looking at it, and sync `FlyCam.yaw/pitch` so subsequent mouse-look continues smoothly.
+fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Transform, &mut FlyCam)>) {
+    let Some(target) = cmd.fly_to.take() else {
+        return;
+    };
+    let Ok((mut tf, mut cam)) = q.single_mut() else {
+        return;
+    };
+    let cam_pos = target + Vec3::new(6.0, 11.0, 18.0); // pulled back + up for context
+    let dir = (target - cam_pos).normalize_or_zero();
+    cam.yaw = dir.x.atan2(-dir.z); // same convention as `setup` (main.rs) / flycam_look
+    cam.pitch = dir.y.asin();
+    tf.translation = cam_pos;
+    tf.rotation = Quat::from_axis_angle(Vec3::Y, cam.yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
 }
 
 fn main() {
@@ -88,6 +115,17 @@ fn main() {
         }
     };
 
+    // Play-alongside-a-game friendliness: by DEFAULT cap to vsync (don't render faster than the
+    // monitor) and idle when the window loses focus (see WinitSettings below) — so with the game in
+    // the foreground the viewer stops churning the GPU. EFT_UNCAPPED=1 restores the old uncapped /
+    // always-render behaviour for FPS A/B benchmarking.
+    let uncapped = std::env::var("EFT_UNCAPPED").map(|v| v.trim() == "1").unwrap_or(false);
+    let present_mode = if uncapped {
+        PresentMode::AutoNoVsync // Immediate/Mailbox — uncapped, lowest latency (benchmark)
+    } else {
+        PresentMode::AutoVsync // capped to refresh — far less GPU when it IS in the foreground
+    };
+
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -95,9 +133,7 @@ fn main() {
                 primary_window: Some(Window {
                     title: "EFT Native Viewer".into(),
                     resolution: (1600u32, 900u32).into(),
-                    // Lowest-latency present: no vsync wait — uncaps FPS and minimizes
-                    // input-to-photon latency. AutoNoVsync picks Immediate/Mailbox.
-                    present_mode: PresentMode::AutoNoVsync,
+                    present_mode,
                     ..default()
                 }),
                 ..default()
@@ -133,15 +169,29 @@ fn main() {
         app.insert_resource(LoadedPack(p));
     }
 
+    // Foreground-gated redraw: full-rate when the window is focused, near-idle (only user/window
+    // events, ~2 Hz) when it's not — so alt-tabbing to your game frees the GPU. Skipped under
+    // EFT_UNCAPPED so the benchmark keeps rendering continuously.
+    if !uncapped {
+        app.insert_resource(bevy::winit::WinitSettings {
+            focused_mode: bevy::winit::UpdateMode::Continuous,
+            unfocused_mode: bevy::winit::UpdateMode::reactive_low_power(
+                std::time::Duration::from_millis(500),
+            ),
+        });
+    }
+
     app.insert_resource(ClearColor(Color::srgb(0.55, 0.58, 0.58))) // overcast horizon stand-in
         .add_plugins(pick::PickPlugin) // double-LEFT-click raycast-vs-pack-data debug pick
         .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
         .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
         .add_plugins(inspect::InspectPlugin) // left-click a marker -> floating info card (\u{2715} to close)
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
+        .add_plugins(pathfind::PathfindPlugin) // on-demand routing via the :8091 GPU pathfind server
+        .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
         .add_systems(Startup, setup)
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain())
-        .add_systems(Update, auto_screenshot);
+        .add_systems(Update, (apply_camera_command, auto_screenshot));
 
     #[cfg(feature = "egui")]
     {

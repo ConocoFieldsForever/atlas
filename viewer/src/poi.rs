@@ -13,7 +13,7 @@
 
 use crate::inspect::{money, prettify, titlecase, MarkerInfo, PickRadius};
 use crate::render::LoadedPack;
-use crate::ui::LayerToggles;
+use crate::ui::{LayerToggles, QuestTracker};
 use bevy::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -37,11 +37,58 @@ pub enum PoiLayer {
     Quest,
 }
 
+/// The owning task id carried by every Quest marker, so the tracker (`ui::QuestTracker`) can
+/// focus marker visibility to the selected task(s) — see `apply_quest_visibility`.
+#[derive(Component)]
+pub struct QuestMarkerTask(pub String);
+
+/// Startup-built catalog of THIS map's tasks (tasks.json filtered to zones on this map), read by
+/// the quest tracker UI (ui.rs) and the outline gizmo. Empty by default so the resource always
+/// exists even without a `tasks.json`.
+#[derive(Resource, Default)]
+pub struct QuestData {
+    pub tasks: Vec<QuestEntry>,
+}
+/// One task with the objective zones that fall on this map.
+pub struct QuestEntry {
+    pub id: String,
+    pub name: String,
+    pub trader: String,
+    pub min_level: Option<u32>,
+    pub kappa: bool,
+    /// Lightkeeper-chain task.
+    pub lk: bool,
+    /// Prerequisite task ids (kept for the UI to reason about ordering).
+    #[allow(dead_code)]
+    pub requires: Vec<String>,
+    pub objectives: Vec<QuestObj>,
+}
+/// One objective and its map-local zones.
+pub struct QuestObj {
+    /// Objective text (schema fidelity; the marker card sources its own copy from tasks.json).
+    #[allow(dead_code)]
+    pub desc: String,
+    pub zones: Vec<QuestZoneW>,
+}
+/// A single objective zone bridged to viewer space: a point + an optional footprint polygon.
+pub struct QuestZoneW {
+    pub pos: Vec3,
+    /// Closed polygon footprint (already world-space at zone height); empty for point-only zones.
+    pub outline: Vec<Vec3>,
+    /// Upper bound of the zone volume (schema fidelity; the outline verts carry their own height).
+    #[allow(dead_code)]
+    pub top: f32,
+}
+
 pub struct PoiPlugin;
 impl Plugin for PoiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_pois)
-            .add_systems(Update, apply_poi_visibility);
+        app.init_resource::<QuestData>()
+            .add_systems(Startup, spawn_pois)
+            // Quest markers get their own visibility pass (toggle AND tracker selection); the other
+            // POI layers stay on the plain toggle-driven `apply_poi_visibility`.
+            .add_systems(Update, (apply_poi_visibility, apply_quest_visibility))
+            .add_systems(Update, draw_quest_outlines);
     }
 }
 
@@ -224,6 +271,8 @@ struct QuestFile {
 #[derive(Deserialize)]
 struct QuestTask {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     name: String,
     #[serde(default)]
     trader: String,
@@ -231,6 +280,12 @@ struct QuestTask {
     min_level: Option<u32>,
     #[serde(default)]
     kappa: bool,
+    /// Lightkeeper-chain task.
+    #[serde(default)]
+    lk: bool,
+    /// Prerequisite task ids.
+    #[serde(default)]
+    requires: Vec<String>,
     #[serde(default)]
     objectives: Vec<QuestObjective>,
 }
@@ -249,6 +304,12 @@ struct QuestZone {
     /// Bridged viewer-space position, or absent (outline-only zone — skipped).
     #[serde(default)]
     pos: Option<[f32; 3]>,
+    /// Footprint polygon (bridged viewer-space verts); empty for point-only zones.
+    #[serde(default)]
+    outline: Vec<[f32; 3]>,
+    /// Upper bound of the zone volume.
+    #[serde(default)]
+    top: f32,
 }
 
 /// Card for a quest objective located on this map (tasks.json).
@@ -549,22 +610,26 @@ fn spawn_pois(
         );
     }
 
-    // helper closure captured by the spawn loop below (all shared handles are Clone).
+    // helper closure captured by the spawn loop below (all shared handles are Clone). Returns the
+    // spawned entity so the quest loop can attach a `QuestMarkerTask` after the fact.
     let mut n = 0u32;
-    let mut spawn = |commands: &mut Commands, l: PoiLayer, p: [f32; 3], info: MarkerInfo| {
+    let mut spawn = |commands: &mut Commands, l: PoiLayer, p: [f32; 3], info: MarkerInfo| -> Entity {
         let (_, r, lift) = poi_look(l);
         // Clamp the click radius up so tiny door/interactable markers stay hittable.
         let pick_r = r.max(0.9);
-        commands.spawn((
-            Mesh3d(sphere.clone()),
-            MeshMaterial3d(mats[&(l as u8)].clone()),
-            Transform::from_xyz(p[0], p[1] + lift, p[2]).with_scale(Vec3::splat(r)),
-            l,
-            PickRadius(pick_r),
-            info,
-            Visibility::Hidden, // POI layers default OFF; the panel toggles them on
-        ));
+        let e = commands
+            .spawn((
+                Mesh3d(sphere.clone()),
+                MeshMaterial3d(mats[&(l as u8)].clone()),
+                Transform::from_xyz(p[0], p[1] + lift, p[2]).with_scale(Vec3::splat(r)),
+                l,
+                PickRadius(pick_r),
+                info,
+                Visibility::Hidden, // POI layers default OFF; the panel toggles them on
+            ))
+            .id();
         n += 1;
+        e
     };
 
     // ---- spawns + map intel from loot.json (pmc/scav/boss nodes, locks, hazards, ...) ----
@@ -641,21 +706,54 @@ fn spawn_pois(
     }
 
     // ---- quest objectives from tasks.json (global catalog, filtered to THIS map's zones) ----
+    // As we spawn each Quest marker we also fold the task into `QuestData` (the tracker's catalog):
+    // one entry per task that has at least one objective zone on THIS map, carrying every such
+    // zone's point + footprint outline. Each marker gets a `QuestMarkerTask` so the tracker can
+    // focus visibility to selected tasks.
+    let mut quest_tasks: Vec<QuestEntry> = Vec::new();
     if let Some(qf) = std::fs::read_to_string(root.join("tasks.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<QuestFile>(&s).ok())
     {
         for t in &qf.tasks {
+            let mut objs: Vec<QuestObj> = Vec::new();
             for o in &t.objectives {
+                let mut zones: Vec<QuestZoneW> = Vec::new();
                 for z in &o.zones {
-                    if z.map == key {
-                        if let Some(p) = z.pos {
-                            spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o));
-                        }
+                    if z.map != key {
+                        continue;
                     }
+                    let Some(p) = z.pos else { continue };
+                    let e = spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o));
+                    commands.entity(e).insert(QuestMarkerTask(t.id.clone()));
+                    zones.push(QuestZoneW {
+                        pos: Vec3::new(p[0], p[1], p[2]),
+                        outline: z.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
+                        top: z.top,
+                    });
+                }
+                if !zones.is_empty() {
+                    objs.push(QuestObj { desc: o.desc.clone(), zones });
                 }
             }
+            if !objs.is_empty() {
+                quest_tasks.push(QuestEntry {
+                    id: t.id.clone(),
+                    name: t.name.clone(),
+                    trader: t.trader.clone(),
+                    min_level: t.min_level,
+                    kappa: t.kappa,
+                    lk: t.lk,
+                    requires: t.requires.clone(),
+                    objectives: objs,
+                });
+            }
         }
+    }
+    let quest_count = quest_tasks.len();
+    commands.insert_resource(QuestData { tasks: quest_tasks });
+    if quest_count > 0 {
+        info!("poi: {quest_count} tasks tracked on this map");
     }
 
     // ---- STATIONARY weapons from GAME GEOMETRY (fills the tarkov.dev gap) ----
@@ -713,7 +811,13 @@ fn spawn_pois(
     info!("poi: {n} POI markers spawned (spawns/extracts/doors/interactables + map intel + quests)");
 }
 
-fn apply_poi_visibility(toggles: Res<LayerToggles>, mut q: Query<(&PoiLayer, &mut Visibility)>) {
+// Quest markers are handled by `apply_quest_visibility` (they carry a `QuestMarkerTask`); this pass
+// owns every OTHER POI layer, so exclude them here to avoid the two systems fighting over the same
+// `Visibility`.
+fn apply_poi_visibility(
+    toggles: Res<LayerToggles>,
+    mut q: Query<(&PoiLayer, &mut Visibility), Without<QuestMarkerTask>>,
+) {
     if !toggles.is_changed() {
         return;
     }
@@ -731,12 +835,61 @@ fn apply_poi_visibility(toggles: Res<LayerToggles>, mut q: Query<(&PoiLayer, &mu
             PoiLayer::Transit => toggles.transits,
             PoiLayer::Stationary => toggles.stationary,
             PoiLayer::LooseLoot => toggles.loose,
-            PoiLayer::Quest => toggles.quests,
+            PoiLayer::Quest => toggles.quests, // unreachable here (filtered out), kept exhaustive
         };
         *vis = if show {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+    }
+}
+
+/// Quest-marker visibility: shown iff the master `quests` toggle is on AND either no task is
+/// selected (all quest markers behave as today) or this marker's task is in the tracker's active
+/// set (selecting tasks focuses the map to them). Cheap; runs only when a toggle or the tracker
+/// changes (~30 quest markers).
+fn apply_quest_visibility(
+    toggles: Res<LayerToggles>,
+    tracker: Res<QuestTracker>,
+    mut q: Query<(&QuestMarkerTask, &mut Visibility)>,
+) {
+    if !toggles.is_changed() && !tracker.is_changed() {
+        return;
+    }
+    for (task, mut vis) in &mut q {
+        let show = toggles.quests
+            && (tracker.active.is_empty() || tracker.active.contains(&task.0));
+        *vis = if show {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+/// Draw each ACTIVE task's objective-zone footprints as closed quest-purple polygons (immediate
+/// mode, mirrors pathfind's `draw_route`). Point-only zones (empty outline) are skipped.
+fn draw_quest_outlines(mut gizmos: Gizmos, quest_data: Res<QuestData>, tracker: Res<QuestTracker>) {
+    if tracker.active.is_empty() {
+        return;
+    }
+    let color = Color::srgb(0.60, 0.50, 0.98); // quest purple (matches the Quest marker hue)
+    for t in &quest_data.tasks {
+        if !tracker.active.contains(&t.id) {
+            continue;
+        }
+        for o in &t.objectives {
+            for z in &o.zones {
+                if z.outline.len() < 2 {
+                    continue;
+                }
+                // Close the loop by chaining the first vertex onto the end.
+                gizmos.linestrip(
+                    z.outline.iter().copied().chain(z.outline.first().copied()),
+                    color,
+                );
+            }
+        }
     }
 }

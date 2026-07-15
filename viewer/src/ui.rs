@@ -69,10 +69,33 @@ impl Default for LayerToggles {
     }
 }
 
+/// Marker-search box state: the live query string. Matched (case-insensitively) against every
+/// marker's `MarkerInfo` title/subtitle; a click flies the camera (`CameraCommand`) to the hit.
+#[derive(Resource, Default)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct UiSearch {
+    pub query: String,
+}
+
+/// Quest-tracker state: the checked ("active") task ids + the filter row. `active` drives per-task
+/// marker visibility (poi::apply_quest_visibility) and the outline gizmo; the filters just prune
+/// the checklist. `max_level == 0` means no level cap. Always present (poi.rs reads `active`).
+#[derive(Resource, Default)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct QuestTracker {
+    pub active: std::collections::HashSet<String>,
+    pub kappa_only: bool,
+    pub lk_only: bool,
+    /// 0 = no cap.
+    pub max_level: u32,
+}
+
 pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LayerToggles>()
+            .init_resource::<UiSearch>()
+            .init_resource::<QuestTracker>()
             .add_systems(Update, apply_loot_visibility);
         // egui UI MUST run in EguiPrimaryContextPass (between egui's begin/end frame); in
         // plain Update the context has no fonts yet and `ctx_mut()` panics (bevy_egui 0.37).
@@ -131,8 +154,20 @@ fn titlecase(s: &str) -> String {
 }
 
 #[cfg(feature = "egui")]
-fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<LayerToggles>) {
+#[allow(clippy::too_many_arguments)]
+fn layers_panel(
+    mut contexts: bevy_egui::EguiContexts,
+    mut toggles: ResMut<LayerToggles>,
+    mut search: ResMut<UiSearch>,
+    mut tracker: ResMut<QuestTracker>,
+    quest_data: Res<crate::poi::QuestData>,
+    markers: Query<(&crate::inspect::MarkerInfo, &GlobalTransform)>,
+    mut cam_cmd: ResMut<crate::CameraCommand>,
+    mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
+    route_result: Res<crate::pathfind::RouteResult>,
+) {
     use bevy_egui::egui::{self, Color32, RichText};
+    use crate::pathfind::{RouteRequest, RouteStatus};
     use crate::poi::PoiLayer;
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -158,6 +193,52 @@ fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<Layer
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(4.0);
+
+            // ---- Marker search (finds any marker by name -> fly the camera to it) ----
+            ui.add(
+                egui::TextEdit::singleline(&mut search.query)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search markers\u{2026}"),
+            );
+            let q = search.query.trim().to_lowercase();
+            if !q.is_empty() {
+                // Case-insensitive substring over title (and subtitle) of every marker.
+                let mut hits: Vec<(&crate::inspect::MarkerInfo, Vec3)> = Vec::new();
+                for (info, gt) in &markers {
+                    if info.title.to_lowercase().contains(&q)
+                        || info.subtitle.to_lowercase().contains(&q)
+                    {
+                        hits.push((info, gt.translation()));
+                    }
+                }
+                let total = hits.len();
+                ui.add_space(2.0);
+                ui.label(RichText::new(format!("{total} results")).size(10.0).color(MUTED));
+                egui::ScrollArea::vertical()
+                    .id_salt("marker_search")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (info, pos) in hits.iter().take(25) {
+                            let label = RichText::new(format!(
+                                "{}  \u{00B7}  {}",
+                                info.title, info.subtitle
+                            ));
+                            if ui.selectable_label(false, label).clicked() {
+                                cam_cmd.fly_to = Some(*pos);
+                            }
+                        }
+                        if total > 25 {
+                            ui.label(
+                                RichText::new(format!("\u{2026} +{} more", total - 25))
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(2.0);
+            }
 
             // ---- Loot layer (functional) ----
             ui.checkbox(&mut toggles.loot, RichText::new("Raw loot").size(15.0).strong());
@@ -205,6 +286,160 @@ fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<Layer
             poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary);
             poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot);
             poi_row(ui, &mut toggles.quests, "Tasks / quests", PoiLayer::Quest);
+
+            // ---- TASK TRACKER (checklist + filters + on-demand route) ----
+            // The `quests` poi_row above stays the master on/off; this section refines WHICH tasks
+            // are shown/routed. Selecting tasks focuses the quest markers to them (poi.rs) and
+            // draws their objective-zone outlines.
+            ui.add_space(12.0);
+            ui.label(RichText::new("TASKS  /  QUESTS").color(HDR).size(11.0).strong());
+            ui.add_space(2.0);
+            ui.separator();
+            ui.add_space(2.0);
+
+            // Filter row: Kappa / Lightkeeper toggles + a max-level cap (0 = any).
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut tracker.kappa_only, "Kappa");
+                ui.checkbox(&mut tracker.lk_only, "Lightkeeper");
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut tracker.max_level).range(0..=79));
+                ui.label(RichText::new("\u{2264} Lvl").size(12.0).color(MUTED));
+            });
+
+            // This map's tasks passing the filters (borrows QuestData; filter reads copied out so
+            // the checklist can still mutate `tracker.active` below).
+            let (kappa_only, lk_only, max_level) =
+                (tracker.kappa_only, tracker.lk_only, tracker.max_level);
+            let shown: Vec<&crate::poi::QuestEntry> = quest_data
+                .tasks
+                .iter()
+                .filter(|t| {
+                    if kappa_only && !t.kappa {
+                        return false;
+                    }
+                    if lk_only && !t.lk {
+                        return false;
+                    }
+                    if max_level > 0 {
+                        if let Some(ml) = t.min_level {
+                            if ml > max_level {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                })
+                .collect();
+            ui.add_space(4.0);
+            ui.label(RichText::new(format!("({} tasks)", shown.len())).size(10.0).color(MUTED));
+            egui::ScrollArea::vertical()
+                .id_salt("quest_list")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    for t in &shown {
+                        ui.horizontal(|ui| {
+                            // Checkbox synced to the tracker's active set (temp bool + apply-on-change).
+                            let mut on = tracker.active.contains(&t.id);
+                            if ui.checkbox(&mut on, "").changed() {
+                                if on {
+                                    tracker.active.insert(t.id.clone());
+                                } else {
+                                    tracker.active.remove(&t.id);
+                                }
+                            }
+                            // Click the name to fly to the first objective's first zone.
+                            let name = if t.name.is_empty() { "Task" } else { t.name.as_str() };
+                            if ui
+                                .selectable_label(false, RichText::new(name).size(13.0))
+                                .clicked()
+                            {
+                                if let Some(pos) = t
+                                    .objectives
+                                    .first()
+                                    .and_then(|o| o.zones.first())
+                                    .map(|z| z.pos)
+                                {
+                                    cam_cmd.fly_to = Some(pos);
+                                }
+                            }
+                        });
+                        // Dim "{trader} \u{00B7} Lvl {min} \u{00B7} Kappa" tag line.
+                        let mut tags =
+                            if t.trader.is_empty() { String::new() } else { t.trader.clone() };
+                        if let Some(ml) = t.min_level.filter(|&l| l > 0) {
+                            if !tags.is_empty() {
+                                tags.push_str("  \u{00B7}  ");
+                            }
+                            tags.push_str(&format!("Lvl {ml}"));
+                        }
+                        if t.kappa {
+                            if !tags.is_empty() {
+                                tags.push_str("  \u{00B7}  ");
+                            }
+                            tags.push_str("Kappa");
+                        }
+                        if !tags.is_empty() {
+                            ui.label(RichText::new(tags).size(10.0).color(MUTED));
+                        }
+                    }
+                });
+
+            // Route buttons: chain through every active task's objectives' first zones (server
+            // optimizes the order); an empty request clears the polyline.
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.button("Route active").clicked() {
+                    let dests: Vec<Vec3> = quest_data
+                        .tasks
+                        .iter()
+                        .filter(|t| tracker.active.contains(&t.id))
+                        .flat_map(|t| {
+                            t.objectives.iter().filter_map(|o| o.zones.first().map(|z| z.pos))
+                        })
+                        .collect();
+                    if !dests.is_empty() {
+                        route_writer.write(RouteRequest {
+                            start: None,
+                            dests,
+                            optimize_order: true,
+                        });
+                    }
+                }
+                if ui.button("Clear route").clicked() {
+                    route_writer.write(RouteRequest {
+                        start: None,
+                        dests: Vec::new(),
+                        optimize_order: false,
+                    });
+                }
+            });
+            // Route status (from pathfind.rs) — a single dim line under the buttons.
+            ui.add_space(2.0);
+            match &route_result.status {
+                RouteStatus::Pending => {
+                    ui.label(RichText::new("routing\u{2026}").size(11.0).color(ACCENT));
+                }
+                RouteStatus::Ok => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Route  {:.0} m  ({} stops)",
+                            route_result.dist,
+                            route_result.points.len()
+                        ))
+                        .size(11.0)
+                        .color(Color32::from_gray(210)),
+                    );
+                }
+                RouteStatus::Error(e) => {
+                    ui.label(
+                        RichText::new(e.as_str())
+                            .size(10.0)
+                            .color(Color32::from_rgb(210, 96, 84)),
+                    );
+                }
+                RouteStatus::Idle => {}
+            }
         });
 }
 

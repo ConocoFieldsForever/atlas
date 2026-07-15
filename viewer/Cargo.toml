@@ -17,6 +17,9 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bevy_egui = { workspace = true, optional = true }
+# On-demand pathfinding: blocking HTTP POST to the local :8091 GPU pathfind server (GraphQL).
+# default-features=false drops rustls/TLS — we only ever hit http://127.0.0.1, no cert machinery.
+ureq = { version = "2", default-features = false }
 
 [features]
 # On by default? No — keep the default build robust against bevy_egui version
