@@ -24,6 +24,7 @@ pub struct LayerToggles {
     pub loot_classes: BTreeMap<String, bool>,
     pub pmc_spawns: bool,
     pub scav_spawns: bool,
+    pub bosses: bool,
     pub extracts: bool,
     pub doors: bool,
     pub interactables: bool,
@@ -31,14 +32,22 @@ pub struct LayerToggles {
 
 impl Default for LayerToggles {
     fn default() -> Self {
+        // `EFT_LAYERS=pmc,scav,boss,extract,door,interact` pre-enables layers (dev/testing);
+        // normally only loot is on and the rest are toggled in the panel.
+        let on: std::collections::HashSet<String> = std::env::var("EFT_LAYERS")
+            .ok()
+            .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+            .unwrap_or_default();
+        let has = |k: &str| on.contains(k);
         Self {
-            loot: true,
+            loot: !has("noloot"),
             loot_classes: LOOT_CLASSES.iter().map(|c| (c.to_string(), true)).collect(),
-            pmc_spawns: false,
-            scav_spawns: false,
-            extracts: false,
-            doors: false,
-            interactables: false,
+            pmc_spawns: has("pmc"),
+            scav_spawns: has("scav"),
+            bosses: has("boss"),
+            extracts: has("extract"),
+            doors: has("door"),
+            interactables: has("interact"),
         }
     }
 }
@@ -107,6 +116,7 @@ fn titlecase(s: &str) -> String {
 #[cfg(feature = "egui")]
 fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<LayerToggles>) {
     use bevy_egui::egui::{self, Color32, RichText};
+    use crate::poi::PoiLayer;
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
@@ -152,20 +162,46 @@ fn layers_panel(mut contexts: bevy_egui::EguiContexts, mut toggles: ResMut<Layer
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(2.0);
-            // Not wired yet — clearly disabled so the framework reads as intentional.
-            ui.add_enabled_ui(false, |ui| {
-                ui.checkbox(&mut toggles.pmc_spawns, "PMC spawns");
-                ui.checkbox(&mut toggles.scav_spawns, "Scav spawns");
-                ui.checkbox(&mut toggles.extracts, "Extracts");
-                ui.checkbox(&mut toggles.doors, "Doors / keycards");
-                ui.checkbox(&mut toggles.interactables, "Interactables");
-            });
+            poi_row(ui, &mut toggles.pmc_spawns, "PMC spawns", PoiLayer::PmcSpawn);
+            poi_row(ui, &mut toggles.scav_spawns, "Scav spawns", PoiLayer::ScavSpawn);
+            poi_row(ui, &mut toggles.bosses, "Bosses", PoiLayer::Boss);
+            poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract);
+            poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door);
+            poi_row(ui, &mut toggles.interactables, "Interactables", PoiLayer::Interactable);
             ui.add_space(8.0);
             ui.label(
-                RichText::new("needs semantics.json  \u{2022}  extract_semantics.py")
+                RichText::new("PMC/scav/boss: tarkov.dev  \u{2022}  extracts/doors: game data")
                     .size(10.0)
                     .italics()
                     .color(MUTED),
             );
         });
+}
+
+/// egui swatch colour for a POI layer (matches the on-map marker colour).
+#[cfg(feature = "egui")]
+fn poi_swatch(l: crate::poi::PoiLayer) -> bevy_egui::egui::Color32 {
+    let (c, _, _) = crate::poi::poi_look(l);
+    let s = c.to_srgba();
+    bevy_egui::egui::Color32::from_rgb(
+        (s.red * 255.0) as u8,
+        (s.green * 255.0) as u8,
+        (s.blue * 255.0) as u8,
+    )
+}
+
+/// One POI toggle row: colour swatch + checkbox.
+#[cfg(feature = "egui")]
+fn poi_row(
+    ui: &mut bevy_egui::egui::Ui,
+    on: &mut bool,
+    label: &str,
+    l: crate::poi::PoiLayer,
+) {
+    use bevy_egui::egui::RichText;
+    ui.horizontal(|ui| {
+        ui.add_space(2.0);
+        ui.label(RichText::new("\u{25CF}").color(poi_swatch(l)).size(12.0));
+        ui.checkbox(on, label);
+    });
 }

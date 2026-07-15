@@ -47,17 +47,19 @@ struct Container {
 /// (the "black weapon crate") but never pure black, and every class gets an emissive
 /// term so it's visible in shadow. Sizes are rough per-type so markers read as boxes.
 fn class_look(cls: &str) -> (Color, Vec3) {
+    // Colours MATCH the panel's swatch legend (ui.rs `class_color`) so the on-map markers and
+    // the panel are one consistent key.
     match cls {
-        "weapon" => (Color::srgb(0.14, 0.15, 0.18), Vec3::new(0.60, 0.28, 0.42)),
-        "medical" => (Color::srgb(0.15, 0.80, 0.30), Vec3::new(0.35, 0.30, 0.30)),
-        "safe" => (Color::srgb(0.95, 0.72, 0.12), Vec3::new(0.32, 0.45, 0.28)),
-        "register" => (Color::srgb(0.15, 0.60, 0.95), Vec3::new(0.35, 0.28, 0.28)),
-        "bag" => (Color::srgb(0.62, 0.40, 0.20), Vec3::new(0.30, 0.24, 0.30)),
-        "crate" => (Color::srgb(0.74, 0.58, 0.35), Vec3::new(0.45, 0.35, 0.45)),
-        "tech" => (Color::srgb(0.62, 0.28, 0.88), Vec3::new(0.35, 0.30, 0.30)),
-        "stash" => (Color::srgb(0.45, 0.45, 0.45), Vec3::new(0.35, 0.20, 0.35)),
-        "furniture" => (Color::srgb(0.60, 0.48, 0.40), Vec3::new(0.35, 0.30, 0.30)),
-        "body" => (Color::srgb(0.90, 0.12, 0.12), Vec3::new(0.35, 0.30, 0.60)),
+        "weapon" => (Color::srgb(0.839, 0.361, 0.282), Vec3::new(0.60, 0.28, 0.42)),
+        "medical" => (Color::srgb(0.361, 0.784, 0.478), Vec3::new(0.35, 0.30, 0.30)),
+        "safe" => (Color::srgb(0.922, 0.745, 0.290), Vec3::new(0.32, 0.45, 0.28)),
+        "register" => (Color::srgb(0.329, 0.635, 0.922), Vec3::new(0.35, 0.28, 0.28)),
+        "bag" => (Color::srgb(0.804, 0.588, 0.361), Vec3::new(0.30, 0.24, 0.30)),
+        "crate" => (Color::srgb(0.769, 0.635, 0.424), Vec3::new(0.45, 0.35, 0.45)),
+        "tech" => (Color::srgb(0.690, 0.439, 0.886), Vec3::new(0.35, 0.30, 0.30)),
+        "stash" => (Color::srgb(0.588, 0.588, 0.588), Vec3::new(0.35, 0.20, 0.35)),
+        "furniture" => (Color::srgb(0.635, 0.541, 0.455), Vec3::new(0.35, 0.30, 0.30)),
+        "body" => (Color::srgb(0.871, 0.290, 0.290), Vec3::new(0.35, 0.30, 0.60)),
         _ => (Color::srgb(0.85, 0.85, 0.85), Vec3::new(0.30, 0.28, 0.30)),
     }
 }

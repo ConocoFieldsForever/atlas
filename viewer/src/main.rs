@@ -12,6 +12,7 @@
 mod eftpack;
 mod loot;
 mod pick;
+mod poi;
 mod render;
 mod ui;
 
@@ -134,6 +135,7 @@ fn main() {
     app.insert_resource(ClearColor(Color::srgb(0.55, 0.58, 0.58))) // overcast horizon stand-in
         .add_plugins(pick::PickPlugin) // double-LEFT-click raycast-vs-pack-data debug pick
         .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
+        .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
         .add_systems(Startup, setup)
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain())
