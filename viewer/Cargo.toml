@@ -21,7 +21,8 @@ bevy_egui = { workspace = true, optional = true }
 [features]
 # On by default? No — keep the default build robust against bevy_egui version
 # skew. Enable with `cargo run --features egui`.
-default = []
+# egui is ON by default now — it drives the right-hand layer-toggle panel (ui.rs).
+default = ["egui"]
 egui = ["dep:bevy_egui"]
 
 [[bin]]

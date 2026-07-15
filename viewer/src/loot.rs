@@ -171,6 +171,7 @@ fn spawn_loot(
             MeshMaterial3d(mat),
             Transform::from_xyz(c.pos[0], c.pos[1] + half.y, c.pos[2]).with_scale(half * 2.0),
             LootMarker,
+            LootClass(c.cls.clone()),
         ));
     }
     info!(
@@ -184,3 +185,7 @@ fn spawn_loot(
 
 #[derive(Component)]
 struct LootMarker;
+
+/// The loot class of a marker ("weapon"/"medical"/…), so the layer panel can filter by class.
+#[derive(Component)]
+pub struct LootClass(pub String);
