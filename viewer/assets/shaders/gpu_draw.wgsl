@@ -62,7 +62,8 @@ struct InstanceGpu {
 @group(1) @binding(1) var<storage, read> visible: array<u32>;
 
 // M3 material table â€” one entry per materials.json material (id == index, 4409 entries).
-// 80 bytes, 16-aligned (Phase 2b added the normal block). Matches the Rust `MaterialGpu` POD.
+// 160 bytes, 16-aligned (Phase 2b added the normal block @64; #6 added the detail block @80).
+// Matches the Rust `MaterialGpu` POD byte-for-byte.
 //   albedo_index : index into `albedo_tex`; 0xFFFFFFFF sentinel = untextured (use tint/white).
 //   flags        : bit0 = cutout (role=cutout / alphaMode=MASK) -> discard when alpha < cutoff.
 //                  bit1 = blend  (role âˆˆ {decal,glass,water} / alphaMode=BLEND) -> BLEND pass.
@@ -91,6 +92,22 @@ struct MaterialGpu {
     normal_flags: u32,
     normal_scale: f32,
     _pad2: u32,
+    // #6 Detail maps: 5 more 16-byte blocks @80 (size -> 160). Byte-identical to the Rust POD.
+    //   detail_albedo_index / detail_normal_index : indices into the SAME albedo_tex / normal_tex
+    //       bindless arrays as the base textures (the 2 shared detail PNGs are appended there).
+    //   detail_flags : bit0 = has detail albedo, bit1 = has detail normal.
+    //   detail_albedo_uv / detail_normal_uv : RAW _Detail*Map_ST (sx,sy,ox,oy); the fragment builds
+    //       a RELATIVE transform against uv_xform (base _MainTex_ST is baked into the vertex UVs).
+    //   detail_params : x=albedo strength, y=normal scale, z=fade start(8m), w=fade end(15m).
+    //   detail_mean_gain : xyz = offline mean(sample_linear×4.5948) for the mean-neutralize; w=1.
+    detail_albedo_index: u32,      // @80
+    detail_normal_index: u32,      // @84
+    detail_flags: u32,             // @88
+    _detpad: u32,                  // @92
+    detail_albedo_uv: vec4<f32>,   // @96
+    detail_normal_uv: vec4<f32>,   // @112
+    detail_params: vec4<f32>,      // @128
+    detail_mean_gain: vec4<f32>,   // @144  -> 160
 };
 
 // Phase 1.6 GGX specular tuning: global multiplier on the dielectric spec lobe. 1.0 = physical.
@@ -104,6 +121,10 @@ const MAT_FLAG_BLEND: u32 = 2u;           // bit1: alpha-blended (decal/glass/wa
 const MAT_FLAG_SOFTCUTOUT: u32 = 4u;      // bit2: Vert Paint SoftCutout decal (feather via color.a)
 const MAT_FLAG_WATER: u32 = 8u;           // bit3: water/mirror (dark wet sheen, not white fallback)
 const MAT_FLAG_TERRAIN: u32 = 16u;        // bit4: MicroSplat terrain (splat-blend 12 layers; slice in _pad2)
+const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary albedo/normal; never on terrain)
+const DETAIL_HAS_ALBEDO: u32 = 1u;        // detail_flags bit0: has detail albedo texture
+const DETAIL_HAS_NORMAL: u32 = 2u;        // detail_flags bit1: has detail normal texture
+const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed in linear space
 
 @group(2) @binding(0) var<storage, read> materials: array<MaterialGpu>;
 @group(2) @binding(1) var albedo_tex: binding_array<texture_2d<f32>>;
@@ -380,6 +401,34 @@ fn perturb_normal(N: vec3<f32>, p: vec3<f32>, uv: vec2<f32>, n_ts: vec3<f32>) ->
     return normalize(mat3x3<f32>(T * invmax, B * invmax, N) * n_ts);
 }
 
+// #6 Detail maps: RNM (Reoriented Normal Mapping) blend of a base and a detail tangent-space
+// normal. Combines the two in TANGENT space so a single cotangent-frame transform (perturb_normal)
+// maps the result to world space ONCE — avoids double-applying the TBN. `base`/`detail` are the
+// unpacked [-1,1] tangent-space normals.
+fn blend_rnm(base: vec3<f32>, detail: vec3<f32>) -> vec3<f32> {
+    let t = base + vec3<f32>(0.0, 0.0, 1.0);
+    let u = detail * vec3<f32>(-1.0, -1.0, 1.0);
+    return normalize(t * (dot(t, u) / max(t.z, 1e-4)) - u);
+}
+
+// #6 Detail maps: build the RELATIVE UV transform from the baked base UV to the detail UV. The base
+// `_MainTex_ST` (bsx,bsy,box,boy) is ALREADY baked into o.uv (and V was flipped afterward), so the
+// authored detail `_Detail*Map_ST` (dsx,dsy,dox,doy) cannot be applied directly. Returns
+// (scale.x, scale.y, offset.x, offset.y) such that `detail_uv = o.uv * scale + offset`. The Y
+// offset term (1 - doy - ry*(1 - boy)) undoes the baked V flip. Guards a ~0 base scale.
+fn detail_xform(base_st: vec4<f32>, det_st: vec4<f32>) -> vec4<f32> {
+    let bsx = select(1.0, base_st.x, abs(base_st.x) > 1e-6);
+    let bsy = select(1.0, base_st.y, abs(base_st.y) > 1e-6);
+    let rx = det_st.x / bsx;
+    let ry = det_st.y / bsy;
+    return vec4<f32>(
+        rx,
+        ry,
+        det_st.z - base_st.z * rx,
+        1.0 - det_st.w - ry * (1.0 - base_st.w),
+    );
+}
+
 @vertex
 fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     let real = visible[instance_index];
@@ -413,6 +462,19 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // derivatives and keep correct mipmapping.
     let duv_dx = dpdx(o.uv);
     let duv_dy = dpdy(o.uv);
+
+    // --- #6 Detail maps: shared gate + distance fade -----------------------------
+    // Strictly ADDITIVE and gated: `has_detail` is false for every non-detail material AND for all
+    // terrain (terrain owns albedo/normal via the splat branch and must never enter here), so those
+    // materials are byte-identical to before. The detail albedo/normal are sampled with
+    // textureSampleGrad (explicit gradients) below, so they are legal in the per-material non-uniform
+    // branches. Fade the whole effect out over detail_params.z..w (8..15 m) so detail tiling doesn't
+    // shimmer in the distance.
+    let has_detail = (m.flags & MAT_FLAG_DETAIL) != 0u && (m.flags & MAT_FLAG_TERRAIN) == 0u;
+    let has_detail_albedo = has_detail && (m.detail_flags & DETAIL_HAS_ALBEDO) != 0u;
+    let has_detail_normal = has_detail && (m.detail_flags & DETAIL_HAS_NORMAL) != 0u;
+    let detail_dist = distance(view.world_position.xyz, o.world_pos);
+    let detail_fade = 1.0 - smoothstep(m.detail_params.z, m.detail_params.w, detail_dist);
 
     // The pass class-discard is done AFTER the albedo sample below (Codex P0): a non-uniform
     // `discard` placed BEFORE textureSample makes the sample's implicit derivatives non-uniform
@@ -455,11 +517,40 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let has_normal = m.normal_index != MAT_NORMAL_NONE;
     let nidx = select(0u, m.normal_index, has_normal); // untextured -> slot 0, result discarded
     let nt = textureSample(normal_tex[nidx], albedo_samp, o.uv).rgb;
-    var n_ts = nt * 2.0 - vec3<f32>(1.0);
-    if ((m.normal_flags & 1u) != 0u) { n_ts.y = -n_ts.y; } // DirectX green-flip (no derivative op)
-    n_ts = vec3<f32>(n_ts.xy * m.normal_scale, max(n_ts.z, 1e-3));
-    let N_mapped = perturb_normal(N, o.world_pos, o.uv, n_ts);
-    N = select(N, N_mapped, has_normal);
+    var base_ts = nt * 2.0 - vec3<f32>(1.0);
+    if ((m.normal_flags & 1u) != 0u) { base_ts.y = -base_ts.y; } // DirectX green-flip (no derivative op)
+    base_ts = vec3<f32>(base_ts.xy * m.normal_scale, max(base_ts.z, 1e-3));
+    // Flat (0,0,1) when the material has no base normal map, so a detail-only material still has a
+    // valid base to RNM-blend against (blend_rnm(flat, detail) == detail).
+    base_ts = select(vec3<f32>(0.0, 0.0, 1.0), base_ts, has_normal);
+
+    // #6 Detail normal: sample the detail normal (SAME bindless array), decode with the SAME
+    // green-flip convention as the base, scale by strength × distance fade, keep a valid hemisphere,
+    // then RNM-blend into the base tangent-space normal. textureSampleGrad uses explicit gradients
+    // (scaled by the relative UV scale) so this optional sample is legal in the non-uniform branch.
+    // The base+detail combine in TANGENT space; the single perturb_normal below is the ONLY TBN
+    // transform (no double-application).
+    var combined_ts = base_ts;
+    if (has_detail_normal) {
+        let dn = detail_xform(m.uv_xform, m.detail_normal_uv);
+        let dn_uv = o.uv * dn.xy + dn.zw;
+        let dn_s = textureSampleGrad(
+            normal_tex[m.detail_normal_index], albedo_samp, dn_uv,
+            duv_dx * dn.xy, duv_dy * dn.xy
+        ).xy;
+        var dxy = dn_s * 2.0 - vec2<f32>(1.0);
+        if ((m.normal_flags & 1u) != 0u) { dxy.y = -dxy.y; }
+        dxy = dxy * (m.detail_params.y * detail_fade);
+        // Keep a valid hemisphere after the authored strength (avoid a NaN z / over-tilt).
+        let d2 = dot(dxy, dxy);
+        if (d2 > 0.99) { dxy = dxy * sqrt(0.99 / d2); }
+        let detail_ts = vec3<f32>(dxy, sqrt(max(1.0 - dot(dxy, dxy), 1e-4)));
+        combined_ts = blend_rnm(base_ts, detail_ts);
+    }
+    // Single cotangent-frame transform for base+detail combined (uniform control flow: dpdx/dpdy).
+    let has_any_normal = has_normal || has_detail_normal;
+    let N_mapped = perturb_normal(N, o.world_pos, o.uv, combined_ts);
+    N = select(N, N_mapped, has_any_normal);
 
     // Pass class-discard (M3b1) — AFTER the samples above (Codex P0). Each pass keeps only its
     // class; the discard is fine here because no derivative-requiring op follows it.
@@ -496,6 +587,29 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
             wsum = wsum + wi;
         }
         albedo = vec4<f32>(acc / max(wsum, 0.002), 1.0) * m.tint;
+    }
+
+    // --- #6 Detail albedo (mean-neutralized contrast) ----------------------------
+    // Multiply the base albedo by the detail texture, but NEUTRALIZED: the detail map's own average
+    // brightness/tint would darken/recolor the whole surface, so we divide out its offline-measured
+    // mean (after Unity's ×4.5948 linear gain) — the result has mean ~1.0, so the detail adds only
+    // LOCAL contrast, not a global shift. Distance-faded; NEVER touches albedo.a; terrain excluded by
+    // `has_detail`. The detail albedo lives in the SAME sRGB `albedo_tex` array, so this sample is
+    // already LINEAR (matching the base albedo path). Gradients are scaled by the relative UV scale.
+    if (has_detail_albedo) {
+        let da = detail_xform(m.uv_xform, m.detail_albedo_uv);
+        let da_uv = o.uv * da.xy + da.zw;
+        let detail_lin = textureSampleGrad(
+            albedo_tex[m.detail_albedo_index], albedo_samp, da_uv,
+            duv_dx * da.xy, duv_dy * da.xy
+        ).rgb;
+        let unity_gain = detail_lin * DETAIL_UNITY_GAIN;
+        let neutral = unity_gain / max(m.detail_mean_gain.xyz, vec3<f32>(1e-3));
+        let weight = clamp(m.detail_params.x * detail_fade, 0.0, 1.0);
+        albedo = vec4<f32>(
+            albedo.rgb * mix(vec3<f32>(1.0), clamp(neutral, vec3<f32>(0.25), vec3<f32>(4.0)), weight),
+            albedo.a
+        );
     }
 
     // Cutout / alpha-test (role=cutout, alphaMode=MASK). Per-material cutoff. discard needs no

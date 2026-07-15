@@ -225,6 +225,39 @@ fn one() -> f32 {
 /// Kept as a loose value tree for M0; the M3 shader path reads it into uniforms.
 pub type VertPaint = serde_json::Value;
 
+/// #6 Detail maps. Optional per-material SECONDARY albedo/normal that adds high-frequency surface
+/// contrast on top of the base textures. Present on ~23 rock materials; `null`/absent otherwise.
+/// Albedo and normal are INDEPENDENT (either may be present). The `*Uv` fields are the RAW Unity
+/// `_DetailAlbedoMap_ST` / `_DetailNormalMap_ST` (sx,sy,ox,oy) — NOT applied directly: the shader
+/// derives a RELATIVE transform against the base `_MainTex_ST` (`Material.uv_xform`), because that
+/// base ST is already baked into the vertex UVs. `albedoMeanGain` is the offline mean of the detail
+/// sample (linear × 4.5948) per channel; the shader divides by it so the blend adds contrast
+/// without shifting overall brightness/color (mean-neutralize).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DetailMap {
+    /// sRGB detail albedo PNG (same format as base albedo), or absent.
+    #[serde(default)]
+    pub albedo: Option<String>,
+    /// RAW `_DetailAlbedoMap_ST` (sx,sy,ox,oy).
+    #[serde(rename = "albedoUv", default)]
+    pub albedo_uv: [f32; 4],
+    /// Detail albedo blend strength 0..1.
+    #[serde(rename = "albedoStrength", default)]
+    pub albedo_strength: f32,
+    /// mean(sample_linear.rgb × 4.5948) per channel — for the mean-neutralize divide.
+    #[serde(rename = "albedoMeanGain", default)]
+    pub albedo_mean_gain: [f32; 3],
+    /// linear detail normal PNG (same format as base normal), or absent.
+    #[serde(default)]
+    pub normal: Option<String>,
+    /// RAW `_DetailNormalMap_ST` (sx,sy,ox,oy).
+    #[serde(rename = "normalUv", default)]
+    pub normal_uv: [f32; 4],
+    /// Detail normal strength (tangent xy multiplier).
+    #[serde(rename = "normalScale", default)]
+    pub normal_scale: f32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Material {
     pub id: u32,
@@ -272,6 +305,10 @@ pub struct Material {
     /// Vert-paint block (null unless this material is a Vert Paint variant).
     #[serde(default)]
     pub vp: Option<VertPaint>,
+    /// #6 Detail map block (rock secondary albedo/normal), or `null`/absent. See `DetailMap`.
+    /// Deserializes cleanly to `None` when the field is missing or JSON null.
+    #[serde(default)]
+    pub detail: Option<DetailMap>,
 }
 
 fn default_uv() -> [f32; 4] {

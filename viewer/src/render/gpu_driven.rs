@@ -142,7 +142,7 @@ pub const DRAW_ARG_STRIDE: u64 = 20;
 /// vert-paint weight (interpolated); the SoftCutout road/track feather rides on color.a.
 pub const DRAW_VERTEX_STRIDE: u64 = 52;
 
-/// Per-material GPU record (M3; 80 bytes after Phase 2b normal mapping), 16-aligned. Indexed DIRECTLY by the global
+/// Per-material GPU record (M3; 80 bytes after Phase 2b normal mapping, 160 bytes after #6 detail maps), 16-aligned. Indexed DIRECTLY by the global
 /// materialId (SubMesh.material_id == materials.json array index for this pack), which the
 /// per-vertex `material_index` carries into the fragment shader.
 ///
@@ -180,7 +180,33 @@ pub struct GpuMaterial {
     /// Material.normalScale (tangent xy multiplier; default 1.0).
     pub normal_scale: f32,
     pub _pad2: u32,
+    // ---- #6 Detail maps: adds 80 bytes (80 -> 160). All zero for the 4436 non-detail materials
+    //      (detail_flags==0 AND flags lacks MAT_FLAG_DETAIL -> the shader's detail path is fully
+    //      skipped -> those materials render byte-identical). The detail albedo/normal textures are
+    //      appended to the SAME bindless `albedo_tex` / `normal_tex` arrays the base textures use;
+    //      these indices point into them. ----
+    /// bindless `albedo_tex` index of the detail albedo PNG, or 0 when absent (bit0 gates use). @80
+    pub detail_albedo_index: u32,
+    /// bindless `normal_tex` index of the detail normal PNG, or 0 when absent (bit1 gates use). @84
+    pub detail_normal_index: u32,
+    /// detail sub-flags: bit0 = has detail albedo, bit1 = has detail normal. @88
+    pub detail_flags: u32,
+    pub _detpad: u32, // @92
+    /// RAW _DetailAlbedoMap_ST (sx,sy,ox,oy). Shader derives the relative transform vs `uv_xform`. @96
+    pub detail_albedo_uv: [f32; 4],
+    /// RAW _DetailNormalMap_ST (sx,sy,ox,oy). @112
+    pub detail_normal_uv: [f32; 4],
+    /// x = albedo blend strength, y = detail normal scale, z = fade start (8 m), w = fade end (15 m). @128
+    pub detail_params: [f32; 4],
+    /// xyz = offline albedoMeanGain = mean(sample_linear × 4.5948); w = 1. Divisor for neutralize. @144
+    pub detail_mean_gain: [f32; 4], // -> total 160 bytes (16-aligned)
 }
+
+// #6: compile-time guard that GpuMaterial stays byte-matched to the WGSL `MaterialGpu` (160 B, all
+// vec4 lanes 16-aligned). A silent mismatch here would corrupt EVERY material's GPU record, so this
+// is checked at `cargo check` time (const eval) rather than trusted by eye.
+const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 160);
+const _: () = assert!(std::mem::align_of::<GpuMaterial>() == 4);
 
 /// `GpuMaterial::albedo_index` sentinel: material has no albedo texture.
 pub const NO_ALBEDO: u32 = 0xFFFF_FFFF;
@@ -206,6 +232,15 @@ pub const MAT_FLAG_WATER: u32 = 1 << 3;
 /// and instead splat-blends the 12 MicroSplat layers by the slice's 3 control maps. The slice
 /// index (0..3) rides in `_pad2`.
 pub const MAT_FLAG_TERRAIN: u32 = 1 << 4;
+/// `GpuMaterial::flags` bit (#6 Detail maps): material carries a detail albedo and/or normal.
+/// The fragment samples the detail texture(s) from the SAME bindless arrays, mean-neutralizes the
+/// albedo, RNM-blends the normal, and distance-fades both. NEVER set together with MAT_FLAG_TERRAIN
+/// (the terrain splat branch owns albedo/normal and must never enter the detail path).
+pub const MAT_FLAG_DETAIL: u32 = 1 << 5;
+/// `GpuMaterial::detail_flags` bit0: this material has a detail ALBEDO texture.
+pub const DETAIL_FLAG_ALBEDO: u32 = 1 << 0;
+/// `GpuMaterial::detail_flags` bit1: this material has a detail NORMAL texture.
+pub const DETAIL_FLAG_NORMAL: u32 = 1 << 1;
 
 /// MicroSplat splat table (group(2) binding(4), storage). All indices are into the SAME bindless
 /// `albedo_tex` array as normal materials (the terrain textures are appended to `albedo_paths`).
@@ -807,6 +842,62 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         if mat.role == "water" {
             flags |= MAT_FLAG_WATER | MAT_FLAG_BLEND;
         }
+        // #6 Detail maps: resolve the (optional) detail albedo + normal into the SAME bindless
+        // arrays the base textures use — dedup by path via the SAME first-seen maps as the base
+        // textures, so the 2 shared detail textures (one albedo, one normal, reused across all 23
+        // rock materials) append only 2 entries total and their indices can never drift. Albedo and
+        // normal are independent (either may be present); detail_flags gates each half. Terrain
+        // materials are excluded (they're tagged AFTER this loop, and we clear detail there too).
+        let mut detail_albedo_index = 0u32;
+        let mut detail_normal_index = 0u32;
+        let mut detail_flags = 0u32;
+        let mut detail_albedo_uv = [0.0f32; 4];
+        let mut detail_normal_uv = [0.0f32; 4];
+        let mut detail_params = [0.0f32; 4];
+        let mut detail_mean_gain = [0.0f32; 4];
+        if let Some(det) = &mat.detail {
+            if let Some(p) = det.albedo.as_deref().filter(|p| !p.is_empty()) {
+                detail_albedo_index = *path_to_index.entry(p.to_string()).or_insert_with(|| {
+                    let idx = albedo_paths.len() as u32;
+                    albedo_paths.push(p.to_string());
+                    idx
+                });
+                detail_flags |= DETAIL_FLAG_ALBEDO;
+                detail_albedo_uv = det.albedo_uv;
+            }
+            if let Some(p) = det.normal.as_deref().filter(|p| !p.is_empty()) {
+                detail_normal_index =
+                    *normal_path_to_index.entry(p.to_string()).or_insert_with(|| {
+                        let idx = normal_paths.len() as u32;
+                        normal_paths.push(p.to_string());
+                        idx
+                    });
+                detail_flags |= DETAIL_FLAG_NORMAL;
+                detail_normal_uv = det.normal_uv;
+            }
+            if detail_flags != 0 {
+                flags |= MAT_FLAG_DETAIL;
+                // detail_params: [albedoStrength, normalScale, fade_start, fade_end]. The fade window
+                // is env-tunable (EFT_DETAIL_FADE="near,far", default 8,15 m) so the detail range can
+                // be verified/tuned without a rebuild — the default camera sits ~15 m out, at which
+                // the shipping 8-15 m window has already faded detail to ~0.
+                let (fnear, ffar) = std::env::var("EFT_DETAIL_FADE")
+                    .ok()
+                    .and_then(|s| {
+                        let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        (v.len() == 2).then(|| (v[0], v[1]))
+                    })
+                    .unwrap_or((8.0, 25.0)); // wider than the web's 8-15 m: this viewer orbits farther out
+                detail_params = [det.albedo_strength, det.normal_scale, fnear, ffar];
+                // mean-neutralize divisor (offline mean of linear×4.5948); w=1 (unused lane).
+                detail_mean_gain = [
+                    det.albedo_mean_gain[0],
+                    det.albedo_mean_gain[1],
+                    det.albedo_mean_gain[2],
+                    1.0,
+                ];
+            }
+        }
         materials_gpu.push(GpuMaterial {
             albedo_index,
             flags,
@@ -822,6 +913,15 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             normal_flags,
             normal_scale: mat.normal_scale,
             _pad2: 0,
+            // #6 Detail maps (zeros unless MAT_FLAG_DETAIL was set above).
+            detail_albedo_index,
+            detail_normal_index,
+            detail_flags,
+            _detpad: 0,
+            detail_albedo_uv,
+            detail_normal_uv,
+            detail_params,
+            detail_mean_gain,
         });
     }
 
@@ -907,6 +1007,11 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             let mid = sub.material_id as usize;
             if mid < materials_gpu.len() {
                 materials_gpu[mid].flags |= MAT_FLAG_TERRAIN;
+                // #6: terrain owns albedo/normal via the splat branch — it must NEVER enter the
+                // detail path. Clear any detail a terrain material might have carried (defensive;
+                // no known terrain material has a `detail` object).
+                materials_gpu[mid].flags &= !MAT_FLAG_DETAIL;
+                materials_gpu[mid].detail_flags = 0;
                 materials_gpu[mid]._pad2 = slice as u32;
                 materials_gpu[mid].roughness = 0.95; // matte ground, no shiny slab
                 tagged += 1;
@@ -943,6 +1048,21 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         materials_gpu
             .iter()
             .filter(|m| m.flags & MAT_FLAG_WATER != 0)
+            .count(),
+    );
+    info!(
+        "gpu-driven #6 detail: {} materials tagged ({} with detail albedo, {} with detail normal)",
+        materials_gpu
+            .iter()
+            .filter(|m| m.flags & MAT_FLAG_DETAIL != 0)
+            .count(),
+        materials_gpu
+            .iter()
+            .filter(|m| m.detail_flags & DETAIL_FLAG_ALBEDO != 0)
+            .count(),
+        materials_gpu
+            .iter()
+            .filter(|m| m.detail_flags & DETAIL_FLAG_NORMAL != 0)
             .count(),
     );
 
@@ -1102,6 +1222,8 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             normal_flags: 0,
             normal_scale: 1.0,
             _pad2: 0,
+            // #6: grass carries no detail map.
+            ..GpuMaterial::default()
         });
 
         // Cross-quad clump mesh: 3 quads at 0/60/120° around Y, base at y=0.

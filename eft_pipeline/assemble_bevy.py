@@ -248,8 +248,51 @@ class MaterialFactory:
             "roughnessFromAlbedoAlpha": bool(sb.get('smA')),          # roughness = 1 - albedo.a
             "specMap": self._tex(sb.get('spec')),                     # roughness from _SpecMap luma
             "vp": self._vp(sb.get('vp')),
+            # #6 DETAIL MAPS: name-keyed up-close detail albedo/normal (ANGRYMESH rocks etc.).
+            # RAW Unity _Detail*Map_ST is emitted here; the shader re-expresses it RELATIVE to the
+            # baked+V-flipped base UV (uvXform) and applies the Unity-Standard x2 (x4.5948) mean-
+            # neutralized albedo blend + whiteout normal blend + 8-15 m distance fade. See
+            # CODEX_5_6_SHADOW_DETAIL_PLAN.md #6. Textures referenced in place from tex/ like normals.
+            "detail": self._detail(sb),
         }
         return rec
+
+    def _detail(self, sb):
+        """Detail-map block {albedo, albedoUv, albedoStrength, normal, normalUv, normalScale} or None.
+        vp (Vert-Paint carrier-slot) subs are skipped (the Bevy vp path doesn't consume detail). UVs are
+        the RAW Unity _Detail*Map_ST; the shader makes them relative to the baked base UV."""
+        if sb.get('vp') or not (sb.get('detA') or sb.get('detN')):
+            return None
+        rec = {}
+        if sb.get('detA'):
+            rec["albedo"] = self._tex(sb['detA'])
+            rec["albedoUv"] = [round(float(x), 6) for x in (sb.get('detAuv') or [1, 1, 0, 0])]
+            rec["albedoStrength"] = round(float(sb['detAI']), 4) if sb.get('detAI') is not None else 1.0
+            rec["albedoMeanGain"] = self._detail_mean(sb['detA'])
+        if sb.get('detN'):
+            rec["normal"] = self._tex(sb['detN'])
+            rec["normalUv"] = [round(float(x), 6) for x in (sb.get('detNuv') or [1, 1, 0, 0])]
+            rec["normalScale"] = round(float(sb['detNS']), 4) if sb.get('detNS') is not None else 1.0
+        return rec
+
+    _DET_MEAN: dict = {}
+    def _detail_mean(self, name):
+        """Mean of the detail albedo in LINEAR space x 4.5948 (Unity Standard x2), for the shader's
+        mean-neutralization (dark ANGRYMESH detail maps would otherwise darken surfaces ~2x under the
+        Standard blend). Cached per texture; falls back to neutral [1,1,1] if the file is unreadable."""
+        if name in self._DET_MEAN:
+            return self._DET_MEAN[name]
+        try:
+            im = self._open(name).convert('RGB')
+            im.thumbnail((256, 256))                       # mean is ~scale-invariant; keep it cheap
+            a = np.asarray(im, np.float32) / 255.0
+            lin = np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
+            m = [round(float(x), 5) for x in (lin.reshape(-1, 3).mean(0) * 4.5948)]
+        except Exception as e:
+            print(f"[bevy] detail mean fallback for {name}: {e}")
+            m = [1.0, 1.0, 1.0]
+        self._DET_MEAN[name] = m
+        return m
 
     def _vp(self, vp):
         if not vp: return None
