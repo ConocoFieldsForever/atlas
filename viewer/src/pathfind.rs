@@ -50,6 +50,9 @@ impl Default for RouteResult {
 #[derive(Resource)]
 struct PathfindConfig {
     url: String,
+    /// Pathfinding is OFF by default (no server dependency / no :8091 calls). Enable with
+    /// `EFT_PATHFIND=1` (or implicitly by setting `EFT_ROUTE=...` for a scripted route).
+    enabled: bool,
 }
 
 #[derive(Resource, Default)]
@@ -60,8 +63,12 @@ impl Plugin for PathfindPlugin {
     fn build(&self, app: &mut App) {
         let url = std::env::var("EFT_PATHFIND_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8091/graphql".to_string());
+        // OFF by default: only route when explicitly enabled, so the viewer has no :8091 dependency
+        // and never touches the pathfind server unless asked.
+        let enabled = std::env::var("EFT_PATHFIND").map(|v| v.trim() == "1").unwrap_or(false)
+            || std::env::var("EFT_ROUTE").is_ok();
         app.add_message::<RouteRequest>()
-            .insert_resource(PathfindConfig { url })
+            .insert_resource(PathfindConfig { url, enabled })
             .init_resource::<RouteResult>()
             .init_resource::<PathfindTask>()
             .add_systems(Update, (debug_route, dispatch_route, poll_route, draw_route));
@@ -134,6 +141,13 @@ fn dispatch_route(
         result.points.clear();
         result.dist = 0.0;
         result.status = RouteStatus::Idle;
+        return;
+    }
+    if !cfg.enabled {
+        // Pathfinding is off by default — tell the UI instead of silently hitting the server.
+        result.points.clear();
+        result.status =
+            RouteStatus::Error("pathfinding off \u{2014} relaunch with EFT_PATHFIND=1".to_string());
         return;
     }
     let Some(pack) = pack else {

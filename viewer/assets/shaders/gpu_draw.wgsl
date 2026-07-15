@@ -112,7 +112,11 @@ struct MaterialGpu {
 
 // Phase 1.6 GGX specular tuning: global multiplier on the dielectric spec lobe. 1.0 = physical.
 // Dial down if broad interior highlights read too hot, up if wet floors/glass look flat.
-const SPEC_STRENGTH: f32 = 1.0;
+const SPEC_STRENGTH: f32 = 1.5;
+// Environment-reflection strength (M4): glossy / glass / water reflect the baked SH volume sampled
+// in the mirror direction (fresnel + gloss weighted), giving the reflections + pop the flat baked
+// diffuse alone can't. 0 = off (pure Phase-1.6 look). Matte surfaces are unaffected (gloss ~0).
+const ENV_REFL_STRENGTH: f32 = 1.6;
 
 const MAT_ALBEDO_NONE: u32 = 0xFFFFFFFFu; // sentinel: material has no albedo texture
 const MAT_NORMAL_NONE: u32 = 0xFFFFFFFFu;  // sentinel: material has no normal map (Phase 2b)
@@ -681,13 +685,17 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // (every material is metallic≈0). Roughness is per-material (glass=0.05 -> a sharp glint).
     // N is the Phase-2b normal-mapped shading normal computed at the top (back-face-flipped
     // geometric normal, perturbed by the tangent-space normal map when the material has one).
+    // Shared view + mirror-reflection direction (used by the GGX lobe AND the env reflection below).
+    let V = normalize(view.world_position.xyz - o.world_pos);
+    let NdotV = max(dot(N, V), 1e-3);
+    let R = reflect(-V, N);
+    let fresnel_v = 0.04 + 0.96 * pow(1.0 - NdotV, 5.0); // Schlick view-fresnel, dielectric F0=0.04
+
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {
-        let V = normalize(view.world_position.xyz - o.world_pos);
         let Ld = dom.dir;
         let H = normalize(V + Ld);
         let NdotL = max(dot(N, Ld), 0.0);
-        let NdotV = max(dot(N, V), 1e-4);
         let NdotH = max(dot(N, H), 0.0);
         let VdotH = max(dot(V, H), 0.0);
         if (NdotL > 0.0) {
@@ -709,6 +717,16 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // because sun_lit_gate already required SH directionality + sun alignment.
     spec_rgb = spec_rgb * (1.0 - shadow_event);
 
+    // --- M4 Environment reflection (from the baked SH volume) --------------------
+    // The baked SH IS the scene's environment lighting, so its radiance in the mirror direction R is
+    // a free, soft environment reflection. Fresnel brightens it toward grazing angles (why glass /
+    // wet floors / water flash at glancing view). Weighted by glossiness (1-roughness) so MATTE
+    // surfaces are untouched and only shiny ones reflect. Sun-shadowed like the GGX lobe. `env` is
+    // computed unconditionally (water/glass in the blend pass reuse it as a smooth mirror).
+    let env = max(sh_irradiance(o.world_pos, R), ambient_floor) * sh.vol_min.w;
+    let gloss = 1.0 - clamp(m.roughness, 0.03, 1.0);
+    let refl_rgb = env * (fresnel_v * gloss * ENV_REFL_STRENGTH) * (1.0 - shadow_event);
+
 #ifdef BLEND_PASS
     // BLEND pass: emit the REAL computed opacity. Non-premultiplied to match the pipeline's
     // BlendState::ALPHA_BLENDING (src=SrcAlpha, dst=OneMinusSrcAlpha), i.e. Unity _Color*_MainTex.
@@ -727,17 +745,22 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
     let is_water = (m.flags & MAT_FLAG_WATER) != 0u;
     if (is_softcutout) {
+        // Roads/decals are matte ground overlays — no env reflection (keeps asphalt from mirroring).
         let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0);
         return vec4<f32>(lit + spec_rgb, coverage);
     } else if (is_water) {
-        // Dark wet sheen, modulated by GI so it isn't a flat slab decoupled from the
-        // scene lighting; the GGX spec on top is what actually reads as a wet/mirror glint.
-        return vec4<f32>(vec3<f32>(0.03, 0.04, 0.05) * gi + spec_rgb, 0.35);
+        // WET reflective water: a dark tinted body + a STRONG fresnel environment reflection (water is
+        // a smooth mirror, so use its own fresnel, not the material roughness) + the GGX glint. The
+        // reflection + the grazing-angle opacity ramp are what read as wet/mirror instead of a flat slab.
+        let wf = 0.08 + 0.92 * pow(1.0 - NdotV, 5.0); // always some reflection, full at grazing
+        let water = vec3<f32>(0.015, 0.025, 0.035) * gi + env * wf + spec_rgb;
+        return vec4<f32>(water, clamp(0.5 + wf * 0.5, 0.5, 0.94));
     }
-    // Glass / plain decal: spec is what makes glass read as shiny.
-    return vec4<f32>(lit + spec_rgb, albedo.a);
+    // Glass / plain decal: env reflection (glass is glossy -> strong) + the GGX glint make it read as
+    // reflective, not a flat tinted pane.
+    return vec4<f32>(lit + spec_rgb + refl_rgb, albedo.a);
 #else
-    // OPAQUE pass: fully opaque (blend materials were already discarded above).
-    return vec4<f32>(lit + spec_rgb, 1.0);
+    // OPAQUE pass: diffuse + GGX glint + the glossy env reflection (matte surfaces: refl_rgb ~0).
+    return vec4<f32>(lit + spec_rgb + refl_rgb, 1.0);
 #endif
 }

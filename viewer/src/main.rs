@@ -250,15 +250,16 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 exposure: 0.4,             // brighten — prior grade came out too dark
                 temperature: -0.03,        // barely cool
                 tint: -0.02,
-                post_saturation: 1.08,     // keep color (0.90 was washed; ~1.08 reads right)
+                post_saturation: 1.14,     // a touch more color pop (was 1.08 — scene read flat/grey)
                 ..default()
             },
             shadows: ColorGradingSection {
-                lift: 0.03,                // raise blacks so shadows aren't crushed
+                lift: 0.02,                // keep blacks milky (not crushed) but a hair deeper for contrast
                 ..default()
             },
             midtones: ColorGradingSection {
-                saturation: 1.06,          // color without the contrast that darkened it
+                saturation: 1.08,
+                contrast: 1.16,            // ADD midtone contrast — the flat/washed look was zero contrast
                 ..default()
             },
             ..default()
