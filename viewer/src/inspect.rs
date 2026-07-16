@@ -44,6 +44,77 @@ pub struct MarkerInfo {
 #[derive(Component)]
 pub struct PickRadius(pub f32);
 
+/// Icon SLUG for the card's title row — the basename of `<pack>/icons/<slug>.png`, cached
+/// there at build time by extraction/intel/fetch_icons.py (the client ships no icon sprites;
+/// it renders inventory icons at runtime from the item's 3D prefab, so the pack carries small
+/// tarkov.dev PNGs instead and the viewer stays offline). Attached by poi.rs to loose-loot
+/// and lock markers; a missing file is silently no-icon. Kept even without the `egui` feature
+/// so the spawners compile unchanged (only `draw_cards` reads it).
+#[derive(Component)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct MarkerIcon(pub String);
+
+/// The `<slug>.png` name contract, shared with fetch_icons.py `slug()`: lowercase, ASCII
+/// alphanumerics pass through, every other run of chars collapses to one '-', trimmed.
+pub fn icon_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut dash = false;
+    for c in name.chars() {
+        let l = c.to_ascii_lowercase();
+        if l.is_ascii_alphanumeric() {
+            out.push(l);
+            dash = false;
+        } else if !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Lazy per-slug icon texture cache for the cards. `None` entries memoize a miss (no file /
+/// bad PNG) so the disk is probed at most once per slug; the egui `TextureHandle`s keep their
+/// textures alive for the app's life (tens of 64-128 px icons — negligible).
+#[cfg(feature = "egui")]
+#[derive(Resource, Default)]
+struct IconCache {
+    /// `<pack>/icons`, resolved from `LoadedPack` on first use.
+    root: Option<std::path::PathBuf>,
+    tex: std::collections::HashMap<String, Option<bevy_egui::egui::TextureHandle>>,
+}
+
+#[cfg(feature = "egui")]
+impl IconCache {
+    fn get(
+        &mut self,
+        ctx: &bevy_egui::egui::Context,
+        pack: &Option<Res<crate::render::LoadedPack>>,
+        slug: &str,
+    ) -> Option<bevy_egui::egui::TextureHandle> {
+        use bevy_egui::egui;
+        if self.root.is_none() {
+            self.root = pack.as_ref().map(|p| p.0.root.join("icons"));
+        }
+        let root = self.root.as_ref()?;
+        if let Some(hit) = self.tex.get(slug) {
+            return hit.clone();
+        }
+        let loaded = image::open(root.join(format!("{slug}.png")))
+            .ok()
+            .map(|img| {
+                let rgba = img.into_rgba8();
+                let (w, h) = rgba.dimensions();
+                let ci = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                ctx.load_texture(format!("icon:{slug}"), ci, egui::TextureOptions::LINEAR)
+            });
+        self.tex.insert(slug.to_string(), loaded.clone());
+        loaded
+    }
+}
+
 /// The markers whose cards are currently open (entity ids). Deduped on insert;
 /// "\u{00D7}" removes one; entries whose entity no longer resolves are dropped by
 /// `draw_cards`.
@@ -69,6 +140,8 @@ impl Plugin for InspectPlugin {
             .init_resource::<PointerOnUi>()
             .init_resource::<UiWantsKeyboard>()
             .add_systems(Update, pick_markers);
+        #[cfg(feature = "egui")]
+        app.init_resource::<IconCache>();
         // The card UI is egui; it MUST live in EguiPrimaryContextPass (see module
         // doc). With the `egui` feature off there's simply no card UI, but the
         // component/resources still exist so loot.rs/poi.rs compile.
@@ -134,15 +207,24 @@ fn pick_markers(
 
 /// System B — draw one egui billboard per open card and publish `PointerOnUi`.
 #[cfg(feature = "egui")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn draw_cards(
     mut contexts: bevy_egui::EguiContexts,
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
-    markers: Query<(&GlobalTransform, &MarkerInfo, &PickRadius, Option<&crate::poi::MarkerValue>)>,
+    markers: Query<(
+        &GlobalTransform,
+        &MarkerInfo,
+        &PickRadius,
+        Option<&crate::poi::MarkerValue>,
+        Option<&MarkerIcon>,
+    )>,
     mut open: ResMut<OpenCards>,
     mut pointer_on_ui: ResMut<PointerOnUi>,
     mut ui_kb: ResMut<UiWantsKeyboard>,
     mut route: MessageWriter<crate::pathfind::RouteRequest>,
     mut plan: ResMut<crate::ui::PlanList>,
+    mut icons: ResMut<IconCache>,
+    pack: Option<Res<crate::render::LoadedPack>>,
 ) {
     use bevy_egui::egui::{self, Align, Align2, Button, Color32, Layout, RichText};
 
@@ -158,10 +240,12 @@ fn draw_cards(
 
     let mut to_close: Vec<Entity> = Vec::new();
     for &e in open.0.iter() {
-        let Ok((tf, info, radius, val)) = markers.get(e) else {
+        let Ok((tf, info, radius, val, icon)) = markers.get(e) else {
             to_close.push(e); // marker despawned — drop its stale card
             continue;
         };
+        // Icon beside the title (loose loot / lock keys); missing file = silently absent.
+        let icon_tex = icon.and_then(|i| icons.get(ctx, &pack, &i.0));
         // Anchor above the marker so the card floats clear of the geometry.
         let world_pos = tf.translation() + Vec3::Y * radius.0.max(1.5);
         let Ok(screen) = camera.world_to_viewport(cam_tf, world_pos) else {
@@ -183,8 +267,15 @@ fn draw_cards(
                     ui.set_max_width(260.0);
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
 
-                    // Title (accent, bold) + a "\u{00D7}" dismiss pushed to the far right.
+                    // Title (accent, bold) + a "\u{00D7}" dismiss pushed to the far right;
+                    // the item icon (when the marker carries one) leads the row, scaled to
+                    // a 22 px title-height square-ish thumb with its aspect kept.
                     ui.horizontal(|ui| {
+                        if let Some(tex) = &icon_tex {
+                            let sz = tex.size_vec2();
+                            let s = 22.0 / sz.y.max(1.0);
+                            ui.image((tex.id(), sz * s));
+                        }
                         ui.label(RichText::new(&info.title).color(accent).size(15.0).strong());
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let x = Button::new(

@@ -11,7 +11,7 @@
 //! (`ui::LayerToggles`) drives its visibility. All positions are already pack space (the same
 //! diag(-1,1,1) X-flip as the geometry). Both sidecars resolve next to the pack (portable).
 
-use crate::inspect::{money, prettify, titlecase, MarkerInfo, PickRadius};
+use crate::inspect::{icon_slug, money, prettify, titlecase, MarkerIcon, MarkerInfo, PickRadius};
 use crate::render::LoadedPack;
 use crate::ui::{LayerToggles, QuestTracker};
 use bevy::prelude::*;
@@ -57,6 +57,13 @@ pub struct ExtractFaction(#[allow(dead_code)] pub String);
 /// (`ui::LayerToggles::min_value`); markers WITHOUT this component are never value-filtered.
 #[derive(Component)]
 pub struct MarkerValue(pub i64);
+
+/// Tag on markers whose gamedata.json record is INACTIVE in the game scene (`active: false` —
+/// disabled exfils like factory's Gate 2, low-power minefields, off sniper zones, disabled
+/// doors/loot points). The panel's global "hide inactive" filter
+/// (`ui::LayerToggles::hide_inactive`) hides them; their cards already say "Inactive in scene".
+#[derive(Component)]
+pub struct SceneInactive;
 
 /// true iff an (optionally value-tagged) marker passes the min-value filter. `min == 0` means the
 /// filter is off; untagged markers always pass; tagged-but-unpriced (value 0) markers hide under
@@ -125,14 +132,19 @@ pub struct KeyUse {
 /// Startup-built zone outlines from `gamedata.json` (TYPED game-file data —
 /// extract_gamedata.py). `live` flips the UI footer to credit the game files and marks that the
 /// typed exfils replaced the tarkov.dev `extracts_dev` layer. Outline verts are already viewer
-/// space, at the collider's bottom face; `draw_gamedata_outlines` lifts them slightly.
+/// space; with `draped` set they were terrain-draped at EXTRACTION time (subdivided ~4 m,
+/// Y = max(terrain+0.3, collider base)) so `draw_gamedata_outlines` adds only a token lift —
+/// undraped (old files / indoor maps) outlines sit at the collider's bottom face and keep the
+/// bigger lift. Each zone carries its scene-active flag so the outlines can follow the panel's
+/// "hide inactive" filter exactly like the markers.
 #[derive(Resource, Default)]
 pub struct GameDataZones {
     pub live: bool,
-    /// (faction, footprint) per typed exfil — drawn with the Extracts toggle.
-    pub exfils: Vec<(String, Vec<Vec3>)>,
-    pub minefields: Vec<Vec<Vec3>>,
-    pub sniper_zones: Vec<Vec<Vec3>>,
+    pub draped: bool,
+    /// (faction, footprint, scene-active) per typed exfil — drawn with the Extracts toggle.
+    pub exfils: Vec<(String, Vec<Vec3>, bool)>,
+    pub minefields: Vec<(Vec<Vec3>, bool)>,
+    pub sniper_zones: Vec<(Vec<Vec3>, bool)>,
 }
 
 pub struct PoiPlugin;
@@ -409,6 +421,9 @@ struct QuestZone {
 /// file for other tools.
 #[derive(Deserialize)]
 struct GameDataFile {
+    /// Outlines were terrain-draped at extraction time (see `GameDataZones::draped`).
+    #[serde(default)]
+    draped: bool,
     #[serde(default)]
     exfils: Vec<GdExfil>,
     #[serde(default)]
@@ -419,6 +434,10 @@ struct GameDataFile {
     doors: Vec<GdDoor>,
     #[serde(default)]
     stationary: Vec<GdStationary>,
+    /// First-party LOOSE-LOOT points (LootPoint MonoBehaviours) with their client-side item
+    /// POOLS — the small curated set the client actually ships (gun racks / safes / piles).
+    #[serde(default)]
+    loose_points: Vec<GdLoose>,
 }
 fn default_true() -> bool {
     true
@@ -446,6 +465,10 @@ struct GdZone {
     name: Option<String>,
     #[serde(default)]
     outline: Vec<[f32; 3]>,
+    /// Pre-subdivision footprint [w, d] m — the outline itself may be terrain-subdivided, so
+    /// the card's "~W x D m" line can no longer be derived from its first three verts.
+    #[serde(default)]
+    extent: Option<[f32; 2]>,
     #[serde(default = "default_true")]
     active: bool,
 }
@@ -472,6 +495,44 @@ struct GdStationary {
     pos: [f32; 3],
     #[serde(default)]
     name: String,
+    #[serde(default = "default_true")]
+    active: bool,
+}
+
+/// One first-party loose-loot point (gamedata.json `loose_points`): a LootPoint transform +
+/// its serialized item pool. `items` is sorted by the extractor — priced real items first,
+/// category slots ("Food and drink") last — so `items[0]` is the card's best item.
+#[derive(Deserialize)]
+struct GdLoose {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: Option<String>,
+    /// Spawn slots merged into this point (several LootPoints at ~one spot).
+    #[serde(default)]
+    n: u32,
+    #[serde(default = "default_true")]
+    active: bool,
+    #[serde(default)]
+    items: Vec<GdLooseItem>,
+    /// "game files" (pool from the LootPoint payload) or "tarkov.dev" (template-less point
+    /// filled from the snapshot's co-located lootLoose entry). Absent = no items known.
+    #[serde(default)]
+    items_src: Option<String>,
+}
+/// One pool entry. `cat == 1` marks a CATEGORY template ("Meds") — unpriced, no icon.
+#[derive(Deserialize)]
+struct GdLooseItem {
+    /// Raw 24-hex template id (the fallback label when the name lookup was offline).
+    #[serde(default)]
+    tpl: Option<String>,
+    #[serde(default)]
+    n: Option<String>,
+    #[serde(default)]
+    s: Option<String>,
+    #[serde(default)]
+    pr: Option<i64>,
+    #[serde(default)]
+    cat: i64,
 }
 
 /// Approx "W x D m" of a rectangular footprint, for zone cards; None for degenerate outlines.
@@ -504,7 +565,11 @@ fn gd_zone_info(l: PoiLayer, z: &GdZone) -> MarkerInfo {
         _ => ("Minefield", "Hazard \u{00B7} game files"),
     };
     let mut detail = Vec::new();
-    if let Some(ext) = outline_extent(&z.outline) {
+    // Prefer the extractor's pre-subdivision extent — on a terrain-draped outline the first
+    // three verts lie along ONE edge, so the derived heuristic below would read ~4 x 4 m.
+    if let Some([w, d]) = z.extent.filter(|[w, d]| *w > 1.0 && *d > 1.0) {
+        detail.push(format!("~{:.0} x {:.0} m", w, d));
+    } else if let Some(ext) = outline_extent(&z.outline) {
         detail.push(ext);
     }
     // The raw GameObject name distinguishes zones ("Minefield LowPower25", "SniperFiringZone
@@ -874,6 +939,54 @@ fn stationary_info(st: &Stationary) -> MarkerInfo {
     }
 }
 
+/// Card for a FIRST-PARTY loose-loot point (gamedata.json `loose_points`): titled by the
+/// spawn's GameObject name, detailing the best pool item + price, the pool size, and the
+/// provenance split the honesty check settled on — 'game files' when the item pool came out
+/// of the LootPoint payload itself, 'pos: game files · items: tarkov.dev' when only the
+/// position is first-party and the items were joined from the snapshot.
+fn gd_loose_info(lo: &GdLoose) -> MarkerInfo {
+    let title = lo
+        .name
+        .as_deref()
+        .map(prettify)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Loose loot".into());
+    let mut detail = Vec::new();
+    if let Some(best) = lo.items.first() {
+        let label = best
+            .n
+            .clone()
+            .or_else(|| best.s.clone())
+            .or_else(|| best.tpl.clone())
+            .unwrap_or_default();
+        if !label.is_empty() {
+            detail.push(if best.cat == 1 { format!("{label} (category)") } else { label });
+        }
+        if let Some(pr) = best.pr.filter(|&p| p > 0) {
+            detail.push(format!("Value  {}", money(pr)));
+        }
+        if lo.items.len() > 1 {
+            detail.push(format!("Pool: {} possible", lo.items.len()));
+        }
+    }
+    if lo.n > 1 {
+        detail.push(format!("\u{00D7}{} spawn slots", lo.n));
+    }
+    if !lo.active {
+        detail.push("Inactive in scene".into());
+    }
+    detail.push(match lo.items_src.as_deref() {
+        Some("tarkov.dev") => "pos: game files \u{00B7} items: tarkov.dev".into(),
+        _ => "game files".into(),
+    });
+    MarkerInfo {
+        title,
+        subtitle: "Loose loot \u{00B7} game files".into(),
+        detail,
+        accent: poi_look(PoiLayer::LooseLoot).0,
+    }
+}
+
 /// Card for a valuable loose-loot point (loot.json `loose`).
 fn loose_info(lo: &Loose) -> MarkerInfo {
     let title = if lo.n.is_empty() { lo.s.clone() } else { lo.n.clone() };
@@ -1016,6 +1129,13 @@ fn spawn_pois(
     .and_then(|s| serde_json::from_str::<GameDataFile>(&s).ok());
     let have_gd_extracts = gamedata.as_ref().is_some_and(|g| !g.exfils.is_empty());
     let have_gd_doors = gamedata.as_ref().is_some_and(|g| !g.doors.is_empty());
+    // First-party loose-loot positions, known BEFORE the loot.json pass: a tarkov.dev loose
+    // point within 2.5 m of one duplicates it (same physical spawn seen by the snapshot) and
+    // is skipped — the typed point wins (exact transform + the game's own pool + provenance).
+    let gd_loose_pos: Vec<Vec3> = gamedata
+        .as_ref()
+        .map(|g| g.loose_points.iter().map(|l| Vec3::from(l.pos)).collect())
+        .unwrap_or_default();
 
     // ---- spawns + map intel from loot.json (pmc/scav/boss nodes, locks, hazards, ...) ----
     // Set when loot.json ships clean faction-tagged extracts; those supersede the semantics
@@ -1024,6 +1144,8 @@ fn spawn_pois(
     let mut have_dev_stationary = false;
     // Aggregated per-key lock list, folded into `KeyCatalog` below (panel's "Keys for this map").
     let mut key_uses: Vec<KeyUse> = Vec::new();
+    // tarkov.dev loose points skipped because a first-party LootPoint owns that spot.
+    let mut pruned_dev_loose = 0usize;
     // Every loot.json lock position + its key's display name, for the typed-door proximity
     // cross-check (a tarkov.dev lock within 2 m names the door's `key_id`).
     let mut lock_keys: Vec<(Vec3, String)> = Vec::new();
@@ -1047,13 +1169,17 @@ fn spawn_pois(
             // Keycard locks get the violet marker material (matches lock_info's accent —
             // ANY key being a card counts, same rule as there).
             let keycard = lk.keys.iter().any(|k| k.card == 1);
-            spawn(
+            let e = spawn(
                 &mut commands,
                 PoiLayer::Lock,
                 lk.pos,
                 lock_info(lk),
                 keycard.then(|| keycard_mat.clone()),
             );
+            // The key's icon on the lock card (first named key = the card's title/needs line).
+            if let Some(k) = lk.keys.iter().find(|k| !k.n.is_empty()) {
+                commands.entity(e).insert(MarkerIcon(icon_slug(&k.n)));
+            }
             // Fold EVERY key into the catalog, grouped by key name (today each lock ships
             // exactly one key, but an alternate key must not vanish from the list).
             if let Some(k) = lk.keys.iter().find(|k| !k.n.is_empty()) {
@@ -1087,9 +1213,19 @@ fn spawn_pois(
             spawn(&mut commands, PoiLayer::Stationary, st.pos, stationary_info(st), None);
         }
         for lo in &mn.loose {
+            // A typed first-party point within 2.5 m owns this spawn — skip the snapshot twin.
+            let p = Vec3::from(lo.pos);
+            if gd_loose_pos.iter().any(|q| q.distance_squared(p) < 2.5 * 2.5) {
+                pruned_dev_loose += 1;
+                continue;
+            }
             // Tagged with the item price so the panel's min-value filter applies (0 = unpriced).
             let e = spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo), None);
             commands.entity(e).insert(MarkerValue(lo.pr.unwrap_or(0)));
+            // Item icon (cached per map by fetch_icons.py; missing file = no icon).
+            if !lo.n.is_empty() {
+                commands.entity(e).insert(MarkerIcon(icon_slug(&lo.n)));
+            }
         }
         // Prefer the clean faction-tagged extract list when it's present — unless the TYPED
         // exfils from gamedata.json already own the Extract layer (they include secret
@@ -1144,6 +1280,7 @@ fn spawn_pois(
     let mut have_gd_stationary = false;
     if let Some(gd) = &gamedata {
         gd_zones.live = have_gd_extracts || !gd.minefields.is_empty() || !gd.sniper_zones.is_empty();
+        gd_zones.draped = gd.draped;
         for e in &gd.exfils {
             let mat = match e.faction.as_str() {
                 "scav" => Some(ex_scav.clone()),
@@ -1153,10 +1290,14 @@ fn spawn_pois(
             };
             let ent = spawn(&mut commands, PoiLayer::Extract, e.pos, gd_exfil_info(e), mat);
             commands.entity(ent).insert(ExtractFaction(e.faction.clone()));
+            if !e.active {
+                commands.entity(ent).insert(SceneInactive);
+            }
             if e.outline.len() >= 3 {
                 gd_zones.exfils.push((
                     e.faction.clone(),
                     e.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
+                    e.active,
                 ));
             }
         }
@@ -1165,11 +1306,40 @@ fn spawn_pois(
             (&gd.sniper_zones, PoiLayer::SniperZone, &mut gd_zones.sniper_zones),
         ] {
             for z in zs {
-                spawn(&mut commands, layer, z.pos, gd_zone_info(layer, z), None);
+                let ent = spawn(&mut commands, layer, z.pos, gd_zone_info(layer, z), None);
+                if !z.active {
+                    commands.entity(ent).insert(SceneInactive);
+                }
                 if z.outline.len() >= 3 {
-                    sink.push(z.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect());
+                    sink.push((
+                        z.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
+                        z.active,
+                    ));
                 }
             }
+        }
+        // First-party LOOSE-LOOT points. Priced points feed the min-value filter; unpriced
+        // ones (category pools / offline ids) stay UNTAGGED so an active filter never hides
+        // them — an unknown pool is not "low value". Real best items also get their icon.
+        for lo in &gd.loose_points {
+            let ent = spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, gd_loose_info(lo), None);
+            let best = lo.items.first();
+            if let Some(pr) = best.and_then(|b| b.pr).filter(|&p| p > 0) {
+                commands.entity(ent).insert(MarkerValue(pr));
+            }
+            if let Some(n) = best.filter(|b| b.cat == 0).and_then(|b| b.n.as_deref()) {
+                commands.entity(ent).insert(MarkerIcon(icon_slug(n)));
+            }
+            if !lo.active {
+                commands.entity(ent).insert(SceneInactive);
+            }
+        }
+        if !gd.loose_points.is_empty() {
+            info!(
+                "poi: {} first-party loose-loot points (game-file LootPoints; {} tarkov.dev twins pruned within 2.5 m)",
+                gd.loose_points.len(),
+                pruned_dev_loose
+            );
         }
         // Typed doors: cross-check each keyed door against the tarkov.dev locks — a lock
         // within 2 m names the raw key_id on the card.
@@ -1193,7 +1363,15 @@ fn spawn_pois(
                 keyed += 1;
                 matched += dev_key.is_some() as usize;
             }
-            spawn(&mut commands, PoiLayer::Door, d.pos, gd_door_info(d, dev_key), None);
+            let ent = spawn(&mut commands, PoiLayer::Door, d.pos, gd_door_info(d, dev_key), None);
+            // The key ITEM's icon on keyed-door cards, keyed by the tarkov.dev name the card
+            // shows (fetch_icons.py also caches these by the door's raw key_id template).
+            if let Some(n) = dev_key {
+                commands.entity(ent).insert(MarkerIcon(icon_slug(n)));
+            }
+            if !d.active {
+                commands.entity(ent).insert(SceneInactive);
+            }
         }
         if !gd.doors.is_empty() {
             info!(
@@ -1208,7 +1386,7 @@ fn spawn_pois(
         if !have_dev_stationary && !gd.stationary.is_empty() {
             have_gd_stationary = true;
             for s in &gd.stationary {
-                spawn(
+                let ent = spawn(
                     &mut commands,
                     PoiLayer::Stationary,
                     s.pos,
@@ -1220,6 +1398,9 @@ fn spawn_pois(
                     },
                     None,
                 );
+                if !s.active {
+                    commands.entity(ent).insert(SceneInactive);
+                }
             }
         }
         info!(
@@ -1394,14 +1575,18 @@ fn spawn_pois(
 // Quest markers are handled by `apply_quest_visibility` (they carry a `QuestMarkerTask`); this pass
 // owns every OTHER POI layer, so exclude them here to avoid the two systems fighting over the same
 // `Visibility`.
+#[allow(clippy::type_complexity)]
 fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
-    mut q: Query<(&PoiLayer, Option<&MarkerValue>, &mut Visibility), Without<QuestMarkerTask>>,
+    mut q: Query<
+        (&PoiLayer, Option<&MarkerValue>, Option<&SceneInactive>, &mut Visibility),
+        Without<QuestMarkerTask>,
+    >,
 ) {
     if !toggles.is_changed() {
         return;
     }
-    for (l, val, mut vis) in &mut q {
+    for (l, val, inactive, mut vis) in &mut q {
         let show = match l {
             PoiLayer::PmcSpawn => toggles.pmc_spawns,
             PoiLayer::ScavSpawn => toggles.scav_spawns,
@@ -1419,8 +1604,12 @@ fn apply_poi_visibility(
             PoiLayer::Minefield => toggles.minefields,
             PoiLayer::SniperZone => toggles.sniper_zones,
         };
-        // Value-tagged markers (loose loot) additionally pass the panel's min-value filter.
-        let show = show && value_passes(toggles.min_value, val);
+        // Value-tagged markers (loose loot) additionally pass the panel's min-value filter,
+        // and scene-inactive markers the global "hide inactive" filter — both COMPOSE with
+        // the layer toggle rather than replacing it.
+        let show = show
+            && value_passes(toggles.min_value, val)
+            && !(toggles.hide_inactive && inactive.is_some());
         *vis = if show {
             Visibility::Visible
         } else {
@@ -1455,30 +1644,43 @@ fn apply_quest_visibility(
 /// Draw the TYPED zone footprints from gamedata.json as closed polygons (immediate mode, the
 /// same idiom as `draw_quest_outlines`): exfil collider footprints in their faction colour with
 /// the Extracts toggle, minefields in hazard red, sniper zones in orange with their own
-/// toggles. Verts sit at the collider's bottom face, so they get a small lift off the ground.
+/// toggles. Terrain-DRAPED outlines (extraction already subdivided them ~4 m and lifted each
+/// vert to terrain+0.3) get only a token lift against z-fighting; undraped ones (old files,
+/// indoor maps) still sit at the collider's flat bottom face and keep the visible lift. Zones
+/// inactive in the scene follow the panel's "hide inactive" filter like their markers.
 fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles: Res<LayerToggles>) {
-    const LIFT: Vec3 = Vec3::new(0.0, 0.4, 0.0);
+    let lift = Vec3::new(0.0, if zones.draped { 0.05 } else { 0.4 }, 0.0);
+    let hide_inactive = toggles.hide_inactive;
     let mut ring = |outline: &Vec<Vec3>, color: Color| {
         gizmos.linestrip(
             outline
                 .iter()
-                .map(|p| *p + LIFT)
-                .chain(outline.first().map(|p| *p + LIFT)),
+                .map(|p| *p + lift)
+                .chain(outline.first().map(|p| *p + lift)),
             color,
         );
     };
     if toggles.extracts {
-        for (fac, outline) in &zones.exfils {
+        for (fac, outline, active) in &zones.exfils {
+            if hide_inactive && !active {
+                continue;
+            }
             ring(outline, extract_faction_color(fac));
         }
     }
     if toggles.minefields {
-        for outline in &zones.minefields {
+        for (outline, active) in &zones.minefields {
+            if hide_inactive && !active {
+                continue;
+            }
             ring(outline, poi_look(PoiLayer::Minefield).0);
         }
     }
     if toggles.sniper_zones {
-        for outline in &zones.sniper_zones {
+        for (outline, active) in &zones.sniper_zones {
+            if hide_inactive && !active {
+                continue;
+            }
             ring(outline, poi_look(PoiLayer::SniperZone).0);
         }
     }

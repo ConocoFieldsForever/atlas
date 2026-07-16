@@ -27,6 +27,12 @@ pub struct LayerToggles {
     /// loose-loot prices); 0 = filter off. ONE filter shared by loot containers and Map Intel's
     /// loose loot, set from the Loot section's "min value" row. Untagged markers never filter.
     pub min_value: i64,
+    /// GLOBAL "hide inactive" filter: hides every marker tagged `poi::SceneInactive` (gamedata
+    /// records serialized `active: false` — disabled exfils, low-power minefields, off sniper
+    /// zones, disabled doors/loot points) and their zone outlines. COMPOSES with the layer
+    /// toggles like `min_value`; untagged markers never filter. Off by default: inactive intel
+    /// still matters when planning (a disabled exfil can be event-enabled mid-wipe).
+    pub hide_inactive: bool,
     pub pmc_spawns: bool,
     pub scav_spawns: bool,
     pub bosses: bool,
@@ -61,6 +67,7 @@ impl Default for LayerToggles {
             loot: !has("noloot"),
             loot_classes: LOOT_CLASSES.iter().map(|c| (c.to_string(), true)).collect(),
             min_value: 0,
+            hide_inactive: has("hideinactive"),
             pmc_spawns: has("pmc"),
             scav_spawns: has("scav"),
             bosses: has("boss"),
@@ -291,6 +298,8 @@ struct GfxUiParams<'w, 's> {
     cam: Query<'w, 's, &'static Transform, With<crate::render::CullCamera>>,
     /// Typed gamedata.json zone state — the footer credits the game files when it's live.
     gamedata: Res<'w, crate::poi::GameDataZones>,
+    /// Scene-inactive markers, counted next to the "hide inactive" filter checkbox.
+    inactive: Query<'w, 's, (), bevy::prelude::With<crate::poi::SceneInactive>>,
 }
 
 #[cfg(feature = "egui")]
@@ -309,6 +318,7 @@ fn layers_panel(
         Option<&crate::loot::LootClass>,
         Option<&crate::poi::QuestMarkerTask>,
         Option<&crate::poi::MarkerValue>,
+        Option<&crate::poi::SceneInactive>,
     )>,
     poi_q: Query<&crate::poi::PoiLayer>,
     loot_q: Query<&crate::loot::LootClass>,
@@ -496,7 +506,7 @@ fn layers_panel(
                 // the hit. Ranked: exact title > title prefix > title substring > subtitle or
                 // detail-only match (an exact "RB-VO" must beat "RB-VO marked key" fragments).
                 let mut hits = Vec::new();
-                for (info, gt, layer, cls, qtask, val) in &markers {
+                for (info, gt, layer, cls, qtask, val, inact) in &markers {
                     let tl = info.title.to_lowercase();
                     let rank = if tl == q {
                         0u8
@@ -511,7 +521,7 @@ fn layers_panel(
                     } else {
                         continue;
                     };
-                    hits.push((rank, info, gt.translation(), layer, cls, qtask, val));
+                    hits.push((rank, info, gt.translation(), layer, cls, qtask, val, inact));
                 }
                 hits.sort_by_key(|h| h.0);
                 let total = hits.len();
@@ -521,7 +531,7 @@ fn layers_panel(
                     .id_salt("marker_search")
                     .max_height(200.0)
                     .show(ui, |ui| {
-                        for (_, info, pos, layer, cls, qtask, val) in hits.iter().take(25) {
+                        for (_, info, pos, layer, cls, qtask, val, inact) in hits.iter().take(25) {
                             // Is the hit's layer/class currently toggled off? (Clicking enables it.)
                             let hidden = if let Some(task) = qtask {
                                 !toggles.quests
@@ -538,9 +548,11 @@ fn layers_panel(
                             // Value-tagged hits (containers / loose loot) can ALSO be hidden by
                             // the min-value filter even with their layer on — surface that as
                             // "(filtered)" and lift the filter on click, else the fly-to lands
-                            // on empty ground.
+                            // on empty ground. Scene-inactive hits under the "hide inactive"
+                            // filter get the exact same treatment.
                             let value_hidden =
                                 !crate::poi::value_passes(toggles.min_value, *val);
+                            let inactive_hidden = toggles.hide_inactive && inact.is_some();
                             // Second column: the subtitle, or — when only a detail line matched —
                             // that matching detail line, so the hit shows WHY it matched.
                             let second = if info.title.to_lowercase().contains(&q)
@@ -573,15 +585,18 @@ fn layers_panel(
                                         toggles.loot = true;
                                         toggles.loot_classes.insert(c.0.clone(), true);
                                     }
-                                    // ... and lift the min-value filter if it alone would keep
-                                    // this hit invisible.
+                                    // ... and lift whichever global filter would keep this
+                                    // hit invisible (min value / hide inactive).
                                     if value_hidden {
                                         toggles.min_value = 0;
+                                    }
+                                    if inactive_hidden {
+                                        toggles.hide_inactive = false;
                                     }
                                 }
                                 if hidden {
                                     ui.label(RichText::new("(off)").size(10.0).color(MUTED));
-                                } else if value_hidden {
+                                } else if value_hidden || inactive_hidden {
                                     ui.label(RichText::new("(filtered)").size(10.0).color(MUTED));
                                 }
                             });
@@ -758,6 +773,19 @@ fn layers_panel(
                                     .italics()
                                     .color(MUTED),
                             );
+                            // ---- HIDE INACTIVE — the OTHER global filter, kept beside min
+                            // value: hides markers/outlines whose gamedata record is disabled
+                            // in the game scene (poi::SceneInactive; cards say "Inactive in
+                            // scene"). Composes with every layer toggle.
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.checkbox(&mut toggles.hide_inactive, "hide inactive")
+                                    .on_hover_text(
+                                        "hide markers disabled in the game scene \
+                                         (inactive exfils, low-power minefields, \u{2026})",
+                                    );
+                                count_tag(ui, gfx_ui.inactive.iter().count(), DIMCOUNT);
+                            });
                         });
 
                     // ===== SPAWNS & POIS =====
