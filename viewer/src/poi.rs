@@ -188,10 +188,42 @@ struct Node {
     /// Expected ruble value of loot reachable from this spawn.
     #[serde(default)]
     ev: Option<i64>,
-    /// Boss name (boss_nodes only).
+    /// Boss slug, e.g. "cultist-priest" (boss_nodes only).
     #[serde(default)]
     boss: Option<String>,
     /// Boss spawn chance 0..1 (boss_nodes only).
+    #[serde(default)]
+    chance: Option<f32>,
+    /// Boss DISPLAY name from tarkov.dev, e.g. "Cultist Priest" (boss_nodes only).
+    #[serde(default)]
+    name: Option<String>,
+    /// Spawn delay in seconds after raid start; -1 = spawns at start (boss_nodes only).
+    #[serde(default)]
+    st: Option<i64>,
+    /// Escort/guard groups (boss_nodes only).
+    #[serde(default)]
+    escorts: Vec<Escort>,
+    /// Named spawn zones with per-zone chance (boss_nodes only).
+    #[serde(default)]
+    locs: Vec<BossLoc>,
+}
+/// One escort/guard group on a boss node, e.g. 4x reshala-guard.
+#[derive(Deserialize)]
+struct Escort {
+    #[serde(default)]
+    boss: String,
+    #[serde(default)]
+    count: Option<u32>,
+    /// Presence chance 0..1 (schema fidelity; near-always 1.0, so not surfaced).
+    #[serde(default)]
+    #[allow(dead_code)]
+    chance: Option<f32>,
+}
+/// One named boss spawn zone and its share of the spawn chance.
+#[derive(Deserialize)]
+struct BossLoc {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     chance: Option<f32>,
 }
@@ -407,15 +439,49 @@ fn node_info(l: PoiLayer, nd: &Node) -> MarkerInfo {
             }
         }
         PoiLayer::Boss => {
+            // Prefer the tarkov.dev display name ("Cultist Priest") — titlecasing the slug
+            // gives "Cultist-priest".
             let title = nd
-                .boss
-                .as_deref()
-                .map(titlecase)
+                .name
+                .clone()
                 .filter(|s| !s.is_empty())
+                .or_else(|| nd.boss.as_deref().map(titlecase).filter(|s| !s.is_empty()))
                 .unwrap_or_else(|| "Boss".into());
             let mut detail = Vec::new();
             if let Some(ch) = nd.chance {
                 detail.push(format!("Chance {:.0}%", ch * 100.0));
+            }
+            // Delayed spawns (e.g. Partisan at 900 s) are raid-planning gold; -1/small
+            // values mean "at raid start" and stay silent.
+            if let Some(st) = nd.st.filter(|&s| s >= 60) {
+                detail.push(format!("Spawns ~{} min in", (st + 30) / 60));
+            }
+            if !nd.escorts.is_empty() {
+                let parts: Vec<String> = nd
+                    .escorts
+                    .iter()
+                    .map(|e| {
+                        let who = titlecase(&e.boss.replace('-', " "));
+                        match e.count {
+                            Some(c) if c > 0 => format!("{c}\u{00D7} {who}"),
+                            _ => who,
+                        }
+                    })
+                    .collect();
+                detail.push(format!("Escorts: {}", parts.join(", ")));
+            }
+            if !nd.locs.is_empty() {
+                let parts: Vec<String> = nd
+                    .locs
+                    .iter()
+                    .map(|l| match l.chance {
+                        Some(c) if c > 0.0 && c < 1.0 => {
+                            format!("{} {:.0}%", l.name, c * 100.0)
+                        }
+                        _ => l.name.clone(),
+                    })
+                    .collect();
+                detail.push(format!("Zones: {}", parts.join("  \u{00B7}  ")));
             }
             if let Some(ev) = nd.ev {
                 detail.push(format!("Est. loot  {}", money(ev)));
@@ -436,14 +502,16 @@ fn node_info(l: PoiLayer, nd: &Node) -> MarkerInfo {
     }
 }
 
-/// Card contents for a semantics.json POI (extract/door/interactable).
+/// Card contents for a semantics.json POI (extract/door/loot prop). The "loot" layer is
+/// NAME-classified props (jackets/weapon boxes/safes) — ground truth showed it mixes real
+/// lootables with decorative variants, so the copy says "Loot prop", not "Interactable".
 fn sem_info(l: PoiLayer, poi: &Poi) -> MarkerInfo {
     let accent = poi_look(l).0;
     let pretty = prettify(&poi.name);
     let (fallback, subtitle) = match l {
         PoiLayer::Extract => ("Extract", "Extract"),
         PoiLayer::Door => ("Door", "Door"),
-        _ => ("Interactable", "Interactable"),
+        _ => ("Loot prop", "Loot prop"),
     };
     let title = if pretty.is_empty() {
         fallback.to_string()
@@ -459,51 +527,60 @@ fn sem_info(l: PoiLayer, poi: &Poi) -> MarkerInfo {
 }
 
 /// Human faction label for an extract card ("pmc"->"PMC", "scav"->"Scav", "shared"->"All").
+/// A merged multi-faction extract ("pmc+scav", see the merge in `spawn_pois`) is usable by
+/// everyone on the map, so it reads "All" too.
 fn faction_label(fac: &str) -> String {
     match fac {
         "pmc" => "PMC".into(),
         "scav" => "Scav".into(),
         "shared" => "All".into(),
+        _ if fac.contains('+') => "All".into(),
         _ => titlecase(fac),
     }
 }
 
 /// Marker/accent colour per extract faction. PMC keeps the layer's extract green; scav-only
-/// reads amber; shared reads a pale white-green.
+/// reads amber; shared / merged multi-faction reads a pale white-green.
 fn extract_faction_color(fac: &str) -> Color {
     match fac {
         "scav" => Color::srgb(0.95, 0.45, 0.10),
         "shared" => Color::srgb(0.78, 0.95, 0.82),
+        _ if fac.contains('+') => Color::srgb(0.78, 0.95, 0.82),
         _ => poi_look(PoiLayer::Extract).0,
     }
 }
 
-/// Card for a clean faction-tagged extract (loot.json `extracts_dev`).
-fn extract_dev_info(ex: &ExtractDev) -> MarkerInfo {
-    let accent = extract_faction_color(&ex.fac);
-    let name = if ex.name.is_empty() {
-        "Extract".to_string()
-    } else {
-        ex.name.clone()
-    };
+/// Card for a clean faction-tagged extract (loot.json `extracts_dev`). `fac` may be a merged
+/// "pmc+scav" (one physical extract listed once per faction by tarkov.dev).
+fn extract_dev_info(name: &str, fac: &str) -> MarkerInfo {
+    let accent = extract_faction_color(fac);
+    let name = if name.is_empty() { "Extract" } else { name };
     // Faction in the title (e.g. "Armored Train  [All]") so search hits "pmc"/"scav".
-    let title = if ex.fac.is_empty() {
-        name
+    let title = if fac.is_empty() {
+        name.to_string()
     } else {
-        format!("{}  [{}]", name, faction_label(&ex.fac))
+        format!("{}  [{}]", name, faction_label(fac))
+    };
+    // Spell out the per-faction breakdown for merged extracts ("Faction: PMC + Scav").
+    let fac_line = if fac.contains('+') {
+        fac.split('+').map(faction_label).collect::<Vec<_>>().join(" + ")
+    } else {
+        faction_label(fac)
     };
     MarkerInfo {
         title,
         subtitle: "Extract".into(),
-        detail: vec![format!("Faction: {}", faction_label(&ex.fac))],
+        detail: vec![format!("Faction: {fac_line}")],
         accent,
     }
 }
 
 /// Card for a locked door/container/trunk (loot.json `locks`).
 fn lock_info(lk: &Lock) -> MarkerInfo {
-    // Keycard locks read violet; ordinary locks keep the gold layer colour.
-    let keycard = lk.keys.first().is_some_and(|k| k.card == 1);
+    // Keycard locks read violet; ordinary locks keep the gold layer colour. ANY key being a
+    // card counts (build_loot.py ships exactly one key per lock today — audited 318 locks,
+    // all single-key — but the rule must not silently miss a card at a later position).
+    let keycard = lk.keys.iter().any(|k| k.card == 1);
     let accent = if keycard {
         Color::srgb(0.72, 0.45, 0.92)
     } else {
@@ -562,15 +639,26 @@ fn switch_info(sw: &Switch) -> MarkerInfo {
 
 /// Card for a transit to another map (loot.json `transits`).
 fn transit_info(tr: &Transit) -> MarkerInfo {
+    // Destination for the title: `to` is a slug ("the-lab-dark" titlecases to "The-lab-dark"),
+    // while the desc usually carries the clean display name ("Transit to The Lab") — prefer
+    // that; otherwise de-hyphenate the slug. When the desc IS the title's source it's fully
+    // redundant, so it's skipped from the detail lines.
+    let (dest, desc_line) = match tr.desc.strip_prefix("Transit to ") {
+        Some(d) if !d.is_empty() => (d.to_string(), None),
+        _ => (
+            titlecase(&tr.to.replace('-', " ")),
+            (!tr.desc.is_empty()).then(|| tr.desc.clone()),
+        ),
+    };
     let mut detail = Vec::new();
-    if !tr.desc.is_empty() {
-        detail.push(tr.desc.clone());
+    if let Some(d) = desc_line {
+        detail.push(d);
     }
     if !tr.cond.is_empty() {
         detail.push(tr.cond.clone());
     }
     MarkerInfo {
-        title: format!("Transit \u{2192} {}", titlecase(&tr.to)),
+        title: format!("Transit \u{2192} {dest}"),
         subtitle: "Transit".into(),
         detail,
         accent: poi_look(PoiLayer::Transit).0,
@@ -756,8 +844,9 @@ fn spawn_pois(
         }
         // ---- map intel ----
         for lk in &mn.locks {
-            // Keycard locks get the violet marker material (matches lock_info's accent).
-            let keycard = lk.keys.first().is_some_and(|k| k.card == 1);
+            // Keycard locks get the violet marker material (matches lock_info's accent —
+            // ANY key being a card counts, same rule as there).
+            let keycard = lk.keys.iter().any(|k| k.card == 1);
             spawn(
                 &mut commands,
                 PoiLayer::Lock,
@@ -765,8 +854,9 @@ fn spawn_pois(
                 lock_info(lk),
                 keycard.then(|| keycard_mat.clone()),
             );
-            // Fold the lock's (first) key into the catalog, grouped by key name.
-            if let Some(k) = lk.keys.first().filter(|k| !k.n.is_empty()) {
+            // Fold EVERY key into the catalog, grouped by key name (today each lock ships
+            // exactly one key, but an alternate key must not vanish from the list).
+            for k in lk.keys.iter().filter(|k| !k.n.is_empty()) {
                 let pos = Vec3::new(lk.pos[0], lk.pos[1], lk.pos[2]);
                 if let Some(u) = key_uses.iter_mut().find(|u| u.name == k.n) {
                     u.lock_positions.push(pos);
@@ -801,14 +891,43 @@ fn spawn_pois(
         // Prefer the clean faction-tagged extract list when it's present.
         if !mn.extracts_dev.is_empty() {
             have_dev_extracts = true;
+            // tarkov.dev lists one entry PER FACTION, so the same physical extract can appear
+            // twice — pmc + scav at (nearly) the same spot (6 such pairs across the 10 maps,
+            // 2 at IDENTICAL coordinates, which z-fight as stacked spheres and hide the second
+            // faction). Merge same-name entries within 3 m into ONE marker carrying every
+            // faction ("pmc+scav" -> "[All]").
+            let mut merged: Vec<(&ExtractDev, String)> = Vec::new();
             for ex in &mn.extracts_dev {
-                let mat = match ex.fac.as_str() {
+                let close = |a: &[f32; 3], b: &[f32; 3]| {
+                    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2) < 9.0
+                };
+                if let Some((_, facs)) = merged
+                    .iter_mut()
+                    .find(|(f, _)| f.name == ex.name && close(&f.pos, &ex.pos))
+                {
+                    if !facs.split('+').any(|f| f == ex.fac) {
+                        facs.push('+');
+                        facs.push_str(&ex.fac);
+                    }
+                } else {
+                    merged.push((ex, ex.fac.clone()));
+                }
+            }
+            for (ex, fac) in &merged {
+                let mat = match fac.as_str() {
                     "scav" => Some(ex_scav.clone()),
                     "shared" => Some(ex_shared.clone()),
+                    f if f.contains('+') => Some(ex_shared.clone()),
                     _ => None, // pmc / unknown keep the layer's extract green
                 };
-                let e = spawn(&mut commands, PoiLayer::Extract, ex.pos, extract_dev_info(ex), mat);
-                commands.entity(e).insert(ExtractFaction(ex.fac.clone()));
+                let e = spawn(
+                    &mut commands,
+                    PoiLayer::Extract,
+                    ex.pos,
+                    extract_dev_info(&ex.name, fac),
+                    mat,
+                );
+                commands.entity(e).insert(ExtractFaction(fac.clone()));
             }
         }
     }
@@ -826,12 +945,31 @@ fn spawn_pois(
             ("door", PoiLayer::Door),
             ("loot", PoiLayer::Interactable),
         ];
+        // The name classifier overcounts: one physical door splits into leaf/handle/ballistic
+        // sub-objects each spawning a marker (lighthouse level198 ground truth: 36 Door
+        // components vs 137 name-matched markers), and the "extract" regex catches kitchen
+        // "Extractor_Fan/Hood" props and "emergency_exit_light" lamps (45 of lighthouse's 63
+        // semantics extracts). Viewer-side guards: drop the known-junk extract names and
+        // collapse same-layer markers within 1.2 m (lighthouse doors: 1390 -> ~670).
+        let junk_extract = |n: &str| {
+            let s = n.to_ascii_lowercase();
+            s.contains("extractor_") || s.contains("exit_light")
+        };
         for (lname, ly) in map {
             if lname == "extract" && have_dev_extracts {
                 continue;
             }
             if let Some(v) = layers.get(lname) {
+                let mut kept: Vec<Vec3> = Vec::new();
                 for poi in v {
+                    if lname == "extract" && junk_extract(&poi.name) {
+                        continue;
+                    }
+                    let p = Vec3::new(poi.p[0], poi.p[1], poi.p[2]);
+                    if kept.iter().any(|q| q.distance_squared(p) < 1.2 * 1.2) {
+                        continue; // a sub-part of an already-marked object
+                    }
+                    kept.push(p);
                     spawn(&mut commands, ly, poi.p, sem_info(ly, poi), None);
                 }
             }

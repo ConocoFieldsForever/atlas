@@ -214,6 +214,7 @@ fn layers_panel(
         Option<&crate::poi::PoiLayer>,
         Option<&crate::loot::LootClass>,
         Option<&crate::poi::QuestMarkerTask>,
+        Option<&crate::poi::MarkerValue>,
     )>,
     poi_q: Query<&crate::poi::PoiLayer>,
     loot_q: Query<&crate::loot::LootClass>,
@@ -337,17 +338,30 @@ fn layers_panel(
             );
             let q = search.query.trim().to_lowercase();
             if !q.is_empty() {
-                // (info, position, poi layer, loot class, quest task) — the layer/class/task let a
-                // click auto-enable whatever hidden layer the hit lives on.
+                // (rank, info, position, poi layer, loot class, quest task, value) — the
+                // layer/class/task let a click auto-enable whatever hidden layer the hit lives
+                // on; the value lets it also lift the min-value filter when that alone hides
+                // the hit. Ranked: exact title > title prefix > title substring > subtitle or
+                // detail-only match (an exact "RB-VO" must beat "RB-VO marked key" fragments).
                 let mut hits = Vec::new();
-                for (info, gt, layer, cls, qtask) in &markers {
-                    if info.title.to_lowercase().contains(&q)
-                        || info.subtitle.to_lowercase().contains(&q)
+                for (info, gt, layer, cls, qtask, val) in &markers {
+                    let tl = info.title.to_lowercase();
+                    let rank = if tl == q {
+                        0u8
+                    } else if tl.starts_with(&q) {
+                        1
+                    } else if tl.contains(&q) {
+                        2
+                    } else if info.subtitle.to_lowercase().contains(&q)
                         || info.detail.iter().any(|d| d.to_lowercase().contains(&q))
                     {
-                        hits.push((info, gt.translation(), layer, cls, qtask));
-                    }
+                        3
+                    } else {
+                        continue;
+                    };
+                    hits.push((rank, info, gt.translation(), layer, cls, qtask, val));
                 }
+                hits.sort_by_key(|h| h.0);
                 let total = hits.len();
                 ui.add_space(2.0);
                 ui.label(RichText::new(format!("{total} results")).size(10.0).color(MUTED));
@@ -355,7 +369,7 @@ fn layers_panel(
                     .id_salt("marker_search")
                     .max_height(200.0)
                     .show(ui, |ui| {
-                        for (info, pos, layer, cls, qtask) in hits.iter().take(25) {
+                        for (_, info, pos, layer, cls, qtask, val) in hits.iter().take(25) {
                             // Is the hit's layer/class currently toggled off? (Clicking enables it.)
                             let hidden = if let Some(task) = qtask {
                                 !toggles.quests
@@ -369,6 +383,12 @@ fn layers_panel(
                             } else {
                                 false
                             };
+                            // Value-tagged hits (containers / loose loot) can ALSO be hidden by
+                            // the min-value filter even with their layer on — surface that as
+                            // "(filtered)" and lift the filter on click, else the fly-to lands
+                            // on empty ground.
+                            let value_hidden =
+                                !crate::poi::value_passes(toggles.min_value, *val);
                             // Second column: the subtitle, or — when only a detail line matched —
                             // that matching detail line, so the hit shows WHY it matched.
                             let second = if info.title.to_lowercase().contains(&q)
@@ -401,9 +421,16 @@ fn layers_panel(
                                         toggles.loot = true;
                                         toggles.loot_classes.insert(c.0.clone(), true);
                                     }
+                                    // ... and lift the min-value filter if it alone would keep
+                                    // this hit invisible.
+                                    if value_hidden {
+                                        toggles.min_value = 0;
+                                    }
                                 }
                                 if hidden {
                                     ui.label(RichText::new("(off)").size(10.0).color(MUTED));
+                                } else if value_hidden {
+                                    ui.label(RichText::new("(filtered)").size(10.0).color(MUTED));
                                 }
                             });
                         }
@@ -495,7 +522,10 @@ fn layers_panel(
                             poi_row(ui, &mut toggles.bosses, "Bosses", PoiLayer::Boss, &poi_counts);
                             poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract, &poi_counts);
                             poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door, &poi_counts);
-                            poi_row(ui, &mut toggles.interactables, "Interactables", PoiLayer::Interactable, &poi_counts);
+                            // Name-classified props from the game files (jackets/weapon
+                            // boxes/safes); mixes real lootables with decorative twins, so it
+                            // reads "props", not "interactables".
+                            poi_row(ui, &mut toggles.interactables, "Loot props", PoiLayer::Interactable, &poi_counts);
                         });
 
                     // ===== MAP INTEL =====
@@ -848,8 +878,10 @@ fn layers_panel(
                     });
 
                     ui.add_space(6.0);
+                    // Extracts come from tarkov.dev too (extracts_dev supersedes the semantics
+                    // layer on every current map) — only doors/loot props are game-file data.
                     ui.label(
-                        RichText::new("PMC/scav/boss: tarkov.dev  \u{2022}  extracts/doors: game data")
+                        RichText::new("spawns/extracts/intel: tarkov.dev  \u{2022}  doors/props: game files")
                             .size(9.0)
                             .italics()
                             .color(MUTED),
