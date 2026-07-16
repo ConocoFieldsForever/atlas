@@ -117,6 +117,11 @@ const SPEC_STRENGTH: f32 = 1.5;
 // in the mirror direction (fresnel + gloss weighted), giving the reflections + pop the flat baked
 // diffuse alone can't. 0 = off (pure Phase-1.6 look). Matte surfaces are unaffected (gloss ~0).
 const ENV_REFL_STRENGTH: f32 = 1.6;
+// Analytic sky reflection (sky_reflect): a crisp cool gradient + sun disk, but scaled by the LOCAL
+// SH exposure so it never exceeds how lit the spot is (indoor floors stay dark, outdoor surfaces pop).
+const SKY_REFL_GAIN: f32 = 1.45;       // how much brighter than the local SH the sky reads (outdoor pop)
+const SUN_REFL_SHARP: f32 = 340.0;     // sun-disk tightness in reflections (higher = tighter)
+const SUN_REFL_STRENGTH: f32 = 1.6;    // sun-glint brightness (the bright wet flash)
 
 const MAT_ALBEDO_NONE: u32 = 0xFFFFFFFFu; // sentinel: material has no albedo texture
 const MAT_NORMAL_NONE: u32 = 0xFFFFFFFFu;  // sentinel: material has no normal map (Phase 2b)
@@ -306,6 +311,26 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     let rb = 0.282095 * cb.x + 0.488603 * (cb.y * L.y + cb.z * L.z + cb.w * L.x);
     out.radiance = max(vec3<f32>(rr, rg, rb), vec3<f32>(0.0));
     return out;
+}
+
+// --- Analytic sky+sun environment for glossy reflections ---------------------
+// The baked SH volume in the mirror direction reads as a dull grey blob, so glass / water reflecting
+// it look flat. Real glossy surfaces reflect the SKY, which is crisper (a directional gradient) and,
+// outdoors, brighter. We synthesize a cool vertical gradient (brighter toward the zenith) plus a soft
+// sun disk from the SH dominant light (the bright glint that reads as wet). CRITICAL: the whole thing
+// is scaled by `level` — the LOCAL exposure (luma of the SH reflection) — so it can NEVER exceed how
+// lit the spot actually is. Indoors (dark SH probe) the "sky" stays dark; only sky-exposed outdoor
+// surfaces get the bright reflection. This is what keeps interior glossy floors from blowing out.
+fn sky_reflect(R: vec3<f32>, level: f32, dom: DomLight) -> vec3<f32> {
+    let up = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
+    let horizon = vec3<f32>(0.66, 0.72, 0.82);
+    let zenith  = vec3<f32>(0.92, 0.98, 1.10);
+    var sky = mix(horizon, zenith, up * up) * (level * SKY_REFL_GAIN); // anchored to local exposure
+    if (dom.mag >= 1e-4) {
+        let s = pow(max(dot(R, dom.dir), 0.0), SUN_REFL_SHARP);        // tight sun disk
+        sky += dom.radiance * (s * SUN_REFL_STRENGTH);                 // dom.radiance already exposure-scaled
+    }
+    return sky;
 }
 
 // --- #5 sun-shadow PCF sampling ----------------------------------------------
@@ -717,14 +742,17 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // because sun_lit_gate already required SH directionality + sun alignment.
     spec_rgb = spec_rgb * (1.0 - shadow_event);
 
-    // --- M4 Environment reflection (from the baked SH volume) --------------------
-    // The baked SH IS the scene's environment lighting, so its radiance in the mirror direction R is
-    // a free, soft environment reflection. Fresnel brightens it toward grazing angles (why glass /
-    // wet floors / water flash at glancing view). Weighted by glossiness (1-roughness) so MATTE
-    // surfaces are untouched and only shiny ones reflect. Sun-shadowed like the GGX lobe. `env` is
-    // computed unconditionally (water/glass in the blend pass reuse it as a smooth mirror).
-    let env = max(sh_irradiance(o.world_pos, R), ambient_floor) * sh.vol_min.w;
+    // --- Environment reflection (analytic sky + sun, anchored to the baked SH) --------------------
+    // Two environments: the SH volume (scene-accurate color, but a dull ground-level probe) and an
+    // analytic overcast SKY (crisp + bright, from sky_reflect). Glossier surfaces see more of the
+    // sky; rougher ones fade back to the soft SH probe. Fresnel brightens toward grazing angles (why
+    // glass / wet floors / water flash at glancing view). Matte surfaces untouched (gloss ~0). Sun-
+    // shadowed like the GGX lobe. `sh_env`/`sky_env` are reused by the water/glass blend branches.
+    let sh_env = max(sh_irradiance(o.world_pos, R), ambient_floor) * sh.vol_min.w;
+    let refl_level = dot(sh_env, vec3<f32>(0.2126, 0.7152, 0.0722)); // local exposure anchor (luma)
+    let sky_env = sky_reflect(R, refl_level, dom);
     let gloss = 1.0 - clamp(m.roughness, 0.03, 1.0);
+    let env = mix(sh_env, max(sh_env, sky_env), gloss);
     let refl_rgb = env * (fresnel_v * gloss * ENV_REFL_STRENGTH) * (1.0 - shadow_event);
 
 #ifdef BLEND_PASS
@@ -749,12 +777,20 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0);
         return vec4<f32>(lit + spec_rgb, coverage);
     } else if (is_water) {
-        // WET reflective water: a dark tinted body + a STRONG fresnel environment reflection (water is
-        // a smooth mirror, so use its own fresnel, not the material roughness) + the GGX glint. The
-        // reflection + the grazing-angle opacity ramp are what read as wet/mirror instead of a flat slab.
-        let wf = 0.08 + 0.92 * pow(1.0 - NdotV, 5.0); // always some reflection, full at grazing
-        let water = vec3<f32>(0.015, 0.025, 0.035) * gi + env * wf + spec_rgb;
-        return vec4<f32>(water, clamp(0.5 + wf * 0.5, 0.5, 0.94));
+        // WET PUDDLE / water. The albedo carries the puddle_noise coverage, but tex.a*tint.a (tint.a≈0.3)
+        // crushed it to ~7% opacity -> the old branch ignored the texture entirely and drew a uniform
+        // slab. Recover the raw noise mask (divide tint.a back out) and remap it to a clean feathered
+        // puddle SHAPE. The film itself is a smooth near-mirror: a dark wet body + a STRONG sky/sun
+        // reflection (water fresnel, not the material roughness) + the GGX sun glint. Opacity follows
+        // the mask so puddle edges dissolve into the dry ground, and grazing angles turn mirror-opaque.
+        let raw = albedo.a / max(m.tint.a, 1e-3);          // ~ puddle_noise coverage in [0,1]
+        let mask = smoothstep(0.12, 0.45, raw);            // feathered puddle shape
+        let wf = 0.04 + 0.96 * pow(1.0 - NdotV, 5.0);      // water fresnel (F0≈0.04), full at grazing
+        let refl = max(sh_env, sky_env);                   // crisp bright sky + sun mirror
+        let body = m.tint.rgb * gi;                        // dark wet film, GI-lit
+        let col = body + refl * (0.30 + 0.70 * wf) + spec_rgb;
+        let a = mask * clamp(0.45 + 0.55 * wf, 0.0, 1.0);  // shape-masked; grazing -> opaque mirror
+        return vec4<f32>(col, a);
     }
     // Glass / plain decal: env reflection (glass is glossy -> strong) + the GGX glint make it read as
     // reflective, not a flat tinted pane.

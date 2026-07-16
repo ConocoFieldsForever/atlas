@@ -25,10 +25,32 @@ ROAD_RE = re.compile(r"road|asphalt|spline|tarcola|parking|sidewalk|\bcurb", re.
 ROAD_NOT_RE = re.compile(r"sign|lamp|light|fence|barrier|pole|rail|wall|cone|bollard", re.I)
 
 
+def _rasterize_tri_xz(cells, cell, ax, az, bx, bz, cx, cz):
+    """Add every grid cell whose center falls inside triangle (a,b,c) projected to XZ.
+    Cell index k under the round(w/cell) convention has its center at world k*cell, so we
+    test the barycentric half-plane sign at PX=gx*cell (matches the clump lookup exactly)."""
+    minx = int(np.floor(min(ax, bx, cx) / cell)); maxx = int(np.ceil(max(ax, bx, cx) / cell))
+    minz = int(np.floor(min(az, bz, cz) / cell)); maxz = int(np.ceil(max(az, bz, cz) / cell))
+    if maxx - minx > 1400 or maxz - minz > 1400:   # guard vs a mismatched map-spanning mesh
+        return
+    gx = np.arange(minx, maxx + 1); gz = np.arange(minz, maxz + 1)
+    if not len(gx) or not len(gz):
+        return
+    PX, PZ = np.meshgrid(gx * cell, gz * cell)
+    d1 = (PX - bx) * (az - bz) - (ax - bx) * (PZ - bz)
+    d2 = (PX - cx) * (bz - cz) - (bx - cx) * (PZ - cz)
+    d3 = (PX - ax) * (cz - az) - (cx - ax) * (PZ - az)
+    inside = ~(((d1 < 0) | (d2 < 0) | (d3 < 0)) & ((d1 > 0) | (d2 > 0) | (d3 > 0)))
+    zz, xx = np.where(inside)
+    cells.update(zip(gx[xx].tolist(), gz[zz].tolist()))
+
+
 def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
     """World-XZ coverage set (cell-quantized) of road/asphalt mesh footprints. Grass clumps that
-    land inside are skipped. Footprint is sampled from the road meshes' world-space vertices (dense
-    along the splines) plus a small dilation to close gaps and cover the surface width."""
+    land inside are skipped. Footprints are filled by rasterizing the road TRIANGLES (not just
+    the vertices): large flat surfaces (parking_floor_LOD0 = 298x519m from only 433 verts) have
+    almost no interior verts, so vertex-only sampling missed their middle and grass poked through
+    the whole slab. Triangle fill covers the interior; a small dilation closes seams + edges."""
     id2mesh = {m["id"]: m for m in mani["meshes"]}
     road_ids = {mid for mid, m in id2mesh.items()
                 if ROAD_RE.search(m["name"]) and not ROAD_NOT_RE.search(m["name"])}
@@ -36,9 +58,10 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
     poff = next(a for a in vl["attrs"] if a["name"] == "position")["offset"]
     inst = mani["instance"]; istride = inst["stride"]
     fo = {f["name"]: f["offset"] for f in inst["fields"]}
+    mbnp = np.frombuffer(mb, np.uint8)
     n = len(ib) // istride
     cells = set()
-    ninst = 0
+    ninst = 0; ntri = 0
     for i in range(n):
         b = i * istride
         mid = struct.unpack_from("<I", ib, b + fo["meshId"])[0]
@@ -46,14 +69,19 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
             continue
         ninst += 1
         a = struct.unpack_from("<12f", ib, b + fo["affine"])
-        me = id2mesh[mid]; N = me["vtxCount"]; off = me["vtxOffset"]
-        step = max(1, N // 4000)                                    # cap verts/mesh for speed
-        for k in range(0, N, step):
-            o = off + k * vs
-            lx, ly, lz = struct.unpack_from("<3f", mb, o + poff)
-            wx = a[0] * lx + a[1] * ly + a[2] * lz + a[3]
-            wz = a[8] * lx + a[9] * ly + a[10] * lz + a[11]
-            cells.add((int(round(wx / cell)), int(round(wz / cell))))
+        me = id2mesh[mid]; voff = me["vtxOffset"]
+        ioff = me["idxOffset"]; ic = me["idxCount"]
+        idx = mbnp[ioff:ioff + ic * 4].view(np.uint32).reshape(-1, 3)
+        step = max(1, len(idx) // 4000)          # cap tris/instance on dense splines
+        for t in idx[::step]:
+            wx = [0.0, 0.0, 0.0]; wz = [0.0, 0.0, 0.0]
+            for j in range(3):
+                o = voff + int(t[j]) * vs
+                lx, ly, lz = struct.unpack_from("<3f", mb, o + poff)
+                wx[j] = a[0] * lx + a[1] * ly + a[2] * lz + a[3]
+                wz[j] = a[8] * lx + a[9] * ly + a[10] * lz + a[11]
+            _rasterize_tri_xz(cells, cell, wx[0], wz[0], wx[1], wz[1], wx[2], wz[2])
+            ntri += 1
     if dilate:
         d = set()
         for (cx, cz) in cells:
@@ -61,7 +89,8 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
                 for dz in range(-dilate, dilate + 1):
                     d.add((cx + dx, cz + dz))
         cells = d
-    print(f"[grass] road mask: {len(road_ids)} road meshes, {ninst} instances -> {len(cells)} masked {cell}m cells")
+    print(f"[grass] road mask: {len(road_ids)} road meshes / {ninst} instances, {ntri} tris "
+          f"-> {len(cells)} masked {cell}m cells")
     return cells, cell
 # density cell -> #instances by value band (sparse map is already road-excluding).
 # 1 clump per non-empty cell keeps it dense but bounded (~300k total on Interchange).
