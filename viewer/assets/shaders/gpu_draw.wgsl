@@ -199,13 +199,16 @@ struct ShVolume {
 // A 2-cascade near-field contact CSM. The SH volume above already bakes the BROAD sun shadow; these
 // two near cascades only add the missing high-frequency contact edge, and the combination below is
 // gated + capped so it can only SUBTRACT a small, bounded amount of light (anti double-darkening).
-// Byte-identical to the Rust `SunShadowUniform` (192 bytes).
+// Byte-identical to the Rust `SunShadowUniform` (208 bytes).
 struct SunShadowUniform {
     view_proj: array<mat4x4<f32>, 2>, // per-cascade world->light-clip (0..1 depth ortho)
     split_depths: vec4<f32>,          // x=far0(15) y=far1(80) z=overlap(0.10) w=enabled(1/0)
     sun_dir_texel: vec4<f32>,         // xyz=Lsun (toward sun), w=1/shadow_map_size (PCF texel)
     texel_world: vec4<f32>,           // x=cascade0 world texel, y=cascade1 world texel (bias units)
     combine: vec4<f32>,               // x=diffuse cap(0.12) y=fade start(65) z=fade end(80) w=debug
+    // Runtime graphics scales from the UI (all 1.0 = shipped look):
+    // x = fog density scale (0 = fog off), y = sky-reflection gain scale, z = emissive scale.
+    gfx: vec4<f32>,
 };
 @group(3) @binding(5) var<uniform> sun: SunShadowUniform;
 @group(3) @binding(6) var shadow_map: texture_depth_2d_array;
@@ -350,7 +353,8 @@ fn sky_reflect(R: vec3<f32>, level: f32) -> vec3<f32> {
     let up = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
     let horizon = vec3<f32>(0.66, 0.72, 0.82);
     let zenith  = vec3<f32>(0.92, 0.98, 1.10);
-    return mix(horizon, zenith, up * up) * (level * SKY_REFL_GAIN); // anchored to local exposure
+    // anchored to local exposure; sun.gfx.y = runtime UI gain scale (1 = shipped look)
+    return mix(horizon, zenith, up * up) * (level * SKY_REFL_GAIN * sun.gfx.y);
 }
 
 // --- Distance fog / aerial perspective ----------------------------------------
@@ -362,7 +366,8 @@ fn sky_reflect(R: vec3<f32>, level: f32) -> vec3<f32> {
 // since whatever is BEHIND a transparent was already fogged.
 fn apply_fog(rgb: vec3<f32>, world_pos: vec3<f32>, directionality: f32) -> vec3<f32> {
     let d = distance(view.world_position.xyz, world_pos);
-    let f = 1.0 - exp(-(d * FOG_DENSITY) * (d * FOG_DENSITY));
+    let dens = FOG_DENSITY * sun.gfx.x; // runtime density scale (0 = fog off, 1 = shipped)
+    let f = 1.0 - exp(-(d * dens) * (d * dens));
     let gate = mix(FOG_INDOOR_FLOOR, 1.0, smoothstep(0.03, 0.20, directionality));
     return mix(rgb, FOG_COLOR, f * gate);
 }
@@ -569,7 +574,8 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let has_em = m.emissive_index != MAT_EMISSIVE_NONE;
     let eidx = select(0u, m.emissive_index, has_em);
     let em_tex = textureSample(albedo_tex[eidx], albedo_samp, o.uv).rgb;
-    let em_rgb = select(vec3<f32>(0.0), em_tex * vec3<f32>(m.em_r, m.em_g, m.em_b), has_em);
+    // sun.gfx.z = runtime emissive scale from the UI (1 = shipped look).
+    let em_rgb = select(vec3<f32>(0.0), em_tex * vec3<f32>(m.em_r, m.em_g, m.em_b) * sun.gfx.z, has_em);
 
     // A2C: screen-space alpha gradient width for the cutout coverage ramp (fwidth is a derivative
     // op — MUST run here in uniform control flow, before any non-uniform discard). Equals

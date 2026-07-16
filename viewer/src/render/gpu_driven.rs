@@ -268,7 +268,7 @@ pub const NO_EMISSIVE: u32 = 0xFFFF_FFFF;
 /// `albedo_tex` array as normal materials (the terrain textures are appended to `albedo_paths`).
 /// Layer `i` weight = control map `i/4`, channel `i%4`. `layer_uv = terrainUV01 * rep` (the value
 /// recovered from the MicroSplat material; NEVER `m_TileSize`). Slice names come from the
-/// terrainLayers sidecar itself (Interchange = 4 slices, Lighthouse = 6; capacity 8). 192 bytes,
+/// terrainLayers sidecar itself (Interchange = 4 slices, Lighthouse = 6; capacity 16). 288 bytes,
 /// 16-aligned.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -348,7 +348,7 @@ struct ShadowCascadeUniform {
 }
 
 /// group(3) binding(5) main sun-shadow uniform read by gpu_draw.wgsl. Byte-identical to the WGSL
-/// `SunShadowUniform` (192 bytes: 2×64 + 4×16).
+/// `SunShadowUniform` (208 bytes: 2×64 + 5×16).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct SunShadowUniform {
@@ -362,6 +362,9 @@ struct SunShadowUniform {
     texel_world: [f32; 4],
     /// x = diffuse cap (0.12), y = fade start (65), z = fade end (80), w = debug mode (1 = spec-only).
     combine: [f32; 4],
+    /// Runtime graphics scales from the UI (GfxSettings): x = fog density scale (0 = off),
+    /// y = sky-reflection gain scale, z = emissive scale, w = reserved. All 1.0 = shipped look.
+    gfx: [f32; 4],
 }
 
 /// Runtime shadow feature switch + the pack's sun direction (already X-flipped into pack space).
@@ -370,9 +373,30 @@ struct SunShadowUniform {
 struct EftShadowConfig {
     /// Lsun: points TOWARD the sun (light travels along -Lsun). Unit. Y-up sentinel when disabled.
     lsun: Vec3,
+    /// EFFECTIVE switch consulted by the extrusion / uniform / shadow node — refreshed every
+    /// frame by `sync_gfx_shadow_toggle` from env_enabled OR the UI toggle (gated on sun_ok).
     enabled: bool,
+    /// The EFT_SHADOWS=1 env opt-in captured at startup.
+    env_enabled: bool,
+    /// The pack HAS a valid sun_dir (lsun is real, not the sentinel) — the runtime UI toggle may
+    /// enable shadows even when the EFT_SHADOWS env opt-in was off.
+    sun_ok: bool,
     /// `EFT_SHADOW_DEBUG=1`: specular-only diagnostic (diffuse cap forced to 0 in the shader).
     debug: bool,
+}
+
+/// Refresh the effective shadow switch from the UI settings (extracted GfxSettings) once per
+/// frame, BEFORE the frustum extrusion, the uniform upload, and the shadow node consult it.
+fn sync_gfx_shadow_toggle(
+    config: Option<ResMut<EftShadowConfig>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+) {
+    if let (Some(mut c), Some(s)) = (config, settings) {
+        let eff = (c.env_enabled || s.shadows) && c.sun_ok;
+        if c.enabled != eff {
+            c.enabled = eff;
+        }
+    }
 }
 
 /// The queued shadow depth pipeline + its group(1) cascade-uniform layout.
@@ -712,6 +736,9 @@ impl Plugin for EftGpuDrivenPlugin {
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
             ExtractComponentPlugin::<CullCamera>::default(),
             ExtractResourcePlugin::<ExtractedCpuData>::default(),
+            // Runtime graphics settings (UI "Graphics (experimental)"): re-extracted every frame
+            // so slider changes land in the same frame's uniforms.
+            ExtractResourcePlugin::<crate::render::GfxSettings>::default(),
         ))
         .add_systems(Startup, build_cpu_data)
         .add_systems(Update, free_cpu_staging);
@@ -725,6 +752,13 @@ impl Plugin for EftGpuDrivenPlugin {
                 Render,
                 (
                     prepare_gpu_buffers.in_set(RenderSystems::PrepareResources),
+                    // Runtime UI shadow toggle: refresh the effective switch BEFORE the frustum
+                    // extrusion + uniform upload + shadow node read it this frame.
+                    sync_gfx_shadow_toggle
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers)
+                        .before(upload_frustum)
+                        .before(prepare_shadow_uniforms),
                     upload_frustum
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
@@ -2038,6 +2072,7 @@ fn prepare_gpu_buffers(
             if shadow_debug { 1.0 } else { 0.0 },
         ],
         sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+        gfx: [1.0, 1.0, 1.0, 0.0], // neutral scales — a zeroed lane would kill fog on frame 0
         ..default()
     };
     let shadow_main_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -2180,6 +2215,8 @@ fn prepare_gpu_buffers(
     commands.insert_resource(EftShadowConfig {
         lsun,
         enabled: shadows_enabled,
+        env_enabled: shadows_enabled,
+        sun_ok: cpu.sun_dir.is_some(),
         debug: shadow_debug,
     });
     commands.insert_resource(EftShadowPipeline {
@@ -2383,6 +2420,7 @@ fn upload_frustum(
     // the SHARED cull and appear in the shadow map. `None`/disabled -> the cull is byte-identical
     // to before (perfect A/B against not EFT_SHADOWS=1).
     shadow: Option<Res<EftShadowConfig>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
     views: Query<&ExtractedView, With<CullCamera>>,
 ) {
     let Some(buffers) = buffers else {
@@ -2412,18 +2450,12 @@ fn upload_frustum(
     // Screen-size cull constants: an instance is culled when its bounding sphere subtends fewer
     // than `min_px` pixels — sphere.w < k * distance, with k = min_px / (0.5 * viewport_h * proj11).
     // Grass gets a larger threshold (a ~1.3 m clump is invisible long before the far plane; this
-    // is where the 100k-clump draw cost goes). EFT_CULL_PX="general,grass" overrides for tuning;
-    // "0,0" disables. Read once (env lookup shouldn't run per-frame in the render loop).
-    static CULL_PX: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
-    let (px_gen, px_grass) = *CULL_PX.get_or_init(|| {
-        std::env::var("EFT_CULL_PX")
-            .ok()
-            .and_then(|s| {
-                let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-                (v.len() == 2).then(|| (v[0], v[1]))
-            })
-            .unwrap_or((1.5, 4.0))
-    });
+    // is where the 100k-clump draw cost goes). Values come from GfxSettings (UI-tunable; defaults
+    // seeded from EFT_CULL_PX). Grass OFF = an enormous k so every clump culls at any distance.
+    let (px_gen, px_grass) = match settings.as_ref() {
+        Some(s) => (s.cull_px, if s.grass { s.cull_px_grass } else { f32::MAX }),
+        None => (1.5, 4.0),
+    };
     let proj11 = view.clip_from_view.y_axis.y; // 1/tan(fov_y/2)
     let vh = view.viewport.w.max(1) as f32;
     let denom = (0.5 * vh * proj11).max(1e-4);
@@ -2459,6 +2491,7 @@ fn prepare_shadow_uniforms(
     render_queue: Res<RenderQueue>,
     config: Option<Res<EftShadowConfig>>,
     resources: Option<Res<EftShadowResources>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
     views: Query<&ExtractedView, With<CullCamera>>,
 ) {
     let (Some(config), Some(res)) = (config, resources) else {
@@ -2466,6 +2499,13 @@ fn prepare_shadow_uniforms(
     };
     let Some(view) = views.iter().next() else {
         return;
+    };
+    // Runtime UI scales (GfxSettings, extracted) ride a spare uniform lane; the shadow switch
+    // itself was already synced into config.enabled by sync_gfx_shadow_toggle this frame.
+    let shadows_on = config.enabled;
+    let gfx = match settings.as_ref() {
+        Some(s) => [s.fog, s.sky_refl, s.emissive, 0.0],
+        None => [1.0, 1.0, 1.0, 0.0],
     };
     let lsun = config.lsun;
     let clip_from_view = view.clip_from_view;
@@ -2490,7 +2530,7 @@ fn prepare_shadow_uniforms(
             SHADOW_SPLITS[1],
             SHADOW_SPLITS[2],
             SHADOW_CASCADE_OVERLAP,
-            if config.enabled { 1.0 } else { 0.0 },
+            if shadows_on { 1.0 } else { 0.0 },
         ],
         sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
         combine: [
@@ -2499,6 +2539,7 @@ fn prepare_shadow_uniforms(
             SHADOW_FADE_END,
             if config.debug { 1.0 } else { 0.0 },
         ],
+        gfx,
         ..default()
     };
 

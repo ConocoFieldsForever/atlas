@@ -189,8 +189,20 @@ fn min_value_label(v: i64) -> String {
 
 #[cfg(feature = "egui")]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+/// Bundled params for the map dropdown + "Graphics (experimental)" section — keeps
+/// `layers_panel` under Bevy's 16-system-param limit.
+#[derive(bevy::ecs::system::SystemParam)]
+struct GfxUiParams<'w, 's> {
+    gfx: ResMut<'w, crate::render::GfxSettings>,
+    map_switch: ResMut<'w, crate::MapSwitch>,
+    pack: Option<Res<'w, crate::render::LoadedPack>>,
+    /// (display name, pack path) list, scanned once from the packs/ dir beside the current pack.
+    pack_list: bevy::ecs::system::Local<'s, Option<Vec<(String, String)>>>,
+}
+
 fn layers_panel(
     mut contexts: bevy_egui::EguiContexts,
+    mut gfx_ui: GfxUiParams,
     mut toggles: ResMut<LayerToggles>,
     mut search: ResMut<UiSearch>,
     mut tracker: ResMut<QuestTracker>,
@@ -266,6 +278,56 @@ fn layers_panel(
                         hide_all(&mut toggles);
                     }
                 });
+            });
+            // ---- Map dropdown (switching restarts the viewer into the selected pack) ----
+            let cur_pack_root = gfx_ui
+                .pack
+                .as_ref()
+                .map(|p| p.0.root.to_string_lossy().replace('\\', "/"));
+            let packs = gfx_ui.pack_list.get_or_insert_with(|| {
+                // Scan the packs/ dir next to the loaded pack (or ./packs as fallback), once.
+                let dir = cur_pack_root
+                    .as_deref()
+                    .and_then(|r| std::path::Path::new(r).parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| std::path::PathBuf::from("packs"));
+                let mut v: Vec<(String, String)> = std::fs::read_dir(&dir)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|e| {
+                        let p = e.path();
+                        let name = p.file_name()?.to_str()?.strip_suffix(".eftpack")?.to_string();
+                        // a real pack has a manifest (skips half-built fleet output)
+                        p.join("manifest.json").is_file()
+                            .then(|| (name, p.to_string_lossy().replace('\\', "/")))
+                    })
+                    .collect();
+                v.sort();
+                v
+            });
+            let cur_name = cur_pack_root
+                .as_deref()
+                .and_then(|r| r.rsplit('/').next())
+                .and_then(|n| n.strip_suffix(".eftpack"))
+                .unwrap_or("(none)")
+                .to_string();
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("map").color(MUTED).size(11.0));
+                egui::ComboBox::from_id_salt("map_select")
+                    .selected_text(RichText::new(&cur_name).color(ACCENT).size(12.0))
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        for (name, path) in packs.iter() {
+                            if ui
+                                .selectable_label(*name == cur_name, name)
+                                .on_hover_text("switch map (restarts the viewer)")
+                                .clicked()
+                                && *name != cur_name
+                            {
+                                gfx_ui.map_switch.0 = Some(path.clone());
+                            }
+                        }
+                    });
             });
             ui.add_space(4.0);
             ui.add(
@@ -705,6 +767,70 @@ fn layers_panel(
                                 .color(MUTED),
                             );
                         });
+
+                    // ---- Graphics (experimental): live toggles for the render features. ----
+                    // Edits go through a local copy so change-detection only fires on a real
+                    // tweak (a bare &mut through ResMut would mark the resource changed every
+                    // frame the sliders render).
+                    CollapsingHeader::new(
+                        RichText::new("Graphics (experimental)").color(HDR).size(12.0).strong(),
+                    )
+                    .id_salt("sec_gfx")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let mut g = gfx_ui.gfx.clone();
+                        ui.add(egui::Slider::new(&mut g.fog, 0.0..=2.0).text("fog"));
+                        ui.add(egui::Slider::new(&mut g.sky_refl, 0.0..=2.0).text("sky reflections"));
+                        ui.add(egui::Slider::new(&mut g.emissive, 0.0..=3.0).text("emissive"));
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut g.bloom, "bloom");
+                            ui.add_enabled(
+                                g.bloom,
+                                egui::Slider::new(&mut g.bloom_intensity, 0.0..=0.3),
+                            );
+                        });
+                        ui.add_enabled_ui(g.grade_available, |ui| {
+                            ui.checkbox(&mut g.grade, "game grade LUT")
+                                .on_hover_text("the game's own display chain; off = TonyMcMapface fallback");
+                            ui.add_enabled(
+                                g.grade && g.grade_available,
+                                egui::Slider::new(&mut g.grade_exposure, 0.05..=0.6).text("exposure"),
+                            );
+                            ui.add_enabled(
+                                g.grade && g.grade_available,
+                                egui::Checkbox::new(&mut g.vignette, "vignette"),
+                            );
+                        });
+                        ui.add_enabled_ui(g.shadows_available, |ui| {
+                            ui.checkbox(&mut g.shadows, "sun shadows")
+                                .on_hover_text("real-time cascades; marginal on the baked-GI look");
+                        });
+                        ui.checkbox(&mut g.grass, "grass");
+                        ui.add(
+                            egui::Slider::new(&mut g.cull_px, 0.0..=8.0)
+                                .text("prop cull px")
+                                .clamping(egui::SliderClamping::Always),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut g.cull_px_grass, 0.0..=16.0)
+                                .text("grass cull px"),
+                        );
+                        if ui.small_button("reset to defaults").clicked() {
+                            let keep = (g.grade_available, g.shadows_available);
+                            g = crate::render::GfxSettings::default();
+                            g.grade_available = keep.0;
+                            g.shadows_available = keep.1;
+                        }
+                        if g != *gfx_ui.gfx {
+                            *gfx_ui.gfx = g;
+                        }
+                        ui.label(
+                            RichText::new("changes apply live; defaults = shipped look")
+                                .size(10.0)
+                                .italics()
+                                .color(MUTED),
+                        );
+                    });
 
                     ui.add_space(6.0);
                     ui.label(

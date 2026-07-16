@@ -68,6 +68,79 @@ pub struct CameraCommand {
     pub fly_to: Option<Vec3>,
 }
 
+/// UI map dropdown target: when set, `apply_map_switch` restarts the viewer into that pack.
+/// (The GPU-driven path builds its buffers/bind-groups exactly once by design — a process swap
+/// is the honest, robust map switch; the new instance inherits the current env settings.)
+#[derive(Resource, Default)]
+pub struct MapSwitch(pub Option<String>);
+
+/// Spawn a fresh viewer on the selected pack, then exit this one.
+fn apply_map_switch(mut sw: ResMut<MapSwitch>, mut exit: MessageWriter<bevy::app::AppExit>) {
+    let Some(pack) = sw.0.take() else { return };
+    match std::env::current_exe() {
+        Ok(exe) => match std::process::Command::new(exe).arg(&pack).spawn() {
+            Ok(_) => {
+                info!("map switch: relaunching into {pack}");
+                exit.write(bevy::app::AppExit::Success);
+            }
+            Err(e) => error!("map switch: failed to spawn viewer for {pack}: {e}"),
+        },
+        Err(e) => error!("map switch: current_exe failed: {e}"),
+    }
+}
+
+/// Apply the main-world halves of the runtime graphics settings: Bloom (component add/remove +
+/// intensity) and the grade-LUT toggle (Tonemapping::None + LUT pass vs TonyMcMapface + hand
+/// grade). Runs only when the settings actually changed.
+fn apply_gfx_camera(
+    mut commands: Commands,
+    gfx: Res<render::GfxSettings>,
+    cam: Query<Entity, With<FlyCam>>,
+) {
+    if !gfx.is_changed() {
+        return;
+    }
+    let Ok(e) = cam.single() else { return };
+    let mut ec = commands.entity(e);
+    if gfx.bloom {
+        ec.insert(Bloom {
+            intensity: gfx.bloom_intensity,
+            ..Bloom::NATURAL
+        });
+    } else {
+        ec.remove::<Bloom>();
+    }
+    if gfx.grade && gfx.grade_available {
+        // Game grade LUT owns the display chain (the render node applies it after Bloom).
+        ec.insert(Tonemapping::None);
+        ec.remove::<ColorGrading>();
+    } else {
+        // Fallback approximation (same values as the EFT_GRADE=0 path in setup()).
+        ec.insert((
+            Tonemapping::TonyMcMapface,
+            ColorGrading {
+                global: ColorGradingGlobal {
+                    exposure: 0.4,
+                    temperature: -0.02,
+                    tint: -0.005,
+                    post_saturation: 0.95,
+                    ..default()
+                },
+                shadows: ColorGradingSection {
+                    lift: 0.02,
+                    ..default()
+                },
+                midtones: ColorGradingSection {
+                    saturation: 0.98,
+                    contrast: 1.16,
+                    ..default()
+                },
+                ..default()
+            },
+        ));
+    }
+}
+
 /// Consume a pending `CameraCommand::fly_to`: place the fly-cam at a framing offset above the target,
 /// looking at it, and sync `FlyCam.yaw/pitch` so subsequent mouse-look continues smoothly.
 fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Transform, &mut FlyCam)>) {
@@ -189,6 +262,11 @@ fn main() {
     // active by default — EFT_GRADE=0 falls back to the TonyMcMapface + hand-grade approximation.
     // Loaded BEFORE the pack moves into its resource so we can use its root for pack-local LUTs.
     let grade_lut = render::load_grade_lut(pack.as_ref().map(|p| p.root.as_path()));
+    // Runtime graphics settings (UI "Graphics (experimental)"). Defaults reproduce the shipped
+    // look; availability flags gate the toggles that need pack data.
+    let mut gfx = render::GfxSettings::default();
+    gfx.grade_available = grade_lut.is_some();
+    app.insert_resource(gfx);
     if let Some(g) = grade_lut {
         app.insert_resource(g);
     }
@@ -218,9 +296,11 @@ fn main() {
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
         .add_plugins(pathfind::PathfindPlugin) // on-demand routing via the :8091 GPU pathfind server
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
+        .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack
         .add_systems(Startup, setup)
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain())
-        .add_systems(Update, (apply_camera_command, auto_screenshot));
+        .add_systems(Update, (apply_camera_command, auto_screenshot))
+        .add_systems(Update, (apply_gfx_camera, apply_map_switch));
 
     #[cfg(feature = "egui")]
     {
@@ -318,6 +398,7 @@ fn setup(
     pack: Option<Res<LoadedPack>>,
     mut images: ResMut<Assets<Image>>,
     grade: Option<Res<GradeLutCpu>>,
+    mut gfx: ResMut<render::GfxSettings>,
 ) {
     // Frame the world AABB: stand back along +Y/+Z by the half-diagonal.
     // Debug: EFT_LOOK="x,y,z" frames the camera CLOSE on that world point (e.g. a coordinate from
@@ -353,7 +434,7 @@ fn setup(
     // Sky sun direction: same volume.json sidecar + X-flip the SH/shadow path uses
     // (gpu_driven::extract_pack_to_render_world), so the skybox sun disk, the baked GI, and the
     // shader's reflected sun all agree. Fallback = a plausible high overcast sun.
-    let sun_dir = pack
+    let sun_from_pack = pack
         .as_ref()
         .and_then(|p| p.0.manifest.sidecars.volume_meta.as_deref())
         .and_then(|path| std::fs::read_to_string(path).ok())
@@ -367,8 +448,10 @@ fn setup(
                 );
                 (raw.length_squared() > 1e-6).then(|| raw.normalize())
             })
-        })
-        .unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize());
+        });
+    // The experimental shadow toggle needs a real sun (matches the render side's sun_ok gate).
+    gfx.shadows_available = sun_from_pack.is_some();
+    let sun_dir = sun_from_pack.unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize());
     let sky = build_sky_cubemap(&mut images, sun_dir);
 
     let mut cam = commands.spawn((

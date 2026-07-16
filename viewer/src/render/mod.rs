@@ -14,6 +14,8 @@
 //! the data is already instanced low-poly (p50 ~384 tris, ~10.5k unique meshes
 //! stored once).
 
+use bevy::prelude::Resource;
+
 pub mod gpu_driven;
 pub mod grade;
 pub mod instancing;
@@ -23,6 +25,71 @@ pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 pub use standard::EftStandardPlugin;
+
+/// Runtime graphics settings, driven by the UI's "Graphics (experimental)" section and extracted
+/// into the render world every frame. Every default reproduces the shipped look EXACTLY (scales
+/// at 1.0, toggles matching their env-var startup defaults) so the panel is opt-in tweaking, not
+/// a second source of truth. Scales ride spare uniform lanes (SunShadowUniform.gfx) — a slider
+/// change is visible the same frame with no rebuild.
+#[derive(Resource, Clone, PartialEq, bevy::render::extract_resource::ExtractResource)]
+pub struct GfxSettings {
+    /// Distance-fog density scale (0 = fog off, 1 = shipped look, 2 = pea soup).
+    pub fog: f32,
+    /// Analytic sky-reflection gain scale on glossy surfaces (0 = SH-probe only).
+    pub sky_refl: f32,
+    /// Emissive strength scale (monitors / signs / lamps).
+    pub emissive: f32,
+    /// Experimental real-time sun shadows (needs a valid sun_dir; marginal on baked-SH scenes).
+    pub shadows: bool,
+    /// Whether the pack has a usable sun_dir at all (set at startup; greys the toggle out).
+    pub shadows_available: bool,
+    /// Bloom on/off + intensity (Bevy camera component; applied in the main world).
+    pub bloom: bool,
+    pub bloom_intensity: f32,
+    /// The game grade LUT (off = TonyMcMapface + hand-grade fallback).
+    pub grade: bool,
+    pub grade_available: bool,
+    /// Pre-LUT exposure (web viewer default 0.18).
+    pub grade_exposure: f32,
+    /// PRISM vignette on/off.
+    pub vignette: bool,
+    /// Grass rendering (off = all clumps screen-size-culled).
+    pub grass: bool,
+    /// Screen-size cull thresholds in pixels (general, grass). 0 disables that cull.
+    pub cull_px: f32,
+    pub cull_px_grass: f32,
+}
+
+impl Default for GfxSettings {
+    fn default() -> Self {
+        let (cull_px, cull_px_grass) = std::env::var("EFT_CULL_PX")
+            .ok()
+            .and_then(|s| {
+                let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 2).then(|| (v[0], v[1]))
+            })
+            .unwrap_or((1.5, 4.0));
+        Self {
+            fog: 1.0,
+            sky_refl: 1.0,
+            emissive: 1.0,
+            shadows: std::env::var("EFT_SHADOWS").map(|v| v.trim() == "1").unwrap_or(false),
+            shadows_available: false, // set at startup when sun_dir resolves
+            bloom: true,
+            bloom_intensity: 0.06,
+            grade: true,             // no-op unless grade_available
+            grade_available: false,  // set at startup when the LUT loads
+            grade_exposure: std::env::var("EFT_GRADE_EXPOSURE")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0.18),
+            vignette: !std::env::var("EFT_VIGNETTE").map(|v| v.trim() == "0").unwrap_or(false),
+            grass: true,
+            cull_px,
+            cull_px_grass,
+        }
+    }
+}
 
 /// A/B render-path selector. `EFT_RENDER=m0` picks the working M0 custom instanced
 /// path (`instancing.rs`, zero culling); anything else (default) picks the M2

@@ -278,6 +278,13 @@ impl ViewNode for GradeNode {
         let Some(gp) = world.get_resource::<GradePipeline>() else {
             return Ok(()); // grade disabled
         };
+        // Runtime UI toggle: when the grade is switched off the main world swaps the camera back
+        // to TonyMcMapface (apply_gfx_camera in main.rs); this node just steps aside.
+        if let Some(s) = world.get_resource::<crate::render::GfxSettings>() {
+            if !s.grade {
+                return Ok(());
+            }
+        }
         let cache = world.resource::<PipelineCache>();
         let Some(pipeline) = cache.get_render_pipeline(gp.pipeline_id) else {
             return Ok(()); // still compiling
@@ -325,6 +332,26 @@ impl ViewNode for GradeNode {
 /// the tonemap — see main.rs).
 pub struct GradePlugin;
 
+/// Live-tune the 48-byte GradeParams uniform from the UI settings (exposure / vignette).
+/// A per-frame 48 B write is free; skipping change-detection keeps it robust across worlds.
+fn update_grade_params(
+    queue: Res<bevy::render::renderer::RenderQueue>,
+    gp: Option<Res<GradePipeline>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+) {
+    let (Some(gp), Some(s)) = (gp, settings) else { return };
+    queue.write_buffer(
+        &gp.params,
+        0,
+        bytemuck::bytes_of(&GradeParamsGpu {
+            exposure: s.grade_exposure,
+            _pad: [0.0; 3],
+            vig: [1.15, 0.95, 0.55, 1.25],
+            vig_strength: [if s.vignette { 0.488 } else { 0.0 }, 0.0, 0.0, 0.0],
+        }),
+    );
+}
+
 impl Plugin for GradePlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(ExtractResourcePlugin::<GradeLutCpu>::default());
@@ -333,6 +360,10 @@ impl Plugin for GradePlugin {
         };
         render_app
             .add_systems(RenderStartup, init_grade_pipeline)
+            .add_systems(
+                bevy::render::Render,
+                update_grade_params.in_set(bevy::render::RenderSystems::PrepareResources),
+            )
             .add_render_graph_node::<ViewNodeRunner<GradeNode>>(Core3d, GradeLabel)
             .add_render_graph_edges(Core3d, (Node3d::Bloom, GradeLabel, Node3d::Tonemapping));
     }
