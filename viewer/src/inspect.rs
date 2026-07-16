@@ -137,11 +137,12 @@ fn pick_markers(
 fn draw_cards(
     mut contexts: bevy_egui::EguiContexts,
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
-    markers: Query<(&GlobalTransform, &MarkerInfo, &PickRadius)>,
+    markers: Query<(&GlobalTransform, &MarkerInfo, &PickRadius, Option<&crate::poi::MarkerValue>)>,
     mut open: ResMut<OpenCards>,
     mut pointer_on_ui: ResMut<PointerOnUi>,
     mut ui_kb: ResMut<UiWantsKeyboard>,
     mut route: MessageWriter<crate::pathfind::RouteRequest>,
+    mut plan: ResMut<crate::ui::PlanList>,
 ) {
     use bevy_egui::egui::{self, Align, Align2, Button, Color32, Layout, RichText};
 
@@ -157,7 +158,7 @@ fn draw_cards(
 
     let mut to_close: Vec<Entity> = Vec::new();
     for &e in open.0.iter() {
-        let Ok((tf, info, radius)) = markers.get(e) else {
+        let Ok((tf, info, radius, val)) = markers.get(e) else {
             to_close.push(e); // marker despawned — drop its stale card
             continue;
         };
@@ -205,15 +206,37 @@ fn draw_cards(
                     for d in &info.detail {
                         ui.label(RichText::new(d).color(Color32::from_gray(228)).size(12.0));
                     }
-                    // One-click route from the camera to this marker (pathfind server).
+                    // One-click route from the camera to this marker (pathfind server), plus
+                    // pin/unpin into the raid plan (the panel's "Raid plan" section lists the
+                    // pins; ui::PlanList). Pin state keys off the marker ENTITY, so re-clicking
+                    // the same marker toggles rather than duplicating.
                     ui.add_space(2.0);
-                    if ui.small_button("route here").clicked() {
-                        route.write(crate::pathfind::RouteRequest {
-                            start: None,
-                            dests: vec![tf.translation()],
-                            optimize_order: false,
-                        });
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("route here").clicked() {
+                            route.write(crate::pathfind::RouteRequest {
+                                start: None,
+                                dests: vec![tf.translation()],
+                                optimize_order: false,
+                            });
+                        }
+                        let pinned = plan.pins.iter().any(|p| p.entity == e);
+                        if ui
+                            .small_button(if pinned { "unpin" } else { "pin" })
+                            .on_hover_text("toggle in the Raid plan list (layers panel)")
+                            .clicked()
+                        {
+                            if pinned {
+                                plan.pins.retain(|p| p.entity != e);
+                            } else {
+                                plan.pins.push(crate::ui::PlanPin {
+                                    entity: e,
+                                    title: info.title.clone(),
+                                    pos: tf.translation(),
+                                    value: val.map(|v| v.0).unwrap_or(0),
+                                });
+                            }
+                        }
+                    });
                 });
             });
     }

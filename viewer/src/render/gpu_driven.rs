@@ -677,6 +677,9 @@ pub struct CpuData {
     /// Bindless albedo indices that are terrain CONTROL maps (blend weights = data, not color):
     /// uploaded LINEAR instead of sRGB so the weights aren't gamma-warped toward one layer.
     ctrl_tex_linear: std::collections::HashSet<u32>,
+    /// Meshes with >=1 BLEND submesh: (mesh index, first-instance world center). Drives the
+    /// per-mesh sorted blend items (back-to-front) instead of a whole-scene P2 re-raster.
+    blend_meshes: Vec<(u32, [f32; 3])>,
     /// #5 shadows: sun direction (points TOWARD the sun) X-flipped into pack space, or `None` when
     /// the volume sidecar has no valid `sun_dir` (the shadow feature then disables itself; no
     /// invented fallback direction). Mirrors standard.rs's exact access + flip.
@@ -1197,6 +1200,10 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let mut index_data: Vec<u32> = Vec::new();
     let mut instances: Vec<InstanceGpuRecord> = Vec::new();
     let mut mesh_meta: Vec<MeshMeta> = Vec::new();
+    // Blend-pass restructure (Codex review): per-mesh material class + a representative center
+    // for back-to-front sorting of the per-mesh blend draws. class: 0=opaque-only, 1=blend-only,
+    // 2=mixed (drawn in both passes; fragment class-discard splits it).
+    let mut blend_meshes: Vec<(u32, [f32; 3])> = Vec::new();
 
     let mut vtx_cursor: u32 = 0;
     let mut idx_cursor: u32 = 0;
@@ -1269,6 +1276,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         let bs = local_spheres[mi];
         let local_center = Vec3::new(bs[0], bs[1], bs[2]);
         let local_r = bs[3];
+        let mut first_center: Option<Vec3> = None;
         for &i in inst_ids {
             let inst = &pack.instances[i as usize];
             let a = &inst.affine;
@@ -1283,9 +1291,37 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 ids: [mesh_meta.len() as u32, inst.flags, 0, 0],
                 sphere: [center.x, center.y, center.z, radius],
             });
+            if first_center.is_none() {
+                first_center = Some(center);
+            }
         }
         let instance_count = inst_ids.len() as u32;
         inst_cursor += instance_count;
+
+        // Blend class from the submeshes' FINAL material flags (terrain tagging ran earlier).
+        let (mut has_blend, mut has_opaque) = (false, false);
+        for sm in &m.submeshes {
+            let f = materials_gpu
+                .get(sm.material_id as usize)
+                .map(|mt| mt.flags)
+                .unwrap_or(0);
+            if f & MAT_FLAG_BLEND != 0 {
+                has_blend = true;
+            } else {
+                has_opaque = true;
+            }
+        }
+        let blend_class: u32 = match (has_opaque, has_blend) {
+            (_, false) => 0,
+            (false, true) => 1,
+            (true, true) => 2,
+        };
+        if blend_class != 0 {
+            blend_meshes.push((
+                mesh_meta.len() as u32,
+                first_center.unwrap_or(Vec3::ZERO).to_array(),
+            ));
+        }
 
         mesh_meta.push(MeshMeta {
             index_count,
@@ -1293,7 +1329,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             base_vertex,
             instance_base,
             instance_count,
-            _pad: [0; 3],
+            _pad: [blend_class, 0, 0],
         });
     }
 
@@ -1468,6 +1504,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         sh_volume,
         terrain,
         ctrl_tex_linear,
+        blend_meshes,
         sun_dir,
         instance_total,
         mesh_count,
@@ -1510,8 +1547,16 @@ struct EftDrawPipeline {
 struct EftGpuBuffers {
     vertex: Buffer,
     index: Buffer,
+    /// P1 OPAQUE indirect args (multidraw over all meshes; blend-only records zeroed by cs_reset).
+    /// Also drives the shadow casters (blend never casts).
     indirect: Buffer,
+    /// P2 BLEND indirect args (opaque-only records zeroed). Drawn as ONE record per blend mesh
+    /// from depth-sorted Transparent3d items — no whole-scene re-raster, stable back-to-front.
+    indirect_blend: Buffer,
     cull_uniform: Buffer,
+    /// (mesh index, first-instance world center) for every mesh with a BLEND submesh — the
+    /// per-frame sort key source for the per-mesh blend items.
+    blend_meshes: Vec<(u32, [f32; 3])>,
     mesh_count: u32,
     instance_total: u32,
 }
@@ -1618,7 +1663,8 @@ fn init_gpu_pipelines(
                 storage_buffer_read_only_sized(false, None), // 1: instances
                 storage_buffer_read_only_sized(false, None), // 2: mesh_meta
                 storage_buffer_sized(false, None),           // 3: visible (rw)
-                storage_buffer_sized(false, None),           // 4: indirect (rw)
+                storage_buffer_sized(false, None),           // 4: indirect OPAQUE (rw)
+                storage_buffer_sized(false, None),           // 5: indirect BLEND (rw)
             ),
         ),
     );
@@ -1738,6 +1784,12 @@ fn prepare_gpu_buffers(
         usage: BufferUsages::INDIRECT | BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    let indirect_blend = render_device.create_buffer(&BufferDescriptor {
+        label: Some("eft_gpu_indirect_blend"),
+        size: cpu.mesh_count as u64 * DRAW_ARG_STRIDE,
+        usage: BufferUsages::INDIRECT | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     // seed the cull uniform to all-zero planes (= everything visible) and zero screen-size
     // thresholds (= cull nothing) so frame 0, before the first frustum upload, draws rather
     // than randomly culling.
@@ -1761,6 +1813,7 @@ fn prepare_gpu_buffers(
             mesh_meta.as_entire_binding(),
             visible.as_entire_binding(),
             indirect.as_entire_binding(),
+            indirect_blend.as_entire_binding(),
         )),
     );
     let draw_bg = render_device.create_bind_group(
@@ -2254,7 +2307,9 @@ fn prepare_gpu_buffers(
         vertex,
         index,
         indirect,
+        indirect_blend,
         cull_uniform,
+        blend_meshes: cpu.blend_meshes.clone(),
         mesh_count: cpu.mesh_count,
         instance_total: cpu.instance_total,
     });
@@ -2691,12 +2746,15 @@ fn queue_gpu_driven(
             },
         );
 
+        let cam_pos = view.world_from_view.translation();
         for (entity, main_entity) in &markers {
             // Transparent3d sorts ASCENDING by distance (values increase toward the camera), so
-            // the OPAQUE item at a large NEGATIVE distance runs FIRST and writes depth; the BLEND
-            // item at ~0.0 runs after and depth-tests against that. Both share the same draw_fn /
-            // multi-draw command and differ ONLY by pipeline (P1 discards BLEND mats, P2 discards
-            // the rest), so each pass draws exactly its material class in one multi_draw.
+            // the OPAQUE item at a large NEGATIVE distance runs FIRST and writes depth. Blend
+            // meshes then draw as ONE ITEM EACH, depth-sorted back-to-front (farthest = most
+            // negative = first), each issuing a single indirect record from indirect_blend —
+            // this replaced the whole-scene P2 re-raster AND gave transparency a stable order
+            // (Codex review). Mixed-class meshes draw in both passes; the fragment class-discard
+            // splits them.
             phase.add(Transparent3d {
                 entity: (entity, *main_entity),
                 pipeline: opaque_pipeline,
@@ -2706,15 +2764,22 @@ fn queue_gpu_driven(
                 extra_index: PhaseItemExtraIndex::None,
                 indexed: true,
             });
-            phase.add(Transparent3d {
-                entity: (entity, *main_entity),
-                pipeline: blend_pipeline,
-                draw_function: draw_fn,
-                distance: 0.0, // sort AFTER opaque (depth-tests against P1's writes)
-                batch_range: 0..1,
-                extra_index: PhaseItemExtraIndex::None,
-                indexed: true,
-            });
+            for (mesh_idx, center) in &_buffers.blend_meshes {
+                let d = (cam_pos - Vec3::from_array(*center)).length();
+                phase.add(Transparent3d {
+                    entity: (entity, *main_entity),
+                    pipeline: blend_pipeline,
+                    draw_function: draw_fn,
+                    // increases toward the camera; all values > -1e30 so opaque still sorts first
+                    distance: -d,
+                    batch_range: 0..1,
+                    extra_index: PhaseItemExtraIndex::IndirectParametersIndex {
+                        range: *mesh_idx..(*mesh_idx + 1),
+                        batch_set_index: None,
+                    },
+                    indexed: true,
+                });
+            }
         }
     }
 }
@@ -3057,7 +3122,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
 
     #[inline]
     fn render<'w>(
-        _item: &P,
+        item: &P,
         _view: (),
         _entity: Option<()>,
         (buffers, draw_bg, material_bg, sh_bg): SystemParamItem<'w, '_, Self::Param>,
@@ -3079,12 +3144,22 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
         pass.set_vertex_buffer(0, buffers.vertex.slice(..));
         pass.set_index_buffer(buffers.index.slice(..), 0, IndexFormat::Uint32);
 
-        // ONE multi-draw for ALL meshes: the GPU reads every mesh's DrawIndexedIndirectArgs
-        // (index_count / first_index / base_vertex / instance_base + the cull-filled
-        // instance_count) straight from the indirect buffer â€” near-zero CPU submission
-        // (replaces a 6.5k-call loop). Fully-culled meshes have instance_count 0 â†’ nothing
-        // drawn. Requires MULTI_DRAW_INDIRECT (guarded at pipeline init).
-        pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count);
+        // OPAQUE item (extra_index None): ONE multi-draw for ALL meshes from the opaque indirect
+        // buffer (blend-only records are zeroed by cs_reset). BLEND items carry their mesh index
+        // in IndirectParametersIndex and draw exactly ONE record from indirect_blend, already
+        // depth-sorted by the phase. Requires MULTI_DRAW_INDIRECT (guarded at pipeline init).
+        match item.extra_index() {
+            PhaseItemExtraIndex::IndirectParametersIndex { range, .. } => {
+                pass.multi_draw_indexed_indirect(
+                    &buffers.indirect_blend,
+                    range.start as u64 * DRAW_ARG_STRIDE,
+                    1,
+                );
+            }
+            _ => {
+                pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count);
+            }
+        }
         RenderCommandResult::Success
     }
 }

@@ -39,7 +39,7 @@ struct MeshMeta {
     base_vertex: i32,
     instance_base: u32,
     instance_count: u32,
-    pad0: u32,
+    blend_class: u32,   // 0 = opaque-only, 1 = blend-only, 2 = mixed (draws in both passes)
     pad1: u32,
     pad2: u32,
 };
@@ -66,18 +66,29 @@ struct CullGlobals {
 @group(0) @binding(1) var<storage, read>        instances: array<InstanceGpu>;
 @group(0) @binding(2) var<storage, read>        mesh_meta: array<MeshMeta>;
 @group(0) @binding(3) var<storage, read_write>  visible: array<u32>;
-@group(0) @binding(4) var<storage, read_write>  indirect: array<DrawArgs>;
+@group(0) @binding(4) var<storage, read_write>  indirect: array<DrawArgs>;        // P1 opaque (+ shadow casters)
+@group(0) @binding(5) var<storage, read_write>  indirect_blend: array<DrawArgs>;  // P2 per-mesh blend draws
 
 @compute @workgroup_size(64)
 fn cs_reset(@builtin(global_invocation_id) gid: vec3<u32>) {
     let m = gid.x;
     if (m >= G.counts.y) { return; }
     let mm = mesh_meta[m];
-    indirect[m].index_count = mm.index_count;
+    // Class-split indirect args: the OPAQUE buffer zeroes blend-only meshes (P1 + the shadow
+    // casters skip them entirely); the BLEND buffer zeroes opaque-only meshes. Mixed meshes
+    // keep their full index run in BOTH (the fragment class-discard splits the materials).
+    let opaque_count = select(mm.index_count, 0u, mm.blend_class == 1u);
+    let blend_count  = select(0u, mm.index_count, mm.blend_class != 0u);
+    indirect[m].index_count = opaque_count;
     indirect[m].first_index = mm.first_index;
     indirect[m].base_vertex = mm.base_vertex;
     indirect[m].first_instance = mm.instance_base;   // static per-mesh region base
     atomicStore(&indirect[m].instance_count, 0u);
+    indirect_blend[m].index_count = blend_count;
+    indirect_blend[m].first_index = mm.first_index;
+    indirect_blend[m].base_vertex = mm.base_vertex;
+    indirect_blend[m].first_instance = mm.instance_base;
+    atomicStore(&indirect_blend[m].instance_count, 0u);
 }
 
 fn sphere_visible(center: vec3<f32>, radius: f32) -> bool {
@@ -132,6 +143,10 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let mesh_id = inst.ids.x;
     let base = mesh_meta[mesh_id].instance_base;
+    // The OPAQUE buffer's counter is the CANONICAL slot allocator for visible[]; the blend
+    // buffer's counter converges to the same total (same survivors), so both passes read the
+    // identical visible[base .. base+count) range.
     let slot = atomicAdd(&indirect[mesh_id].instance_count, 1u);
+    atomicAdd(&indirect_blend[mesh_id].instance_count, 1u);
     visible[base + slot] = i;
 }

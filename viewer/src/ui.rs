@@ -96,18 +96,95 @@ pub struct QuestTracker {
     pub max_level: u32,
 }
 
+/// One pinned marker in the raid plan. `entity` ties the pin back to the live marker so pins
+/// whose marker despawned self-prune; title/pos/value are snapshotted at pin time so the row
+/// renders without re-resolving the marker every frame.
+#[derive(Clone, PartialEq)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct PlanPin {
+    pub entity: Entity,
+    pub title: String,
+    pub pos: Vec3,
+    /// Estimated ruble value carried over from the marker's `poi::MarkerValue` (0 = unpriced).
+    pub value: i64,
+}
+
+/// The raid plan: markers pinned from their inspect cards ("pin" button, inspect.rs). Read and
+/// pruned by the panel's "Raid plan" section; mutations are click-gated so change detection
+/// stays quiet.
+#[derive(Resource, Default)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct PlanList {
+    pub pins: Vec<PlanPin>,
+}
+
+/// One saved camera view. `pos` is the exact camera position at save time; `target` is the point
+/// ~20 m along the camera forward that a bookmark click flies to (`CameraCommand::fly_to` reframes
+/// with the standard offset — see the panel's views row). Both persist so an exact-pose restore
+/// can be added later without a schema change.
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct Bookmark {
+    pub name: String,
+    pub pos: [f32; 3],
+    pub target: [f32; 3],
+}
+
+/// Saved camera views, persisted per map to `<pack>/bookmarks.json` (loaded once the pack is up,
+/// written on every real change from the panel).
+#[derive(Resource, Default, Clone, PartialEq)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct Bookmarks {
+    pub views: Vec<Bookmark>,
+    /// Set once the per-pack bookmarks.json load has run (whether or not the file existed).
+    pub loaded: bool,
+}
+
+/// Position-HUD toggle: the small top-left live camera-coords readout (`pos_hud`). Default ON;
+/// flipped by the "position HUD" checkbox in the panel footer.
+#[derive(Resource)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct PosHud(pub bool);
+impl Default for PosHud {
+    fn default() -> Self {
+        Self(true)
+    }
+}
+
 pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LayerToggles>()
             .init_resource::<UiSearch>()
             .init_resource::<QuestTracker>()
-            .add_systems(Update, apply_loot_visibility);
+            .init_resource::<PlanList>()
+            .init_resource::<Bookmarks>()
+            .init_resource::<PosHud>()
+            .add_systems(Update, (apply_loot_visibility, load_bookmarks));
         // egui UI MUST run in EguiPrimaryContextPass (between egui's begin/end frame); in
         // plain Update the context has no fonts yet and `ctx_mut()` panics (bevy_egui 0.37).
         #[cfg(feature = "egui")]
-        app.add_systems(bevy_egui::EguiPrimaryContextPass, layers_panel);
+        app.add_systems(bevy_egui::EguiPrimaryContextPass, (layers_panel, pos_hud));
     }
+}
+
+/// One-shot: once the pack is loaded, read `<pack>/bookmarks.json` into `Bookmarks`. After the
+/// first success it's a single bool check per frame. A missing/corrupt file just means an empty
+/// list (the next save recreates it).
+fn load_bookmarks(mut bm: ResMut<Bookmarks>, pack: Option<Res<crate::render::LoadedPack>>) {
+    if bm.loaded {
+        return;
+    }
+    let Some(pack) = pack else {
+        return;
+    };
+    let path = pack.0.root.join("bookmarks.json");
+    let views = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|txt| serde_json::from_str::<Vec<Bookmark>>(&txt).ok())
+        .unwrap_or_default();
+    bm.views = views;
+    bm.loaded = true;
 }
 
 /// Show/hide loot markers by the master toggle AND the per-class filter AND the min-value
@@ -190,7 +267,8 @@ fn min_value_label(v: i64) -> String {
 #[cfg(feature = "egui")]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 /// Bundled params for the map dropdown + "Graphics (experimental)" section — keeps
-/// `layers_panel` under Bevy's 16-system-param limit.
+/// `layers_panel` under Bevy's 16-system-param limit. Also carries the raid-planning state
+/// (pin list, camera bookmarks, position-HUD toggle, camera transform) for the same reason.
 #[derive(bevy::ecs::system::SystemParam)]
 struct GfxUiParams<'w, 's> {
     gfx: ResMut<'w, crate::render::GfxSettings>,
@@ -198,8 +276,17 @@ struct GfxUiParams<'w, 's> {
     pack: Option<Res<'w, crate::render::LoadedPack>>,
     /// (display name, pack path) list, scanned once from the packs/ dir beside the current pack.
     pack_list: bevy::ecs::system::Local<'s, Option<Vec<(String, String)>>>,
+    /// Raid plan pins (inspect-card "pin" button fills it; the panel section lists/prunes it).
+    plan: ResMut<'w, PlanList>,
+    /// Saved camera views (persisted per pack to bookmarks.json).
+    bookmarks: ResMut<'w, Bookmarks>,
+    /// Position-HUD on/off (footer checkbox).
+    hud: ResMut<'w, PosHud>,
+    /// The fly-cam transform (root-level entity, so `Transform` IS world space) for "save view".
+    cam: Query<'w, 's, &'static Transform, With<crate::render::CullCamera>>,
 }
 
+#[cfg(feature = "egui")]
 fn layers_panel(
     mut contexts: bevy_egui::EguiContexts,
     mut gfx_ui: GfxUiParams,
@@ -241,6 +328,11 @@ fn layers_panel(
     // Widgets edit these copies; the deltas are written back once at the end only if real.
     let mut toggles = toggles_res.clone();
     let mut tracker = tracker_res.clone();
+    // Same clone-compare for the bookmarks (write-back also persists to bookmarks.json) and the
+    // HUD toggle. The raid-plan list is NOT cloned: its mutations are all click-gated, so it
+    // never dirties change detection from mere rendering.
+    let mut bm = gfx_ui.bookmarks.clone();
+    let mut hud_on = gfx_ui.hud.0;
     const ACCENT: Color32 = Color32::from_rgb(232, 194, 122); // warm tactical amber
     const HDR: Color32 = Color32::from_rgb(160, 164, 160);
     const MUTED: Color32 = Color32::from_rgb(120, 122, 120);
@@ -336,6 +428,53 @@ fn layers_panel(
                         }
                     });
             });
+            // ---- CAMERA BOOKMARKS (per map, persisted to <pack>/bookmarks.json). "save view"
+            // snapshots the fly-cam; clicking a row flies to the stored TARGET via the standard
+            // `CameraCommand` framing (fly_to is the only camera command — the exact saved pose
+            // isn't restorable without touching main.rs, so pos is stored but unused for now).
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("views").color(MUTED).size(11.0));
+                if ui
+                    .small_button("save view")
+                    .on_hover_text("bookmark the current camera view (persists per map)")
+                    .clicked()
+                {
+                    if let Ok(tf) = gfx_ui.cam.single() {
+                        let pos = tf.translation;
+                        let target = pos + tf.forward() * 20.0;
+                        let mut n = bm.views.len() + 1;
+                        while bm.views.iter().any(|b| b.name == format!("View {n}")) {
+                            n += 1;
+                        }
+                        bm.views.push(Bookmark {
+                            name: format!("View {n}"),
+                            pos: pos.to_array(),
+                            target: target.to_array(),
+                        });
+                    }
+                }
+            });
+            let mut bm_remove: Option<usize> = None;
+            for (i, b) in bm.views.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    if ui
+                        .selectable_label(false, RichText::new(&b.name).size(12.0))
+                        .on_hover_text("fly to this view")
+                        .clicked()
+                    {
+                        cam_cmd.fly_to = Some(Vec3::from(b.target));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button(RichText::new("\u{00D7}").size(12.0)).clicked() {
+                            bm_remove = Some(i);
+                        }
+                    });
+                });
+            }
+            if let Some(i) = bm_remove {
+                bm.views.remove(i);
+            }
             ui.add_space(4.0);
             ui.add(
                 egui::TextEdit::singleline(&mut search.query)
@@ -457,6 +596,108 @@ fn layers_panel(
                 .id_salt("panel_body")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    // ===== RAID PLAN (markers pinned from their inspect cards) =====
+                    // Self-prune pins whose marker entity despawned; write back only when
+                    // something was actually dropped so change detection stays quiet.
+                    let alive: Vec<PlanPin> = gfx_ui
+                        .plan
+                        .pins
+                        .iter()
+                        .filter(|p| markers.get(p.entity).is_ok())
+                        .cloned()
+                        .collect();
+                    if alive.len() != gfx_ui.plan.pins.len() {
+                        gfx_ui.plan.pins = alive;
+                    }
+                    let n_pins = gfx_ui.plan.pins.len();
+                    CollapsingHeader::new(section_hdr("Raid plan", n_pins, HDR))
+                        .id_salt("sec_plan")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            if n_pins == 0 {
+                                ui.label(
+                                    RichText::new("pin markers from their info cards")
+                                        .size(10.0)
+                                        .italics()
+                                        .color(MUTED),
+                                );
+                                return;
+                            }
+                            let mut remove: Option<usize> = None;
+                            for (i, pin) in gfx_ui.plan.pins.iter().enumerate() {
+                                ui.horizontal(|ui| {
+                                    let mut row = pin.title.clone();
+                                    if pin.value > 0 {
+                                        row.push_str(&format!(
+                                            "  {}",
+                                            crate::inspect::money(pin.value)
+                                        ));
+                                    }
+                                    if ui
+                                        .selectable_label(false, RichText::new(row).size(12.0))
+                                        .on_hover_text("fly to this pin")
+                                        .clicked()
+                                    {
+                                        cam_cmd.fly_to = Some(pin.pos);
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .small_button(
+                                                    RichText::new("\u{00D7}").size(12.0),
+                                                )
+                                                .clicked()
+                                            {
+                                                remove = Some(i);
+                                            }
+                                        },
+                                    );
+                                });
+                            }
+                            if let Some(i) = remove {
+                                gfx_ui.plan.pins.remove(i);
+                            }
+                            let total: i64 =
+                                gfx_ui.plan.pins.iter().map(|p| p.value.max(0)).sum();
+                            if total > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "total  {}",
+                                        crate::inspect::money(total)
+                                    ))
+                                    .size(11.0)
+                                    .color(Color32::from_gray(210)),
+                                );
+                            }
+                            ui.add_space(2.0);
+                            // Routing needs the :8091 server up — same gate as the Pathfinding
+                            // section's "Route: nearest extract" button.
+                            let pf_running = server.status == ServerStatus::Running;
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(pf_running, egui::Button::new("Route plan"))
+                                    .on_hover_text(
+                                        "shortest tour through every pin (pathfind server)",
+                                    )
+                                    .clicked()
+                                {
+                                    let dests: Vec<Vec3> =
+                                        gfx_ui.plan.pins.iter().map(|p| p.pos).collect();
+                                    if !dests.is_empty() {
+                                        route_writer.write(RouteRequest {
+                                            start: None,
+                                            dests,
+                                            optimize_order: true,
+                                        });
+                                    }
+                                }
+                                if ui.button("Clear").clicked() {
+                                    gfx_ui.plan.pins.clear();
+                                }
+                            });
+                        });
+
                     // ===== LOOT =====
                     // The active min-value filter is surfaced in the header so it's visible even
                     // when the section is collapsed.
@@ -892,6 +1133,9 @@ fn layers_panel(
                             .italics()
                             .color(MUTED),
                     );
+                    ui.add_space(2.0);
+                    ui.checkbox(&mut hud_on, RichText::new("position HUD").size(11.0))
+                        .on_hover_text("live camera coords, top-left - copy for callouts");
                 });
         });
 
@@ -902,6 +1146,72 @@ fn layers_panel(
     if tracker != *tracker_res {
         *tracker_res = tracker;
     }
+    if hud_on != gfx_ui.hud.0 {
+        gfx_ui.hud.0 = hud_on;
+    }
+    // Bookmarks: a real change (save view / remove) also persists to <pack>/bookmarks.json.
+    // A write failure only warns — the in-memory list still updates for this session.
+    if bm != *gfx_ui.bookmarks {
+        if let Some(pack) = gfx_ui.pack.as_ref() {
+            let path = pack.0.root.join("bookmarks.json");
+            match serde_json::to_string_pretty(&bm.views) {
+                Ok(txt) => {
+                    if let Err(e) = std::fs::write(&path, txt) {
+                        warn!("ui: bookmarks save failed ({}): {e}", path.display());
+                    }
+                }
+                Err(e) => warn!("ui: bookmarks serialize failed: {e}"),
+            }
+        }
+        *gfx_ui.bookmarks = bm;
+    }
+}
+
+/// POSITION HUD — a small live camera-coords readout (top-left, under the pick readout) with a
+/// "copy" button so callouts can be shared. Toggled by `PosHud` (panel-footer checkbox). Styled
+/// to match the pick readout: dark translucent box, small light text.
+#[cfg(feature = "egui")]
+fn pos_hud(
+    mut contexts: bevy_egui::EguiContexts,
+    hud: Res<PosHud>,
+    cams: Query<&Transform, With<crate::render::CullCamera>>,
+) {
+    use bevy_egui::egui::{self, Color32, RichText};
+    if !hud.0 {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    let Ok(tf) = cams.single() else {
+        return;
+    };
+    let p = tf.translation;
+    let coords = format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z);
+    egui::Area::new(egui::Id::new("pos_hud"))
+        .fixed_pos(egui::pos2(8.0, 36.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 153))
+                .inner_margin(egui::Margin::same(6))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("POS")
+                                .size(11.0)
+                                .color(Color32::from_rgb(160, 164, 160)),
+                        );
+                        ui.label(
+                            RichText::new(&coords)
+                                .size(13.0)
+                                .color(Color32::from_rgb(230, 245, 230)),
+                        );
+                        if ui.small_button("copy").clicked() {
+                            ui.ctx().copy_text(coords.clone());
+                        }
+                    });
+                });
+        });
 }
 
 /// Section header text: name + a dim count of markers in that section.
