@@ -2,11 +2,20 @@
 """#4 GRASS — deterministic placement from the GPU-Instancer density grids.
 
 EFT grass is baked GPU-Instancer density (NOT Unity terrain detail — that DB is a zeroed
-decoy). We already extracted the 4 slice density grids (grass_density_Slice_*.bin, 1024^2
-uint8, road/building-excluding, hand-authored). This emits one grass instance per non-empty
-cell (deterministic per-cell hash for rotation/scale — NEVER client-random), placed on the
-terrain surface via a UV->world bilinear lookup built from the pack's terrain meshes (so XZ
-AND height are exact and in pack space).
+decoy). The extractor (extraction/unity/eft_extract_grass.py) dumps per-slice combined grids
+(grass_density_Slice_*.bin, side^2 uint8; side=512 on interchange/lighthouse — the game's
+int32[512*512] detail arrays summed over ~12-22 prototypes, road/building-excluding,
+hand-authored). This emits one grass instance per non-empty cell (deterministic per-cell hash
+for rotation/scale — NEVER client-random), placed on the terrain surface via a UV->world
+bilinear lookup built from the pack's terrain meshes (so XZ AND height are exact and in pack
+space).
+
+GRID ORIENTATION: grids are dumped in GAME row order (Unity detail [row=z][col=x], terrain-
+local). Our terrain meshes carry UVs in the Unity heightmap/splat IMAGE frame — u = x_frac,
+but v = 1 - z_frac (validated: splat ctrl textures sampled with these UVs render correctly) —
+so grid cell (col cx, row cy) samples the mesh at u=(cx+.5)/side, v=1-(cy+.5)/side.
+Verified against road footprints + sea level on lighthouse AND interchange (the un-flipped
+mapping drops 75% of lighthouse Slice_5_4's clumps into the sea).
 
 Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 (20 B), pack space.
         <pack>/grass_sidecar.json = {count, albedo, tint}
@@ -19,17 +28,23 @@ import numpy as np
 # Cross-map albedo fallback for packs whose terrain_layers ship no grass texture.
 FALLBACK_ALBEDO = r"C:/Users/user/beamng_blender_pipeline/eft_assets/interchange_v2/terrain_layers/grass_Grass3_D.png"
 FLAG_TERRAIN = 1 << 1
-# Road/asphalt SURFACE meshes (laid ON the grass terrain, so the density grid still has grass
-# under them -> grass pokes through). Their XZ footprint masks grass. Exclude non-surface props
-# that happen to be named road_* (signs, lamps, fences, barriers).
+# Road/asphalt SURFACE meshes (laid ON the grass terrain; the game grids are road-excluding but
+# leave some road-EDGE cells nonzero, and decal-role roads sit millimetres above the terrain, so
+# a safety mask is kept). Their XZ footprint masks grass. Exclude non-surface props that happen
+# to match (signs, lamps, fences, barriers, WIRE splines — wires cross grass fields).
+# NB 'light(?!house)': plain 'light' matched 'Lighthouse_main_road_*', silently disabling the
+# whole mask on Lighthouse (dry tufts through the main road).
 ROAD_RE = re.compile(r"road|asphalt|spline|tarcola|parking|sidewalk|\bcurb", re.I)
-ROAD_NOT_RE = re.compile(r"sign|lamp|light|fence|barrier|pole|rail|wall|cone|bollard", re.I)
+ROAD_NOT_RE = re.compile(r"sign|lamp|light(?!house)|fence|barrier|pole|rail|wall|cone|bollard|wire", re.I)
 
 
 def _rasterize_tri_xz(cells, cell, ax, az, bx, bz, cx, cz):
-    """Add every grid cell whose center falls inside triangle (a,b,c) projected to XZ.
-    Cell index k under the round(w/cell) convention has its center at world k*cell, so we
-    test the barycentric half-plane sign at PX=gx*cell (matches the clump lookup exactly)."""
+    """Add every grid cell whose center falls inside triangle (a,b,c) projected to XZ, PLUS the
+    cells under the triangle's edges. Cell index k under the round(w/cell) convention has its
+    center at world k*cell, so we test the barycentric half-plane sign at PX=gx*cell (matches
+    the clump lookup exactly). The edge pass is the conservative half: a thin road strip can
+    contain no cell center at all and would otherwise contribute nothing (dilation cannot grow
+    an empty seed)."""
     minx = int(np.floor(min(ax, bx, cx) / cell)); maxx = int(np.ceil(max(ax, bx, cx) / cell))
     minz = int(np.floor(min(az, bz, cz) / cell)); maxz = int(np.ceil(max(az, bz, cz) / cell))
     if maxx - minx > 1400 or maxz - minz > 1400:   # guard vs a mismatched map-spanning mesh
@@ -44,6 +59,13 @@ def _rasterize_tri_xz(cells, cell, ax, az, bx, bz, cx, cz):
     inside = ~(((d1 < 0) | (d2 < 0) | (d3 < 0)) & ((d1 > 0) | (d2 > 0) | (d3 > 0)))
     zz, xx = np.where(inside)
     cells.update(zip(gx[xx].tolist(), gz[zz].tolist()))
+    # conservative edge sampling at half-cell spacing (bounded by the same span guard above)
+    for (x0, z0, x1, z1) in ((ax, az, bx, bz), (bx, bz, cx, cz), (cx, cz, ax, az)):
+        npt = int(max(abs(x1 - x0), abs(z1 - z0)) / (cell * 0.5)) + 1
+        t = np.linspace(0.0, 1.0, npt + 1)
+        ex = np.round((x0 + (x1 - x0) * t) / cell).astype(np.int64)
+        ez = np.round((z0 + (z1 - z0) * t) / cell).astype(np.int64)
+        cells.update(zip(ex.tolist(), ez.tolist()))
 
 
 def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
@@ -73,8 +95,10 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
         me = id2mesh[mid]; voff = me["vtxOffset"]
         ioff = me["idxOffset"]; ic = me["idxCount"]
         idx = mbnp[ioff:ioff + ic * 4].view("<u4").reshape(-1, 3)  # explicit LE (pack contract)
-        step = max(1, len(idx) // 4000)          # cap tris/instance on dense splines
-        for t in idx[::step]:
+        # NO triangle subsampling: index order gives no coverage guarantee, so a cap can drop
+        # arbitrary (even large) triangles and leave grass-through-road holes. Full raster is
+        # only ~14% more triangles than the old cap on interchange.
+        for t in idx:
             wx = [0.0, 0.0, 0.0]; wz = [0.0, 0.0, 0.0]
             for j in range(3):
                 o = voff + int(t[j]) * vs
@@ -93,8 +117,8 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
     print(f"[grass] road mask: {len(road_ids)} road meshes / {ninst} instances, {ntri} tris "
           f"-> {len(cells)} masked {cell}m cells")
     return cells, cell
-# density cell -> #instances by value band (sparse map is already road-excluding).
-# 1 clump per non-empty cell keeps it dense but bounded (~300k total on Interchange).
+# 1 clump per non-empty density cell keeps it dense but bounded (~435k on Lighthouse,
+# ~217k on Interchange at 512-res grids / 1.37m cells).
 
 
 def load_pack(pack):
@@ -105,12 +129,19 @@ def load_pack(pack):
 
 
 def terrain_uv_world_grid(mani, mb, aff, mesh):
-    """513x513 grid of world XYZ indexed [gy, gx], from the terrain mesh verts (uv->world)."""
+    """GxG grid of world XYZ indexed [gy, gx], from the terrain mesh verts (uv->world).
+    G is derived from the mesh's vertex count (513x513 heightmap grid on all current maps);
+    a non-square terrain mesh falls back to 513 with a warning. Nodes no vertex maps to stay
+    NaN — the caller counts them and clump placement skips non-finite lookups."""
     vl = mani["vertex"]; vs = vl["stride"]
     poff = next(a for a in vl["attrs"] if a["name"] == "position")["offset"]
     uoff = next(a for a in vl["attrs"] if a["name"] == "uv")["offset"]
     N = mesh["vtxCount"]; off = mesh["vtxOffset"]
-    G = 513  # 513x513 heightmap grid
+    G = int(round(N ** 0.5))
+    if G * G != N or G < 2:
+        print(f"[grass] WARNING: terrain mesh {mesh['name']} has {N} verts (not a square grid) "
+              f"- assuming 513x513 uv nodes")
+        G = 513
     grid = np.full((G, G, 3), np.nan, np.float32)
     a = aff  # row-major 3x4
     for k in range(N):
@@ -123,7 +154,10 @@ def terrain_uv_world_grid(mani, mb, aff, mesh):
         gx = int(round(u * (G - 1))); gy = int(round(v * (G - 1)))
         if 0 <= gx < G and 0 <= gy < G:
             grid[gy, gx] = (wx, wy, wz)
-    # fill any missing cells (rare) by nearest along rows
+    nan = int((~np.isfinite(grid[..., 0])).sum())
+    if nan:
+        print(f"[grass] WARNING: {mesh['name']}: {nan}/{G*G} uv grid nodes unfilled "
+              f"({100.0*nan/(G*G):.2f}%) - clumps hitting them are skipped")
     return grid
 
 
@@ -141,7 +175,10 @@ def bilinear(grid, u, v):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True)
-    ap.add_argument("--stride", type=int, default=2, help="place 1 clump per N density cells (2 = 1/4 density)")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="keep ~1/N^2 of the nonzero density cells (deterministic hash-selected, "
+                         "no parity bias). Default 1 = every nonzero cell: the 512-res grids "
+                         "(1.37m cells) already bound the count (~435k lighthouse, ~217k interchange)")
     a = ap.parse_args()
     pack = a.pack
     mani, mb, ib = load_pack(pack)
@@ -201,22 +238,35 @@ def main():
         side = int(round(len(raw) ** 0.5))
         if side * side != len(raw):
             print(f"[grass] {sname}: density file is {len(raw)} bytes (not square) - skipping"); continue
-        dens = raw.reshape(side, side)  # [row=y, col=x]; interchange/lighthouse ship 1024^2
+        dens = raw.reshape(side, side)  # GAME order: [row=terrain-local z, col=terrain-local x]
         grid = terrain_uv_world_grid(mani, mb, aff, me)
         ys, xs = np.nonzero(dens)
-        # subsample by stride for a bounded count
-        sel = (xs % a.stride == 0) & (ys % a.stride == 0)
-        xs, ys = xs[sel], ys[sel]
+        ngame = len(xs)
+        if a.stride > 1:
+            # deterministic hash selection (NOT xs%stride: 512 is divisible by common strides,
+            # so a modulo grid would alias against the density grid with origin-locked bias).
+            # The xor-shift/multiply finalizer avalanches the low bits so `% stride^2` does not
+            # fall back into a fixed diagonal lattice.
+            hh = (xs.astype(np.uint64) * np.uint64(73856093)) ^ (ys.astype(np.uint64) * np.uint64(19349663))
+            hh ^= hh >> np.uint64(13)
+            hh *= np.uint64(0x9E3779B97F4A7C15)
+            hh ^= hh >> np.uint64(29)
+            sel = (hh % np.uint64(a.stride * a.stride)) == 0
+            xs, ys = xs[sel], ys[sel]
         cnt = 0
+        sk = 0
         for cx, cy in zip(xs, ys):
+            # game grid row axis runs OPPOSITE the mesh v axis (see module docstring)
             u = (cx + 0.5) / float(side)
-            v = (cy + 0.5) / float(side)
-            w = bilinear(grid, u, v)
+            v = 1.0 - (cy + 0.5) / float(side)
+            # cast to f32 BEFORE the road test: records are stored as f32, so testing the f64
+            # bilinear value can round a half-cell boundary differently than consumers see it
+            w = np.asarray(bilinear(grid, u, v), np.float32)
             if not np.all(np.isfinite(w)):
                 continue
             # skip clumps that land under a road/asphalt surface mesh
             if (int(round(w[0] / rcell)), int(round(w[2] / rcell))) in road_cells:
-                skipped_road += 1
+                sk += 1
                 continue
             # deterministic per-cell hash -> rotation + scale (never client-random)
             h = (int(cx) * 73856093) ^ (int(cy) * 19349663)
@@ -225,7 +275,8 @@ def main():
             recs += struct.pack("<5f", float(w[0]), float(w[1]), float(w[2]), rot, scale)
             cnt += 1
         total += cnt
-        print(f"[grass] {sname}: {cnt} clumps")
+        skipped_road += sk
+        print(f"[grass] {sname}: {cnt} clumps ({ngame} game cells, {sk} road-masked)")
 
     if total == 0:
         raise SystemExit(f"[grass] FATAL: 0 clumps emitted for {pack} — "
