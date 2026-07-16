@@ -145,14 +145,20 @@ def main():
     a = ap.parse_args()
     pack = a.pack
     mani, mb, ib = load_pack(pack)
-    # per-pack terrain_layers dir (manifest sidecar is an absolute path to its manifest.json)
-    TL = os.path.dirname(mani["sidecars"]["terrainLayers"])
+    # per-pack terrain_layers dir (manifest sidecar is an absolute path to its manifest.json).
+    # Maps with no terrain sidecar or no density grids (indoor maps: Factory, Labs) simply have
+    # no grass — SKIP cleanly (write nothing, exit 0) so the all-maps build fleet doesn't abort.
+    # A map that HAS density grids but yields zero clumps still hard-fails below (that's a bug).
+    tl_side = (mani.get("sidecars") or {}).get("terrainLayers")
+    if not tl_side:
+        print(f"[grass] {pack}: no terrainLayers sidecar — grassless map, skipping"); return
+    TL = os.path.dirname(tl_side)
     # discover slice names from the density files (interchange: 4, lighthouse: 6, ...)
     names = sorted({re.search(r"(Slice_\d+_\d+)", os.path.basename(f)).group(1)
                     for f in glob.glob(os.path.join(TL, "grass_density_Slice_*.bin"))})
     if not names:
-        raise SystemExit(f"[grass] FATAL: no grass_density_Slice_*.bin found under {TL} — "
-                         f"refusing to emit an empty grass.bin (it would silently disable grass)")
+        print(f"[grass] {pack}: no grass_density_Slice_*.bin under {TL} — grassless map, skipping")
+        return
     print(f"[grass] density slices in {TL}: {names}")
     id2mesh = {m["id"]: m for m in mani["meshes"]}
     inst = mani["instance"]; istride = inst["stride"]

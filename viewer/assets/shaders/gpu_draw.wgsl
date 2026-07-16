@@ -168,7 +168,7 @@ const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed
 struct TerrainSplat {
     layer_albedo: array<u32, 12>,
     layer_rep: array<f32, 12>,
-    ctrl_idx: array<u32, 24>,   // up to 8 slices × 3 maps at [slice*3 + k] (slice names from sidecar)
+    ctrl_idx: array<u32, 48>,   // up to 16 slices × 3 maps at [slice*3 + k] (slice names from sidecar)
 };
 @group(2) @binding(4) var<storage, read> terrain_splat: TerrainSplat;
 

@@ -277,8 +277,9 @@ pub struct TerrainSplatGpu {
     pub layer_albedo: [u32; 12],
     /// per-layer UV repeat (`terrainUV01 * rep`).
     pub layer_rep: [f32; 12],
-    /// up to 8 slices × 3 control-map bindless indices: slice `s` map `k` at `[s*3 + k]`.
-    pub ctrl_idx: [u32; 24],
+    /// up to 16 slices × 3 control-map bindless indices: slice `s` map `k` at `[s*3 + k]`.
+    /// (Streets-scale maps can carry more slices than Interchange's 4 / Lighthouse's 6.)
+    pub ctrl_idx: [u32; 48],
 }
 
 // ---------------------------------------------------------------------------
@@ -994,7 +995,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let mut terrain = TerrainSplatGpu {
         layer_albedo: [0; 12],
         layer_rep: [1.0; 12],
-        ctrl_idx: [0; 24],
+        ctrl_idx: [0; 48],
     };
     // Control-map bindless indices: these are DATA (blend weights), not color — they must be
     // uploaded LINEAR, not sRGB-decoded, or the weights warp toward the dominant layer.
@@ -1035,12 +1036,12 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         // mapping; for Interchange the sorted order is identical to the old hardcoded const.
         let mut slice_names: Vec<String> = tiles.keys().cloned().collect();
         slice_names.sort();
-        if slice_names.len() > 8 {
+        if slice_names.len() > 16 {
             warn!(
-                "gpu-driven terrain: {} slices exceeds the 8-slice ctrl table — truncating",
+                "gpu-driven terrain: {} slices exceeds the 16-slice ctrl table — truncating",
                 slice_names.len()
             );
-            slice_names.truncate(8);
+            slice_names.truncate(16);
         }
         let mut layers_done = false;
         for (si, sname) in slice_names.iter().enumerate() {
@@ -1072,31 +1073,43 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             }
         }
         // Tag the terrain materials: FLAG_TERRAIN + slice index in _pad2, matte roughness.
+        // Cross-map correctness (audit): match the slice name as a WHOLE token (substring
+        // matching mis-assigned Slice_1_1's control maps to Slice_1_11 on >9-slice maps), and
+        // tag EVERY submesh's material, not just the first (multi-submesh terrain slices left
+        // their remaining submeshes un-splatted).
         let mut tagged = 0u32;
+        let token_match = |name: &str, s: &str| {
+            name.match_indices(s).any(|(i, _)| {
+                !name[i + s.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit())
+            })
+        };
         for inst in &pack.instances {
             if inst.flags & crate::eftpack::flags::TERRAIN == 0 {
                 continue;
             }
             let me = &pack.manifest.meshes[inst.mesh_id as usize];
-            let Some(slice) = slice_names.iter().position(|s| me.name.contains(s.as_str()))
+            let Some(slice) = slice_names.iter().position(|s| token_match(&me.name, s))
             else {
                 continue;
             };
-            let Some(sub) = me.submeshes.first() else { continue };
-            let mid = sub.material_id as usize;
-            if mid < materials_gpu.len() {
-                materials_gpu[mid].flags |= MAT_FLAG_TERRAIN;
-                // #6: terrain owns albedo/normal via the splat branch — it must NEVER enter the
-                // detail path. Clear any detail a terrain material might have carried (defensive;
-                // no known terrain material has a `detail` object). Same for RFA (terrain forces
-                // matte roughness below — the base albedo alpha is meaningless in the splat path)
-                // and emissive.
-                materials_gpu[mid].flags &= !(MAT_FLAG_DETAIL | MAT_FLAG_RFA);
-                materials_gpu[mid].detail_flags = 0;
-                materials_gpu[mid].emissive_index = NO_EMISSIVE;
-                materials_gpu[mid]._pad2 = slice as u32;
-                materials_gpu[mid].roughness = 0.95; // matte ground, no shiny slab
-                tagged += 1;
+            for sub in &me.submeshes {
+                let mid = sub.material_id as usize;
+                if mid < materials_gpu.len() {
+                    materials_gpu[mid].flags |= MAT_FLAG_TERRAIN;
+                    // #6: terrain owns albedo/normal via the splat branch — it must NEVER enter
+                    // the detail path. Clear any detail a terrain material might have carried
+                    // (defensive). Same for RFA (terrain forces matte roughness below — the base
+                    // albedo alpha is meaningless in the splat path) and emissive.
+                    materials_gpu[mid].flags &= !(MAT_FLAG_DETAIL | MAT_FLAG_RFA);
+                    materials_gpu[mid].detail_flags = 0;
+                    materials_gpu[mid].emissive_index = NO_EMISSIVE;
+                    materials_gpu[mid]._pad2 = slice as u32;
+                    materials_gpu[mid].roughness = 0.95; // matte ground, no shiny slab
+                    tagged += 1;
+                }
             }
         }
         info!(
