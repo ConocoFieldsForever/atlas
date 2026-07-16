@@ -29,7 +29,7 @@ struct InstanceGpu {
     m0: vec4<f32>,      // ROW-MAJOR world 3x4 affine, row 0 (incl shear+mirror)
     m1: vec4<f32>,      // row 1
     m2: vec4<f32>,      // row 2
-    ids: vec4<u32>,     // x=mesh_id  y=flags  z,w=pad
+    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class (1=grass -> bigger screen-size cull)  w=pad
     sphere: vec4<f32>,  // xyz = world-space center, w = conservative world radius
 };
 
@@ -55,7 +55,11 @@ struct DrawArgs {
 
 struct CullGlobals {
     frustum: array<vec4<f32>, 6>,   // 6 world planes, NORMALIZED, inward (visible: dot(n,c)+w >= -r)
-    counts: vec4<u32>,              // x=instance_count  y=mesh_count  z,w=pad
+    counts: vec4<u32>,              // x=instance_count  y=mesh_count  z=bitcast f32 k_grass  w=pad
+    // Screen-size cull anchor: xyz = camera world pos, w = k_general where
+    // k = min_px / (0.5 * viewport_h * proj11). Cull when sphere.w < k * distance(cam, center)
+    // (the sphere subtends fewer than min_px pixels). Zeros = disabled (frame-0 seed).
+    cam_k: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> G: CullGlobals;
@@ -116,6 +120,15 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     let sphere = inst.sphere;   // CPU-precomputed conservative world sphere (default path)
 #endif
     if (!sphere_visible(sphere.xyz, sphere.w)) { return; }
+
+    // Screen-size cull: drop instances whose bounding sphere subtends fewer than min_px pixels
+    // (grass uses a larger threshold — 100k+ ~1.3 m clumps are invisible way before the far
+    // plane and dominated the draw cost). k==0 (frame-0 seed / EFT_CULL_PX=0) disables.
+    let k = select(G.cam_k.w, bitcast<f32>(G.counts.z), inst.ids.z == 1u);
+    if (k > 0.0) {
+        let d = max(distance(G.cam_k.xyz, sphere.xyz), 1e-3);
+        if (sphere.w < k * d) { return; }
+    }
 
     let mesh_id = inst.ids.x;
     let base = mesh_meta[mesh_id].instance_base;

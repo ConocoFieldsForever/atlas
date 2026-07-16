@@ -123,13 +123,20 @@ pub struct DrawIndexedIndirectArgs {
     pub first_instance: u32,
 }
 
-/// Tiny per-frame cull uniform: 6 normalized inward frustum planes + counts. 112 bytes.
+/// Tiny per-frame cull uniform: 6 normalized inward frustum planes + counts + the screen-size
+/// cull anchor. 128 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct CullUniform {
     pub frustum: [[f32; 4]; 6],
-    /// x = instance_count, y = mesh_count, z,w = pad.
+    /// x = instance_count, y = mesh_count, z = bitcast f32 k_grass (grass screen-size cull
+    /// threshold — larger than the general one so 100k sub-pixel clumps drop early), w = pad.
     pub counts: [u32; 4],
+    /// Screen-size cull: xyz = camera world pos, w = k_general where
+    /// k = min_px / (0.5 * viewport_h * proj11). An instance is culled when its bounding-sphere
+    /// radius subtends fewer than min_px pixels: sphere.w < k * distance(cam, sphere.center).
+    /// Zeros = cull nothing (build-time seed before the first upload_frustum).
+    pub cam_k: [f32; 4],
 }
 
 /// Stride of one indirect draw record, in bytes.
@@ -199,13 +206,21 @@ pub struct GpuMaterial {
     /// x = albedo blend strength, y = detail normal scale, z = fade start (8 m), w = fade end (15 m). @128
     pub detail_params: [f32; 4],
     /// xyz = offline albedoMeanGain = mean(sample_linear × 4.5948); w = 1. Divisor for neutralize. @144
-    pub detail_mean_gain: [f32; 4], // -> total 160 bytes (16-aligned)
+    pub detail_mean_gain: [f32; 4],
+    // ---- Emissive: adds 16 bytes (160 -> 176). Windows / monitors / signs / lamps glow —
+    //      with the HDR view target + Bloom they read like the game's lit interiors. ----
+    /// bindless `albedo_tex` index of the emissive texture (sRGB, matching the pack's
+    /// conventions.colorSpace.emissive), or `NO_EMISSIVE`. @160
+    pub emissive_index: u32,
+    /// linear rgb emissive = factor × hdr, precomputed on CPU. Declared as 3 scalars (not a
+    /// vec3) in WGSL too, so the struct stays exactly 176 B with no implicit vec3 16-padding. @164
+    pub emissive_rgb: [f32; 3], // -> total 176 bytes (16-aligned)
 }
 
-// #6: compile-time guard that GpuMaterial stays byte-matched to the WGSL `MaterialGpu` (160 B, all
+// #6: compile-time guard that GpuMaterial stays byte-matched to the WGSL `MaterialGpu` (176 B, all
 // vec4 lanes 16-aligned). A silent mismatch here would corrupt EVERY material's GPU record, so this
 // is checked at `cargo check` time (const eval) rather than trusted by eye.
-const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 160);
+const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 176);
 const _: () = assert!(std::mem::align_of::<GpuMaterial>() == 4);
 
 /// `GpuMaterial::albedo_index` sentinel: material has no albedo texture.
@@ -237,15 +252,24 @@ pub const MAT_FLAG_TERRAIN: u32 = 1 << 4;
 /// albedo, RNM-blends the normal, and distance-fades both. NEVER set together with MAT_FLAG_TERRAIN
 /// (the terrain splat branch owns albedo/normal and must never enter the detail path).
 pub const MAT_FLAG_DETAIL: u32 = 1 << 5;
+/// `GpuMaterial::flags` bit: roughness-from-albedo-alpha (Unity Standard smoothness-in-alpha).
+/// The fragment derives per-pixel roughness = 1 - tex.a (raw alpha, NOT tint-multiplied) instead
+/// of the constant `roughness`. Only set for role=opaque (glass keeps its authored 0.05; cutout
+/// alpha is coverage, not smoothness); cleared again for terrain-tagged materials.
+pub const MAT_FLAG_RFA: u32 = 1 << 6;
 /// `GpuMaterial::detail_flags` bit0: this material has a detail ALBEDO texture.
 pub const DETAIL_FLAG_ALBEDO: u32 = 1 << 0;
 /// `GpuMaterial::detail_flags` bit1: this material has a detail NORMAL texture.
 pub const DETAIL_FLAG_NORMAL: u32 = 1 << 1;
+/// `GpuMaterial::emissive_index` sentinel: material has no emissive texture.
+pub const NO_EMISSIVE: u32 = 0xFFFF_FFFF;
 
 /// MicroSplat splat table (group(2) binding(4), storage). All indices are into the SAME bindless
 /// `albedo_tex` array as normal materials (the terrain textures are appended to `albedo_paths`).
 /// Layer `i` weight = control map `i/4`, channel `i%4`. `layer_uv = terrainUV01 * rep` (the value
-/// recovered from the MicroSplat material; NEVER `m_TileSize`). 144 bytes (12·4·3), 16-aligned.
+/// recovered from the MicroSplat material; NEVER `m_TileSize`). Slice names come from the
+/// terrainLayers sidecar itself (Interchange = 4 slices, Lighthouse = 6; capacity 8). 192 bytes,
+/// 16-aligned.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct TerrainSplatGpu {
@@ -253,8 +277,8 @@ pub struct TerrainSplatGpu {
     pub layer_albedo: [u32; 12],
     /// per-layer UV repeat (`terrainUV01 * rep`).
     pub layer_rep: [f32; 12],
-    /// 4 slices × 3 control-map bindless indices: slice `s` map `k` at `[s*3 + k]`.
-    pub ctrl_idx: [u32; 12],
+    /// up to 8 slices × 3 control-map bindless indices: slice `s` map `k` at `[s*3 + k]`.
+    pub ctrl_idx: [u32; 24],
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +649,9 @@ pub struct CpuData {
     sh_volume: Option<ShVolumeCpu>,
     /// #1 MicroSplat: the terrain splat table (layer/control bindless indices + per-layer rep).
     terrain: TerrainSplatGpu,
+    /// Bindless albedo indices that are terrain CONTROL maps (blend weights = data, not color):
+    /// uploaded LINEAR instead of sRGB so the weights aren't gamma-warped toward one layer.
+    ctrl_tex_linear: std::collections::HashSet<u32>,
     /// #5 shadows: sun direction (points TOWARD the sun) X-flipped into pack space, or `None` when
     /// the volume sidecar has no valid `sun_dir` (the shadow feature then disables itself; no
     /// invented fallback direction). Mirrors standard.rs's exact access + flip.
@@ -821,12 +848,19 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         if mat.role == "cutout" || mat.alpha_mode == "MASK" {
             flags |= MAT_FLAG_CUTOUT;
         }
+        // NOTE: water is EXCLUDED here (its alphaMode is BLEND in the pack) — the water block
+        // below decides blend vs opaque by whether it's a textured puddle or deep water.
         if mat.role == "decal"
             || mat.role == "glass"
-            || mat.role == "water"
-            || mat.alpha_mode == "BLEND"
+            || (mat.alpha_mode == "BLEND" && mat.role != "water")
         {
             flags |= MAT_FLAG_BLEND;
+        }
+        // Per-pixel roughness from the albedo alpha (Unity Standard smoothness-in-alpha).
+        // Opaque-only: glass keeps its authored sharp 0.05, cutout alpha is coverage. 82% of
+        // materials carry this — without it everything specular-shades at one constant roughness.
+        if mat.roughness_from_albedo_alpha && mat.role == "opaque" {
+            flags |= MAT_FLAG_RFA;
         }
         // M3b2 SoftCutout / water classification. The Vert-Paint SoftCutout family (Custom/Vert
         // Paint SoftCutout Decal) is identified by the `vp.softCutout` param triple — its BLEND
@@ -840,7 +874,33 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             flags |= MAT_FLAG_SOFTCUTOUT | MAT_FLAG_BLEND;
         }
         if mat.role == "water" {
-            flags |= MAT_FLAG_WATER | MAT_FLAG_BLEND;
+            flags |= MAT_FLAG_WATER;
+            // Textured water = a thin PUDDLE film: alpha-blended over the ground (P2).
+            // Untextured water = DEEP water (sea / basins): OPAQUE pass — depth-write on, so
+            // glass composites over it correctly and no pale clear-color bleeds through, and
+            // the surface can't z-fight with the unsorted blend pass.
+            if albedo_index != NO_ALBEDO {
+                flags |= MAT_FLAG_BLEND;
+            }
+        }
+        // Emissive (windows / monitors / signs / lamps): resolve the texture into the SAME
+        // bindless sRGB albedo array (conventions.colorSpace.emissive == "srgb"); rgb = factor×hdr
+        // precomputed. Both packs' emissive materials all carry textures — no factor-only path.
+        let mut emissive_index = NO_EMISSIVE;
+        let mut emissive_rgb = [0.0f32; 3];
+        if let Some(em) = &mat.emissive {
+            if let Some(p) = em.texture.as_deref().filter(|p| !p.is_empty()) {
+                emissive_index = *path_to_index.entry(p.to_string()).or_insert_with(|| {
+                    let idx = albedo_paths.len() as u32;
+                    albedo_paths.push(p.to_string());
+                    idx
+                });
+                emissive_rgb = [
+                    em.factor[0] * em.hdr,
+                    em.factor[1] * em.hdr,
+                    em.factor[2] * em.hdr,
+                ];
+            }
         }
         // #6 Detail maps: resolve the (optional) detail albedo + normal into the SAME bindless
         // arrays the base textures use — dedup by path via the SAME first-seen maps as the base
@@ -922,6 +982,8 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             detail_normal_uv,
             detail_params,
             detail_mean_gain,
+            emissive_index,
+            emissive_rgb,
         });
     }
 
@@ -932,8 +994,11 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let mut terrain = TerrainSplatGpu {
         layer_albedo: [0; 12],
         layer_rep: [1.0; 12],
-        ctrl_idx: [0; 12],
+        ctrl_idx: [0; 24],
     };
+    // Control-map bindless indices: these are DATA (blend weights), not color — they must be
+    // uploaded LINEAR, not sRGB-decoded, or the weights warp toward the dominant layer.
+    let mut ctrl_tex_linear: std::collections::HashSet<u32> = std::collections::HashSet::new();
     'terrain: {
         let Some(tl_path) = pack.manifest.sidecars.terrain_layers.as_deref() else {
             warn!("gpu-driven terrain: no terrainLayers sidecar — terrain stays single-layer");
@@ -965,14 +1030,27 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 idx
             })
         };
-        const SLICES: [&str; 4] = ["Slice_1_1", "Slice_1_2", "Slice_2_1", "Slice_2_2"];
+        // Slice names come from the sidecar itself (NOT a hardcoded list — that silently
+        // disabled MicroSplat on every non-Interchange map). Sorted for a stable slice->index
+        // mapping; for Interchange the sorted order is identical to the old hardcoded const.
+        let mut slice_names: Vec<String> = tiles.keys().cloned().collect();
+        slice_names.sort();
+        if slice_names.len() > 8 {
+            warn!(
+                "gpu-driven terrain: {} slices exceeds the 8-slice ctrl table — truncating",
+                slice_names.len()
+            );
+            slice_names.truncate(8);
+        }
         let mut layers_done = false;
-        for (si, sname) in SLICES.iter().enumerate() {
-            let Some(tile) = tiles.get(*sname) else { continue };
+        for (si, sname) in slice_names.iter().enumerate() {
+            let Some(tile) = tiles.get(sname) else { continue };
             if let Some(cm) = tile.get("ctrl_maps").and_then(|v| v.as_array()) {
                 for (k, c) in cm.iter().take(3).enumerate() {
                     if let Some(cn) = c.as_str() {
-                        terrain.ctrl_idx[si * 3 + k] = add_tex(cn);
+                        let idx = add_tex(cn);
+                        terrain.ctrl_idx[si * 3 + k] = idx;
+                        ctrl_tex_linear.insert(idx); // blend weights -> linear upload
                     }
                 }
             }
@@ -993,14 +1071,15 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 }
             }
         }
-        // Tag the 4 terrain materials: FLAG_TERRAIN + slice index (0..3) in _pad2, matte roughness.
+        // Tag the terrain materials: FLAG_TERRAIN + slice index in _pad2, matte roughness.
         let mut tagged = 0u32;
         for inst in &pack.instances {
             if inst.flags & crate::eftpack::flags::TERRAIN == 0 {
                 continue;
             }
             let me = &pack.manifest.meshes[inst.mesh_id as usize];
-            let Some(slice) = SLICES.iter().position(|s| me.name.contains(s)) else {
+            let Some(slice) = slice_names.iter().position(|s| me.name.contains(s.as_str()))
+            else {
                 continue;
             };
             let Some(sub) = me.submeshes.first() else { continue };
@@ -1009,16 +1088,20 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 materials_gpu[mid].flags |= MAT_FLAG_TERRAIN;
                 // #6: terrain owns albedo/normal via the splat branch — it must NEVER enter the
                 // detail path. Clear any detail a terrain material might have carried (defensive;
-                // no known terrain material has a `detail` object).
-                materials_gpu[mid].flags &= !MAT_FLAG_DETAIL;
+                // no known terrain material has a `detail` object). Same for RFA (terrain forces
+                // matte roughness below — the base albedo alpha is meaningless in the splat path)
+                // and emissive.
+                materials_gpu[mid].flags &= !(MAT_FLAG_DETAIL | MAT_FLAG_RFA);
                 materials_gpu[mid].detail_flags = 0;
+                materials_gpu[mid].emissive_index = NO_EMISSIVE;
                 materials_gpu[mid]._pad2 = slice as u32;
                 materials_gpu[mid].roughness = 0.95; // matte ground, no shiny slab
                 tagged += 1;
             }
         }
         info!(
-            "gpu-driven #1 terrain: MicroSplat table built (12 layers × 4 slices, {tagged} tiles tagged)"
+            "gpu-driven #1 terrain: MicroSplat table built (12 layers × {} slices, {tagged} tiles tagged)",
+            slice_names.len()
         );
     }
 
@@ -1222,6 +1305,8 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             normal_flags: 0,
             normal_scale: 1.0,
             _pad2: 0,
+            // No emissive: the all-zero Default would alias bindless slot 0 as an emissive map.
+            emissive_index: NO_EMISSIVE,
             // #6: grass carries no detail map.
             ..GpuMaterial::default()
         });
@@ -1266,7 +1351,9 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 m0: [c * sc, 0.0, s * sc, x],
                 m1: [0.0, sc, 0.0, y],
                 m2: [-s * sc, 0.0, c * sc, z],
-                ids: [mesh_meta.len() as u32, 0, 0, 0],
+                // ids.z = 1 tags GRASS for the cull's screen-size test (a clump's ~1.3 m sphere
+                // is sub-pixel long before the frustum far plane — cull it by projected size).
+                ids: [mesh_meta.len() as u32, 0, 1, 0],
                 sphere: [x, y + gh * sc * 0.5, z, 1.3 * sc],
             });
             count += 1;
@@ -1336,6 +1423,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         normal_paths,
         sh_volume,
         terrain,
+        ctrl_tex_linear,
         sun_dir,
         instance_total,
         mesh_count,
@@ -1598,11 +1686,13 @@ fn prepare_gpu_buffers(
         usage: BufferUsages::INDIRECT | BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    // seed the cull uniform to all-zero planes (= everything visible) so frame 0,
-    // before the first frustum upload, draws rather than randomly culling.
+    // seed the cull uniform to all-zero planes (= everything visible) and zero screen-size
+    // thresholds (= cull nothing) so frame 0, before the first frustum upload, draws rather
+    // than randomly culling.
     let seed = CullUniform {
         frustum: [[0.0; 4]; 6],
         counts: [cpu.instance_total, cpu.mesh_count, 0, 0],
+        cam_k: [0.0; 4],
     };
     let cull_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_cull_uniform"),
@@ -1649,8 +1739,14 @@ fn prepare_gpu_buffers(
     // a failed decode still pushes a placeholder at its slot to preserve that alignment.
     let mut textures: Vec<Texture> = Vec::with_capacity(cpu.albedo_paths.len());
     let mut views: Vec<TextureView> = Vec::with_capacity(cpu.albedo_paths.len());
-    for path in &cpu.albedo_paths {
-        let (tex, view) = load_albedo_texture(&render_device, &render_queue, path);
+    for (i, path) in cpu.albedo_paths.iter().enumerate() {
+        // Terrain CONTROL maps are blend weights (data, not color): load them LINEAR — the sRGB
+        // decode would gamma-warp the weights toward the dominant layer (visible splat banding).
+        let (tex, view) = if cpu.ctrl_tex_linear.contains(&(i as u32)) {
+            load_normal_texture(&render_device, &render_queue, path) // linear Rgba8Unorm loader
+        } else {
+            load_albedo_texture(&render_device, &render_queue, path)
+        };
         textures.push(tex);
         views.push(view);
     }
@@ -1692,6 +1788,9 @@ fn prepare_gpu_buffers(
         mag_filter: FilterMode::Linear,
         min_filter: FilterMode::Linear,
         mipmap_filter: FilterMode::Linear,
+        // 8x anisotropy: keeps ground/road textures sharp at grazing angles now that the full
+        // mip chain exists (valid because mag/min/mipmap are all Linear, a wgpu requirement).
+        anisotropy_clamp: 8,
         ..default()
     });
 
@@ -2168,6 +2267,31 @@ fn make_dummy_normal_texture(device: &RenderDevice, queue: &RenderQueue) -> (Tex
     upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_dummy")
 }
 
+/// Build a full mip chain from mip0 RGBA8 bytes. Each level is Triangle-resampled from the
+/// PREVIOUS level ((w>>l).max(1) — the .max(1) matters for non-square textures whose short axis
+/// hits 1 early). Returns (mip_count, concatenated level bytes). Without mips every distant
+/// surface point-samples mip0 -> the severe far-field shimmer (opposite of EFT's soft look) and
+/// texture-cache thrash. 1x1 placeholders return (1, mip0) untouched.
+fn build_mip_chain(width: u32, height: u32, rgba: &[u8]) -> (u32, Vec<u8>) {
+    let mips = 32 - width.max(height).leading_zeros(); // floor(log2)+1
+    if mips <= 1 || rgba.len() != (width * height * 4) as usize {
+        return (1, rgba.to_vec());
+    }
+    let mut data = Vec::with_capacity(rgba.len() * 4 / 3 + 64);
+    data.extend_from_slice(rgba);
+    let mut prev = match image::RgbaImage::from_raw(width, height, rgba.to_vec()) {
+        Some(img) => img,
+        None => return (1, rgba.to_vec()),
+    };
+    for l in 1..mips {
+        let (mw, mh) = ((width >> l).max(1), (height >> l).max(1));
+        let next = image::imageops::resize(&prev, mw, mh, image::imageops::FilterType::Triangle);
+        data.extend_from_slice(&next);
+        prev = next;
+    }
+    (mips, data)
+}
+
 fn upload_rgba8_srgb(
     device: &RenderDevice,
     queue: &RenderQueue,
@@ -2176,7 +2300,8 @@ fn upload_rgba8_srgb(
     rgba: &[u8],
     label: &'static str,
 ) -> (Texture, TextureView) {
-    // create_texture_with_data handles the 256-byte row-padding for the staging copy.
+    let (mips, chain) = build_mip_chain(width, height, rgba);
+    // create_texture_with_data handles the 256-byte row-padding for the staging copy (per mip).
     let tex = device.create_texture_with_data(
         queue,
         &TextureDescriptor {
@@ -2186,7 +2311,7 @@ fn upload_rgba8_srgb(
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1, // full mip chain / BC7 compression deferred to M3b
+            mip_level_count: mips,
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8UnormSrgb,
@@ -2194,7 +2319,7 @@ fn upload_rgba8_srgb(
             view_formats: &[],
         },
         TextureDataOrder::default(),
-        rgba,
+        &chain,
     );
     let view = tex.create_view(&TextureViewDescriptor::default());
     (tex, view)
@@ -2202,6 +2327,8 @@ fn upload_rgba8_srgb(
 
 /// Phase 2b: upload RGBA8 bytes as a LINEAR (Rgba8Unorm) texture — for normal maps, whose texels
 /// are tangent-space vectors, not sRGB color. Identical to `upload_rgba8_srgb` but for the format.
+/// (Mipping normals by box filter denormalizes them slightly; the shader renormalizes after
+/// perturbation, and shortened far-mip normals actually soften distant spec — desirable here.)
 fn upload_rgba8_linear(
     device: &RenderDevice,
     queue: &RenderQueue,
@@ -2210,7 +2337,8 @@ fn upload_rgba8_linear(
     rgba: &[u8],
     label: &'static str,
 ) -> (Texture, TextureView) {
-    // create_texture_with_data handles the 256-byte row-padding for the staging copy.
+    let (mips, chain) = build_mip_chain(width, height, rgba);
+    // create_texture_with_data handles the 256-byte row-padding for the staging copy (per mip).
     let tex = device.create_texture_with_data(
         queue,
         &TextureDescriptor {
@@ -2220,7 +2348,7 @@ fn upload_rgba8_linear(
                 height,
                 depth_or_array_layers: 1,
             },
-            mip_level_count: 1,
+            mip_level_count: mips,
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba8Unorm, // LINEAR — NOT sRGB (normal vectors, not color)
@@ -2228,7 +2356,7 @@ fn upload_rgba8_linear(
             view_formats: &[],
         },
         TextureDataOrder::default(),
-        rgba,
+        &chain,
     );
     let view = tex.create_view(&TextureViewDescriptor::default());
     (tex, view)
@@ -2268,6 +2396,25 @@ fn upload_frustum(
             }
         }
     }
+    // Screen-size cull constants: an instance is culled when its bounding sphere subtends fewer
+    // than `min_px` pixels — sphere.w < k * distance, with k = min_px / (0.5 * viewport_h * proj11).
+    // Grass gets a larger threshold (a ~1.3 m clump is invisible long before the far plane; this
+    // is where the 100k-clump draw cost goes). EFT_CULL_PX="general,grass" overrides for tuning;
+    // "0,0" disables. Read once (env lookup shouldn't run per-frame in the render loop).
+    static CULL_PX: std::sync::OnceLock<(f32, f32)> = std::sync::OnceLock::new();
+    let (px_gen, px_grass) = *CULL_PX.get_or_init(|| {
+        std::env::var("EFT_CULL_PX")
+            .ok()
+            .and_then(|s| {
+                let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (v.len() == 2).then(|| (v[0], v[1]))
+            })
+            .unwrap_or((1.5, 4.0))
+    });
+    let proj11 = view.clip_from_view.y_axis.y; // 1/tan(fov_y/2)
+    let vh = view.viewport.w.max(1) as f32;
+    let denom = (0.5 * vh * proj11).max(1e-4);
+    let cam_pos = view.world_from_view.translation();
     let uniform = CullUniform {
         frustum: [
             planes[0].to_array(),
@@ -2277,7 +2424,13 @@ fn upload_frustum(
             planes[4].to_array(),
             planes[5].to_array(),
         ],
-        counts: [buffers.instance_total, buffers.mesh_count, 0, 0],
+        counts: [
+            buffers.instance_total,
+            buffers.mesh_count,
+            (px_grass / denom).to_bits(),
+            0,
+        ],
+        cam_k: [cam_pos.x, cam_pos.y, cam_pos.z, px_gen / denom],
     };
     render_queue.write_buffer(&buffers.cull_uniform, 0, bytemuck::bytes_of(&uniform));
 }
@@ -2657,7 +2810,10 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             multisample: MultisampleState {
                 count: key.samples,
                 mask: !0,
-                alpha_to_coverage_enabled: false,
+                // Opaque pass + MSAA: alpha-to-coverage dithers the cutout coverage ramp the
+                // fragment outputs (grass/foliage edges anti-alias instead of hard 1-bit alias).
+                // Non-cutout opaque materials output alpha 1.0 = full coverage (bit-identical).
+                alpha_to_coverage_enabled: !key.blend_pass && key.samples > 1,
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),

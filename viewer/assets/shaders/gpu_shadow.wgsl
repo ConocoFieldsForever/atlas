@@ -52,6 +52,15 @@ struct MaterialGpu {
     normal_flags: u32,
     normal_scale: f32,
     _pad2: u32,
+    // Stride padding ONLY: the bound table is the 176-byte gpu_draw.wgsl/Rust record (#6 detail
+    // maps + emissive). This shader reads none of those fields, but the array STRIDE must match
+    // or every material index > 0 reads garbage (cutout casters alpha-test the wrong texture).
+    _detail_idx: vec4<u32>,     // @80  detail indices + flags + pad
+    _detail_auv: vec4<f32>,     // @96
+    _detail_nuv: vec4<f32>,     // @112
+    _detail_par: vec4<f32>,     // @128
+    _detail_mg: vec4<f32>,      // @144
+    _emissive: vec4<u32>,       // @160 emissive_index + rgb (stride only) -> 176 B total
 };
 @group(2) @binding(0) var<storage, read> materials: array<MaterialGpu>;
 @group(2) @binding(1) var albedo_tex: binding_array<texture_2d<f32>>;

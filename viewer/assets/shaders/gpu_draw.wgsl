@@ -107,7 +107,13 @@ struct MaterialGpu {
     detail_albedo_uv: vec4<f32>,   // @96
     detail_normal_uv: vec4<f32>,   // @112
     detail_params: vec4<f32>,      // @128
-    detail_mean_gain: vec4<f32>,   // @144  -> 160
+    detail_mean_gain: vec4<f32>,   // @144
+    // Emissive (windows/monitors/signs/lamps): 16-byte block @160 (size -> 176). Declared as
+    // FOUR SCALARS, not u32+vec3 (a vec3 would 16-align and silently desync from the Rust POD).
+    emissive_index: u32,           // @160  bindless albedo_tex index, or MAT_EMISSIVE_NONE
+    em_r: f32,                     // @164  linear rgb emissive = factor × hdr (CPU-precomputed)
+    em_g: f32,                     // @168
+    em_b: f32,                     // @172  -> 176
 };
 
 // Phase 1.6 GGX specular tuning: global multiplier on the dielectric spec lobe. 1.0 = physical.
@@ -117,20 +123,34 @@ const SPEC_STRENGTH: f32 = 1.5;
 // in the mirror direction (fresnel + gloss weighted), giving the reflections + pop the flat baked
 // diffuse alone can't. 0 = off (pure Phase-1.6 look). Matte surfaces are unaffected (gloss ~0).
 const ENV_REFL_STRENGTH: f32 = 1.6;
-// Analytic sky reflection (sky_reflect): a crisp cool gradient + sun disk, but scaled by the LOCAL
-// SH exposure so it never exceeds how lit the spot is (indoor floors stay dark, outdoor surfaces pop).
+// Analytic sky reflection (sky_reflect): a crisp cool gradient, scaled by the LOCAL SH exposure so
+// it never exceeds how lit the spot is (indoor floors stay dark, outdoor surfaces pop). The sun
+// glint is OWNED by the GGX lobe (dom light) — a second analytic sun disk here double-counted it
+// and was ~14x the real sun's angular size.
 const SKY_REFL_GAIN: f32 = 1.45;       // how much brighter than the local SH the sky reads (outdoor pop)
-const SUN_REFL_SHARP: f32 = 340.0;     // sun-disk tightness in reflections (higher = tighter)
-const SUN_REFL_STRENGTH: f32 = 1.6;    // sun-glint brightness (the bright wet flash)
+
+// --- Distance fog / aerial perspective ---------------------------------------
+// The single biggest "real EFT" cue outdoors: overcast Baltic haze milks out geometry with
+// distance toward the horizon color. Exponential-squared in distance, faded DOWN indoors via the
+// SH directionality (isotropic probe = interior = little haze) with a floor (overcast outdoor
+// directionality is itself low — a hard gate would kill fog on the terrain it targets), and faded
+// UP slightly with view height drop so low coastal sightlines haze harder than top-down views.
+const FOG_DENSITY: f32 = 0.00075;              // ~17% haze at 600 m, ~50% at 1.2 km
+// Haze color: sits BETWEEN scene radiance (~0.2-0.4 pre-tonemap) and the sky horizon (~0.6) —
+// matching the horizon exactly overpowered mid-distance geometry (bright milk veil at 300 m).
+const FOG_COLOR: vec3<f32> = vec3<f32>(0.44, 0.49, 0.58);
+const FOG_INDOOR_FLOOR: f32 = 0.2;             // fraction of fog that survives indoors
 
 const MAT_ALBEDO_NONE: u32 = 0xFFFFFFFFu; // sentinel: material has no albedo texture
 const MAT_NORMAL_NONE: u32 = 0xFFFFFFFFu;  // sentinel: material has no normal map (Phase 2b)
+const MAT_EMISSIVE_NONE: u32 = 0xFFFFFFFFu; // sentinel: material has no emissive texture
 const MAT_FLAG_CUTOUT: u32 = 1u;          // bit0: alpha-tested (MASK) surface
 const MAT_FLAG_BLEND: u32 = 2u;           // bit1: alpha-blended (decal/glass/water/BLEND) surface
 const MAT_FLAG_SOFTCUTOUT: u32 = 4u;      // bit2: Vert Paint SoftCutout decal (feather via color.a)
 const MAT_FLAG_WATER: u32 = 8u;           // bit3: water/mirror (dark wet sheen, not white fallback)
 const MAT_FLAG_TERRAIN: u32 = 16u;        // bit4: MicroSplat terrain (splat-blend 12 layers; slice in _pad2)
 const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary albedo/normal; never on terrain)
+const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW tex.a (smoothness-in-alpha)
 const DETAIL_HAS_ALBEDO: u32 = 1u;        // detail_flags bit0: has detail albedo texture
 const DETAIL_HAS_NORMAL: u32 = 2u;        // detail_flags bit1: has detail normal texture
 const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed in linear space
@@ -148,7 +168,7 @@ const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed
 struct TerrainSplat {
     layer_albedo: array<u32, 12>,
     layer_rep: array<f32, 12>,
-    ctrl_idx: array<u32, 12>,
+    ctrl_idx: array<u32, 24>,   // up to 8 slices × 3 maps at [slice*3 + k] (slice names from sidecar)
 };
 @group(2) @binding(4) var<storage, read> terrain_splat: TerrainSplat;
 
@@ -309,28 +329,42 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     let rr = 0.282095 * cr.x + 0.488603 * (cr.y * L.y + cr.z * L.z + cr.w * L.x);
     let rg = 0.282095 * cg.x + 0.488603 * (cg.y * L.y + cg.z * L.z + cg.w * L.x);
     let rb = 0.282095 * cb.x + 0.488603 * (cb.y * L.y + cb.z * L.z + cb.w * L.x);
-    out.radiance = max(vec3<f32>(rr, rg, rb), vec3<f32>(0.0));
+    // Scale by directionality: the raw reconstruction includes the L0 AMBIENT band, which
+    // inflated the GGX "sun" ~6.8x in flat-lit (isotropic) probes — indoor floors got sun
+    // glints from what is actually ambient. Genuinely sun-lit areas (directionality -> 1)
+    // keep their current tuning; isotropic probes smoothly lose the phantom highlight.
+    out.radiance = max(vec3<f32>(rr, rg, rb), vec3<f32>(0.0)) * out.directionality;
     return out;
 }
 
-// --- Analytic sky+sun environment for glossy reflections ---------------------
+// --- Analytic sky environment for glossy reflections -------------------------
 // The baked SH volume in the mirror direction reads as a dull grey blob, so glass / water reflecting
 // it look flat. Real glossy surfaces reflect the SKY, which is crisper (a directional gradient) and,
-// outdoors, brighter. We synthesize a cool vertical gradient (brighter toward the zenith) plus a soft
-// sun disk from the SH dominant light (the bright glint that reads as wet). CRITICAL: the whole thing
-// is scaled by `level` — the LOCAL exposure (luma of the SH reflection) — so it can NEVER exceed how
-// lit the spot actually is. Indoors (dark SH probe) the "sky" stays dark; only sky-exposed outdoor
-// surfaces get the bright reflection. This is what keeps interior glossy floors from blowing out.
-fn sky_reflect(R: vec3<f32>, level: f32, dom: DomLight) -> vec3<f32> {
+// outdoors, brighter. We synthesize a cool vertical gradient (brighter toward the zenith); the SUN
+// glint is owned solely by the GGX lobe (which is properly shadow-gated) — a second analytic disk
+// here double-counted the sun at ~14x its real angular size. CRITICAL: the gradient is scaled by
+// `level` — the LOCAL exposure (luma of the SH reflection) — so it can NEVER exceed how lit the spot
+// actually is. Indoors (dark SH probe) the "sky" stays dark; only sky-exposed outdoor surfaces get
+// the bright reflection. This is what keeps interior glossy floors from blowing out.
+fn sky_reflect(R: vec3<f32>, level: f32) -> vec3<f32> {
     let up = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
     let horizon = vec3<f32>(0.66, 0.72, 0.82);
     let zenith  = vec3<f32>(0.92, 0.98, 1.10);
-    var sky = mix(horizon, zenith, up * up) * (level * SKY_REFL_GAIN); // anchored to local exposure
-    if (dom.mag >= 1e-4) {
-        let s = pow(max(dot(R, dom.dir), 0.0), SUN_REFL_SHARP);        // tight sun disk
-        sky += dom.radiance * (s * SUN_REFL_STRENGTH);                 // dom.radiance already exposure-scaled
-    }
-    return sky;
+    return mix(horizon, zenith, up * up) * (level * SKY_REFL_GAIN); // anchored to local exposure
+}
+
+// --- Distance fog / aerial perspective ----------------------------------------
+// Exp² haze toward the overcast horizon color — the strongest single "real EFT" cue outdoors
+// (Lighthouse sightlines run 1-2 km; razor-sharp distant terrain is the tell of a renderer).
+// Gated DOWN indoors via the SH directionality (an isotropic probe = interior) with a floor:
+// overcast outdoor directionality is itself low, so a hard zero-gate would kill fog on the very
+// terrain it targets. rgb-only (alpha untouched) — correct under non-premultiplied ALPHA_BLENDING,
+// since whatever is BEHIND a transparent was already fogged.
+fn apply_fog(rgb: vec3<f32>, world_pos: vec3<f32>, directionality: f32) -> vec3<f32> {
+    let d = distance(view.world_position.xyz, world_pos);
+    let f = 1.0 - exp(-(d * FOG_DENSITY) * (d * FOG_DENSITY));
+    let gate = mix(FOG_INDOOR_FLOOR, 1.0, smoothstep(0.03, 0.20, directionality));
+    return mix(rgb, FOG_COLOR, f * gate);
 }
 
 // --- #5 sun-shadow PCF sampling ----------------------------------------------
@@ -528,6 +562,20 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let idx = select(0u, m.albedo_index, has_albedo);
     let tex = textureSample(albedo_tex[idx], albedo_samp, o.uv);
 
+    // Emissive (windows / monitors / signs / lamps): same uniform-flow pattern as the albedo —
+    // sample slot 0 unconditionally and select the result. Lives in the sRGB albedo array
+    // (conventions.colorSpace.emissive == "srgb"). em_rgb = tex × (factor·hdr), added to the lit
+    // returns below; with the HDR target + Bloom, hot emitters bleed like the game's.
+    let has_em = m.emissive_index != MAT_EMISSIVE_NONE;
+    let eidx = select(0u, m.emissive_index, has_em);
+    let em_tex = textureSample(albedo_tex[eidx], albedo_samp, o.uv).rgb;
+    let em_rgb = select(vec3<f32>(0.0), em_tex * vec3<f32>(m.em_r, m.em_g, m.em_b), has_em);
+
+    // A2C: screen-space alpha gradient width for the cutout coverage ramp (fwidth is a derivative
+    // op — MUST run here in uniform control flow, before any non-uniform discard). Equals
+    // fwidth(albedo.a) for textured cutouts since tint.a is flat per material.
+    let cutout_aw = max(fwidth(tex.a * m.tint.a), 1e-3);
+
     // --- Shading normal (Phase 2b normal mapping) --------------------------------
     // Computed ONCE here, in UNIFORM control flow, BEFORE any discard. BOTH the normal
     // textureSample AND the screen-space TBN's dpdx/dpdy need implicit derivatives, so — exactly
@@ -646,7 +694,10 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // BLEND_PASS never reaches it because the class-discard above already dropped non-blend.)
     // Alpha-test on the COMPUTED albedo.a (tex.a*tint.a, or tint.a when untextured) so an
     // untextured cutout with tint.a < cutoff still discards (Codex P2), not just textured ones.
-    if ((m.flags & MAT_FLAG_CUTOUT) != 0u && albedo.a < m.alpha_cutoff) {
+    // A2C: the threshold sits at HALF the cutoff so alpha-to-coverage can dither the lower half
+    // of the coverage ramp (the return below outputs the fwidth-remapped coverage); the hard
+    // discard still kills fully-transparent texels so depth stays clean.
+    if ((m.flags & MAT_FLAG_CUTOUT) != 0u && albedo.a < 0.5 * m.alpha_cutoff) {
         discard;
     }
 
@@ -716,6 +767,18 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let R = reflect(-V, N);
     let fresnel_v = 0.04 + 0.96 * pow(1.0 - NdotV, 5.0); // Schlick view-fresnel, dielectric F0=0.04
 
+    // Per-pixel roughness: RFA materials (82% of the pack — Unity Standard smoothness-in-alpha)
+    // derive roughness from the RAW tex.a (NOT albedo.a — tint.a would bias it); everything else
+    // keeps the per-material constant. Water floors at 0.10 so its sun glint is a believable
+    // overcast smudge rather than a pinprick (the analytic sun disk that used to fake width is gone).
+    var rough = clamp(m.roughness, 0.03, 1.0);
+    if ((m.flags & MAT_FLAG_RFA) != 0u && has_albedo) {
+        rough = clamp(1.0 - tex.a, 0.06, 1.0);
+    }
+    if ((m.flags & MAT_FLAG_WATER) != 0u) {
+        rough = max(rough, 0.10);
+    }
+
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {
         let Ld = dom.dir;
@@ -724,14 +787,13 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let NdotH = max(dot(N, H), 0.0);
         let VdotH = max(dot(V, H), 0.0);
         if (NdotL > 0.0) {
-            let rough = clamp(m.roughness, 0.03, 1.0);
             let a  = rough * rough;
             let a2 = a * a;
             let d  = (NdotH * NdotH * (a2 - 1.0) + 1.0);
             let D  = a2 / (3.14159265 * d * d);                       // GGX/Trowbridge-Reitz NDF
-            let k  = (rough + 1.0) * (rough + 1.0) / 8.0;             // Smith k (direct lighting)
-            let gv = NdotV / (NdotV * (1.0 - k) + k);
-            let gl = NdotL / (NdotL * (1.0 - k) + k);
+            let sk = (rough + 1.0) * (rough + 1.0) / 8.0;             // Smith k (direct lighting)
+            let gv = NdotV / (NdotV * (1.0 - sk) + sk);
+            let gl = NdotL / (NdotL * (1.0 - sk) + sk);
             let G  = gv * gl;                                         // Smith geometry
             let F  = 0.04 + 0.96 * pow(1.0 - VdotH, 5.0);            // Schlick, dielectric F0=0.04
             spec_rgb = dom.radiance * (D * G * F / (4.0 * NdotV * NdotL + 1e-4)) * NdotL * SPEC_STRENGTH;
@@ -750,10 +812,14 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // shadowed like the GGX lobe. `sh_env`/`sky_env` are reused by the water/glass blend branches.
     let sh_env = max(sh_irradiance(o.world_pos, R), ambient_floor) * sh.vol_min.w;
     let refl_level = dot(sh_env, vec3<f32>(0.2126, 0.7152, 0.0722)); // local exposure anchor (luma)
-    let sky_env = sky_reflect(R, refl_level, dom);
-    let gloss = 1.0 - clamp(m.roughness, 0.03, 1.0);
+    let sky_env = sky_reflect(R, refl_level);
+    let gloss = 1.0 - rough; // per-pixel when RFA — glossy pipes/tiles pop, worn surfaces go matte
     let env = mix(sh_env, max(sh_env, sky_env), gloss);
     let refl_rgb = env * (fresnel_v * gloss * ENV_REFL_STRENGTH) * (1.0 - shadow_event);
+
+    // Water class is needed by BOTH passes now: textured puddles blend (P2), untextured DEEP
+    // water (sea / basins) is OPAQUE (P1) so depth sorts it correctly under glass.
+    let is_water = (m.flags & MAT_FLAG_WATER) != 0u;
 
 #ifdef BLEND_PASS
     // BLEND pass: emit the REAL computed opacity. Non-premultiplied to match the pipeline's
@@ -771,32 +837,62 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     //    Emit a translucent dark wet sheen instead (animated flow deferred).
     //  * Other blend (glass / plain decal): keep the tex.a*tint.a coverage.
     let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
-    let is_water = (m.flags & MAT_FLAG_WATER) != 0u;
     if (is_softcutout) {
         // Roads/decals are matte ground overlays — no env reflection (keeps asphalt from mirroring).
         let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0);
-        return vec4<f32>(lit + spec_rgb, coverage);
+        return vec4<f32>(apply_fog(lit + spec_rgb, o.world_pos, dom.directionality), coverage);
     } else if (is_water) {
-        // WET PUDDLE / water. The albedo carries the puddle_noise coverage, but tex.a*tint.a (tint.a≈0.3)
-        // crushed it to ~7% opacity -> the old branch ignored the texture entirely and drew a uniform
-        // slab. Recover the raw noise mask (divide tint.a back out) and remap it to a clean feathered
-        // puddle SHAPE. The film itself is a smooth near-mirror: a dark wet body + a STRONG sky/sun
-        // reflection (water fresnel, not the material roughness) + the GGX sun glint. Opacity follows
-        // the mask so puddle edges dissolve into the dry ground, and grazing angles turn mirror-opaque.
+        // PUDDLE (textured water — untextured DEEP water is opaque-pass now, see #else path).
+        // A thin wet film: albedo.a is the puddle_noise coverage but tex.a*tint.a (tint.a≈0.3)
+        // crushed it to ~7% -> divide tint.a back out to recover the mask, remap to a clean
+        // feathered SHAPE, and let opacity follow it so edges dissolve into the dry ground.
+        // Energy-balanced fresnel mix (body*(1-wf) + refl*wf): no additive pedestal, so the film
+        // is dark from above and a mirror only toward grazing — like a real puddle.
+        let wf = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);      // water fresnel (F0≈0.02..0.04)
+        let refl = max(sh_env, sky_env);                   // crisp bright sky mirror
         let raw = albedo.a / max(m.tint.a, 1e-3);          // ~ puddle_noise coverage in [0,1]
         let mask = smoothstep(0.12, 0.45, raw);            // feathered puddle shape
-        let wf = 0.04 + 0.96 * pow(1.0 - NdotV, 5.0);      // water fresnel (F0≈0.04), full at grazing
-        let refl = max(sh_env, sky_env);                   // crisp bright sky + sun mirror
         let body = m.tint.rgb * gi;                        // dark wet film, GI-lit
-        let col = body + refl * (0.30 + 0.70 * wf) + spec_rgb;
+        let col = body * (1.0 - wf) + refl * wf + spec_rgb;
         let a = mask * clamp(0.45 + 0.55 * wf, 0.0, 1.0);  // shape-masked; grazing -> opaque mirror
-        return vec4<f32>(col, a);
+        return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality), a);
     }
     // Glass / plain decal: env reflection (glass is glossy -> strong) + the GGX glint make it read as
-    // reflective, not a flat tinted pane.
-    return vec4<f32>(lit + spec_rgb + refl_rgb, albedo.a);
+    // reflective, not a flat tinted pane. Emissive rides here too (lit windows / signage panes).
+    return vec4<f32>(
+        apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality),
+        albedo.a
+    );
 #else
-    // OPAQUE pass: diffuse + GGX glint + the glossy env reflection (matte surfaces: refl_rgb ~0).
-    return vec4<f32>(lit + spec_rgb + refl_rgb, 1.0);
+    // DEEP WATER (untextured role=water: the sea + treatment basins) — OPAQUE pass, so depth-write
+    // sorts it under glass and no pale clear-color bleeds through. Energy-balanced fresnel between
+    // a dark teal body (IGNORE the white tint) and the sky mirror, over a procedural ripple that
+    // perturbs the EXISTING shading normal (keeps any authored wave normal map) and fades with
+    // distance (raw sin ripples alias into sparkle at km range — and fog owns the far look anyway).
+    if (is_water && !has_albedo) {
+        let d = distance(view.world_position.xyz, o.world_pos);
+        let ripple_amp = 0.06 / (1.0 + d * 0.004);
+        let wp = o.world_pos.xz * 0.35;
+        let dxy = (vec2<f32>(sin(wp.x + wp.y * 0.6), sin(wp.x * 0.7 - wp.y))
+                 + 0.5 * vec2<f32>(sin(wp.x * 3.1 + wp.y * 2.3), sin(wp.y * 3.7 - wp.x * 2.9)))
+                 * ripple_amp;
+        let Nw = normalize(N + vec3<f32>(dxy.x, 0.0, dxy.y));
+        let Rw = reflect(-V, Nw);
+        let NwV = max(dot(Nw, V), 1e-3);
+        let wf = 0.02 + 0.98 * pow(1.0 - NwV, 5.0);
+        let refl = max(sh_env, sky_reflect(Rw, refl_level));
+        let deep = vec3<f32>(0.015, 0.045, 0.060);
+        let col = deep * gi * (1.0 - wf) + refl * wf + spec_rgb;
+        return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality), 1.0);
+    }
+    // OPAQUE pass: diffuse + GGX glint + the glossy env reflection (matte surfaces: refl_rgb ~0)
+    // + emissive, all under the aerial-perspective fog. Cutouts output the fwidth-remapped
+    // coverage ramp for alpha-to-coverage (MSAA dithers the edge); everything else is alpha 1.0.
+    let is_cut = (m.flags & MAT_FLAG_CUTOUT) != 0u;
+    let cov = clamp((albedo.a - m.alpha_cutoff) / cutout_aw + 0.5, 0.0, 1.0);
+    return vec4<f32>(
+        apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality),
+        select(1.0, cov, is_cut)
+    );
 #endif
 }

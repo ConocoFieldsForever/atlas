@@ -22,7 +22,13 @@ use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::core_pipeline::tonemapping::Tonemapping;
-use bevy::render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, NoIndirectDrawing};
+use bevy::core_pipeline::Skybox;
+use bevy::post_process::bloom::Bloom;
+use bevy::asset::RenderAssetUsages;
+use bevy::render::render_resource::{
+    Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+};
+use bevy::render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, Hdr, NoIndirectDrawing};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 
 use eftpack::Pack;
@@ -78,7 +84,18 @@ fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Trans
 
 fn main() {
     // ---- parse argv: pack dir + optional render-path token ----
-    let pack_dir = std::env::args().nth(1);
+    // Pack selection order: explicit argv[1] > EFT_PACK env > first existing default pack.
+    // Default map is LIGHTHOUSE (falls back to interchange if its pack isn't built), so a
+    // bare `eft_viewer` with no arguments opens a map instead of an empty window.
+    let pack_dir = std::env::args().nth(1)
+        .filter(|a| !a.starts_with('-'))
+        .or_else(|| std::env::var("EFT_PACK").ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            ["packs/lighthouse.eftpack", "packs/interchange.eftpack"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).exists())
+                .map(str::to_string)
+        });
     // A/B selector: `EFT_RENDER=m0|gpu` env, or a 2nd argv token; default = GPU-driven.
     let render_path = RenderPath::from_env_or(std::env::args().nth(2).as_deref());
     eprintln!("render path: {render_path:?}  (override with EFT_RENDER=m0|gpu)");
@@ -205,8 +222,90 @@ fn main() {
     app.run();
 }
 
+/// f32 -> IEEE 754 half bits (round-to-nearest-even). Local so the sky cubemap can be
+/// Rgba16Float without adding a `half` dependency (Rgba32Float is NOT filterable — the
+/// skybox pipeline uses a filtering sampler and would fail wgpu validation).
+fn f32_to_f16_bits(v: f32) -> u16 {
+    let x = v.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let mut exp = ((x >> 23) & 0xff) as i32 - 127 + 15;
+    let mut man = (x >> 13) & 0x3ff;
+    if exp <= 0 {
+        return sign; // flush denormals/underflow to signed zero (sky values never need them)
+    }
+    if exp >= 31 {
+        exp = 30; // clamp to max finite half (65504) instead of inf
+        man = 0x3ff;
+    }
+    sign | ((exp as u16) << 10) | man as u16
+}
+
+/// Procedural overcast-sky cubemap: the same horizon/zenith gradient family the shader's
+/// `sky_reflect` uses (so reflections agree with the visible sky) plus a soft warm sun disk +
+/// wide glow at the bake's sun_dir. HDR (disk peaks ~4.0) so Bloom picks it up. 6x128x128
+/// Rgba16Float; Skybox.brightness rescales it against the camera's physical Exposure.
+fn build_sky_cubemap(images: &mut Assets<Image>, sun: Vec3) -> Handle<Image> {
+    const N: usize = 128;
+    let mut data = Vec::with_capacity(N * N * 6 * 8);
+    for face in 0..6 {
+        for y in 0..N {
+            for x in 0..N {
+                let u = 2.0 * (x as f32 + 0.5) / N as f32 - 1.0;
+                let v = 2.0 * (y as f32 + 0.5) / N as f32 - 1.0;
+                // Standard wgpu/Vulkan cubemap texel->direction mapping, face order +X..-Z.
+                let dir = match face {
+                    0 => Vec3::new(1.0, -v, -u),
+                    1 => Vec3::new(-1.0, -v, u),
+                    2 => Vec3::new(u, 1.0, v),
+                    3 => Vec3::new(u, -1.0, -v),
+                    4 => Vec3::new(u, -v, 1.0),
+                    _ => Vec3::new(-u, -v, -1.0),
+                }
+                .normalize();
+                let up = (dir.y * 0.5 + 0.5).clamp(0.0, 1.0);
+                let t = up * up;
+                let horizon = Vec3::new(0.66, 0.72, 0.82);
+                let zenith = Vec3::new(0.92, 0.98, 1.10);
+                let mut sky = horizon.lerp(zenith, t);
+                if dir.y < 0.0 {
+                    // Below the horizon: fade to a darker sea/ground haze so coastline edges
+                    // and downward reflections don't read as bright sky.
+                    sky *= 1.0 - 0.55 * (-dir.y * 3.0).min(1.0);
+                }
+                let s = dir.dot(sun).max(0.0);
+                // Overcast sun: a soft disk (not a hard point) + a broad warm glow behind cloud.
+                let sun_col = Vec3::new(1.05, 1.0, 0.9);
+                sky += sun_col * (s.powf(350.0) * 3.0 + s.powf(8.0) * 0.3);
+                for c in [sky.x, sky.y, sky.z, 1.0] {
+                    data.extend_from_slice(&f32_to_f16_bits(c).to_le_bytes());
+                }
+            }
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: N as u32,
+            height: N as u32,
+            depth_or_array_layers: 6,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba16Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_view_descriptor = Some(TextureViewDescriptor {
+        dimension: Some(TextureViewDimension::Cube),
+        ..default()
+    });
+    images.add(image)
+}
+
 /// Spawn camera + a key light, framed on the pack bounds if one is loaded.
-fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
+fn setup(
+    mut commands: Commands,
+    pack: Option<Res<LoadedPack>>,
+    mut images: ResMut<Assets<Image>>,
+) {
     // Frame the world AABB: stand back along +Y/+Z by the half-diagonal.
     // Debug: EFT_LOOK="x,y,z" frames the camera CLOSE on that world point (e.g. a coordinate from
     // the double-click pick) instead of the whole-map overview — to confirm a specific mesh renders
@@ -238,19 +337,57 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     let yaw = dir.x.atan2(-dir.z);
     let pitch = dir.y.asin();
 
+    // Sky sun direction: same volume.json sidecar + X-flip the SH/shadow path uses
+    // (gpu_driven::extract_pack_to_render_world), so the skybox sun disk, the baked GI, and the
+    // shader's reflected sun all agree. Fallback = a plausible high overcast sun.
+    let sun_dir = pack
+        .as_ref()
+        .and_then(|p| p.0.manifest.sidecars.volume_meta.as_deref())
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+        .and_then(|v| {
+            v.get("sun_dir").and_then(|s| s.as_array()).and_then(|a| {
+                let raw = Vec3::new(
+                    -(a.first()?.as_f64()? as f32),
+                    a.get(1)?.as_f64()? as f32,
+                    a.get(2)?.as_f64()? as f32,
+                );
+                (raw.length_squared() > 1e-6).then(|| raw.normalize())
+            })
+        })
+        .unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize());
+    let sky = build_sky_cubemap(&mut images, sun_dir);
+
     commands.spawn((
         Camera3d::default(),
-        // Phase 3 — EFT display grade. AgX filmic base (muted, desaturates highlights toward
-        // the game's washed palette) + a subtle grade: cool shadows, slight green tint, reduced
-        // saturation, and a small shadow lift for EFT's milky (not crushed) blacks. Exposure is
-        // the shared brightness knob — it pairs with gi_intensity in the SH volume uniform.
+        // HDR view target: the custom draw shader outputs LINEAR HDR radiance (sun glints,
+        // sky reflections >1.0). Without this marker the pipeline specialized to an 8-bit sRGB
+        // target and everything above 1.0 flat-clipped BEFORE tonemapping — and Bloom (which
+        // #[require(Hdr)]s) was impossible.
+        Hdr,
+        Bloom {
+            intensity: 0.06, // subtle: sun disk / glints / emissive bleed, not a haze filter
+            ..Bloom::NATURAL
+        },
+        // Procedural overcast sky (gradient + soft sun) — brightness is in cd/m^2 and is
+        // multiplied by the camera's physical Exposure (default ev100 9.7 => ~1/1000), so ~900
+        // lands the ~1.0-range texels at parity with the shader's own radiance scale.
+        Skybox {
+            image: sky,
+            brightness: 900.0,
+            rotation: Quat::IDENTITY,
+        },
+        // Phase 3 — EFT display grade. TonyMcMapface filmic base (muted, desaturates highlights
+        // toward the game's washed palette) + a subtle grade: cool shadows, slight green tint,
+        // and a small shadow lift for EFT's milky (not crushed) blacks. Saturation sits *below*
+        // 1.0 — the real game is desaturated; punch comes from midtone contrast, not chroma.
         Tonemapping::TonyMcMapface,
         ColorGrading {
             global: ColorGradingGlobal {
                 exposure: 0.4,             // brighten — prior grade came out too dark
-                temperature: -0.03,        // barely cool
-                tint: -0.02,
-                post_saturation: 1.14,     // a touch more color pop (was 1.08 — scene read flat/grey)
+                temperature: -0.02,        // barely cool
+                tint: -0.005,              // was -0.02: under the HDR target it read as a green cast
+                post_saturation: 0.95,     // EFT palette is DEsaturated (was 1.14 — oversold color)
                 ..default()
             },
             shadows: ColorGradingSection {
@@ -258,8 +395,8 @@ fn setup(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                 ..default()
             },
             midtones: ColorGradingSection {
-                saturation: 1.08,
-                contrast: 1.16,            // ADD midtone contrast — the flat/washed look was zero contrast
+                saturation: 0.98,
+                contrast: 1.16,            // midtone contrast carries the look instead of saturation
                 ..default()
             },
             ..default()
