@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "factory_rework",
+  "name": "Factory (1.0 rework, day)",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Factory_Rework",
+    "levels": [526, 527, 528, 529, 530, 531, 532, 533, 534, 535],
+    "root": "eft_assets/factory_rework",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": { "global_matrix": [[-1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]], "flip_winding_on_negative_determinant": true }
+}

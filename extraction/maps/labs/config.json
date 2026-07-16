@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "id": "labs",
+  "name": "The Lab",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Laboratory",
+    "levels": [
+      71,
+      72,
+      73,
+      74,
+      75,
+      76,
+      77,
+      78,
+      79,
+      80,
+      81,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88,
+      89,
+      90,
+      91,
+      92,
+      93,
+      94,
+      95,
+      96,
+      97,
+      98,
+      99,
+      100,
+      101,
+      102,
+      103,
+      104,
+      105,
+      106,
+      107,
+      108,
+      109,
+      110,
+      111,
+      112,
+      114,
+      400,
+      516
+    ],
+    "root": "eft_assets/labs",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "up": "y",
+    "source_handedness": "left",
+    "target_handedness": "right",
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  },
+  "cull": {
+    "keep_root_prefix": null,
+    "drop_root_regex": null,
+    "drop_shadow_submeshes": true
+  }
+}

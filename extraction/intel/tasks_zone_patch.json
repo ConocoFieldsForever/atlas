@@ -1,0 +1,8 @@
+[
+ {
+  "task": "The Blood of War - Part 1",
+  "desc_contains": "fourth fuel tank",
+  "zone": {"map": "interchange", "pos": [-40.7, 22.8, 308.3], "outline": null, "top": null, "bottom": null},
+  "derivation": "tarkov.dev ships ZERO zones for this objective (verified against the live API). Position derived from our own map data: the cistern mesh confirmed at tanks 1+3 (model_lod0 __1401, byte-identical file size) has exactly one instance adjacent to the map's only 12-trailer cluster -- 'south of the trailer park' per task guides -- at unity(40.7, 21.3, 308.3); stored here in viewer coords (diag(-1,1,1)*unity), zone height matched to sibling zones (+1.5m over mesh pivot)."
+ }
+]

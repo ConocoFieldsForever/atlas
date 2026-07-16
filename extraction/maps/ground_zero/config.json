@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "id": "ground_zero",
+  "name": "Ground Zero",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Sandbox",
+    "levels": [
+      466,
+      467,
+      468,
+      469,
+      470,
+      471,
+      472,
+      473,
+      474,
+      475,
+      476,
+      477,
+      478,
+      479,
+      480,
+      481,
+      482,
+      483,
+      484,
+      485,
+      486,
+      487,
+      488,
+      489,
+      490,
+      491,
+      492,
+      493,
+      504,
+      505,
+      506,
+      507,
+      509,
+      510,
+      512
+    ],
+    "root": "eft_assets/ground_zero",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "up": "y",
+    "source_handedness": "left",
+    "target_handedness": "right",
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  },
+  "cull": {
+    "keep_root_prefix": null,
+    "drop_root_regex": null,
+    "drop_shadow_submeshes": true
+  }
+}
