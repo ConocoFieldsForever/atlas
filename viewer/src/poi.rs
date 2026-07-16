@@ -17,6 +17,7 @@ use crate::ui::{LayerToggles, QuestTracker};
 use bevy::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub enum PoiLayer {
@@ -41,6 +42,12 @@ pub enum PoiLayer {
 /// focus marker visibility to the selected task(s) — see `apply_quest_visibility`.
 #[derive(Component)]
 pub struct QuestMarkerTask(pub String);
+
+/// The extract's faction ("pmc"/"scav"/"shared") carried by every `extracts_dev` marker, so the
+/// UI can reason about who can use it (nearest-extract routing; the string itself is kept for
+/// future per-faction filtering).
+#[derive(Component)]
+pub struct ExtractFaction(#[allow(dead_code)] pub String);
 
 /// Startup-built catalog of THIS map's tasks (tasks.json filtered to zones on this map), read by
 /// the quest tracker UI (ui.rs) and the outline gizmo. Empty by default so the resource always
@@ -80,10 +87,30 @@ pub struct QuestZoneW {
     pub top: f32,
 }
 
+/// Startup-built aggregate of every key used by THIS map's locks (loot.json `locks`), read by the
+/// layer panel's "Keys for this map" list. One entry per distinct key (most expensive first),
+/// carrying every lock position it opens so a click can fly to one. Empty by default so the
+/// resource always exists even without a `loot.json`.
+#[derive(Resource, Default)]
+pub struct KeyCatalog {
+    pub keys: Vec<KeyUse>,
+}
+/// One key and the locks it opens on this map. Only the egui panel reads it (hence the gated
+/// allow, same as ui.rs `UiSearch`).
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct KeyUse {
+    pub name: String,
+    pub price: Option<i64>,
+    /// true = keycard (reads violet in the panel, matching the marker/card accent).
+    pub card: bool,
+    pub lock_positions: Vec<Vec3>,
+}
+
 pub struct PoiPlugin;
 impl Plugin for PoiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<QuestData>()
+            .init_resource::<KeyCatalog>()
             .add_systems(Startup, spawn_pois)
             // Quest markers get their own visibility pass (toggle AND tracker selection); the other
             // POI layers stay on the plain toggle-driven `apply_poi_visibility`.
@@ -175,9 +202,8 @@ struct Key {
     /// Full item name.
     #[serde(default)]
     n: String,
-    /// shortName (unused in the card, kept for schema fidelity).
+    /// shortName (titles the lock marker when present).
     #[serde(default)]
-    #[allow(dead_code)]
     s: String,
     /// 0/1 — 1 means a keycard.
     #[serde(default)]
@@ -429,13 +455,29 @@ fn faction_label(fac: &str) -> String {
     }
 }
 
+/// Marker/accent colour per extract faction. PMC keeps the layer's extract green; scav-only
+/// reads amber; shared reads a pale white-green.
+fn extract_faction_color(fac: &str) -> Color {
+    match fac {
+        "scav" => Color::srgb(0.95, 0.45, 0.10),
+        "shared" => Color::srgb(0.78, 0.95, 0.82),
+        _ => poi_look(PoiLayer::Extract).0,
+    }
+}
+
 /// Card for a clean faction-tagged extract (loot.json `extracts_dev`).
 fn extract_dev_info(ex: &ExtractDev) -> MarkerInfo {
-    let accent = poi_look(PoiLayer::Extract).0;
-    let title = if ex.name.is_empty() {
-        "Extract".into()
+    let accent = extract_faction_color(&ex.fac);
+    let name = if ex.name.is_empty() {
+        "Extract".to_string()
     } else {
         ex.name.clone()
+    };
+    // Faction in the title (e.g. "Armored Train  [All]") so search hits "pmc"/"scav".
+    let title = if ex.fac.is_empty() {
+        name
+    } else {
+        format!("{}  [{}]", name, faction_label(&ex.fac))
     };
     MarkerInfo {
         title,
@@ -454,27 +496,37 @@ fn lock_info(lk: &Lock) -> MarkerInfo {
     } else {
         poi_look(PoiLayer::Lock).0
     };
-    let detail = if let Some(k) = lk.keys.first() {
+    // EVERY key (not just the first) goes into the detail lines so secondary keys are searchable.
+    let detail = if lk.keys.is_empty() {
+        vec!["No key listed".into()]
+    } else {
         let mut d = Vec::new();
-        let mut needs = format!("Needs: {}", k.n);
-        if k.card == 1 {
-            needs.push_str("  [keycard]");
-        }
-        d.push(needs);
-        if let Some(pr) = k.pr {
-            if pr > 0 {
-                d.push(format!("Value  {}", money(pr)));
+        for (i, k) in lk.keys.iter().enumerate() {
+            let mut needs = format!("{}: {}", if i == 0 { "Needs" } else { "Or" }, k.n);
+            if k.card == 1 {
+                needs.push_str("  [keycard]");
+            }
+            d.push(needs);
+            if let Some(pr) = k.pr {
+                if pr > 0 {
+                    d.push(format!("Value  {}", money(pr)));
+                }
             }
         }
         if lk.pw == 1 {
             d.push("Power required".into());
         }
         d
-    } else {
-        vec!["No key listed".into()]
     };
+    // Title with the key's shortName when we have one, so the marker/search read as the key.
+    let title = lk
+        .keys
+        .first()
+        .filter(|k| !k.s.is_empty())
+        .map(|k| k.s.clone())
+        .unwrap_or_else(|| "Locked".into());
     MarkerInfo {
-        title: "Locked".into(),
+        title,
         subtitle: titlecase(&lk.lt),
         detail,
         accent,
@@ -569,6 +621,30 @@ fn map_key(dataset: &str) -> String {
     dataset.to_string()
 }
 
+/// Resolve a POI sidecar (`tasks.json` / `semantics.json`) WITHOUT a hardcoded path, mirroring
+/// loot.rs `resolve_loot_json`: the env override, then next to the pack, then the cwd. Warns on a
+/// total miss naming the UI feature that stays empty (`lost`) — the sidecars are optional, so
+/// this is the only breadcrumb.
+fn resolve_sidecar(env_key: &str, file: &str, root: &Path, lost: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(env_key) {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+        warn!("poi: {env_key}='{p}' is not a file — ignoring");
+    }
+    let pb = root.join(file);
+    if pb.is_file() {
+        return Some(pb);
+    }
+    let cwd = PathBuf::from(file);
+    if cwd.is_file() {
+        return Some(cwd);
+    }
+    warn!("poi: no {file} found (set {env_key}, or drop {file} next to the .eftpack) — {lost}");
+    None
+}
+
 fn spawn_pois(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -595,32 +671,43 @@ fn spawn_pois(
         PoiLayer::LooseLoot,
         PoiLayer::Quest,
     ];
+    let mk = |materials: &mut Assets<StandardMaterial>, c: Color| {
+        let lin = c.to_linear();
+        materials.add(StandardMaterial {
+            base_color: c,
+            emissive: LinearRgba::new(lin.red * 0.85, lin.green * 0.85, lin.blue * 0.85, 1.0),
+            perceptual_roughness: 0.9,
+            ..default()
+        })
+    };
     let mut mats: HashMap<u8, Handle<StandardMaterial>> = HashMap::new();
     for &l in &all {
         let (c, _, _) = poi_look(l);
-        let lin = c.to_linear();
-        mats.insert(
-            l as u8,
-            materials.add(StandardMaterial {
-                base_color: c,
-                emissive: LinearRgba::new(lin.red * 0.85, lin.green * 0.85, lin.blue * 0.85, 1.0),
-                perceptual_roughness: 0.9,
-                ..default()
-            }),
-        );
+        mats.insert(l as u8, mk(&mut materials, c));
     }
+    // Off-palette marker materials (same emissive formula as the layer mats): faction-tinted
+    // extracts + violet keycard locks. PMC extracts keep the layer's default extract green.
+    let ex_scav = mk(&mut materials, extract_faction_color("scav"));
+    let ex_shared = mk(&mut materials, extract_faction_color("shared"));
+    let keycard_mat = mk(&mut materials, Color::srgb(0.72, 0.45, 0.92)); // lock_info's violet
 
-    // helper closure captured by the spawn loop below (all shared handles are Clone). Returns the
-    // spawned entity so the quest loop can attach a `QuestMarkerTask` after the fact.
+    // helper closure captured by the spawn loop below (all shared handles are Clone). `mat`
+    // overrides the per-layer material (faction extracts / keycard locks); None = layer default.
+    // Returns the spawned entity so the quest loop can attach a `QuestMarkerTask` after the fact.
     let mut n = 0u32;
-    let mut spawn = |commands: &mut Commands, l: PoiLayer, p: [f32; 3], info: MarkerInfo| -> Entity {
+    let mut spawn = |commands: &mut Commands,
+                     l: PoiLayer,
+                     p: [f32; 3],
+                     info: MarkerInfo,
+                     mat: Option<Handle<StandardMaterial>>|
+     -> Entity {
         let (_, r, lift) = poi_look(l);
         // Clamp the click radius up so tiny door/interactable markers stay hittable.
         let pick_r = r.max(0.9);
         let e = commands
             .spawn((
                 Mesh3d(sphere.clone()),
-                MeshMaterial3d(mats[&(l as u8)].clone()),
+                MeshMaterial3d(mat.unwrap_or_else(|| mats[&(l as u8)].clone())),
                 Transform::from_xyz(p[0], p[1] + lift, p[2]).with_scale(Vec3::splat(r)),
                 l,
                 PickRadius(pick_r),
@@ -637,6 +724,8 @@ fn spawn_pois(
     // `extract` layer below.
     let mut have_dev_extracts = false;
     let mut have_dev_stationary = false;
+    // Aggregated per-key lock list, folded into `KeyCatalog` below (panel's "Keys for this map").
+    let mut key_uses: Vec<KeyUse> = Vec::new();
     let key = map_key(&lp.0.manifest.dataset);
     if let Some(mn) = std::fs::read_to_string(root.join("loot.json"))
         .ok()
@@ -644,49 +733,78 @@ fn spawn_pois(
         .and_then(|mut f| f.maps.remove(&key))
     {
         for nd in &mn.pmc_nodes {
-            spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd));
+            spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd), None);
         }
         for nd in &mn.scav_nodes {
-            spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd));
+            spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd), None);
         }
         for nd in &mn.boss_nodes {
-            spawn(&mut commands, PoiLayer::Boss, nd.pos, node_info(PoiLayer::Boss, nd));
+            spawn(&mut commands, PoiLayer::Boss, nd.pos, node_info(PoiLayer::Boss, nd), None);
         }
         // ---- map intel ----
         for lk in &mn.locks {
-            spawn(&mut commands, PoiLayer::Lock, lk.pos, lock_info(lk));
+            // Keycard locks get the violet marker material (matches lock_info's accent).
+            let keycard = lk.keys.first().is_some_and(|k| k.card == 1);
+            spawn(
+                &mut commands,
+                PoiLayer::Lock,
+                lk.pos,
+                lock_info(lk),
+                keycard.then(|| keycard_mat.clone()),
+            );
+            // Fold the lock's (first) key into the catalog, grouped by key name.
+            if let Some(k) = lk.keys.first().filter(|k| !k.n.is_empty()) {
+                let pos = Vec3::new(lk.pos[0], lk.pos[1], lk.pos[2]);
+                if let Some(u) = key_uses.iter_mut().find(|u| u.name == k.n) {
+                    u.lock_positions.push(pos);
+                } else {
+                    key_uses.push(KeyUse {
+                        name: k.n.clone(),
+                        price: k.pr,
+                        card: k.card == 1,
+                        lock_positions: vec![pos],
+                    });
+                }
+            }
         }
         for sw in &mn.switches {
-            spawn(&mut commands, PoiLayer::Switch, sw.pos, switch_info(sw));
+            spawn(&mut commands, PoiLayer::Switch, sw.pos, switch_info(sw), None);
         }
         for tr in &mn.transits {
-            spawn(&mut commands, PoiLayer::Transit, tr.pos, transit_info(tr));
+            spawn(&mut commands, PoiLayer::Transit, tr.pos, transit_info(tr), None);
         }
         for hz in &mn.hazards {
-            spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz));
+            spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz), None);
         }
         have_dev_stationary = !mn.stationary.is_empty();
         for st in &mn.stationary {
-            spawn(&mut commands, PoiLayer::Stationary, st.pos, stationary_info(st));
+            spawn(&mut commands, PoiLayer::Stationary, st.pos, stationary_info(st), None);
         }
         for lo in &mn.loose {
-            spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo));
+            spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo), None);
         }
         // Prefer the clean faction-tagged extract list when it's present.
         if !mn.extracts_dev.is_empty() {
             have_dev_extracts = true;
             for ex in &mn.extracts_dev {
-                spawn(&mut commands, PoiLayer::Extract, ex.pos, extract_dev_info(ex));
+                let mat = match ex.fac.as_str() {
+                    "scav" => Some(ex_scav.clone()),
+                    "shared" => Some(ex_shared.clone()),
+                    _ => None, // pmc / unknown keep the layer's extract green
+                };
+                let e = spawn(&mut commands, PoiLayer::Extract, ex.pos, extract_dev_info(ex), mat);
+                commands.entity(e).insert(ExtractFaction(ex.fac.clone()));
             }
         }
     }
 
     // ---- extracts / doors / interactables from semantics.json ----
     // Skip the semantics `extract` layer if loot.json already gave us clean extracts.
-    if let Some(layers) = std::fs::read_to_string(root.join("semantics.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<SemFile>(&s).ok())
-        .map(|f| f.layers)
+    if let Some(layers) =
+        resolve_sidecar("EFT_SEMANTICS_JSON", "semantics.json", root, "doors/interactables missing")
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<SemFile>(&s).ok())
+            .map(|f| f.layers)
     {
         let map = [
             ("extract", PoiLayer::Extract),
@@ -699,7 +817,7 @@ fn spawn_pois(
             }
             if let Some(v) = layers.get(lname) {
                 for poi in v {
-                    spawn(&mut commands, ly, poi.p, sem_info(ly, poi));
+                    spawn(&mut commands, ly, poi.p, sem_info(ly, poi), None);
                 }
             }
         }
@@ -711,8 +829,8 @@ fn spawn_pois(
     // zone's point + footprint outline. Each marker gets a `QuestMarkerTask` so the tracker can
     // focus visibility to selected tasks.
     let mut quest_tasks: Vec<QuestEntry> = Vec::new();
-    if let Some(qf) = std::fs::read_to_string(root.join("tasks.json"))
-        .ok()
+    if let Some(qf) = resolve_sidecar("EFT_TASKS_JSON", "tasks.json", root, "quest tracker empty")
+        .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<QuestFile>(&s).ok())
     {
         for t in &qf.tasks {
@@ -724,7 +842,7 @@ fn spawn_pois(
                         continue;
                     }
                     let Some(p) = z.pos else { continue };
-                    let e = spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o));
+                    let e = spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o), None);
                     commands.entity(e).insert(QuestMarkerTask(t.id.clone()));
                     zones.push(QuestZoneW {
                         pos: Vec3::new(p[0], p[1], p[2]),
@@ -751,6 +869,9 @@ fn spawn_pois(
         }
     }
     let quest_count = quest_tasks.len();
+    // Most expensive keys first — the panel renders the catalog in this order.
+    key_uses.sort_by_key(|k| std::cmp::Reverse(k.price.unwrap_or(0)));
+    commands.insert_resource(KeyCatalog { keys: key_uses });
     commands.insert_resource(QuestData { tasks: quest_tasks });
     if quest_count > 0 {
         info!("poi: {quest_count} tasks tracked on this map");
@@ -801,6 +922,7 @@ fn spawn_pois(
                     detail: vec!["From map geometry".into()],
                     accent: poi_look(PoiLayer::Stationary).0,
                 },
+                None,
             );
         }
         if !seen.is_empty() {

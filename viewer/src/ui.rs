@@ -154,16 +154,28 @@ fn titlecase(s: &str) -> String {
 }
 
 #[cfg(feature = "egui")]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn layers_panel(
     mut contexts: bevy_egui::EguiContexts,
     mut toggles: ResMut<LayerToggles>,
     mut search: ResMut<UiSearch>,
     mut tracker: ResMut<QuestTracker>,
     quest_data: Res<crate::poi::QuestData>,
-    markers: Query<(&crate::inspect::MarkerInfo, &GlobalTransform)>,
+    key_catalog: Res<crate::poi::KeyCatalog>,
+    markers: Query<(
+        &crate::inspect::MarkerInfo,
+        &GlobalTransform,
+        Option<&crate::poi::PoiLayer>,
+        Option<&crate::loot::LootClass>,
+        Option<&crate::poi::QuestMarkerTask>,
+    )>,
     poi_q: Query<&crate::poi::PoiLayer>,
     loot_q: Query<&crate::loot::LootClass>,
+    extracts: Query<(
+        &crate::poi::PoiLayer,
+        &GlobalTransform,
+        Option<&crate::poi::ExtractFaction>,
+    )>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
     mut server_cmd: MessageWriter<crate::pathfind::ServerCmd>,
@@ -181,6 +193,7 @@ fn layers_panel(
     const MUTED: Color32 = Color32::from_rgb(120, 122, 120);
     const DIMCOUNT: Color32 = Color32::from_rgb(110, 112, 110);
     const PANEL_BG: Color32 = Color32::from_rgb(20, 22, 23);
+    const KEYCARD: Color32 = Color32::from_rgb(184, 115, 235); // violet = Color::srgb(0.72,0.45,0.92)
 
     // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
     // dim number after each row so the planner can gauge density without enabling the layer.
@@ -228,12 +241,15 @@ fn layers_panel(
             );
             let q = search.query.trim().to_lowercase();
             if !q.is_empty() {
-                let mut hits: Vec<(&crate::inspect::MarkerInfo, Vec3)> = Vec::new();
-                for (info, gt) in &markers {
+                // (info, position, poi layer, loot class, quest task) — the layer/class/task let a
+                // click auto-enable whatever hidden layer the hit lives on.
+                let mut hits = Vec::new();
+                for (info, gt, layer, cls, qtask) in &markers {
                     if info.title.to_lowercase().contains(&q)
                         || info.subtitle.to_lowercase().contains(&q)
+                        || info.detail.iter().any(|d| d.to_lowercase().contains(&q))
                     {
-                        hits.push((info, gt.translation()));
+                        hits.push((info, gt.translation(), layer, cls, qtask));
                     }
                 }
                 let total = hits.len();
@@ -243,12 +259,57 @@ fn layers_panel(
                     .id_salt("marker_search")
                     .max_height(200.0)
                     .show(ui, |ui| {
-                        for (info, pos) in hits.iter().take(25) {
+                        for (info, pos, layer, cls, qtask) in hits.iter().take(25) {
+                            // Is the hit's layer/class currently toggled off? (Clicking enables it.)
+                            let hidden = if let Some(task) = qtask {
+                                !toggles.quests
+                                    || (!tracker.active.is_empty()
+                                        && !tracker.active.contains(&task.0))
+                            } else if let Some(l) = layer {
+                                !*layer_toggle_mut(&mut toggles, **l)
+                            } else if let Some(c) = cls {
+                                !(toggles.loot
+                                    && toggles.loot_classes.get(&c.0).copied().unwrap_or(true))
+                            } else {
+                                false
+                            };
+                            // Second column: the subtitle, or — when only a detail line matched —
+                            // that matching detail line, so the hit shows WHY it matched.
+                            let second = if info.title.to_lowercase().contains(&q)
+                                || info.subtitle.to_lowercase().contains(&q)
+                            {
+                                info.subtitle.as_str()
+                            } else {
+                                info.detail
+                                    .iter()
+                                    .find(|d| d.to_lowercase().contains(&q))
+                                    .map(|s| s.as_str())
+                                    .unwrap_or(info.subtitle.as_str())
+                            };
                             let label =
-                                RichText::new(format!("{}  \u{00B7}  {}", info.title, info.subtitle));
-                            if ui.selectable_label(false, label).clicked() {
-                                cam_cmd.fly_to = Some(*pos);
-                            }
+                                RichText::new(format!("{}  \u{00B7}  {}", info.title, second));
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(false, label).clicked() {
+                                    cam_cmd.fly_to = Some(*pos);
+                                    // Flying to an invisible marker is useless — turn its layer on.
+                                    if let Some(task) = qtask {
+                                        toggles.quests = true;
+                                        if !tracker.active.is_empty()
+                                            && !tracker.active.contains(&task.0)
+                                        {
+                                            tracker.active.insert(task.0.clone());
+                                        }
+                                    } else if let Some(l) = layer {
+                                        *layer_toggle_mut(&mut toggles, **l) = true;
+                                    } else if let Some(c) = cls {
+                                        toggles.loot = true;
+                                        toggles.loot_classes.insert(c.0.clone(), true);
+                                    }
+                                }
+                                if hidden {
+                                    ui.label(RichText::new("(off)").size(10.0).color(MUTED));
+                                }
+                            });
                         }
                         if total > 25 {
                             ui.label(
@@ -328,6 +389,37 @@ fn layers_panel(
                             poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit, &poi_counts);
                             poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary, &poi_counts);
                             poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot, &poi_counts);
+
+                            // ---- KEYS FOR THIS MAP (aggregated from the lock markers, price desc;
+                            // poi::KeyCatalog). Click a key -> locks layer on + fly to a lock it opens.
+                            if !key_catalog.keys.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("Keys for this map").size(11.0).color(MUTED),
+                                );
+                                for k in &key_catalog.keys {
+                                    let mut row = format!(
+                                        "{}  \u{00D7}{}",
+                                        k.name,
+                                        k.lock_positions.len()
+                                    );
+                                    if let Some(pr) = k.price.filter(|&p| p > 0) {
+                                        row.push_str(&format!("  {}", crate::inspect::money(pr)));
+                                    }
+                                    // Keycards read violet (matches the marker/card accent).
+                                    let text = if k.card {
+                                        RichText::new(row).size(12.0).color(KEYCARD)
+                                    } else {
+                                        RichText::new(row).size(12.0)
+                                    };
+                                    if ui.selectable_label(false, text).clicked() {
+                                        toggles.locks = true;
+                                        if let Some(p) = k.lock_positions.first() {
+                                            cam_cmd.fly_to = Some(*p);
+                                        }
+                                    }
+                                }
+                            }
                         });
 
                     // ===== TASKS / QUESTS =====
@@ -505,9 +597,9 @@ fn layers_panel(
                                 ui.label(RichText::new(dot).color(col).size(11.0));
                                 ui.label(RichText::new(txt).color(col).size(12.0));
                             });
+                            let running = server.status == ServerStatus::Running;
+                            let starting = server.status == ServerStatus::Starting;
                             ui.horizontal(|ui| {
-                                let running = server.status == ServerStatus::Running;
-                                let starting = server.status == ServerStatus::Starting;
                                 if ui
                                     .add_enabled(!running && !starting, egui::Button::new("Start server"))
                                     .clicked()
@@ -521,6 +613,25 @@ fn layers_panel(
                                     server_cmd.write(ServerCmd::Stop);
                                 }
                             });
+                            // One-click route from the camera through every extract — the `chain`
+                            // query re-orders the stops, so the nearest extract comes first.
+                            if ui
+                                .add_enabled(running, egui::Button::new("Route: nearest extract"))
+                                .clicked()
+                            {
+                                let dests: Vec<Vec3> = extracts
+                                    .iter()
+                                    .filter(|(l, _, _)| **l == PoiLayer::Extract)
+                                    .map(|(_, gt, _)| gt.translation())
+                                    .collect();
+                                if !dests.is_empty() {
+                                    route_writer.write(RouteRequest {
+                                        start: None,
+                                        dests,
+                                        optimize_order: true,
+                                    });
+                                }
+                            }
                             ui.label(
                                 RichText::new(
                                     "on-demand routing via the local :8091 GPU server (first query loads the map \u{2248}30 s)",
@@ -582,6 +693,28 @@ fn hide_all(t: &mut LayerToggles) {
     t.stationary = false;
     t.loose = false;
     t.quests = false;
+}
+
+/// The `LayerToggles` field owning a POI layer's visibility — the same mapping as poi.rs
+/// `apply_poi_visibility` — so search can flip a hidden layer on when one of its hits is clicked.
+#[cfg(feature = "egui")]
+fn layer_toggle_mut(t: &mut LayerToggles, l: crate::poi::PoiLayer) -> &mut bool {
+    use crate::poi::PoiLayer as P;
+    match l {
+        P::PmcSpawn => &mut t.pmc_spawns,
+        P::ScavSpawn => &mut t.scav_spawns,
+        P::Boss => &mut t.bosses,
+        P::Extract => &mut t.extracts,
+        P::Door => &mut t.doors,
+        P::Interactable => &mut t.interactables,
+        P::Lock => &mut t.locks,
+        P::Hazard => &mut t.hazards,
+        P::Switch => &mut t.switches,
+        P::Transit => &mut t.transits,
+        P::Stationary => &mut t.stationary,
+        P::LooseLoot => &mut t.loose,
+        P::Quest => &mut t.quests,
+    }
 }
 
 /// egui swatch colour for a POI layer (matches the on-map marker colour).

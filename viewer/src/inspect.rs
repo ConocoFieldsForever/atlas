@@ -134,6 +134,7 @@ fn draw_cards(
     markers: Query<(&GlobalTransform, &MarkerInfo, &PickRadius)>,
     mut open: ResMut<OpenCards>,
     mut pointer_on_ui: ResMut<PointerOnUi>,
+    mut route: MessageWriter<crate::pathfind::RouteRequest>,
 ) {
     use bevy_egui::egui::{self, Align, Align2, Button, Color32, Layout, RichText};
 
@@ -195,6 +196,15 @@ fn draw_cards(
                     // Detail lines (near-white, small).
                     for d in &info.detail {
                         ui.label(RichText::new(d).color(Color32::from_gray(228)).size(12.0));
+                    }
+                    // One-click route from the camera to this marker (pathfind server).
+                    ui.add_space(2.0);
+                    if ui.small_button("route here").clicked() {
+                        route.write(crate::pathfind::RouteRequest {
+                            start: None,
+                            dests: vec![tf.translation()],
+                            optimize_order: false,
+                        });
                     }
                 });
             });
