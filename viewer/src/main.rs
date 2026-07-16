@@ -26,7 +26,8 @@ use bevy::core_pipeline::Skybox;
 use bevy::post_process::bloom::Bloom;
 use bevy::asset::RenderAssetUsages;
 use bevy::render::render_resource::{
-    Extent3d, TextureDimension, TextureFormat, TextureViewDescriptor, TextureViewDimension,
+    Extent3d, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+    TextureViewDimension,
 };
 use bevy::render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, Hdr, NoIndirectDrawing};
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
@@ -270,7 +271,7 @@ fn main() {
     if let Some(g) = grade_lut {
         app.insert_resource(g);
     }
-    app.add_plugins(GradePlugin);
+    app.add_plugins((GradePlugin, render::SsaoPlugin));
 
     if let Some(p) = pack {
         app.insert_resource(LoadedPack(p));
@@ -455,7 +456,13 @@ fn setup(
     let sky = build_sky_cubemap(&mut images, sun_dir);
 
     let mut cam = commands.spawn((
-        Camera3d::default(),
+        Camera3d {
+            // SSAO (render::ssao) samples the main depth buffer — without TEXTURE_BINDING the
+            // depth view is attachment-only and the SSAO bind group fails wgpu validation.
+            depth_texture_usages: (TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING)
+                .into(),
+            ..default()
+        },
         // HDR view target: the custom draw shader outputs LINEAR HDR radiance (sun glints,
         // sky reflections >1.0). Without this marker the pipeline specialized to an 8-bit sRGB
         // target and everything above 1.0 flat-clipped BEFORE tonemapping — and Bloom (which

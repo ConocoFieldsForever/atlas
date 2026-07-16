@@ -19,11 +19,13 @@ use bevy::prelude::Resource;
 pub mod gpu_driven;
 pub mod grade;
 pub mod instancing;
+pub mod ssao;
 pub mod standard;
 
 pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
+pub use ssao::SsaoPlugin;
 pub use standard::EftStandardPlugin;
 
 /// Runtime graphics settings, driven by the UI's "Graphics (experimental)" section and extracted
@@ -58,6 +60,13 @@ pub struct GfxSettings {
     /// Screen-size cull thresholds in pixels (general, grass). 0 disables that cull.
     pub cull_px: f32,
     pub cull_px_grass: f32,
+    /// Depth-only SSAO post pass (experimental; off = shipped look).
+    pub ssao: bool,
+    pub ssao_intensity: f32,
+    /// SSAO sampling radius in meters.
+    pub ssao_radius: f32,
+    /// EFT-style unsharp-mask strength in the grade pass (0 = off; the game ships ~0.5).
+    pub sharpen: f32,
 }
 
 impl Default for GfxSettings {
@@ -87,6 +96,13 @@ impl Default for GfxSettings {
             grass: true,
             cull_px,
             cull_px_grass,
+            ssao: std::env::var("EFT_SSAO").map(|v| v.trim() == "1").unwrap_or(false),
+            ssao_intensity: 1.0,
+            ssao_radius: 0.7,
+            sharpen: std::env::var("EFT_SHARPEN")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0.0),
         }
     }
 }

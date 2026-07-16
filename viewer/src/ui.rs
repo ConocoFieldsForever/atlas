@@ -815,6 +815,21 @@ fn layers_panel(
                             egui::Slider::new(&mut g.cull_px_grass, 0.0..=16.0)
                                 .text("grass cull px"),
                         );
+                        ui.checkbox(&mut g.ssao, "SSAO (contact shading)")
+                            .on_hover_text("depth-based ambient occlusion \u{2014} crevices/corners darken like the game");
+                        ui.add_enabled(
+                            g.ssao,
+                            egui::Slider::new(&mut g.ssao_intensity, 0.0..=2.0).text("ssao intensity"),
+                        );
+                        ui.add_enabled(
+                            g.ssao,
+                            egui::Slider::new(&mut g.ssao_radius, 0.2..=2.0).text("ssao radius m"),
+                        );
+                        ui.add_enabled(
+                            g.grade && g.grade_available,
+                            egui::Slider::new(&mut g.sharpen, 0.0..=1.0).text("sharpen"),
+                        )
+                        .on_hover_text("EFT-style unsharp mask (the game ships ~0.5); needs the grade LUT");
                         if ui.small_button("reset to defaults").clicked() {
                             let keep = (g.grade_available, g.shadows_available);
                             g = crate::render::GfxSettings::default();

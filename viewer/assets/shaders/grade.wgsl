@@ -16,9 +16,11 @@
 // 64^3 LUT cover HDR up to 4.0. Get it wrong and the LUT reads the wrong slice.
 
 struct GradeParams {
-    // x = exposure (default 0.18; eye-adaptation may override). yzw reserved.
+    // x = exposure (default 0.18; eye-adaptation may override).
     exposure: f32,
-    _pad0: f32, _pad1: f32, _pad2: f32,
+    // EFT-style unsharp-mask strength on the pre-LUT linear scene (0 = off; game ships ~0.5).
+    sharpen: f32,
+    _pad1: f32, _pad2: f32,
     // vignette tuning (PRISM): aspect divisors + smoothstep edges + strength.
     // xy = (1.15, 0.95) axis divisors; z,w = smoothstep(0.55, 1.25).
     vig: vec4<f32>,
@@ -64,7 +66,18 @@ fn lut_sample(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_grade(in: FsIn) -> @location(0) vec4<f32> {
-    let lin = textureSampleLevel(scene_tex, scene_samp, in.uv, 0.0).rgb * grade.exposure;
+    var scene = textureSampleLevel(scene_tex, scene_samp, in.uv, 0.0).rgb;
+    // EFT-style sharpen: 4-tap unsharp mask on the pre-LUT linear scene (the game applies a
+    // strong sharpen in its own post chain). max() guards ringing below zero.
+    if (grade.sharpen > 0.0) {
+        let ts = 1.0 / vec2<f32>(textureDimensions(scene_tex));
+        let n = textureSampleLevel(scene_tex, scene_samp, in.uv + vec2<f32>(ts.x, 0.0), 0.0).rgb
+              + textureSampleLevel(scene_tex, scene_samp, in.uv - vec2<f32>(ts.x, 0.0), 0.0).rgb
+              + textureSampleLevel(scene_tex, scene_samp, in.uv + vec2<f32>(0.0, ts.y), 0.0).rgb
+              + textureSampleLevel(scene_tex, scene_samp, in.uv - vec2<f32>(0.0, ts.y), 0.0).rgb;
+        scene = max(scene + (scene - n * 0.25) * grade.sharpen, vec3<f32>(0.0));
+    }
+    let lin = scene * grade.exposure;
     let g = lut_sample(lin);
 
     // PRISM vignette: e = (uv-0.5)*2 / (1.15, 0.95); vig = 1 - smoothstep(0.55,1.25,|e|)*0.488.

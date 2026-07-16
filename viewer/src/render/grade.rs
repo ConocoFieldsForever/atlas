@@ -131,7 +131,9 @@ pub fn load_grade_lut(pack_root: Option<&std::path::Path>) -> Option<GradeLutCpu
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GradeParamsGpu {
     exposure: f32,
-    _pad: [f32; 3],
+    /// EFT-style unsharp-mask strength (rides the old pad lane; 0 = off).
+    sharpen: f32,
+    _pad: [f32; 2],
     vig: [f32; 4],          // xy = aspect divisors, zw = smoothstep edges
     vig_strength: [f32; 4], // x = strength
 }
@@ -197,7 +199,8 @@ fn init_grade_pipeline(
         label: Some("eft_grade_params"),
         contents: bytemuck::bytes_of(&GradeParamsGpu {
             exposure: lut.exposure,
-            _pad: [0.0; 3],
+            sharpen: 0.0, // live value comes from update_grade_params each frame
+            _pad: [0.0; 2],
             vig: [1.15, 0.95, 0.55, 1.25], // PRISM defaults (see grade.wgsl header)
             vig_strength: [lut.vignette, 0.0, 0.0, 0.0],
         }),
@@ -345,7 +348,8 @@ fn update_grade_params(
         0,
         bytemuck::bytes_of(&GradeParamsGpu {
             exposure: s.grade_exposure,
-            _pad: [0.0; 3],
+            sharpen: s.sharpen,
+            _pad: [0.0; 2],
             vig: [1.15, 0.95, 0.55, 1.25],
             vig_strength: [if s.vignette { 0.488 } else { 0.0 }, 0.0, 0.0, 0.0],
         }),
