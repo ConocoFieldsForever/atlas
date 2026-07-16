@@ -154,19 +154,47 @@ class _TexTest:
             except Exception: res = False
         self._nm[name] = res; return res
 
-    def alpha_is_coverage(self, name):
-        """True when alpha is real hole-coverage (leaf atlas): >10% texels A<80 AND >2% A>200,
-        measured at FULL RES (a downscale smears sparse 255s below threshold). SpeedTree bark
-        smoothness-alpha is mid-heavy with ~0 opaque texels and must NOT alpha-test."""
-        if not name: return False
+    def alpha_coverage(self, name):
+        """Universal DATA-DRIVEN coverage detection: returns the Otsu-split alpha cutoff when the
+        texture's own alpha histogram says it is authored hole-coverage, else None. No shader
+        names, no per-asset rules, and no fixed cutoff — the histogram supplies its own split.
+        Three criteria, each physically motivated (validated across foliage atlases, ground
+        overlays, camo nets vs. AO/height/smoothness alpha on floors and props):
+          * Otsu separability >= 0.5      — the alpha is clearly BIMODAL (two populations);
+          * transparent-mode mean <= 0.1  — the low mode is actual HOLES (data-alpha lows sit
+                                            higher: AO/height rarely reaches true zero);
+          * solid-mode mean >= 0.3        — the stuff you KEEP is meaningfully opaque (alpha-as-
+                                            data clusters far below: measured 0.12-0.22 on the
+                                            false-positive floors vs 0.36-0.97 on real coverage).
+        The old fixed-number test ((A<80)>10% AND (A>200)>2%) missed real foliage whose leaves
+        are semi-soft (brush_dry: 95% holes but few texels above 200) — exactly the class of
+        hardcoded-threshold bug this replaces."""
+        if not name: return None
         if name in self._cov: return self._cov[name]
-        res = False
+        res = None
         im = self._open(name)
         if im is not None and im.mode == 'RGBA':
             try:
-                a = np.asarray(im.getchannel('A'), np.float32)
-                res = bool((a < 80).mean() > 0.10 and (a > 200).mean() > 0.02)
-            except Exception: res = False
+                a = np.asarray(im.getchannel('A'), np.float64) / 255.0
+                hist, _ = np.histogram(a, bins=256, range=(0.0, 1.0))
+                w = hist / max(hist.sum(), 1)
+                lv = (np.arange(256) + 0.5) / 256.0
+                mean_all = (w * lv).sum()
+                total_var = ((lv - mean_all) ** 2 * w).sum()
+                if total_var >= 1e-6:
+                    wc = np.cumsum(w); mc = np.cumsum(w * lv); mt = mc[-1]
+                    w0 = wc; w1 = 1.0 - wc
+                    ok = (w0 > 0) & (w1 > 0)
+                    m0 = np.where(ok, mc / np.maximum(w0, 1e-12), 0.0)
+                    m1 = np.where(ok, (mt - mc) / np.maximum(w1, 1e-12), 0.0)
+                    between = w0 * w1 * (m0 - m1) ** 2
+                    t = int(np.argmax(between))
+                    if (between[t] / total_var >= 0.5     # bimodal
+                            and m0[t] <= 0.1              # low mode = true holes
+                            and m1[t] >= 0.3):            # solid mode = meaningfully opaque
+                        res = float(lv[t])
+            except Exception:
+                res = None
         self._cov[name] = res; return res
 
 
@@ -452,10 +480,19 @@ def main():
         # ---- per-submesh dedup / smooth-normal build (objio + the assemble geometry loop -- verbatim math) ----
         pending = []; f0 = 0
         for sb in subs:
-            # SpeedTree opaque leaf -> cutout when the texture alpha is genuinely bimodal (real holes). Data decides.
-            if ('speedtree' in (sb.get('sh') or '').lower() and sb.get('role', 'opaque') == 'opaque'
-                    and tex.alpha_is_coverage(sb.get('tex'))):
-                sb['role'] = 'cutout'; sb.setdefault('cut', 0.33)
+            # UNIVERSAL alpha-coverage recovery — no shader lists, the texture data decides.
+            # Unity's RenderType tag gives the extractor an authoritative role, but CUSTOM EFT
+            # shaders (SpeedTreeEFT foliage, Cloth ground overlays, deferred one-offs) don't tag
+            # TransparentCutout and fell through to 'opaque' -> solid black cards/sheets. For any
+            # opaque textured sub whose alpha is NOT smoothness (smA — the game's own flag), ask
+            # the albedo's alpha histogram whether it is authored hole-coverage (alpha_coverage:
+            # Otsu bimodality + true-zero holes + opaque solid mode). Cutoff priority: the
+            # material's own authored _Cutoff (game data) over the histogram's Otsu split.
+            if (sb.get('role', 'opaque') == 'opaque' and not sb.get('smA')):
+                _otsu = tex.alpha_coverage(sb.get('tex'))
+                if _otsu is not None:
+                    sb['role'] = 'cutout'
+                    sb['cut'] = float(sb.get('cut') or _otsu)
             n = sb.get('n', -1); n = (len(F) - f0) if n < 0 else n
             if n <= 0 or f0 + n > len(F): f0 += max(n, 0); continue
             if not CULLS.keep_submesh(sb): f0 += n; continue          # shadow / billboard-LOD / fog / proxy
