@@ -22,11 +22,30 @@ The Unity->viewer bridge is the map config's coordinates.global_matrix conjugati
 points (G3 @ p, the diag(-1,1,1) X-flip) — identical rule as the geometry pipeline; corner
 order is reversed after the flip so outlines stay CCW.
 
+LOOSE LOOT (first-party): LootPoint MonoBehaviours are the ONLY loose-loot positions the
+client ships — a small curated set (lighthouse: gun racks / gun safes / food piles / car
+trunks; factory: none). The bulk of loose loot is SERVER data (resources.assets carries only
+"err"-wrapped Test*/LootData mocks of that exchange). A LootPoint payload DOES carry its item
+pool: dword flags(=1); Id GUID string @4; 28-byte fixed block; dword N; N length-prefixed
+24-hex item/category TEMPLATE ids; dword tail (validated on all 4 lighthouse variants). No
+weights are serialized. Template ids resolve to names/prices via tarkov.dev (items +
+itemCategories); each point is also nearest-neighbor-joined to tarkov.dev lootLoose for a
+match-distance report. Both net steps degrade gracefully offline (ids ship un-named).
+
+TERRAIN DRAPING: outline verts sit at the collider's BOTTOM face, which floats/sinks on
+hills. When the map's .eftpack is present (EFT_PACK_DIR override, default <repo>/packs/
+<map>.eftpack), a world heightfield is built from the pack's FLAG_TERRAIN instances (same
+uv->world idea as eft_pipeline/build_grass.py, binned to a 2 m world-XZ grid), every outline
+edge is subdivided ~4 m and each vert lifted to max(terrain+0.3, collider_base_y) — lines
+follow the ground and never sink below the collider. Verts off the terrain grid keep the
+collider Y. Zones keep a pre-subdivision "extent" [w, d] for the cards; the file gets a
+top-level "draped" flag so the viewer can drop its own lift.
+
   python extraction/intel/extract_gamedata.py <map> [--levels a,b,c] [--out FILE]
       (requires EFT_TARKMAP_ROOT; levels default to the map config's source.levels;
        default output <EFT_TARKMAP_ROOT>/out/<map>/gamedata.json)
 """
-import os, sys, json, gc, time, math, struct, functools
+import os, sys, json, gc, time, math, struct, functools, urllib.request
 from collections import Counter
 
 import numpy as np
@@ -139,6 +158,32 @@ def dec_spawn(pl):
 def dec_stationary_name(pl):
     s, _ = read_cstr(pl, 20)
     return (s or "").strip() or None
+
+
+def dec_lootpoint(pl):
+    """LootPoint: dword flags(=1); Id GUID str @4; 28-byte fixed block (two variant dwords +
+    zeros); dword N; N x length-prefixed 24-hex item/category template ids; dword tail.
+    Recovered empirically on lighthouse levels 185-207 (all 4 GameObject variants agree). The
+    array offset is SCANNED over a small window past the GUID instead of hardcoded, so a
+    fixed-block size change degrades to (guid, []) rather than garbage."""
+    guid, e = read_cstr(pl, 4)
+    if guid is None or len(guid) < 8:
+        return None, []
+    for off in range(e, min(len(pl) - 4, e + 64), 4):
+        n = int.from_bytes(pl[off:off + 4], "little")
+        if not 1 <= n <= 64:
+            continue
+        tps, p, ok = [], off + 4, True
+        for _ in range(n):
+            s, p2 = read_cstr(pl, p)
+            if s is None or len(s) != 24 or not all(c in "0123456789abcdef" for c in s):
+                ok = False
+                break
+            tps.append(s)
+            p = p2
+        if ok:
+            return guid, tps
+    return guid, []
 
 
 def trs_mat(t, q, s):
@@ -328,7 +373,7 @@ def scan_level(lv, sink):
             cls = None
         if cls not in EXFIL_CLASSES and cls not in DOOR_CLASSES and cls not in (
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
-                "SpawnPointMarker", "MineDirectional"):
+                "SpawnPointMarker", "MineDirectional", "LootPoint"):
             continue
         go_pid = (hdr.get("m_GameObject") or {}).get("m_PathID")
         if not go_pid:
@@ -393,6 +438,13 @@ def scan_level(lv, sink):
                                              "categories_mask": None, "infiltration": None, "lv": lv})
         elif cls == "MineDirectional":
             sink["mines_directional"].append({"pos": tpos, "lv": lv})
+        elif cls == "LootPoint":
+            guid, tps = dec_lootpoint(pl)
+            if guid:
+                sink["loose_points"].append({
+                    "pos": tpos, "name": name, "guid": guid, "templates": tps,
+                    "active": active, "lv": lv,
+                })
 
     print(f"[level{lv}] {len(objs)} objs, {len(mbs)} MBs -> {n_hit} typed hits ({time.time()-t0:.0f}s)")
     del env, objs, go_obj, tr_obj, col_obj, mbs, tt_cache, go_tt_cache, wm_cache
@@ -407,6 +459,283 @@ def dedupe(rows, keyf):
         if k not in best or (r.get("active") and not best[k].get("active")):
             best[k] = r
     return list(best.values())
+
+
+# ---------------------------------------------------------------------------
+# TERRAIN HEIGHTFIELD (Task: drape zone outlines on the ground)
+# ---------------------------------------------------------------------------
+class TerrainField:
+    """World-XZ heightfield from the map's .eftpack FLAG_TERRAIN instances (pack space =
+    viewer space, so outline verts sample it directly). Vertices are binned to a CELL-metre
+    grid (mean Y per cell — terrain slices overlap at seams); sampling is a bilinear blend of
+    the 4 surrounding cell centres, degrading to the plain cell mean where neighbours are
+    missing and to None off the grid. Same data as eft_pipeline/build_grass.py's uv->world
+    grids, but keyed by world XZ (we need height AT a point, not point AT a uv)."""
+    CELL = 2.0  # instances are filtered on FLAG_TERRAIN = 1<<1 (build_grass.py's contract)
+
+    def __init__(self, pack_dir):
+        mani = json.load(open(os.path.join(pack_dir, "manifest.json")))
+        mb = open(os.path.join(pack_dir, "meshes.bin"), "rb").read()
+        ib = open(os.path.join(pack_dir, "instances.bin"), "rb").read()
+        vl = mani["vertex"]
+        vs = vl["stride"]
+        poff = next(a for a in vl["attrs"] if a["name"] == "position")["offset"]
+        inst = mani["instance"]
+        istride = inst["stride"]
+        fo = {f["name"]: f["offset"] for f in inst["fields"]}
+        id2mesh = {m["id"]: m for m in mani["meshes"]}
+        pts = []
+        for i in range(len(ib) // istride):
+            b = i * istride
+            if not struct.unpack_from("<I", ib, b + fo["flags"])[0] & 2:
+                continue
+            a = np.array(struct.unpack_from("<12f", ib, b + fo["affine"]),
+                         np.float64).reshape(3, 4)
+            me = id2mesh[struct.unpack_from("<I", ib, b + fo["meshId"])[0]]
+            n, off = me["vtxCount"], me["vtxOffset"]
+            vb = np.frombuffer(mb, np.uint8, count=n * vs, offset=off).reshape(n, vs)
+            loc = vb[:, poff:poff + 12].copy().view("<f4").astype(np.float64)
+            pts.append(loc @ a[:, :3].T + a[:, 3])
+        if not pts:
+            raise ValueError("no FLAG_TERRAIN instances")
+        w = np.concatenate(pts)
+        c = self.CELL
+        ix = np.floor(w[:, 0] / c).astype(np.int64)
+        iz = np.floor(w[:, 2] / c).astype(np.int64)
+        self.x0, self.z0 = int(ix.min()), int(iz.min())
+        nx, nz = int(ix.max()) - self.x0 + 1, int(iz.max()) - self.z0 + 1
+        s = np.zeros((nx, nz), np.float64)
+        n = np.zeros((nx, nz), np.int64)
+        np.add.at(s, (ix - self.x0, iz - self.z0), w[:, 1])
+        np.add.at(n, (ix - self.x0, iz - self.z0), 1)
+        self.h = np.where(n > 0, s / np.maximum(n, 1), np.nan)
+        self.n_verts, self.n_cells = len(w), int((n > 0).sum())
+
+    def sample(self, x, z):
+        """terrain height at world (x, z) or None when off-grid."""
+        c = self.CELL
+        fx, fz = x / c - 0.5 - self.x0, z / c - 0.5 - self.z0
+        x0, z0 = int(np.floor(fx)), int(np.floor(fz))
+        tx, tz = fx - x0, fz - z0
+        acc = wsum = 0.0
+        for dx, dz, wgt in ((0, 0, (1 - tx) * (1 - tz)), (1, 0, tx * (1 - tz)),
+                            (0, 1, (1 - tx) * tz), (1, 1, tx * tz)):
+            xi, zi = x0 + dx, z0 + dz
+            if 0 <= xi < self.h.shape[0] and 0 <= zi < self.h.shape[1]:
+                v = self.h[xi, zi]
+                if np.isfinite(v) and wgt > 0.0:
+                    acc += v * wgt
+                    wsum += wgt
+        return acc / wsum if wsum > 1e-6 else None
+
+
+def load_terrain_field():
+    """the map's pack heightfield, or None (indoor maps / pack absent) — draping is optional."""
+    pack = os.environ.get("EFT_PACK_DIR") or os.path.join(
+        os.path.dirname(KIT), "packs", f"{MAP}.eftpack")
+    if not os.path.exists(os.path.join(pack, "manifest.json")):
+        print(f"[drape] no pack at {pack} - outlines stay at collider Y")
+        return None
+    try:
+        tf = TerrainField(pack)
+        print(f"[drape] heightfield from {pack}: {tf.n_verts} terrain verts -> "
+              f"{tf.n_cells} cells @ {tf.CELL} m")
+        return tf
+    except ValueError:
+        print(f"[drape] pack has no terrain instances (indoor map) - outlines stay at collider Y")
+        return None
+    except Exception as ex:
+        print(f"[drape] heightfield failed ({type(ex).__name__}: {ex}) - outlines stay at collider Y")
+        return None
+
+
+def drape_outline(outline, field, step=4.0, lift=0.3):
+    """subdivide each closed-outline edge every ~`step` m and set vert Y to
+    max(terrain + lift, collider_base_y); base Y interpolates along the edge and is kept
+    wherever the terrain grid has no data. Returns the new vert list."""
+    n = len(outline)
+    if n < 3 or field is None:
+        return outline
+    out = []
+    for i in range(n):
+        a, b = outline[i], outline[(i + 1) % n]
+        seg = math.hypot(b[0] - a[0], b[2] - a[2])
+        k = max(1, int(math.ceil(seg / step)))
+        for j in range(k):
+            t = j / k
+            x = a[0] + (b[0] - a[0]) * t
+            y0 = a[1] + (b[1] - a[1]) * t
+            z = a[2] + (b[2] - a[2]) * t
+            ty = field.sample(x, z)
+            y = max(ty + lift, y0) if ty is not None else y0
+            out.append([round(x, 2), round(y, 2), round(z, 2)])
+    return out
+
+
+def outline_extent(outline):
+    """[w, d] metres of the (pre-subdivision) rectangular footprint, for the viewer cards."""
+    if len(outline) < 3:
+        return None
+    d = lambda a, b: math.dist(a, b)
+    w, h = d(outline[0], outline[1]), d(outline[1], outline[2])
+    return [round(w, 1), round(h, 1)] if w > 0.05 and h > 0.05 else None
+
+
+def drape_zones(sink, keys=("exfils", "minefields", "sniper_zones", "transit_points")):
+    """drape every zone outline in `keys` (and stamp its pre-subdivision extent). Returns
+    (draped?, verts_before, verts_after)."""
+    field = load_terrain_field()
+    before = after = 0
+    for k in keys:
+        for r in sink[k]:
+            ol = r.get("outline") or []
+            if len(ol) < 3:
+                continue
+            ext = outline_extent(ol)
+            if ext:
+                r["extent"] = ext
+            before += len(ol)
+            r["outline"] = drape_outline(ol, field)
+            after += len(r["outline"])
+    return field is not None, before, after
+
+
+# ---------------------------------------------------------------------------
+# tarkov.dev RESOLUTION + lootLoose JOIN (loose_points) — all failures degrade to offline.
+# ---------------------------------------------------------------------------
+DEV_API = "https://api.tarkov.dev/graphql"
+# tarkov.dev display name for the per-map lootLoose query (same per-map fetch pattern as
+# build_loot.py — the all-maps query 503s). Unlisted maps fall back to a title-cased key.
+DEV_NAME = {"lighthouse": "Lighthouse", "factory": "Factory", "labs": "The Lab",
+            "streets": "Streets of Tarkov", "ground_zero": "Ground Zero", "labyrinth": "The Labyrinth"}
+
+
+def gql(q, tries=3):
+    req = urllib.request.Request(DEV_API, data=json.dumps({"query": q}).encode(),
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": "eft-native-viewer-gamedata/1.0"})
+    last = None
+    for i in range(tries):
+        try:
+            r = json.load(urllib.request.urlopen(req, timeout=60))
+            if "errors" in r:
+                raise RuntimeError("tarkov.dev errors: " + json.dumps(r["errors"][:2])[:300])
+            return r["data"]
+        except Exception as ex:                                  # 503/timeout/offline
+            last = ex
+            time.sleep(1.5 * (i + 1))
+    raise RuntimeError(f"tarkov.dev unreachable: {last}")
+
+
+def resolve_templates(loose):
+    """template id -> {'n','s','pr','cat'} via tarkov.dev items(ids) + itemCategories.
+    cat=1 marks a CATEGORY template ('Food and drink' pool slot, no price/icon)."""
+    ids = sorted({t for r in loose for t in r["templates"]})
+    if not ids or os.environ.get("EFT_GAMEDATA_OFFLINE"):
+        return {}
+    idx = {}
+    try:
+        lst = ",".join('"%s"' % i for i in ids)
+        d = gql("{ items(ids: [%s]) { id name shortName avg24hPrice } }" % lst)
+        for it in d.get("items") or []:
+            idx[it["id"]] = {"n": it.get("name"), "s": it.get("shortName"),
+                             "pr": it.get("avg24hPrice"), "cat": 0}
+        left = [i for i in ids if i not in idx]
+        if left:
+            cd = gql("{ itemCategories { id name } }")
+            cidx = {c["id"]: c["name"] for c in cd.get("itemCategories") or []}
+            for i in left:
+                if i in cidx:
+                    idx[i] = {"n": cidx[i], "s": None, "pr": None, "cat": 1}
+        print(f"[loose] resolved {len(idx)}/{len(ids)} template ids via tarkov.dev "
+              f"({sum(1 for v in idx.values() if v['cat'])} categories)")
+    except RuntimeError as ex:
+        print(f"[loose] template resolution OFFLINE ({ex}) - shipping raw template ids")
+    return idx
+
+
+def join_dev_loose(loose):
+    """nearest tarkov.dev lootLoose point per first-party point -> r['dev_d'] (m) + items for
+    template-less points within 2.5 m. Prints the match-distance distribution."""
+    if not loose or os.environ.get("EFT_GAMEDATA_OFFLINE"):
+        return
+    name = DEV_NAME.get(MAP, MAP.replace("_", " ").title())
+    try:
+        d = gql('{ maps(name:"%s"){ lootLoose { position { x y z } '
+                'items { name shortName avg24hPrice } } } }' % name)
+        ms = d.get("maps") or []
+        rows = (ms[0].get("lootLoose") or []) if ms else []
+    except RuntimeError as ex:
+        print(f"[loose] lootLoose join OFFLINE ({ex})")
+        return
+    pts = []
+    for ll in rows:
+        p = ll.get("position") or {}
+        if all(k in p for k in "xyz"):
+            pts.append(([-p["x"], p["y"], p["z"]], ll.get("items") or []))  # dev -> viewer bridge
+    if not pts:
+        print(f"[loose] tarkov.dev lootLoose('{name}') returned 0 points - no join")
+        return
+    P = np.array([p for p, _ in pts])
+    ds = []
+    for r in loose:
+        q = np.array(r["pos"])
+        i = int(np.argmin(((P - q) ** 2).sum(axis=1)))
+        dist = float(np.linalg.norm(P[i] - q))
+        r["dev_d"] = round(dist, 2)
+        ds.append(dist)
+        # a point whose payload had NO pool still gets the snapshot's items when co-located
+        if not r.get("items") and dist <= 2.5:
+            best = sorted(pts[i][1], key=lambda it: -(it.get("avg24hPrice") or 0))[:4]
+            r["items"] = [{"n": it.get("name"), "s": it.get("shortName"),
+                           "pr": it.get("avg24hPrice"), "cat": 0} for it in best]
+            r["items_src"] = "tarkov.dev"
+    ds = np.array(ds)
+    print(f"[loose] join vs {len(pts)} tarkov.dev lootLoose points: "
+          f"median {np.median(ds):.1f} m, p90 {np.percentile(ds, 90):.1f} m, max {ds.max():.1f} m; "
+          f"<=1m {(ds <= 1).sum()}, <=2m {(ds <= 2).sum()}, <=5m {(ds <= 5).sum()} of {len(ds)}")
+
+
+def finalize_loose(sink):
+    """guid-dedupe (scene variants re-serialize the same rack), then merge same-name points
+    within 0.5 m into one map point (a rack has several spawn SLOTS at ~one spot): n = slot
+    count, templates = union. Then resolve templates + join tarkov.dev."""
+    best = {}
+    for r in sink["loose_points"]:
+        k = r["guid"]
+        if k not in best or (r.get("active") and not best[k].get("active")):
+            best[k] = r
+    merged = []
+    for r in best.values():
+        hit = None
+        for m in merged:
+            if m["name"] == r["name"] and math.dist(m["pos"], r["pos"]) <= 0.5:
+                hit = m
+                break
+        if hit is None:
+            merged.append({"pos": r["pos"], "name": r["name"], "n": 1,
+                           "templates": list(r["templates"]),
+                           "active": r["active"], "lv": r["lv"]})
+        else:
+            hit["n"] += 1
+            hit["active"] = hit["active"] or r["active"]
+            for t in r["templates"]:
+                if t not in hit["templates"]:
+                    hit["templates"].append(t)
+    idx = resolve_templates(merged)
+    for r in merged:
+        items = []
+        for t in r["templates"]:
+            e = idx.get(t)
+            items.append({"tpl": t, **e} if e else {"tpl": t})
+        # priced real items first, categories last — the viewer titles the card off items[0]
+        items.sort(key=lambda it: (it.get("cat", 0), -(it.get("pr") or 0)))
+        if items:
+            r["items"] = items
+            r["items_src"] = "game files"  # the POOL is client data; names/prices are lookups
+        del r["templates"]
+    join_dev_loose(merged)
+    sink["loose_points"] = merged
 
 
 def sibling_levels(scanned):
@@ -438,7 +767,8 @@ def sibling_levels(scanned):
 def main():
     print(f"[cfg] map={MAP} levels={LEVELS} G3={G3.round(2).tolist()}")
     sink = {k: [] for k in ("exfils", "minefields", "sniper_zones", "doors",
-                            "transit_points", "stationary", "spawn_points", "mines_directional")}
+                            "transit_points", "stationary", "spawn_points",
+                            "mines_directional", "loose_points")}
     t0 = time.time()
     scanned = list(LEVELS)
     for lv in LEVELS:
@@ -457,12 +787,19 @@ def main():
         sink[k] = dedupe(sink[k], lambda r: (r.get("name"), tuple(r["pos"])))
     sink["spawn_points"] = dedupe(sink["spawn_points"], lambda r: (r.get("name"), tuple(r["pos"])))
 
+    # first-party loose loot: guid-dedupe + slot-merge, then tarkov.dev resolution + join.
+    finalize_loose(sink)
+    # terrain-drape every zone outline (subdivide ~4 m; Y = max(terrain+0.3, collider base)).
+    draped, ol_before, ol_after = drape_zones(sink)
+    if draped:
+        print(f"[drape] outline verts {ol_before} -> {ol_after}")
+
     logic_levels = sorted({e["lv"] for e in sink["exfils"]})
     counts = {k: len(v) for k, v in sink.items()}
     counts["exfils_by_faction"] = dict(Counter(e["faction"] for e in sink["exfils"]))
     counts["doors_with_key"] = sum(1 for d in sink["doors"] if d.get("key_id"))
     out = {"map": MAP, "generated_levels": scanned, "logic_levels": logic_levels,
-           "counts": counts, **sink}
+           "draped": draped, "counts": counts, **sink}
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     json.dump(out, open(OUT, "w"), separators=(",", ":"))
     print(f"\n[out] {OUT}  ({os.path.getsize(OUT)/1e3:.0f} kB, {time.time()-t0:.0f}s)")
@@ -475,6 +812,11 @@ def main():
         print(f"  stationary {s['name']:12s} pos={s['pos']}")
     st = Counter(d["state"] for d in sink["doors"])
     print(f"  doors: {len(sink['doors'])} states={dict(st)} with_key={counts['doors_with_key']}")
+    for r in sink["loose_points"]:
+        top = (r.get("items") or [{}])[0]
+        print(f"  loose {str(r['name'])[:28]:28s} pos={r['pos']} slots={r['n']} "
+              f"pool={len(r.get('items') or [])} top={top.get('s') or top.get('n') or top.get('tpl')} "
+              f"dev_d={r.get('dev_d')}")
     print("  copy next to the pack:  copy \"%s\" packs\\%s.eftpack\\" % (OUT, MAP))
 
 
