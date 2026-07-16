@@ -15,10 +15,12 @@
 //! stored once).
 
 pub mod gpu_driven;
+pub mod grade;
 pub mod instancing;
 pub mod standard;
 
 pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin};
+pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 pub use standard::EftStandardPlugin;
 

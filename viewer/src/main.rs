@@ -32,7 +32,10 @@ use bevy::render::view::{ColorGrading, ColorGradingGlobal, ColorGradingSection, 
 use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow};
 
 use eftpack::Pack;
-use render::{CullCamera, EftGpuDrivenPlugin, EftInstancingPlugin, LoadedPack, RenderPath};
+use render::{
+    CullCamera, EftGpuDrivenPlugin, EftInstancingPlugin, GradeLutCpu, GradePlugin, LoadedPack,
+    RenderPath,
+};
 
 /// Fly camera state (WASD + mouse-look while RMB held; QE up/down; Shift = fast).
 #[derive(Component)]
@@ -182,6 +185,15 @@ fn main() {
         }
     }
 
+    // The REAL EFT display chain (grade LUT): resolved from the pack (or env/repo default) and
+    // active by default — EFT_GRADE=0 falls back to the TonyMcMapface + hand-grade approximation.
+    // Loaded BEFORE the pack moves into its resource so we can use its root for pack-local LUTs.
+    let grade_lut = render::load_grade_lut(pack.as_ref().map(|p| p.root.as_path()));
+    if let Some(g) = grade_lut {
+        app.insert_resource(g);
+    }
+    app.add_plugins(GradePlugin);
+
     if let Some(p) = pack {
         app.insert_resource(LoadedPack(p));
     }
@@ -222,10 +234,10 @@ fn main() {
     app.run();
 }
 
-/// f32 -> IEEE 754 half bits (round-to-nearest-even). Local so the sky cubemap can be
-/// Rgba16Float without adding a `half` dependency (Rgba32Float is NOT filterable — the
-/// skybox pipeline uses a filtering sampler and would fail wgpu validation).
-fn f32_to_f16_bits(v: f32) -> u16 {
+/// f32 -> IEEE 754 half bits (round-to-nearest-even). Shared by the sky cubemap and the grade
+/// LUT (render::grade) so Rgba16Float textures need no `half` dependency (Rgba32Float is NOT
+/// filterable — filtering samplers on it fail wgpu validation).
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
     let x = v.to_bits();
     let sign = ((x >> 16) & 0x8000) as u16;
     let mut exp = ((x >> 23) & 0xff) as i32 - 127 + 15;
@@ -305,6 +317,7 @@ fn setup(
     mut commands: Commands,
     pack: Option<Res<LoadedPack>>,
     mut images: ResMut<Assets<Image>>,
+    grade: Option<Res<GradeLutCpu>>,
 ) {
     // Frame the world AABB: stand back along +Y/+Z by the half-diagonal.
     // Debug: EFT_LOOK="x,y,z" frames the camera CLOSE on that world point (e.g. a coordinate from
@@ -358,7 +371,7 @@ fn setup(
         .unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize());
     let sky = build_sky_cubemap(&mut images, sun_dir);
 
-    commands.spawn((
+    let mut cam = commands.spawn((
         Camera3d::default(),
         // HDR view target: the custom draw shader outputs LINEAR HDR radiance (sun glints,
         // sky reflections >1.0). Without this marker the pipeline specialized to an 8-bit sRGB
@@ -377,30 +390,9 @@ fn setup(
             brightness: 900.0,
             rotation: Quat::IDENTITY,
         },
-        // Phase 3 — EFT display grade. TonyMcMapface filmic base (muted, desaturates highlights
-        // toward the game's washed palette) + a subtle grade: cool shadows, slight green tint,
-        // and a small shadow lift for EFT's milky (not crushed) blacks. Saturation sits *below*
-        // 1.0 — the real game is desaturated; punch comes from midtone contrast, not chroma.
-        Tonemapping::TonyMcMapface,
-        ColorGrading {
-            global: ColorGradingGlobal {
-                exposure: 0.4,             // brighten — prior grade came out too dark
-                temperature: -0.02,        // barely cool
-                tint: -0.005,              // was -0.02: under the HDR target it read as a green cast
-                post_saturation: 0.95,     // EFT palette is DEsaturated (was 1.14 — oversold color)
-                ..default()
-            },
-            shadows: ColorGradingSection {
-                lift: 0.02,                // keep blacks milky (not crushed) but a hair deeper for contrast
-                ..default()
-            },
-            midtones: ColorGradingSection {
-                saturation: 0.98,
-                contrast: 1.16,            // midtone contrast carries the look instead of saturation
-                ..default()
-            },
-            ..default()
-        },
+        // Tonemapping is decided below: the REAL game grade LUT (render::grade) replaces the
+        // whole tonemap+grade chain when active; the TonyMcMapface + hand ColorGrading
+        // approximation is only the EFT_GRADE=0 fallback.
         // Far plane derived from pack bounds so the whole map is visible; the
         // default 1000 m clipped Interchange (extent >745 m) — Codex P1.
         Projection::Perspective(PerspectiveProjection {
@@ -420,6 +412,36 @@ fn setup(
             ..default()
         },
     ));
+    // Display chain: the REAL game grade LUT (render::grade — Hejl + film curves + Fahrenheit
+    // fit, baked FROM THE GAME and identical on every map) replaces Bevy's tonemapping when
+    // active: Tonemapping::None keeps the scene linear for the LUT pass, which runs after Bloom.
+    // Fallback (EFT_GRADE=0 / LUT missing): TonyMcMapface + a hand-grade approximation.
+    if grade.is_some() {
+        cam.insert(Tonemapping::None);
+    } else {
+        cam.insert((
+            Tonemapping::TonyMcMapface,
+            ColorGrading {
+                global: ColorGradingGlobal {
+                    exposure: 0.4,
+                    temperature: -0.02,
+                    tint: -0.005,
+                    post_saturation: 0.95, // EFT palette is DEsaturated
+                    ..default()
+                },
+                shadows: ColorGradingSection {
+                    lift: 0.02, // milky (not crushed) blacks
+                    ..default()
+                },
+                midtones: ColorGradingSection {
+                    saturation: 0.98,
+                    contrast: 1.16, // midtone contrast carries the look instead of saturation
+                    ..default()
+                },
+                ..default()
+            },
+        ));
+    }
 
     // Analytic-sky key light (real sun_dir comes from the SH volume sidecar later).
     // M0 lighting is a fixed key baked into the shader; this light is for when the

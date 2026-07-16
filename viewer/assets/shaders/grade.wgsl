@@ -36,13 +36,15 @@ struct FsIn {
     @location(0) uv: vec2<f32>,
 };
 
-// Fullscreen triangle: 3 verts covering the screen, uv in [0,1].
+// Fullscreen triangle: 3 verts covering the screen, uv in [0,1]. The clip-space Y is FLIPPED
+// (Bevy's fullscreen_vertex_shader convention): uv (0,0) = clip (-1,+1) = top-left pixel, so
+// texture V grows downward in step with framebuffer Y — without this the image is upside down.
 @vertex
 fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> FsIn {
     var out: FsIn;
     let uv = vec2<f32>(f32((vid << 1u) & 2u), f32(vid & 2u));  // (0,0),(2,0),(0,2)
     out.uv = uv;
-    out.clip = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);            // NDC; flip y at target if needed
+    out.clip = vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
     return out;
 }
 
