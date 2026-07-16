@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "id": "arena_train",
+  "name": "Train",
+  "game": "arena",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Arena_Train",
+    "levels": [
+      161,
+      192
+    ],
+    "data_root": "C:\\Battlestate Games\\Escape from Tarkov Arena\\EscapeFromTarkovArena_Data",
+    "root": "eft_assets/arena_train",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "up": "y",
+    "source_handedness": "left",
+    "target_handedness": "right",
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  },
+  "cull": {
+    "keep_root_prefix": null,
+    "drop_root_regex": null,
+    "drop_shadow_submeshes": true
+  }
+}

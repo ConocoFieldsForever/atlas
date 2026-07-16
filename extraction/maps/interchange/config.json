@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "id": "interchange",
+  "name": "Interchange",
+  "source": {
+    "type": "unity_eft_v2",
+    "root": "eft_assets/interchange_v2",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex",
+    "unity_location": "Shopping_Mall",
+    "levels": [
+      54,
+      55,
+      56,
+      57,
+      58,
+      59,
+      60,
+      61,
+      62,
+      63,
+      64,
+      65,
+      403,
+      520
+    ]
+  },
+  "coordinates": {
+    "up": "y",
+    "source_handedness": "left",
+    "target_handedness": "right",
+    "global_matrix": [[-1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+    "flip_winding_on_negative_determinant": true
+  },
+  "scene_filters": [
+    {
+      "name": "keep_content_roots",
+      "match": {
+        "any": [
+          {
+            "kind": "terrain"
+          },
+          {
+            "root_prefix": "SBG"
+          }
+        ]
+      },
+      "action": "keep_only"
+    },
+    {
+      "name": "drop_shadow_submeshes",
+      "match": {
+        "shader_prefix": "shadow"
+      },
+      "action": "drop_submesh"
+    },
+    {
+      "name": "drop_collision_proxies",
+      "match": {
+        "untextured": true,
+        "shader_in": [
+          "",
+          "?",
+          "Standard"
+        ],
+        "world_max_dim_lt": 12.0
+      },
+      "action": "drop"
+    },
+    {
+      "name": "drop_skybox_backdrops",
+      "match": {
+        "world_footprint_gt": 400.0,
+        "world_height_gt": 80.0
+      },
+      "action": "drop"
+    }
+  ],
+  "material_rules": [
+    {
+      "name": "glass",
+      "match": {
+        "shader_regex": ".*([Gg]lass|Transparent).*"
+      },
+      "set": {
+        "alpha_mode": "BLEND",
+        "double_sided": true,
+        "depth_write": false,
+        "sort_bucket": "glass"
+      }
+    },
+    {
+      "name": "foliage",
+      "match": {
+        "shader_regex": ".*(Foliage|Leaves|Grass|Tree|Nature).*"
+      },
+      "set": {
+        "alpha_mode": "MASK",
+        "double_sided": true,
+        "alpha_coverage_mips": true,
+        "sort_bucket": "foliage",
+        "no_decimate": true
+      }
+    },
+    {
+      "name": "cutout",
+      "match": {
+        "alpha_cutoff_present": true
+      },
+      "set": {
+        "alpha_mode": "MASK",
+        "sort_bucket": "cutout"
+      }
+    },
+    {
+      "name": "default_opaque",
+      "match": {
+        "any": true
+      },
+      "set": {
+        "alpha_mode": "OPAQUE",
+        "sort_bucket": "opaque"
+      }
+    }
+  ],
+  "terrain": {
+    "type": "microsplat",
+    "pre_transform": "flip_x",
+    "albedo_source": "baked_slices",
+    "note": "MicroSplat is the #1 fidelity risk; dedicated terrain baker in P2"
+  },
+  "tiling": {
+    "strategy": "fixed_world_size",
+    "tile_size_m": 128.0,
+    "split_crossing_triangles": true,
+    "bounds": "filtered_content_percentile"
+  },
+  "lod": {
+    "method": "meshoptimizer",
+    "metric": "screen_error",
+    "sse_px": 16.0,
+    "levels": [
+      {
+        "target_error": 0.0
+      },
+      {
+        "target_error": 0.02
+      },
+      {
+        "target_error": 0.06
+      }
+    ],
+    "preserve_boundaries": true,
+    "preserve_material_borders": true
+  },
+  "ao": {
+    "mode": "vertex",
+    "samples": 64,
+    "radius": 6.0,
+    "intensity": 0.55,
+    "sun": [
+      0.35,
+      0.82,
+      0.45
+    ],
+    "ambient": 0.35,
+    "bake": "occlusion_only"
+  },
+  "textures": {
+    "max_size": 1024,
+    "albedo": {
+      "encode": "basis-lz",
+      "colorspace": "srgb"
+    },
+    "normal": {
+      "encode": "uastc",
+      "colorspace": "linear"
+    },
+    "atlas": true,
+    "dedup": true
+  },
+  "tiers": {
+    "mobile": {
+      "normals": false,
+      "lightmap": true,
+      "max_draws": 250
+    },
+    "desktop": {
+      "normals": true,
+      "ssao": true,
+      "max_draws": 1500
+    }
+  },
+  "validation": {
+    "unknown_shader": "warn",
+    "missing_texture": "warn",
+    "missing_texture_area_pct": 8.0
+  },
+  "budget_mb": 40,
+  "cull": {
+    "keep_root_prefix": "SBG",
+    "drop_root_regex": null,
+    "drop_shadow_submeshes": true
+  }
+}

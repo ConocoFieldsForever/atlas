@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "therapist",
+  "name": "Therapist's Office (Vendors)",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Venders",
+    "levels": [645],
+    "root": "eft_assets/therapist",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": { "global_matrix": [[-1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]], "flip_winding_on_negative_determinant": true }
+}

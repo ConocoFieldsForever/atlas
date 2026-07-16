@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "id": "jaeger",
+  "name": "Jaeger (Vendors)",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Venders",
+    "levels": [
+      639
+    ],
+    "root": "eft_assets/jaeger",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  }
+}

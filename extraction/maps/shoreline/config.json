@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "id": "shoreline",
+  "name": "Shoreline",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "shorline",
+    "levels": [
+      23,
+      25,
+      26,
+      28,
+      29,
+      30,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      39,
+      40,
+      402
+    ],
+    "root": "eft_assets/shoreline",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "up": "y",
+    "source_handedness": "left",
+    "target_handedness": "right",
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  },
+  "cull": {
+    "keep_root_prefix": null,
+    "drop_root_regex": null,
+    "drop_shadow_submeshes": true
+  }
+}

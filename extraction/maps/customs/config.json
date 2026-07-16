@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "id": "customs",
+  "name": "Customs",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Custom",
+    "levels": [
+      5,
+      6,
+      7,
+      9,
+      10,
+      11,
+      12,
+      14,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      170,
+      171,
+      172,
+      173,
+      174,
+      175,
+      176,
+      511,
+      514
+    ],
+    "root": "eft_assets/customs",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "up": "y",
+    "source_handedness": "left",
+    "target_handedness": "right",
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  },
+  "cull": {
+    "keep_root_prefix": null,
+    "drop_root_regex": null,
+    "drop_shadow_submeshes": true
+  }
+}

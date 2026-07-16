@@ -1,0 +1,13 @@
+# EFT extraction kit -- python deps (Python 3.10+ recommended; validated on 3.12).
+#   pip install -r extraction/requirements.txt
+
+UnityPy==1.25.0      # Unity asset reader (all extractors). PINNED: UnityPy's API shifts between minors;
+                     # the extractors were written/validated against 1.25.0.
+numpy>=1.26          # used everywhere (validated with 2.2.x)
+Pillow>=10.0         # texture decode/save (extractors, SH bake albedo sampling, grade LUT)
+scipy>=1.11          # ONLY grade/make_grade_lut.py (PCHIP film curves) -- a prebuilt LUT ships in the kit
+warp-lang>=1.5       # ONLY bake/bake_volume2.py (SH irradiance volume). Needs an NVIDIA GPU + CUDA
+                     # driver at runtime (validated with warp 1.12).
+
+# NOT needed: requests/pygltflib -- the loot/tasks builders use stdlib urllib only.
+# The pack emitter (eft_pipeline/assemble_bevy.py, already in this repo) needs only numpy + Pillow.

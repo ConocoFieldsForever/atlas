@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "id": "ground_zero_start",
+  "name": "Ground Zero (Start)",
+  "source": {
+    "type": "unity_eft_v2",
+    "unity_location": "Sandbox_StartLocation",
+    "levels": [
+      559,
+      560,
+      561,
+      562,
+      563,
+      564,
+      565,
+      566,
+      567,
+      568,
+      569,
+      570,
+      571,
+      572,
+      573,
+      574,
+      575,
+      576,
+      577,
+      578,
+      579,
+      580
+    ],
+    "root": "eft_assets/ground_zero_start",
+    "scene": "scene.json",
+    "mesh_dir": "meshes",
+    "texture_dir": "tex"
+  },
+  "coordinates": {
+    "global_matrix": [
+      [
+        -1,
+        0,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        0,
+        1
+      ]
+    ],
+    "flip_winding_on_negative_determinant": true
+  }
+}
