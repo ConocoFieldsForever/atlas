@@ -1,7 +1,8 @@
 //! ui.rs — right-hand LAYER-TOGGLE panel (egui).
 //!
 //! A `SidePanel::right` with checkboxes to show/hide map overlay layers. The LOOT layer is
-//! fully wired (master toggle + per-class filters driving `LootClass` marker visibility). The
+//! fully wired (master toggle + per-class filters + a min-value filter driving `LootClass`
+//! marker visibility; the same `min_value` also prunes Map Intel's value-tagged loose loot). The
 //! other layers (PMC/scav spawns, extracts, doors, interactables) are present as the framework
 //! and light up as their data/overlays land (extract_semantics.py → semantics.json).
 //!
@@ -22,6 +23,10 @@ pub struct LayerToggles {
     pub loot: bool,
     /// class -> shown. Missing class defaults to shown.
     pub loot_classes: BTreeMap<String, bool>,
+    /// Min ruble value for VALUE-TAGGED markers (`poi::MarkerValue`: container `ev` estimates +
+    /// loose-loot prices); 0 = filter off. ONE filter shared by loot containers and Map Intel's
+    /// loose loot, set from the Loot section's "min value" row. Untagged markers never filter.
+    pub min_value: i64,
     pub pmc_spawns: bool,
     pub scav_spawns: bool,
     pub bosses: bool,
@@ -52,6 +57,7 @@ impl Default for LayerToggles {
         Self {
             loot: !has("noloot"),
             loot_classes: LOOT_CLASSES.iter().map(|c| (c.to_string(), true)).collect(),
+            min_value: 0,
             pmc_spawns: has("pmc"),
             scav_spawns: has("scav"),
             bosses: has("boss"),
@@ -104,20 +110,25 @@ impl Plugin for UiPlugin {
     }
 }
 
-/// Show/hide loot markers by the master toggle AND the per-class filter. Only touches the
-/// markers when the toggles change (true on the first run too, so the initial state is applied
-/// once the markers exist), so it's ~free per frame.
-fn apply_loot_visibility(toggles: Res<LayerToggles>, mut q: Query<(&LootClass, &mut Visibility)>) {
+/// Show/hide loot markers by the master toggle AND the per-class filter AND the min-value
+/// filter. Only touches the markers when the toggles change (true on the first run too, so the
+/// initial state is applied once the markers exist), so it's ~free per frame.
+fn apply_loot_visibility(
+    toggles: Res<LayerToggles>,
+    mut q: Query<(&LootClass, Option<&crate::poi::MarkerValue>, &mut Visibility)>,
+) {
     if !toggles.is_changed() {
         return;
     }
-    for (cls, mut vis) in &mut q {
-        *vis = vis_for(&toggles, &cls.0);
+    for (cls, val, mut vis) in &mut q {
+        *vis = vis_for(&toggles, &cls.0, val);
     }
 }
 
-fn vis_for(t: &LayerToggles, cls: &str) -> Visibility {
-    let shown = t.loot && t.loot_classes.get(cls).copied().unwrap_or(true);
+fn vis_for(t: &LayerToggles, cls: &str, val: Option<&crate::poi::MarkerValue>) -> Visibility {
+    let shown = t.loot
+        && t.loot_classes.get(cls).copied().unwrap_or(true)
+        && crate::poi::value_passes(t.min_value, val);
     if shown {
         Visibility::Visible
     } else {
@@ -151,6 +162,29 @@ fn titlecase(s: &str) -> String {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
     }
+}
+
+/// The min-value filter steps offered by the panel's "min value" selector (0 = Off). ASCII-only
+/// labels — the default egui font has no ruble sign, and `inspect::money` doesn't emit one.
+#[cfg(feature = "egui")]
+const MIN_VALUE_STEPS: &[(i64, &str)] = &[
+    (0, "Off"),
+    (50_000, "50k"),
+    (100_000, "100k"),
+    (250_000, "250k"),
+    (500_000, "500k"),
+    (1_000_000, "1M"),
+];
+
+/// Short label for the current min-value ("Off"/"50k"/…); off-step values (none today) fall back
+/// to the thousands-separated `inspect::money` form.
+#[cfg(feature = "egui")]
+fn min_value_label(v: i64) -> String {
+    MIN_VALUE_STEPS
+        .iter()
+        .find(|(s, _)| *s == v)
+        .map(|(_, n)| (*n).to_string())
+        .unwrap_or_else(|| crate::inspect::money(v))
 }
 
 #[cfg(feature = "egui")]
@@ -329,7 +363,14 @@ fn layers_panel(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // ===== LOOT =====
-                    CollapsingHeader::new(section_hdr("Loot", loot_total, HDR))
+                    // The active min-value filter is surfaced in the header so it's visible even
+                    // when the section is collapsed.
+                    let loot_name = if toggles.min_value > 0 {
+                        format!("Loot (min {})", min_value_label(toggles.min_value))
+                    } else {
+                        "Loot".to_string()
+                    };
+                    CollapsingHeader::new(section_hdr(&loot_name, loot_total, HDR))
                         .id_salt("sec_loot")
                         .default_open(true)
                         .show(ui, |ui| {
@@ -351,6 +392,29 @@ fn layers_panel(
                                     count_tag(ui, n, DIMCOUNT);
                                 });
                             }
+                            // ---- MIN VALUE — ONE filter shared by the containers above and Map
+                            // Intel's loose loot (both carry a `poi::MarkerValue`); every other
+                            // marker kind ignores it. min_value lives in `LayerToggles`, so the
+                            // apply systems re-run on change exactly like the toggles.
+                            ui.add_space(2.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("min value").size(12.0).color(MUTED));
+                                egui::ComboBox::from_id_salt("loot_min_value")
+                                    .width(76.0)
+                                    .selected_text(min_value_label(toggles.min_value))
+                                    .show_ui(ui, |ui| {
+                                        for &(v, name) in MIN_VALUE_STEPS {
+                                            ui.selectable_value(&mut toggles.min_value, v, name);
+                                        }
+                                    });
+                            });
+                            ui.label(
+                                RichText::new("also filters Map Intel \u{2192} Loose loot")
+                                    .size(9.0)
+                                    .italics()
+                                    .color(MUTED),
+                            );
                         });
 
                     // ===== SPAWNS & POIS =====

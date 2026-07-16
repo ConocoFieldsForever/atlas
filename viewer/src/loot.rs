@@ -16,6 +16,7 @@
 //! so it reads even in a dark interior.
 
 use crate::inspect::{money, titlecase, MarkerInfo, PickRadius};
+use crate::poi::MarkerValue;
 use crate::render::LoadedPack;
 use bevy::prelude::*;
 use serde::Deserialize;
@@ -201,6 +202,9 @@ fn spawn_loot(
             Transform::from_xyz(c.pos[0], c.pos[1] + half.y, c.pos[2]).with_scale(half * 2.0),
             LootMarker,
             LootClass(c.cls.clone()),
+            // The ev estimate feeds the panel's min-value filter (0 = no estimate, hides under
+            // an active filter).
+            MarkerValue(c.ev),
             PickRadius(pick_r),
             MarkerInfo {
                 title,

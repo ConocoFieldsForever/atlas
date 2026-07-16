@@ -49,6 +49,19 @@ pub struct QuestMarkerTask(pub String);
 #[derive(Component)]
 pub struct ExtractFaction(#[allow(dead_code)] pub String);
 
+/// A marker's estimated ruble value — the container's `ev` on loot.rs container markers, the item
+/// price `pr` on loose-loot markers (0 when unpriced). Read by the panel's "min value" filter
+/// (`ui::LayerToggles::min_value`); markers WITHOUT this component are never value-filtered.
+#[derive(Component)]
+pub struct MarkerValue(pub i64);
+
+/// true iff an (optionally value-tagged) marker passes the min-value filter. `min == 0` means the
+/// filter is off; untagged markers always pass; tagged-but-unpriced (value 0) markers hide under
+/// an active filter — an unknown-value marker is exactly the clutter the filter exists to cut.
+pub fn value_passes(min: i64, v: Option<&MarkerValue>) -> bool {
+    min <= 0 || v.map_or(true, |mv| mv.0 >= min)
+}
+
 /// Startup-built catalog of THIS map's tasks (tasks.json filtered to zones on this map), read by
 /// the quest tracker UI (ui.rs) and the outline gizmo. Empty by default so the resource always
 /// exists even without a `tasks.json`.
@@ -781,7 +794,9 @@ fn spawn_pois(
             spawn(&mut commands, PoiLayer::Stationary, st.pos, stationary_info(st), None);
         }
         for lo in &mn.loose {
-            spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo), None);
+            // Tagged with the item price so the panel's min-value filter applies (0 = unpriced).
+            let e = spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo), None);
+            commands.entity(e).insert(MarkerValue(lo.pr.unwrap_or(0)));
         }
         // Prefer the clean faction-tagged extract list when it's present.
         if !mn.extracts_dev.is_empty() {
@@ -938,12 +953,12 @@ fn spawn_pois(
 // `Visibility`.
 fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
-    mut q: Query<(&PoiLayer, &mut Visibility), Without<QuestMarkerTask>>,
+    mut q: Query<(&PoiLayer, Option<&MarkerValue>, &mut Visibility), Without<QuestMarkerTask>>,
 ) {
     if !toggles.is_changed() {
         return;
     }
-    for (l, mut vis) in &mut q {
+    for (l, val, mut vis) in &mut q {
         let show = match l {
             PoiLayer::PmcSpawn => toggles.pmc_spawns,
             PoiLayer::ScavSpawn => toggles.scav_spawns,
@@ -959,6 +974,8 @@ fn apply_poi_visibility(
             PoiLayer::LooseLoot => toggles.loose,
             PoiLayer::Quest => toggles.quests, // unreachable here (filtered out), kept exhaustive
         };
+        // Value-tagged markers (loose loot) additionally pass the panel's min-value filter.
+        let show = show && value_passes(toggles.min_value, val);
         *vis = if show {
             Visibility::Visible
         } else {
