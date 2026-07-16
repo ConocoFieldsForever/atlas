@@ -13,10 +13,11 @@ Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 (20 B), pack s
 
   python -m eft_pipeline.build_grass --pack packs/interchange.eftpack
 """
-import os, sys, json, struct, argparse, re
+import os, sys, json, struct, argparse, re, glob
 import numpy as np
 
-TL = r"C:/Users/user/beamng_blender_pipeline/eft_assets/interchange_v2/terrain_layers"
+# Cross-map albedo fallback for packs whose terrain_layers ship no grass texture.
+FALLBACK_ALBEDO = r"C:/Users/user/beamng_blender_pipeline/eft_assets/interchange_v2/terrain_layers/grass_Grass3_D.png"
 FLAG_TERRAIN = 1 << 1
 # Road/asphalt SURFACE meshes (laid ON the grass terrain, so the density grid still has grass
 # under them -> grass pokes through). Their XZ footprint masks grass. Exclude non-surface props
@@ -144,6 +145,15 @@ def main():
     a = ap.parse_args()
     pack = a.pack
     mani, mb, ib = load_pack(pack)
+    # per-pack terrain_layers dir (manifest sidecar is an absolute path to its manifest.json)
+    TL = os.path.dirname(mani["sidecars"]["terrainLayers"])
+    # discover slice names from the density files (interchange: 4, lighthouse: 6, ...)
+    names = sorted({re.search(r"(Slice_\d+_\d+)", os.path.basename(f)).group(1)
+                    for f in glob.glob(os.path.join(TL, "grass_density_Slice_*.bin"))})
+    if not names:
+        raise SystemExit(f"[grass] FATAL: no grass_density_Slice_*.bin found under {TL} — "
+                         f"refusing to emit an empty grass.bin (it would silently disable grass)")
+    print(f"[grass] density slices in {TL}: {names}")
     id2mesh = {m["id"]: m for m in mani["meshes"]}
     inst = mani["instance"]; istride = inst["stride"]
     fo = {f["name"]: f["offset"] for f in inst["fields"]}
@@ -159,10 +169,13 @@ def main():
         mid = struct.unpack_from("<I", ib, b + fo["meshId"])[0]
         aff = struct.unpack_from("<12f", ib, b + fo["affine"])
         me = id2mesh[mid]
-        for s in ("Slice_1_1", "Slice_1_2", "Slice_2_1", "Slice_2_2"):
+        for s in names:
             if s in me["name"]:
                 slices[s] = (aff, me)
     print(f"[grass] {len(slices)} terrain slices")
+    if not slices:
+        raise SystemExit(f"[grass] FATAL: no FLAG_TERRAIN instance matched any of {names} — "
+                         f"refusing to emit an empty grass.bin (it would silently disable grass)")
 
     # road/asphalt footprint mask (grass under road SURFACE meshes -> pokes through, skip it).
     road_cells, rcell = build_road_mask(mani, mb, ib)
@@ -200,12 +213,23 @@ def main():
         total += cnt
         print(f"[grass] {sname}: {cnt} clumps")
 
+    if total == 0:
+        raise SystemExit(f"[grass] FATAL: 0 clumps emitted for {pack} — "
+                         f"refusing to write an empty grass.bin (it would silently disable grass)")
     open(os.path.join(pack, "grass.bin"), "wb").write(recs)
-    # grass albedo: prefer the denser Grass3_D
-    alb = os.path.join(TL, "grass_Grass3_D.png")
+    # grass albedo: prefer the denser Grass3_D, else Grass5, else cross-map fallback
+    alb = None
+    for cand in ("grass_Grass3_D.png", "grass_Grass5_512_D.png"):
+        p = os.path.join(TL, cand)
+        if os.path.exists(p):
+            alb = p
+            break
+    if alb is None:
+        alb = FALLBACK_ALBEDO
+        print(f"[grass] no grass albedo in {TL}, using cross-map fallback {alb}")
     tint = [0.7, 0.75, 0.55]
     try:
-        g = json.load(open(os.path.join(TL, "grass.json")))
+        g = json.load(open(mani["sidecars"]["grassJson"]))
         sl = next(iter(g.get("slices", {}).values()), {})
         tint = sl.get("tint", tint)
     except Exception:
