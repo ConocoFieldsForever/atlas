@@ -159,6 +159,11 @@ impl ViewNode for SsaoNode {
         if target.main_texture_format() != ViewTarget::TEXTURE_FORMAT_HDR {
             return Ok(());
         }
+        // The pipeline binds texture_depth_2d_multisampled — a 1x-MSAA view would fail bind-group
+        // validation (latent: this app always runs MSAA 4x; guard anyway per the Codex review).
+        if depth.texture.sample_count() <= 1 {
+            return Ok(());
+        }
         // Live params from the UI (96 B write per frame while enabled — negligible).
         let vp = view.viewport;
         let params = SsaoParamsGpu {

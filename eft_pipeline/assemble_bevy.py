@@ -507,7 +507,11 @@ def main():
                     sb['role'] = 'cutout'
                     sb['cut'] = float(sb.get('cut') or _otsu)
             n = sb.get('n', -1); n = (len(F) - f0) if n < 0 else n
-            if n <= 0 or f0 + n > len(F): f0 += max(n, 0); continue
+            if n <= 0 or f0 + n > len(F):
+                if f0 + n > len(F):
+                    print(f"[bevy] WARNING: submesh span overruns OBJ tris "
+                          f"({f0}+{n} > {len(F)}) - geometry silently dropped for this sub")
+                f0 += max(n, 0); continue
             if not CULLS.keep_submesh(sb): f0 += n; continue          # shadow / billboard-LOD / fog / proxy
             cor = F[f0:f0 + n]; f0 += n
             vi = cor[:, :, 0].reshape(-1); ti = cor[:, :, 1].reshape(-1)

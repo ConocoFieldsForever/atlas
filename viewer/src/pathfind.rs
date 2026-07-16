@@ -115,6 +115,8 @@ impl Plugin for PathfindPlugin {
             .init_resource::<PathfindServer>()
             .add_systems(
                 Update,
+                // chained: the tuple order IS the dataflow (cmd -> health -> request -> poll ->
+                // draw); unordered they could interleave and draw one-frame-stale routes.
                 (
                     handle_server_cmd,
                     poll_server_health,
@@ -122,7 +124,8 @@ impl Plugin for PathfindPlugin {
                     dispatch_route,
                     poll_route,
                     draw_route,
-                ),
+                )
+                    .chain(),
             );
     }
 }

@@ -640,6 +640,26 @@ fn parse_instances(layout: &InstanceLayout, bin: &[u8]) -> Result<Vec<GpuInstanc
     let o_li = find("lodIndex")?.offset as usize;
     let o_root = find("rootId")?.offset as usize;
     let o_flags = find("flags")?.offset as usize;
+    // Validate every field fits inside one stride record: a malformed manifest must Err at load
+    // (message names the field), not panic on a slice index deep in the record loop (Codex review).
+    for (name, off, sz) in [
+        ("affine", o_affine, 48usize),
+        ("meshId", o_mesh, 4),
+        ("lodGroup", o_lg, 4),
+        ("lodIndex", o_li, 4),
+        ("rootId", o_root, 4),
+        ("flags", o_flags, 4),
+    ] {
+        if off + sz > stride {
+            return Err(anyhow!(
+                "instance field '{}' (offset {} + {} bytes) overruns stride {}",
+                name,
+                off,
+                sz,
+                stride
+            ));
+        }
+    }
 
     let count = bin.len() / stride;
     let mut out = Vec::with_capacity(count);

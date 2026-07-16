@@ -88,14 +88,21 @@ fn apply_map_switch(
     }
     let Some(pack) = sw.0.take() else { return };
     match std::env::current_exe() {
-        Ok(exe) => match std::process::Command::new(exe).arg(&pack).spawn() {
+        Ok(exe) => {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg(&pack);
+            if let Some(rp) = std::env::args().nth(2) {
+                cmd.arg(rp); // forward an argv render-path token (EFT_RENDER env inherits anyway)
+            }
+            match cmd.spawn() {
             Ok(_) => {
                 info!("map switch: relaunching into {pack}");
                 server.stop_owned_child();
                 exit.write(bevy::app::AppExit::Success);
             }
-            Err(e) => error!("map switch: failed to spawn viewer for {pack}: {e}"),
-        },
+                Err(e) => error!("map switch: failed to spawn viewer for {pack}: {e}"),
+            }
+        }
         Err(e) => error!("map switch: current_exe failed: {e}"),
     }
 }
@@ -155,6 +162,9 @@ fn apply_gfx_camera(
 /// Consume a pending `CameraCommand::fly_to`: place the fly-cam at a framing offset above the target,
 /// looking at it, and sync `FlyCam.yaw/pitch` so subsequent mouse-look continues smoothly.
 fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Transform, &mut FlyCam)>) {
+    if cmd.fly_to.is_none() {
+        return; // read-only fast path: a take() through DerefMut would dirty change detection
+    }
     let Some(target) = cmd.fly_to.take() else {
         return;
     };

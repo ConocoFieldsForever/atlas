@@ -1693,8 +1693,16 @@ fn prepare_gpu_buffers(
         }
         return;
     }
+    // Pipelines are created in RenderStartup, which runs BEFORE the first extract — so if the
+    // extracted blob exists but the pipelines don't, the bindless feature guard disabled the
+    // path permanently: drop the ~650 MiB render-world copy instead of retaining it forever
+    // (Codex review). Capture the flag before the destructuring move below.
+    let pipelines_missing = compute.is_none() || draw.is_none();
     let (Some(cpu), Some(compute), Some(draw)) = (cpu, compute, draw) else {
-        return; // wait for the extracted blob + layouts (also skipped if feature-disabled)
+        if pipelines_missing {
+            commands.remove_resource::<ExtractedCpuData>();
+        }
+        return;
     };
     let cpu = &cpu.0;
 

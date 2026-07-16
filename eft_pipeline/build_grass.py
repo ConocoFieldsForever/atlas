@@ -72,7 +72,7 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
         a = struct.unpack_from("<12f", ib, b + fo["affine"])
         me = id2mesh[mid]; voff = me["vtxOffset"]
         ioff = me["idxOffset"]; ic = me["idxCount"]
-        idx = mbnp[ioff:ioff + ic * 4].view(np.uint32).reshape(-1, 3)
+        idx = mbnp[ioff:ioff + ic * 4].view("<u4").reshape(-1, 3)  # explicit LE (pack contract)
         step = max(1, len(idx) // 4000)          # cap tris/instance on dense splines
         for t in idx[::step]:
             wx = [0.0, 0.0, 0.0]; wz = [0.0, 0.0, 0.0]
@@ -154,8 +154,9 @@ def main():
         print(f"[grass] {pack}: no terrainLayers sidecar — grassless map, skipping"); return
     TL = os.path.dirname(tl_side)
     # discover slice names from the density files (interchange: 4, lighthouse: 6, ...)
-    names = sorted({re.search(r"(Slice_\d+_\d+)", os.path.basename(f)).group(1)
-                    for f in glob.glob(os.path.join(TL, "grass_density_Slice_*.bin"))})
+    names = sorted({m.group(1)
+                    for f in glob.glob(os.path.join(TL, "grass_density_Slice_*.bin"))
+                    if (m := re.search(r"(Slice_\d+_\d+)", os.path.basename(f)))})
     if not names:
         print(f"[grass] {pack}: no grass_density_Slice_*.bin under {TL} — grassless map, skipping")
         return
@@ -196,7 +197,11 @@ def main():
         dpath = os.path.join(TL, f"grass_density_{sname}.bin")
         if not os.path.exists(dpath):
             print(f"[grass] {sname}: no density {dpath}"); continue
-        dens = np.fromfile(dpath, np.uint8).reshape(1024, 1024)  # [row=y, col=x]
+        raw = np.fromfile(dpath, np.uint8)
+        side = int(round(len(raw) ** 0.5))
+        if side * side != len(raw):
+            print(f"[grass] {sname}: density file is {len(raw)} bytes (not square) - skipping"); continue
+        dens = raw.reshape(side, side)  # [row=y, col=x]; interchange/lighthouse ship 1024^2
         grid = terrain_uv_world_grid(mani, mb, aff, me)
         ys, xs = np.nonzero(dens)
         # subsample by stride for a bounded count
@@ -204,8 +209,8 @@ def main():
         xs, ys = xs[sel], ys[sel]
         cnt = 0
         for cx, cy in zip(xs, ys):
-            u = (cx + 0.5) / 1024.0
-            v = (cy + 0.5) / 1024.0
+            u = (cx + 0.5) / float(side)
+            v = (cy + 0.5) / float(side)
             w = bilinear(grid, u, v)
             if not np.all(np.isfinite(w)):
                 continue
