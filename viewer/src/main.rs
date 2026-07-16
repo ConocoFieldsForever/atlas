@@ -75,13 +75,23 @@ pub struct CameraCommand {
 #[derive(Resource, Default)]
 pub struct MapSwitch(pub Option<String>);
 
-/// Spawn a fresh viewer on the selected pack, then exit this one.
-fn apply_map_switch(mut sw: ResMut<MapSwitch>, mut exit: MessageWriter<bevy::app::AppExit>) {
+/// Spawn a fresh viewer on the selected pack, then exit this one. The viewer-OWNED pathfind
+/// server child is stopped first so the switch doesn't orphan it (Codex review); an externally
+/// started server is untouched.
+fn apply_map_switch(
+    mut sw: ResMut<MapSwitch>,
+    mut server: ResMut<pathfind::PathfindServer>,
+    mut exit: MessageWriter<bevy::app::AppExit>,
+) {
+    if sw.0.is_none() {
+        return; // immutable-ish fast path: don't dirty change detection via take() every frame
+    }
     let Some(pack) = sw.0.take() else { return };
     match std::env::current_exe() {
         Ok(exe) => match std::process::Command::new(exe).arg(&pack).spawn() {
             Ok(_) => {
                 info!("map switch: relaunching into {pack}");
+                server.stop_owned_child();
                 exit.write(bevy::app::AppExit::Success);
             }
             Err(e) => error!("map switch: failed to spawn viewer for {pack}: {e}"),
@@ -272,6 +282,10 @@ fn main() {
         app.insert_resource(g);
     }
     app.add_plugins((GradePlugin, render::SsaoPlugin));
+    // Runtime graphics settings reach the render world on EVERY render path (grade/SSAO install
+    // unconditionally, so the extraction can't live inside EftGpuDrivenPlugin — under EFT_RENDER=
+    // m0/std the toggles would silently stop reaching the GPU).
+    app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<render::GfxSettings>::default());
 
     if let Some(p) = pack {
         app.insert_resource(LoadedPack(p));
@@ -552,6 +566,7 @@ fn setup(
 /// Hold RMB to capture the cursor for mouse-look; release to free it.
 fn cursor_grab(
     mouse: Res<ButtonInput<MouseButton>>,
+    pointer_on_ui: Res<inspect::PointerOnUi>,
     // Bevy 0.17 split cursor state out of `Window` into a `CursorOptions` component
     // on the same window entity.
     mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -559,7 +574,9 @@ fn cursor_grab(
     let Ok(mut cursor) = cursors.single_mut() else {
         return;
     };
-    if mouse.just_pressed(MouseButton::Right) {
+    // Don't lock the cursor when the RMB press lands on an egui panel (Codex review: UI
+    // right-clicks were hijacking the camera).
+    if mouse.just_pressed(MouseButton::Right) && !pointer_on_ui.0 {
         cursor.grab_mode = CursorGrabMode::Locked;
         cursor.visible = false;
     }
@@ -575,9 +592,10 @@ fn cursor_grab(
 fn flycam_look(
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
+    pointer_on_ui: Res<inspect::PointerOnUi>,
     mut q: Query<(&mut Transform, &mut FlyCam)>,
 ) {
-    if !mouse.pressed(MouseButton::Right) {
+    if !mouse.pressed(MouseButton::Right) || pointer_on_ui.0 {
         return;
     }
     let delta = motion.delta;
@@ -597,8 +615,13 @@ fn flycam_look(
 fn flycam_move(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
+    ui_kb: Res<inspect::UiWantsKeyboard>,
     mut q: Query<(&mut Transform, &FlyCam)>,
 ) {
+    // Typing 'wasd' into the marker-search box must not fly the camera (Codex review).
+    if ui_kb.0 {
+        return;
+    }
     let dt = time.delta_secs();
     for (mut tf, cam) in &mut q {
         let mut v = Vec3::ZERO;

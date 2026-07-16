@@ -56,12 +56,18 @@ struct OpenCards(Vec<Entity>);
 #[derive(Resource, Default)]
 pub struct PointerOnUi(pub bool);
 
+/// True while egui wants KEYBOARD input (marker search box, quest filters, sliders being typed
+/// into) — the flycam must not fly when the user types 'wasd' into a text field.
+#[derive(Resource, Default)]
+pub struct UiWantsKeyboard(pub bool);
+
 pub struct InspectPlugin;
 
 impl Plugin for InspectPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<OpenCards>()
             .init_resource::<PointerOnUi>()
+            .init_resource::<UiWantsKeyboard>()
             .add_systems(Update, pick_markers);
         // The card UI is egui; it MUST live in EguiPrimaryContextPass (see module
         // doc). With the `egui` feature off there's simply no card UI, but the
@@ -134,6 +140,7 @@ fn draw_cards(
     markers: Query<(&GlobalTransform, &MarkerInfo, &PickRadius)>,
     mut open: ResMut<OpenCards>,
     mut pointer_on_ui: ResMut<PointerOnUi>,
+    mut ui_kb: ResMut<UiWantsKeyboard>,
     mut route: MessageWriter<crate::pathfind::RouteRequest>,
 ) {
     use bevy_egui::egui::{self, Align, Align2, Button, Color32, Layout, RichText};
@@ -144,6 +151,7 @@ fn draw_cards(
     let Ok((camera, cam_tf)) = cameras.single() else {
         // No camera yet (first frame): still refresh the UI-hover flag and bail.
         pointer_on_ui.0 = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
+        ui_kb.0 = ctx.wants_keyboard_input();
         return;
     };
 
@@ -218,6 +226,7 @@ fn draw_cards(
     // GLOBAL to the egui context, so it also covers the layers panel and the stats
     // window — exactly what the world raycast wants to ignore.
     pointer_on_ui.0 = ctx.is_pointer_over_area() || ctx.wants_pointer_input();
+    ui_kb.0 = ctx.wants_keyboard_input();
 }
 
 /// Headless-QA aid: with `EFT_INSPECT` set, ~80 frames in (just before the frame-90

@@ -16,7 +16,8 @@
 //!
 //! LUT resolution order: EFT_GRADE_LUT env → <pack>/grade_lut.bin → tarkmap/out default.
 //! EFT_GRADE=0 disables the pass entirely (camera falls back to TonyMcMapface + hand grade).
-//! EFT_GRADE_EXPOSURE overrides the pre-LUT exposure (default 0.18, the web viewer's value).
+//! EFT_GRADE_EXPOSURE overrides the pre-LUT exposure (default 1.7 — recalibrated for this
+//! renderer's radiance scale; the web viewer's 0.18 was tuned for a different pipeline).
 //! EFT_VIGNETTE=0 zeroes the PRISM vignette strength.
 
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -113,7 +114,7 @@ pub fn load_grade_lut(pack_root: Option<&std::path::Path>) -> Option<GradeLutCpu
     let exposure = std::env::var("EFT_GRADE_EXPOSURE")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0.18f32);
+        .unwrap_or(1.7f32); // matches GfxSettings::default — see recalibration note there
     let vignette = if std::env::var("EFT_VIGNETTE").map(|v| v.trim() == "0").unwrap_or(false) {
         0.0
     } else {
@@ -157,8 +158,17 @@ fn init_grade_pipeline(
     queue: Res<RenderQueue>,
     cache: Res<PipelineCache>,
     lut: Option<Res<GradeLutCpu>>,
+    existing: Option<Res<GradePipeline>>,
     asset_server: Res<AssetServer>,
 ) {
+    // Run-once in the Render schedule, NOT RenderStartup: RenderStartup executes BEFORE the very
+    // first extract (bevy_render set_extract), so GradeLutCpu — which only reaches the render
+    // world via ExtractResourcePlugin — was still absent and the pipeline was silently never
+    // built (the viewer rendered un-tonemapped linear; caught by a Codex review + an exposure
+    // A/B: 10x exposure change produced byte-identical output).
+    if existing.is_some() {
+        return;
+    }
     let Some(lut) = lut else { return }; // grade disabled — node stays a no-op
     let lut_tex = device.create_texture_with_data(
         &queue,
@@ -377,10 +387,17 @@ impl Plugin for GradePlugin {
             return;
         };
         render_app
-            .add_systems(RenderStartup, init_grade_pipeline)
             .add_systems(
                 bevy::render::Render,
-                update_grade_params.in_set(bevy::render::RenderSystems::PrepareResources),
+                (
+                    // Run-once pipeline init (guarded internally) — MUST be in Render, not
+                    // RenderStartup, because the extracted GradeLutCpu doesn't exist yet when
+                    // RenderStartup runs (see init_grade_pipeline).
+                    init_grade_pipeline.in_set(bevy::render::RenderSystems::PrepareResources),
+                    update_grade_params
+                        .in_set(bevy::render::RenderSystems::PrepareResources)
+                        .after(init_grade_pipeline),
+                ),
             )
             .add_render_graph_node::<ViewNodeRunner<GradeNode>>(Core3d, GradeLabel)
             .add_render_graph_edges(Core3d, (Node3d::Bloom, GradeLabel, Node3d::Tonemapping));

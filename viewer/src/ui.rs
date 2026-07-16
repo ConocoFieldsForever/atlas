@@ -18,7 +18,7 @@ const LOOT_CLASSES: &[&str] = &[
     "weapon", "medical", "safe", "register", "bag", "crate", "tech", "stash", "furniture", "body",
 ];
 
-#[derive(Resource)]
+#[derive(Resource, Clone, PartialEq)]
 pub struct LayerToggles {
     pub loot: bool,
     /// class -> shown. Missing class defaults to shown.
@@ -86,7 +86,7 @@ pub struct UiSearch {
 /// Quest-tracker state: the checked ("active") task ids + the filter row. `active` drives per-task
 /// marker visibility (poi::apply_quest_visibility) and the outline gizmo; the filters just prune
 /// the checklist. `max_level == 0` means no level cap. Always present (poi.rs reads `active`).
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone, PartialEq)]
 #[cfg_attr(not(feature = "egui"), allow(dead_code))]
 pub struct QuestTracker {
     pub active: std::collections::HashSet<String>,
@@ -203,9 +203,9 @@ struct GfxUiParams<'w, 's> {
 fn layers_panel(
     mut contexts: bevy_egui::EguiContexts,
     mut gfx_ui: GfxUiParams,
-    mut toggles: ResMut<LayerToggles>,
+    mut toggles_res: ResMut<LayerToggles>,
     mut search: ResMut<UiSearch>,
-    mut tracker: ResMut<QuestTracker>,
+    mut tracker_res: ResMut<QuestTracker>,
     quest_data: Res<crate::poi::QuestData>,
     key_catalog: Res<crate::poi::KeyCatalog>,
     markers: Query<(
@@ -235,6 +235,12 @@ fn layers_panel(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    // Clone-edit-compare (Codex review): passing `&mut toggles.x` from a ResMut into egui widgets
+    // marks the resource CHANGED every frame the panel renders, which made apply_poi_visibility /
+    // apply_loot_visibility / apply_quest_visibility rewrite every marker's Visibility per frame.
+    // Widgets edit these copies; the deltas are written back once at the end only if real.
+    let mut toggles = toggles_res.clone();
+    let mut tracker = tracker_res.clone();
     const ACCENT: Color32 = Color32::from_rgb(232, 194, 122); // warm tactical amber
     const HDR: Color32 = Color32::from_rgb(160, 164, 160);
     const MUTED: Color32 = Color32::from_rgb(120, 122, 120);
@@ -824,7 +830,7 @@ fn layers_panel(
                                 .on_hover_text("the game's own display chain; off = TonyMcMapface fallback");
                             ui.add_enabled(
                                 g.grade && g.grade_available,
-                                egui::Slider::new(&mut g.grade_exposure, 0.05..=0.6).text("exposure"),
+                                egui::Slider::new(&mut g.grade_exposure, 0.2..=4.0).text("exposure"),
                             );
                             ui.add_enabled(
                                 g.grade && g.grade_available,
@@ -888,6 +894,14 @@ fn layers_panel(
                     );
                 });
         });
+
+    // Write back ONLY on real change so downstream is_changed() gates stay meaningful.
+    if toggles != *toggles_res {
+        *toggles_res = toggles;
+    }
+    if tracker != *tracker_res {
+        *tracker_res = tracker;
+    }
 }
 
 /// Section header text: name + a dim count of markers in that section.

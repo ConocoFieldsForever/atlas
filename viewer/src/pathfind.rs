@@ -85,6 +85,19 @@ pub struct PathfindServer {
     check: Option<Task<bool>>,
 }
 
+impl PathfindServer {
+    /// Kill + reap the child WE spawned (no-op for an external server). Used by the UI Stop
+    /// button and by the map switch so a relaunch doesn't orphan the server process.
+    pub fn stop_owned_child(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        self.status = ServerStatus::Stopped;
+        self.check = None;
+    }
+}
+
 pub struct PathfindPlugin;
 impl Plugin for PathfindPlugin {
     fn build(&self, app: &mut App) {
@@ -364,12 +377,7 @@ fn handle_server_cmd(mut ev: MessageReader<ServerCmd>, mut server: ResMut<Pathfi
                 }
             }
             ServerCmd::Stop => {
-                if let Some(mut c) = server.child.take() {
-                    let _ = c.kill();
-                    let _ = c.wait();
-                }
-                server.status = ServerStatus::Stopped;
-                server.check = None;
+                server.stop_owned_child();
             }
         }
     }
@@ -385,6 +393,14 @@ fn poll_server_health(
     if let Some(t) = server.check.as_mut() {
         if let Some(reachable) = block_on(future::poll_once(t)) {
             server.check = None;
+            // Reap a self-exited child (crash / port conflict): try_wait() returns Some(status)
+            // once it died — without this the panel showed "Starting…" forever (Codex review).
+            if let Some(c) = server.child.as_mut() {
+                if let Ok(Some(status)) = c.try_wait() {
+                    warn!("pathfind: server process exited ({status})");
+                    server.child = None;
+                }
+            }
             server.status = if reachable {
                 ServerStatus::Running
             } else if server.child.is_some() {

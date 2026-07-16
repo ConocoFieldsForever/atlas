@@ -189,10 +189,12 @@ class _TexTest:
                     m1 = np.where(ok, (mt - mc) / np.maximum(w1, 1e-12), 0.0)
                     between = w0 * w1 * (m0 - m1) ** 2
                     t = int(np.argmax(between))
+                    w_lo = float(wc[t])
                     if (between[t] / total_var >= 0.5     # bimodal
                             and m0[t] <= 0.1              # low mode = true holes
-                            and m1[t] >= 0.3):            # solid mode = meaningfully opaque
-                        res = float(lv[t])
+                            and m1[t] >= 0.3              # solid mode = meaningfully opaque
+                            and 0.005 <= w_lo <= 0.995):  # both classes non-trivial (Codex: one
+                        res = float(lv[t])                # stray texel must not flip a texture)
             except Exception:
                 res = None
         self._cov[name] = res; return res
@@ -311,7 +313,11 @@ class MaterialFactory:
         if name in self._DET_MEAN:
             return self._DET_MEAN[name]
         try:
-            im = self._open(name).convert('RGB')
+            # NOTE: MaterialFactory has no _open (that's _TexTest) — calling self._open here was an
+            # AttributeError swallowed by this except, silently neutralizing EVERY pack's detail
+            # mean (dark ANGRYMESH detail maps then darken surfaces ~2x — the exact bug this code
+            # exists to fix). Open the texture directly.
+            im = _PILImage.open(os.path.join(self.ds, 'tex', name + '.png')).convert('RGB')
             im.thumbnail((256, 256))                       # mean is ~scale-invariant; keep it cheap
             a = np.asarray(im, np.float32) / 255.0
             lin = np.where(a <= 0.04045, a / 12.92, ((a + 0.055) / 1.055) ** 2.4)
@@ -368,6 +374,13 @@ def main():
     LIMIT = int(argv[argv.index('--limit') + 1]) if '--limit' in argv else 0
     OUT = (argv[argv.index('--out') + 1] if '--out' in argv
            else os.path.join(os.getcwd(), 'packs', f'{MAP}.eftpack'))
+    # ATOMIC EMISSION (Codex review): write into a staging sibling and swap at the end. Writing
+    # blobs in place with the manifest last meant a mid-build failure left new meshes.bin under
+    # the OLD manifest — a pack that loads without error and renders garbage.
+    FINAL_OUT = OUT
+    OUT = OUT + '.building'
+    if os.path.exists(OUT):
+        shutil.rmtree(OUT)
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
 
@@ -675,7 +688,9 @@ def main():
         "sidecars": sidecars,
         "note": "web-lossy tail dropped (no 512 downscale / KTX2 / meshopt / quantize / split_glb / TRS split)",
     }
-    json.dump(manifest, open(os.path.join(OUT, 'manifest.json'), 'w'), indent=1)
+    # allow_nan=False: a NaN/Infinity (e.g. bounds never updated) must fail THE BUILD here, not
+    # brick the pack at load time (serde_json rejects non-finite numbers).
+    json.dump(manifest, open(os.path.join(OUT, 'manifest.json'), 'w'), indent=1, allow_nan=False)
 
     # ---- GLOBAL sidecars: ship the all-maps catalogs + the game grade LUT into every pack so a
     #      new map is complete out of the box (loot/quests/grade were previously hand-copied and
@@ -703,6 +718,22 @@ def main():
     print(f"  instances.bin = {mb(os.path.join(OUT,'instances.bin')):.1f} MB  ({len(inst_records):,} instances)")
     print(f"  materials.json= {len(MF.records):,} materials   roots={len(root_names):,}   "
           f"bounds={manifest['bounds']}")
+    # ---- atomic swap: migrate per-map sidecars the build doesn't regenerate (semantics.json,
+    #      grass.bin/grass_sidecar.json, and any loot/tasks/grade already in the live pack), then
+    #      retire the old dir and move the staging dir into place. ----
+    if os.path.abspath(FINAL_OUT) != os.path.abspath(OUT):
+        old_dir = FINAL_OUT + '.old'
+        if os.path.exists(old_dir):
+            shutil.rmtree(old_dir)
+        if os.path.exists(FINAL_OUT):
+            for fn in os.listdir(FINAL_OUT):
+                if not os.path.exists(os.path.join(OUT, fn)):
+                    shutil.move(os.path.join(FINAL_OUT, fn), os.path.join(OUT, fn))
+            os.rename(FINAL_OUT, old_dir)
+        os.rename(OUT, FINAL_OUT)
+        if os.path.exists(old_dir):
+            shutil.rmtree(old_dir)
+        print(f"[bevy] pack swapped into place: {FINAL_OUT}")
     print(f"[bevy] done in {time.time()-t0:.0f}s")
 
 

@@ -177,6 +177,9 @@ def main():
         me = id2mesh[mid]
         for s in names:
             if s in me["name"]:
+                if s in slices:
+                    print(f"[grass] WARNING: slice {s} matches MULTIPLE terrain instances - "
+                          f"keeping the last; split/multipart terrain (Streets-style) loses parts")
                 slices[s] = (aff, me)
     print(f"[grass] {len(slices)} terrain slices")
     if not slices:

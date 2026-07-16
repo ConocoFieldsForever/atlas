@@ -91,7 +91,8 @@ impl Default for GfxSettings {
             grade_exposure: std::env::var("EFT_GRADE_EXPOSURE")
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(0.18),
+                .unwrap_or(1.7), // recalibrated: 0.18 was the web viewer's scale (and was tuned
+                                 // while the LUT pass was silently dead — see render/grade.rs)
             vignette: !std::env::var("EFT_VIGNETTE").map(|v| v.trim() == "0").unwrap_or(false),
             grass: true,
             cull_px,

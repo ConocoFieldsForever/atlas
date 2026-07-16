@@ -111,10 +111,13 @@ fn pick_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
     pack: Option<Res<LoadedPack>>,
+    pointer_on_ui: Res<crate::inspect::PointerOnUi>,
     mut readout: Query<&mut Text, With<PickReadout>>,
 ) {
     // ---- double-click gate -------------------------------------------------
-    if !mouse.just_pressed(MouseButton::Left) {
+    // Ignore clicks landing on egui panels (Codex review: UI double-clicks were triggering the
+    // expensive full-geometry raycast).
+    if !mouse.just_pressed(MouseButton::Left) || pointer_on_ui.0 {
         return;
     }
     let now = time.elapsed_secs();

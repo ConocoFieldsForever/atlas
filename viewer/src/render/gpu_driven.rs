@@ -736,9 +736,6 @@ impl Plugin for EftGpuDrivenPlugin {
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
             ExtractComponentPlugin::<CullCamera>::default(),
             ExtractResourcePlugin::<ExtractedCpuData>::default(),
-            // Runtime graphics settings (UI "Graphics (experimental)"): re-extracted every frame
-            // so slider changes land in the same frame's uniforms.
-            ExtractResourcePlugin::<crate::render::GfxSettings>::default(),
         ))
         .add_systems(Startup, build_cpu_data)
         .add_systems(Update, free_cpu_staging);
