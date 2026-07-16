@@ -265,8 +265,13 @@ fn init_grade_pipeline(
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
 struct GradeLabel;
 
+/// Bind-group cache keyed on the post-process SOURCE view id (Bevy's own custom_post_processing
+/// example pattern): post_process_write ping-pongs between two textures, so at most two entries
+/// ever exist — re-creating the bind group every frame is pure churn.
 #[derive(Default)]
-struct GradeNode;
+struct GradeNode {
+    cached_bg: std::sync::Mutex<Option<(bevy::render::render_resource::TextureViewId, bevy::render::render_resource::BindGroup)>>,
+}
 
 impl ViewNode for GradeNode {
     type ViewQuery = &'static ViewTarget;
@@ -297,17 +302,26 @@ impl ViewNode for GradeNode {
             return Ok(());
         }
         let post = target.post_process_write();
-        let bind = render_context.render_device().create_bind_group(
-            "eft_grade_bg",
-            &gp.layout,
-            &BindGroupEntries::sequential((
-                post.source,
-                &gp.scene_sampler,
-                &gp.lut_view,
-                &gp.lut_sampler,
-                gp.params.as_entire_binding(),
-            )),
-        );
+        let mut cache = self.cached_bg.lock().unwrap();
+        let bind = match cache.as_ref() {
+            Some((id, bg)) if *id == post.source.id() => bg.clone(),
+            _ => {
+                let bg = render_context.render_device().create_bind_group(
+                    "eft_grade_bg",
+                    &gp.layout,
+                    &BindGroupEntries::sequential((
+                        post.source,
+                        &gp.scene_sampler,
+                        &gp.lut_view,
+                        &gp.lut_sampler,
+                        gp.params.as_entire_binding(),
+                    )),
+                );
+                *cache = Some((post.source.id(), bg.clone()));
+                bg
+            }
+        };
+        drop(cache);
         let mut pass = render_context.command_encoder().begin_render_pass(&RenderPassDescriptor {
             label: Some("eft_grade_pass"),
             color_attachments: &[Some(RenderPassColorAttachment {

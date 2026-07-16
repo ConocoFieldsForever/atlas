@@ -116,8 +116,18 @@ fn init_ssao_pipeline(
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
 struct SsaoLabel;
 
+/// Bind-group cache keyed on (source view id, depth view id) — same pattern as render::grade
+/// (the depth view is also swapped when the window resizes).
 #[derive(Default)]
-struct SsaoNode;
+struct SsaoNode {
+    cached_bg: std::sync::Mutex<
+        Option<(
+            bevy::render::render_resource::TextureViewId,
+            bevy::render::render_resource::TextureViewId,
+            bevy::render::render_resource::BindGroup,
+        )>,
+    >,
+}
 
 impl ViewNode for SsaoNode {
     type ViewQuery = (
@@ -166,16 +176,27 @@ impl ViewNode for SsaoNode {
             .write_buffer(&sp.params, 0, bytemuck::bytes_of(&params));
 
         let post = target.post_process_write();
-        let bind = render_context.render_device().create_bind_group(
-            "eft_ssao_bg",
-            &sp.layout,
-            &BindGroupEntries::sequential((
-                post.source,
-                &sp.scene_sampler,
-                depth.view(),
-                sp.params.as_entire_binding(),
-            )),
-        );
+        let mut cache = self.cached_bg.lock().unwrap();
+        let bind = match cache.as_ref() {
+            Some((sid, did, bg)) if *sid == post.source.id() && *did == depth.view().id() => {
+                bg.clone()
+            }
+            _ => {
+                let bg = render_context.render_device().create_bind_group(
+                    "eft_ssao_bg",
+                    &sp.layout,
+                    &BindGroupEntries::sequential((
+                        post.source,
+                        &sp.scene_sampler,
+                        depth.view(),
+                        sp.params.as_entire_binding(),
+                    )),
+                );
+                *cache = Some((post.source.id(), depth.view().id(), bg.clone()));
+                bg
+            }
+        };
+        drop(cache);
         let mut pass = render_context
             .command_encoder()
             .begin_render_pass(&RenderPassDescriptor {
