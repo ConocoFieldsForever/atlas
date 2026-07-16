@@ -36,6 +36,9 @@ pub enum PoiLayer {
     LooseLoot,
     // ---- QUESTS (tasks.json) ----
     Quest,
+    // ---- TYPED GAME DATA (gamedata.json — extract_gamedata.py) ----
+    Minefield,
+    SniperZone,
 }
 
 /// The owning task id carried by every Quest marker, so the tracker (`ui::QuestTracker`) can
@@ -119,16 +122,30 @@ pub struct KeyUse {
     pub lock_positions: Vec<Vec3>,
 }
 
+/// Startup-built zone outlines from `gamedata.json` (TYPED game-file data —
+/// extract_gamedata.py). `live` flips the UI footer to credit the game files and marks that the
+/// typed exfils replaced the tarkov.dev `extracts_dev` layer. Outline verts are already viewer
+/// space, at the collider's bottom face; `draw_gamedata_outlines` lifts them slightly.
+#[derive(Resource, Default)]
+pub struct GameDataZones {
+    pub live: bool,
+    /// (faction, footprint) per typed exfil — drawn with the Extracts toggle.
+    pub exfils: Vec<(String, Vec<Vec3>)>,
+    pub minefields: Vec<Vec<Vec3>>,
+    pub sniper_zones: Vec<Vec<Vec3>>,
+}
+
 pub struct PoiPlugin;
 impl Plugin for PoiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<QuestData>()
             .init_resource::<KeyCatalog>()
+            .init_resource::<GameDataZones>()
             .add_systems(Startup, spawn_pois)
             // Quest markers get their own visibility pass (toggle AND tracker selection); the other
             // POI layers stay on the plain toggle-driven `apply_poi_visibility`.
             .add_systems(Update, (apply_poi_visibility, apply_quest_visibility))
-            .add_systems(Update, draw_quest_outlines);
+            .add_systems(Update, (draw_quest_outlines, draw_gamedata_outlines));
     }
 }
 
@@ -148,6 +165,8 @@ pub fn poi_look(l: PoiLayer) -> (Color, f32, f32) {
         PoiLayer::Stationary => (Color::srgb(0.66, 0.62, 0.35), 0.6, 0.8),
         PoiLayer::LooseLoot => (Color::srgb(0.86, 0.80, 0.55), 0.32, 0.5),
         PoiLayer::Quest => (Color::srgb(0.52, 0.48, 0.96), 0.85, 1.0),
+        PoiLayer::Minefield => (Color::srgb(0.95, 0.26, 0.20), 0.9, 1.0),
+        PoiLayer::SniperZone => (Color::srgb(0.95, 0.60, 0.15), 0.9, 1.1),
     }
 }
 
@@ -383,6 +402,164 @@ struct QuestZone {
     top: f32,
 }
 
+/// gamedata.json (extract_gamedata.py) — TYPED gameplay data read from the map's Unity logic
+/// scene (ExfiltrationPoint/Minefield/SniperFiringZone/Door MonoBehaviours — ground truth, not
+/// name classification). Positions/outlines are already viewer space. Only the sections the
+/// viewer consumes are declared; extra sections (spawn_points, transit_points, ...) stay in the
+/// file for other tools.
+#[derive(Deserialize)]
+struct GameDataFile {
+    #[serde(default)]
+    exfils: Vec<GdExfil>,
+    #[serde(default)]
+    minefields: Vec<GdZone>,
+    #[serde(default)]
+    sniper_zones: Vec<GdZone>,
+    #[serde(default)]
+    doors: Vec<GdDoor>,
+    #[serde(default)]
+    stationary: Vec<GdStationary>,
+}
+fn default_true() -> bool {
+    true
+}
+/// A typed extract: faction comes from the COMPONENT TYPE (ExfiltrationPoint = pmc,
+/// ScavExfiltrationPoint = scav, Shared… = shared, Secret… = secret).
+#[derive(Deserialize)]
+struct GdExfil {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    faction: String,
+    /// BoxCollider footprint corners (viewer space, ground height); empty when none.
+    #[serde(default)]
+    outline: Vec<[f32; 3]>,
+    #[serde(default = "default_true")]
+    active: bool,
+}
+/// A typed zone (Minefield / SniperFiringZone) with its collider footprint.
+#[derive(Deserialize)]
+struct GdZone {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    outline: Vec<[f32; 3]>,
+    #[serde(default = "default_true")]
+    active: bool,
+}
+/// A typed Door/Trunk MonoBehaviour: `key_id` is the game's item id for the key; `state` the
+/// serialized initial EDoorState ("locked"/"shut"/"open"/"breach").
+#[derive(Deserialize)]
+struct GdDoor {
+    pos: [f32; 3],
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    /// "door" | "trunk".
+    #[serde(default)]
+    kind: String,
+    /// Raw GameObject name (prettified for the card).
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_true")]
+    active: bool,
+}
+#[derive(Deserialize)]
+struct GdStationary {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: String,
+}
+
+/// Approx "W x D m" of a rectangular footprint, for zone cards; None for degenerate outlines.
+fn outline_extent(outline: &[[f32; 3]]) -> Option<String> {
+    if outline.len() < 3 {
+        return None;
+    }
+    let d = |a: &[f32; 3], b: &[f32; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    let (w, h) = (d(&outline[0], &outline[1]), d(&outline[1], &outline[2]));
+    (w > 1.0 && h > 1.0).then(|| format!("~{:.0} x {:.0} m", w, h))
+}
+
+/// Card for a typed extract (gamedata.json `exfils`). Same look as the tarkov.dev card it
+/// replaces, plus the game-file provenance and an inactive tag.
+fn gd_exfil_info(e: &GdExfil) -> MarkerInfo {
+    let mut info = extract_dev_info(&e.name, &e.faction);
+    if !e.active {
+        info.detail.push("Inactive in scene".into());
+    }
+    info.detail.push("Source: game files".into());
+    info
+}
+
+/// Card for a typed minefield / sniper zone (gamedata.json).
+fn gd_zone_info(l: PoiLayer, z: &GdZone) -> MarkerInfo {
+    let (title, subtitle) = match l {
+        PoiLayer::SniperZone => ("Sniper zone", "Hazard \u{00B7} game files"),
+        _ => ("Minefield", "Hazard \u{00B7} game files"),
+    };
+    let mut detail = Vec::new();
+    if let Some(ext) = outline_extent(&z.outline) {
+        detail.push(ext);
+    }
+    // The raw GameObject name distinguishes zones ("Minefield LowPower25", "SniperFiringZone
+    // Right") when several sit close together.
+    if let Some(n) = z.name.as_deref().map(prettify).filter(|n| !n.is_empty()) {
+        detail.push(n);
+    }
+    if !z.active {
+        detail.push("Inactive in scene".into());
+    }
+    MarkerInfo {
+        title: title.into(),
+        subtitle: subtitle.into(),
+        detail,
+        accent: poi_look(l).0,
+    }
+}
+
+/// Card for a typed Door/Trunk (gamedata.json). `dev_key` is the tarkov.dev key NAME when a
+/// loot.json lock sits within 2 m (proximity cross-check) — the human-readable answer to the
+/// raw `key_id`.
+fn gd_door_info(d: &GdDoor, dev_key: Option<&str>) -> MarkerInfo {
+    let kind = if d.kind == "trunk" { "Trunk" } else { "Door" };
+    let title = dev_key
+        .map(|s| s.to_string())
+        .or_else(|| d.name.as_deref().map(prettify).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| kind.to_string());
+    let mut detail = Vec::new();
+    if let Some(k) = d.key_id.as_deref().filter(|k| !k.is_empty()) {
+        detail.push(format!("Key: {k}"));
+        if let Some(n) = dev_key {
+            detail.push(format!("= {n} (tarkov.dev)"));
+        }
+    }
+    if let Some(st) = d.state.as_deref() {
+        detail.push(format!("State: {}", titlecase(st)));
+    }
+    if !d.active {
+        detail.push("Inactive in scene".into());
+    }
+    // Locked doors read in the locks-gold so the state is visible at card level; the rest keep
+    // the door orange.
+    let accent = if d.state.as_deref() == Some("locked") {
+        poi_look(PoiLayer::Lock).0
+    } else {
+        poi_look(PoiLayer::Door).0
+    };
+    MarkerInfo {
+        title,
+        subtitle: format!("{kind} \u{00B7} game files"),
+        detail,
+        accent,
+    }
+}
+
 /// Card for a quest objective located on this map (tasks.json).
 fn quest_info(t: &QuestTask, o: &QuestObjective) -> MarkerInfo {
     let mut detail = Vec::new();
@@ -534,6 +711,7 @@ fn faction_label(fac: &str) -> String {
         "pmc" => "PMC".into(),
         "scav" => "Scav".into(),
         "shared" => "All".into(),
+        "secret" => "Secret".into(),
         _ if fac.contains('+') => "All".into(),
         _ => titlecase(fac),
     }
@@ -545,6 +723,7 @@ fn extract_faction_color(fac: &str) -> Color {
     match fac {
         "scav" => Color::srgb(0.95, 0.45, 0.10),
         "shared" => Color::srgb(0.78, 0.95, 0.82),
+        "secret" => Color::srgb(0.85, 0.30, 0.90),
         _ if fac.contains('+') => Color::srgb(0.78, 0.95, 0.82),
         _ => poi_look(PoiLayer::Extract).0,
     }
@@ -771,6 +950,8 @@ fn spawn_pois(
         PoiLayer::Stationary,
         PoiLayer::LooseLoot,
         PoiLayer::Quest,
+        PoiLayer::Minefield,
+        PoiLayer::SniperZone,
     ];
     let mk = |materials: &mut Assets<StandardMaterial>, c: Color| {
         let lin = c.to_linear();
@@ -790,6 +971,7 @@ fn spawn_pois(
     // extracts + violet keycard locks. PMC extracts keep the layer's default extract green.
     let ex_scav = mk(&mut materials, extract_faction_color("scav"));
     let ex_shared = mk(&mut materials, extract_faction_color("shared"));
+    let ex_secret = mk(&mut materials, extract_faction_color("secret"));
     let keycard_mat = mk(&mut materials, Color::srgb(0.72, 0.45, 0.92)); // lock_info's violet
 
     // helper closure captured by the spawn loop below (all shared handles are Clone). `mat`
@@ -820,6 +1002,21 @@ fn spawn_pois(
         e
     };
 
+    // ---- TYPED game data (gamedata.json, extract_gamedata.py) is loaded FIRST because its
+    // typed exfils/doors supersede both the tarkov.dev `extracts_dev` list and the
+    // name-classified semantics layers below (the classifier's extract layer measured a 71%
+    // false-positive rate; the typed MonoBehaviours are ground truth).
+    let gamedata: Option<GameDataFile> = resolve_sidecar(
+        "EFT_GAMEDATA_JSON",
+        "gamedata.json",
+        root,
+        "typed exfils/minefields/sniper zones unavailable (tarkov.dev extracts still shown)",
+    )
+    .and_then(|p| std::fs::read_to_string(p).ok())
+    .and_then(|s| serde_json::from_str::<GameDataFile>(&s).ok());
+    let have_gd_extracts = gamedata.as_ref().is_some_and(|g| !g.exfils.is_empty());
+    let have_gd_doors = gamedata.as_ref().is_some_and(|g| !g.doors.is_empty());
+
     // ---- spawns + map intel from loot.json (pmc/scav/boss nodes, locks, hazards, ...) ----
     // Set when loot.json ships clean faction-tagged extracts; those supersede the semantics
     // `extract` layer below.
@@ -827,6 +1024,9 @@ fn spawn_pois(
     let mut have_dev_stationary = false;
     // Aggregated per-key lock list, folded into `KeyCatalog` below (panel's "Keys for this map").
     let mut key_uses: Vec<KeyUse> = Vec::new();
+    // Every loot.json lock position + its key's display name, for the typed-door proximity
+    // cross-check (a tarkov.dev lock within 2 m names the door's `key_id`).
+    let mut lock_keys: Vec<(Vec3, String)> = Vec::new();
     let key = map_key(&lp.0.manifest.dataset);
     if let Some(mn) = std::fs::read_to_string(root.join("loot.json"))
         .ok()
@@ -856,6 +1056,9 @@ fn spawn_pois(
             );
             // Fold EVERY key into the catalog, grouped by key name (today each lock ships
             // exactly one key, but an alternate key must not vanish from the list).
+            if let Some(k) = lk.keys.iter().find(|k| !k.n.is_empty()) {
+                lock_keys.push((Vec3::new(lk.pos[0], lk.pos[1], lk.pos[2]), k.n.clone()));
+            }
             for k in lk.keys.iter().filter(|k| !k.n.is_empty()) {
                 let pos = Vec3::new(lk.pos[0], lk.pos[1], lk.pos[2]);
                 if let Some(u) = key_uses.iter_mut().find(|u| u.name == k.n) {
@@ -888,8 +1091,10 @@ fn spawn_pois(
             let e = spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo), None);
             commands.entity(e).insert(MarkerValue(lo.pr.unwrap_or(0)));
         }
-        // Prefer the clean faction-tagged extract list when it's present.
-        if !mn.extracts_dev.is_empty() {
+        // Prefer the clean faction-tagged extract list when it's present — unless the TYPED
+        // exfils from gamedata.json already own the Extract layer (they include secret
+        // extracts and exact collider footprints; tarkov.dev stays the fallback).
+        if !mn.extracts_dev.is_empty() && !have_gd_extracts {
             have_dev_extracts = true;
             // tarkov.dev lists one entry PER FACTION, so the same physical extract can appear
             // twice — pmc + scav at (nearly) the same spot (6 such pairs across the 10 maps,
@@ -932,6 +1137,100 @@ fn spawn_pois(
         }
     }
 
+    // ---- TYPED game data markers + zone outlines (gamedata.json) ----
+    // Exfil markers REPLACE extracts_dev (gated above); minefields / sniper zones are their
+    // own layers; typed doors replace the semantics door layer and carry KeyId/DoorState.
+    let mut gd_zones = GameDataZones::default();
+    let mut have_gd_stationary = false;
+    if let Some(gd) = &gamedata {
+        gd_zones.live = have_gd_extracts || !gd.minefields.is_empty() || !gd.sniper_zones.is_empty();
+        for e in &gd.exfils {
+            let mat = match e.faction.as_str() {
+                "scav" => Some(ex_scav.clone()),
+                "shared" => Some(ex_shared.clone()),
+                "secret" => Some(ex_secret.clone()),
+                _ => None, // pmc keeps the layer's extract green
+            };
+            let ent = spawn(&mut commands, PoiLayer::Extract, e.pos, gd_exfil_info(e), mat);
+            commands.entity(ent).insert(ExtractFaction(e.faction.clone()));
+            if e.outline.len() >= 3 {
+                gd_zones.exfils.push((
+                    e.faction.clone(),
+                    e.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
+                ));
+            }
+        }
+        for (zs, layer, sink) in [
+            (&gd.minefields, PoiLayer::Minefield, &mut gd_zones.minefields),
+            (&gd.sniper_zones, PoiLayer::SniperZone, &mut gd_zones.sniper_zones),
+        ] {
+            for z in zs {
+                spawn(&mut commands, layer, z.pos, gd_zone_info(layer, z), None);
+                if z.outline.len() >= 3 {
+                    sink.push(z.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect());
+                }
+            }
+        }
+        // Typed doors: cross-check each keyed door against the tarkov.dev locks — a lock
+        // within 2 m names the raw key_id on the card.
+        let (mut keyed, mut matched) = (0usize, 0usize);
+        for d in &gd.doors {
+            let p = Vec3::new(d.pos[0], d.pos[1], d.pos[2]);
+            let dev_key = d
+                .key_id
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .and_then(|_| {
+                    lock_keys
+                        .iter()
+                        .filter(|(lp, _)| lp.distance_squared(p) < 4.0)
+                        .min_by(|(a, _), (b, _)| {
+                            a.distance_squared(p).total_cmp(&b.distance_squared(p))
+                        })
+                        .map(|(_, n)| n.as_str())
+                });
+            if d.key_id.as_deref().is_some_and(|k| !k.is_empty()) {
+                keyed += 1;
+                matched += dev_key.is_some() as usize;
+            }
+            spawn(&mut commands, PoiLayer::Door, d.pos, gd_door_info(d, dev_key), None);
+        }
+        if !gd.doors.is_empty() {
+            info!(
+                "poi: gamedata {} typed doors ({} keyed, {} matched a tarkov.dev lock within 2 m)",
+                gd.doors.len(),
+                keyed,
+                matched
+            );
+        }
+        // Typed stationary weapons fill the gap when tarkov.dev shipped none (positions are
+        // the game's own StationaryWeapon components — better than mining the geometry).
+        if !have_dev_stationary && !gd.stationary.is_empty() {
+            have_gd_stationary = true;
+            for s in &gd.stationary {
+                spawn(
+                    &mut commands,
+                    PoiLayer::Stationary,
+                    s.pos,
+                    MarkerInfo {
+                        title: prettify(&s.name),
+                        subtitle: "Stationary weapon \u{00B7} game files".into(),
+                        detail: Vec::new(),
+                        accent: poi_look(PoiLayer::Stationary).0,
+                    },
+                    None,
+                );
+            }
+        }
+        info!(
+            "poi: gamedata live — {} exfils, {} minefields, {} sniper zones replace/extend the dev layers",
+            gd.exfils.len(),
+            gd.minefields.len(),
+            gd.sniper_zones.len()
+        );
+    }
+    commands.insert_resource(gd_zones);
+
     // ---- extracts / doors / interactables from semantics.json ----
     // Skip the semantics `extract` layer if loot.json already gave us clean extracts.
     if let Some(layers) =
@@ -956,7 +1255,12 @@ fn spawn_pois(
             s.contains("extractor_") || s.contains("exit_light")
         };
         for (lname, ly) in map {
-            if lname == "extract" && have_dev_extracts {
+            // typed gamedata exfils/doors own these layers when present (ground truth beats
+            // the name classifier); tarkov.dev extracts_dev is the next-best extract source.
+            if lname == "extract" && (have_dev_extracts || have_gd_extracts) {
+                continue;
+            }
+            if lname == "door" && have_gd_doors {
                 continue;
             }
             if let Some(v) = layers.get(lname) {
@@ -1033,9 +1337,10 @@ fn spawn_pois(
     // ---- STATIONARY weapons from GAME GEOMETRY (fills the tarkov.dev gap) ----
     // tarkov.dev's `stationaryWeapons` is empty for many maps (incl. Interchange), yet the map
     // HAS mounted MGs — in the pack they're `reciever_*` (and NSV/Kord/DShK/Utes) meshes. When
-    // loot.json gave us no stationary data, scan the pack instances and dedupe co-located
-    // receiver parts (one gun = several meshes at ~one spot) into one marker per gun.
-    if !have_dev_stationary {
+    // neither loot.json nor gamedata.json gave us stationary data, scan the pack instances and
+    // dedupe co-located receiver parts (one gun = several meshes at ~one spot) into one marker
+    // per gun.
+    if !have_dev_stationary && !have_gd_stationary {
         let pack = &lp.0;
         let is_mg = |name: &str| {
             let s = name.to_ascii_lowercase();
@@ -1111,6 +1416,8 @@ fn apply_poi_visibility(
             PoiLayer::Stationary => toggles.stationary,
             PoiLayer::LooseLoot => toggles.loose,
             PoiLayer::Quest => toggles.quests, // unreachable here (filtered out), kept exhaustive
+            PoiLayer::Minefield => toggles.minefields,
+            PoiLayer::SniperZone => toggles.sniper_zones,
         };
         // Value-tagged markers (loose loot) additionally pass the panel's min-value filter.
         let show = show && value_passes(toggles.min_value, val);
@@ -1142,6 +1449,38 @@ fn apply_quest_visibility(
         } else {
             Visibility::Hidden
         };
+    }
+}
+
+/// Draw the TYPED zone footprints from gamedata.json as closed polygons (immediate mode, the
+/// same idiom as `draw_quest_outlines`): exfil collider footprints in their faction colour with
+/// the Extracts toggle, minefields in hazard red, sniper zones in orange with their own
+/// toggles. Verts sit at the collider's bottom face, so they get a small lift off the ground.
+fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles: Res<LayerToggles>) {
+    const LIFT: Vec3 = Vec3::new(0.0, 0.4, 0.0);
+    let mut ring = |outline: &Vec<Vec3>, color: Color| {
+        gizmos.linestrip(
+            outline
+                .iter()
+                .map(|p| *p + LIFT)
+                .chain(outline.first().map(|p| *p + LIFT)),
+            color,
+        );
+    };
+    if toggles.extracts {
+        for (fac, outline) in &zones.exfils {
+            ring(outline, extract_faction_color(fac));
+        }
+    }
+    if toggles.minefields {
+        for outline in &zones.minefields {
+            ring(outline, poi_look(PoiLayer::Minefield).0);
+        }
+    }
+    if toggles.sniper_zones {
+        for outline in &zones.sniper_zones {
+            ring(outline, poi_look(PoiLayer::SniperZone).0);
+        }
     }
 }
 

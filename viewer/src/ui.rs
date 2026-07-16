@@ -40,6 +40,9 @@ pub struct LayerToggles {
     pub transits: bool,
     pub stationary: bool,
     pub loose: bool,
+    // ---- TYPED GAME DATA (gamedata.json) ----
+    pub minefields: bool,
+    pub sniper_zones: bool,
     // ---- QUESTS (tasks.json) ----
     pub quests: bool,
 }
@@ -70,6 +73,8 @@ impl Default for LayerToggles {
             transits: has("transit"),
             stationary: has("stationary"),
             loose: has("loose"),
+            minefields: has("minefield"),
+            sniper_zones: has("sniper"),
             quests: has("quest"),
         }
     }
@@ -284,6 +289,8 @@ struct GfxUiParams<'w, 's> {
     hud: ResMut<'w, PosHud>,
     /// The fly-cam transform (root-level entity, so `Transform` IS world space) for "save view".
     cam: Query<'w, 's, &'static Transform, With<crate::render::CullCamera>>,
+    /// Typed gamedata.json zone state — the footer credits the game files when it's live.
+    gamedata: Res<'w, crate::poi::GameDataZones>,
 }
 
 #[cfg(feature = "egui")]
@@ -781,13 +788,19 @@ fn layers_panel(
                         + poi_counts[PoiLayer::Switch as usize]
                         + poi_counts[PoiLayer::Transit as usize]
                         + poi_counts[PoiLayer::Stationary as usize]
-                        + poi_counts[PoiLayer::LooseLoot as usize];
+                        + poi_counts[PoiLayer::LooseLoot as usize]
+                        + poi_counts[PoiLayer::Minefield as usize]
+                        + poi_counts[PoiLayer::SniperZone as usize];
                     CollapsingHeader::new(section_hdr("Map Intel", intel_total, HDR))
                         .id_salt("sec_intel")
                         .default_open(false)
                         .show(ui, |ui| {
                             poi_row(ui, &mut toggles.locks, "Locks & keys", PoiLayer::Lock, &poi_counts);
                             poi_row(ui, &mut toggles.hazards, "Hazards", PoiLayer::Hazard, &poi_counts);
+                            // TYPED zones from the game files (gamedata.json): markers + red /
+                            // orange footprint outlines (poi::draw_gamedata_outlines).
+                            poi_row(ui, &mut toggles.minefields, "Minefields", PoiLayer::Minefield, &poi_counts);
+                            poi_row(ui, &mut toggles.sniper_zones, "Sniper zones", PoiLayer::SniperZone, &poi_counts);
                             poi_row(ui, &mut toggles.switches, "Switches", PoiLayer::Switch, &poi_counts);
                             poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit, &poi_counts);
                             poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary, &poi_counts);
@@ -1125,10 +1138,17 @@ fn layers_panel(
                     });
 
                     ui.add_space(6.0);
-                    // Extracts come from tarkov.dev too (extracts_dev supersedes the semantics
-                    // layer on every current map) — only doors/loot props are game-file data.
+                    // Provenance: with gamedata.json live, extracts/minefields/sniper zones/doors
+                    // are TYPED data read from the game's own scene MonoBehaviours; otherwise the
+                    // extracts fall back to tarkov.dev (extracts_dev) and doors to the name
+                    // classifier.
+                    let provenance = if gfx_ui.gamedata.live {
+                        "exfils/mines/snipers: game files  \u{2022}  spawns/intel: tarkov.dev"
+                    } else {
+                        "spawns/extracts/intel: tarkov.dev  \u{2022}  doors/props: game files"
+                    };
                     ui.label(
-                        RichText::new("spawns/extracts/intel: tarkov.dev  \u{2022}  doors/props: game files")
+                        RichText::new(provenance)
                             .size(9.0)
                             .italics()
                             .color(MUTED),
@@ -1253,6 +1273,8 @@ fn hide_all(t: &mut LayerToggles) {
     t.transits = false;
     t.stationary = false;
     t.loose = false;
+    t.minefields = false;
+    t.sniper_zones = false;
     t.quests = false;
 }
 
@@ -1275,6 +1297,8 @@ fn layer_toggle_mut(t: &mut LayerToggles, l: crate::poi::PoiLayer) -> &mut bool 
         P::Stationary => &mut t.stationary,
         P::LooseLoot => &mut t.loose,
         P::Quest => &mut t.quests,
+        P::Minefield => &mut t.minefields,
+        P::SniperZone => &mut t.sniper_zones,
     }
 }
 
