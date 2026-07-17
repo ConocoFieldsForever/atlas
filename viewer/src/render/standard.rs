@@ -83,7 +83,14 @@ fn spawn_ingame_lights(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         return;
     }
     let Some(lp) = pack else { return };
-    let Some(path) = lp.0.manifest.sidecars.lights.as_deref() else {
+    let lights_path = lp
+        .0
+        .manifest
+        .sidecars
+        .lights
+        .as_deref()
+        .map(|m| lp.0.resolve_path(m)); // self-contained packs: pack-relative sidecars
+    let Some(path) = lights_path.as_deref() else {
         warn!("standard: no lights sidecar — interiors rely on ambient only");
         return;
     };

@@ -511,7 +511,13 @@ fn setup(
     // shader's reflected sun all agree. Fallback = a plausible high overcast sun.
     let sun_from_pack = pack
         .as_ref()
-        .and_then(|p| p.0.manifest.sidecars.volume_meta.as_deref())
+        .and_then(|p| {
+            p.0.manifest
+                .sidecars
+                .volume_meta
+                .as_deref()
+                .map(|m| p.0.resolve_path(m)) // self-contained packs: pack-relative sidecars
+        })
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
         .and_then(|v| {

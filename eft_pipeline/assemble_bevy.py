@@ -32,7 +32,14 @@ Output is the self-describing .eftpack v1 contract:
   <pack>/materials.json  -- one record per unique (submesh) material signature.
 
 Usage:
-  python -m eft_pipeline.assemble_bevy [map=interchange] [--out <dir.eftpack>] [--limit N]
+  python -m eft_pipeline.assemble_bevy [map=interchange] [--out <dir.eftpack>] [--limit N] [--self-contained]
+
+--self-contained (redistribution PR3, default OFF): copy every referenced texture into
+<pack>/tex/ and every sidecar file (volume.bin/volume.json/volume.vis.bin, terrain_layers/,
+lights_*.json) INTO the pack, and write pack-RELATIVE paths everywhere. The Rust loader
+(Pack::resolve_path) resolves relative manifest/materials/sidecar paths against the pack
+dir; absolute (legacy dev) paths pass through untouched, so default builds are unchanged.
+manifest.datasetPath stays ABSOLUTE for provenance; "selfContained": true marks the mode.
 """
 import sys, os, time, json, glob, shutil, functools
 import numpy as np
@@ -368,10 +375,131 @@ def _corners(lo, hi):
     return np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])], np.float64)
 
 
+# =============================================================================================================
+# SELF-CONTAINED PACK mode (redistribution PR3, --self-contained). Everything a shipped pack
+# needs is COPIED into the pack dir and referenced pack-RELATIVE; the Rust loader
+# (Pack::resolve_path) resolves relative paths against the pack dir and passes absolute
+# (legacy dev) paths through, so default builds stay byte-identical.
+# =============================================================================================================
+class _PackShipper:
+    """Copies files into the staging pack dir and tallies count/bytes for the summary line."""
+
+    def __init__(self, out_dir):
+        self.out = out_dir; self.files = 0; self.bytes = 0; self.missing = []
+        self._by_src = {}    # normalized source path -> pack-relative path (copy dedup)
+        self._by_base = {}   # claimed tex/ basename  -> owning source path (collision check)
+        self._sha = {}       # source path -> short content hash (lazy, for collisions only)
+
+    def _sha8(self, path):
+        h = self._sha.get(path)
+        if h is None:
+            import hashlib
+            hh = hashlib.sha1()
+            with open(path, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b''):
+                    hh.update(chunk)
+            h = self._sha[path] = hh.hexdigest()[:8]
+        return h
+
+    def ship(self, src, rel):
+        """Copy src -> <pack>/<rel> (rel = pack-relative, posix slashes). None if src missing."""
+        if not src or not os.path.exists(src):
+            return None
+        dst = os.path.join(self.out, rel.replace('/', os.sep))
+        d = os.path.dirname(dst)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        shutil.copy2(src, dst)
+        self.files += 1; self.bytes += os.path.getsize(src)
+        return rel
+
+    def ship_tex(self, src):
+        """Copy a referenced texture into <pack>/tex/ FLAT (basenames kept). Two DIFFERENT
+        source files sharing a basename get a deterministic short-content-hash suffix
+        (<stem>.<sha1[:8]>.png); identical content shares one copy. A MISSING source still
+        returns tex/<basename> (the loader falls back on a missing texture exactly as it
+        did for a missing absolute path) and is tallied for the summary."""
+        src = os.path.normpath(src)
+        hit = self._by_src.get(src)
+        if hit is not None:
+            return hit
+        base = os.path.basename(src)
+        if not os.path.exists(src):
+            self.missing.append(src)
+            rel = self._by_src[src] = 'tex/' + base
+            return rel
+        owner = self._by_base.get(base)
+        if owner is not None and owner != src:
+            if self._sha8(owner) == self._sha8(src):        # same bytes -> share the copy
+                rel = self._by_src[src] = self._by_src[owner]
+                return rel
+            stem, ext = os.path.splitext(base)
+            base = f"{stem}.{self._sha8(src)}{ext}"         # different bytes -> deterministic suffix
+        else:
+            self._by_base[base] = src
+        rel = self.ship(src, 'tex/' + base)
+        self._by_src[src] = rel
+        return rel
+
+    def ship_dir(self, srcdir, reldir, skip_suffixes=('.bak',)):
+        """Copy every regular file of srcdir into <pack>/<reldir>/ (flat, sorted, backups skipped)."""
+        n = 0
+        if srcdir and os.path.isdir(srcdir):
+            for fn in sorted(os.listdir(srcdir)):
+                sp = os.path.join(srcdir, fn)
+                if not os.path.isfile(sp) or fn.endswith(tuple(skip_suffixes)):
+                    continue
+                if self.ship(sp, f"{reldir}/{fn}"):
+                    n += 1
+        return n
+
+
+def _self_contain_materials(records, shipper):
+    """Rewrite EVERY texture path in the materials.json records to pack-relative tex/<name>,
+    copying the files via shipper.ship_tex. Covers all texture-bearing fields: albedo, normal,
+    specMap, emissive.texture, detail.albedo/.normal, vp.layers[].albedo/.normal, vp.heights."""
+    for m in records:
+        for k in ('albedo', 'normal', 'specMap'):
+            if m.get(k): m[k] = shipper.ship_tex(m[k])
+        em = m.get('emissive')
+        if em and em.get('texture'): em['texture'] = shipper.ship_tex(em['texture'])
+        det = m.get('detail')
+        if det:
+            for k in ('albedo', 'normal'):
+                if det.get(k): det[k] = shipper.ship_tex(det[k])
+        vp = m.get('vp')
+        if vp:
+            if vp.get('heights'): vp['heights'] = shipper.ship_tex(vp['heights'])
+            for ly in vp.get('layers') or []:
+                for k in ('albedo', 'normal'):
+                    if ly.get(k): ly[k] = shipper.ship_tex(ly[k])
+
+
+def _relativize_tl_manifest(path):
+    """Defensive: rewrite any ABSOLUTE *.png path inside the COPIED terrain_layers manifest to
+    its basename. The loader resolves those names relative to the sidecar's own dir (i.e.
+    <pack>/terrain_layers/), so a basename IS the pack-relative terrain_layers/<name>.png.
+    Current extractors already emit bare basenames -> normally a no-op."""
+    try:
+        d0 = json.load(open(path, encoding='utf-8'))
+    except Exception:
+        return
+    def walk(o):
+        if isinstance(o, dict): return {k: walk(v) for k, v in o.items()}
+        if isinstance(o, list): return [walk(v) for v in o]
+        if isinstance(o, str) and os.path.isabs(o) and o.lower().endswith('.png'):
+            return os.path.basename(o)
+        return o
+    d1 = walk(d0)
+    if d1 != d0:
+        json.dump(d1, open(path, 'w'), separators=(',', ':'))
+
+
 def main():
     argv = sys.argv[1:]
     MAP = argv[0] if argv and not argv[0].startswith('-') else 'interchange'
     LIMIT = int(argv[argv.index('--limit') + 1]) if '--limit' in argv else 0
+    SELF_CONTAINED = '--self-contained' in argv     # redistribution PR3; default OFF (dev builds unchanged)
     OUT = (argv[argv.index('--out') + 1] if '--out' in argv
            else os.path.join(os.getcwd(), 'packs', f'{MAP}.eftpack'))
     # ATOMIC EMISSION (Codex review): write into a staging sibling and swap at the end. Writing
@@ -635,6 +763,12 @@ def main():
         fh.write(ia.tobytes())
 
     # ---- materials.json --------------------------------------------------------------------------------------
+    shipper = _PackShipper(OUT) if SELF_CONTAINED else None
+    if shipper:
+        _self_contain_materials(MF.records, shipper)
+        if shipper.missing:
+            print(f"[bevy] self-contained: {len(shipper.missing)} referenced textures MISSING on disk "
+                  f"(kept as tex/<name>; loader falls back same as for a missing absolute path)")
     json.dump(MF.records, open(os.path.join(OUT, 'materials.json'), 'w'), separators=(',', ':'))
 
     # ---- LOD groups (conjugated centers) for runtime screen-height LOD ---------------------------------------
@@ -645,23 +779,48 @@ def main():
         g2 = dict(grp); g2['center'] = [round(float(v), 4) for v in c]
         lod_groups.append(g2)
 
-    # ---- sidecars: referenced IN PLACE (never copied) --------------------------------------------------------
+    # ---- sidecars: referenced IN PLACE by default; COPIED INTO THE PACK with --self-contained ----------------
     beamng = os.path.dirname(os.path.dirname(DS))           # .../beamng_blender_pipeline
     vol_dir = os.path.join(beamng, 'tarkmap', 'out', MAP)
     def _abs(p): return p.replace('\\', '/') if p and os.path.exists(p) else None
     lights = sorted(g for g in glob.glob(os.path.join(DS, 'lights_*.json')) if not g.endswith('_all.json'))
     lights_primary = next((l for l in lights if os.path.basename(l) == 'lights_64.json'), (lights[0] if lights else None))
-    sidecars = {
-        "terrainLayers": _abs(os.path.join(DS, 'terrain_layers', 'manifest.json')),
-        "lights":        _abs(lights_primary or ''),
-        "volume":        _abs(os.path.join(vol_dir, 'volume.bin')),
-        "semantics":     None,                              # roots table embedded in manifest.roots instead
-        # extras (self-describing; the loader reads the SH layout from volume.json):
-        "volumeMeta":    _abs(os.path.join(vol_dir, 'volume.json')),
-        "volumeVis":     _abs(os.path.join(vol_dir, 'volume.vis.bin')),
-        "lightsAll":     [p.replace('\\', '/') for p in lights],
-        "grassJson":     _abs(os.path.join(DS, 'terrain_layers', 'grass.json')),
-    }
+    if not shipper:
+        sidecars = {
+            "terrainLayers": _abs(os.path.join(DS, 'terrain_layers', 'manifest.json')),
+            "lights":        _abs(lights_primary or ''),
+            "volume":        _abs(os.path.join(vol_dir, 'volume.bin')),
+            "semantics":     None,                          # roots table embedded in manifest.roots instead
+            # extras (self-describing; the loader reads the SH layout from volume.json):
+            "volumeMeta":    _abs(os.path.join(vol_dir, 'volume.json')),
+            "volumeVis":     _abs(os.path.join(vol_dir, 'volume.vis.bin')),
+            "lightsAll":     [p.replace('\\', '/') for p in lights],
+            "grassJson":     _abs(os.path.join(DS, 'terrain_layers', 'grass.json')),
+        }
+    else:
+        # SELF-CONTAINED: ship the whole terrain_layers dir (ctrl/layer PNGs, density bins,
+        # grass.json, its manifest -- build_grass reads density from the sidecar's dir, so a
+        # shipped pack can rebuild grass), the volume triple and the lights jsons; reference
+        # everything pack-relative. Missing sources -> null, same as the legacy _abs contract.
+        shipper.ship_dir(os.path.join(DS, 'terrain_layers'), 'terrain_layers')
+        tl_rel = 'terrain_layers/manifest.json'
+        if os.path.exists(os.path.join(OUT, 'terrain_layers', 'manifest.json')):
+            _relativize_tl_manifest(os.path.join(OUT, 'terrain_layers', 'manifest.json'))
+        else:
+            tl_rel = None
+        lights_rel = [r for r in (shipper.ship(p, os.path.basename(p)) for p in lights) if r]
+        sidecars = {
+            "terrainLayers": tl_rel,
+            "lights":        (os.path.basename(lights_primary)
+                              if lights_primary and os.path.exists(lights_primary) else None),
+            "volume":        shipper.ship(os.path.join(vol_dir, 'volume.bin'), 'volume.bin'),
+            "semantics":     None,                          # roots table embedded in manifest.roots instead
+            "volumeMeta":    shipper.ship(os.path.join(vol_dir, 'volume.json'), 'volume.json'),
+            "volumeVis":     shipper.ship(os.path.join(vol_dir, 'volume.vis.bin'), 'volume.vis.bin'),
+            "lightsAll":     lights_rel,
+            "grassJson":     ('terrain_layers/grass.json'
+                              if os.path.exists(os.path.join(OUT, 'terrain_layers', 'grass.json')) else None),
+        }
 
     manifest = {
         "version": 1,
@@ -692,6 +851,10 @@ def main():
         "sidecars": sidecars,
         "note": "web-lossy tail dropped (no 512 downscale / KTX2 / meshopt / quantize / split_glb / TRS split)",
     }
+    if SELF_CONTAINED:
+        # datasetPath above stays ABSOLUTE deliberately (build provenance only): the loader
+        # never resolves textures/sidecars through it -- every consumer path is pack-relative.
+        manifest["selfContained"] = True
     # allow_nan=False: a NaN/Infinity (e.g. bounds never updated) must fail THE BUILD here, not
     # brick the pack at load time (serde_json rejects non-finite numbers).
     json.dump(manifest, open(os.path.join(OUT, 'manifest.json'), 'w'), indent=1, allow_nan=False)
@@ -723,6 +886,9 @@ def main():
     print(f"  instances.bin = {mb(os.path.join(OUT,'instances.bin')):.1f} MB  ({len(inst_records):,} instances)")
     print(f"  materials.json= {len(MF.records):,} materials   roots={len(root_names):,}   "
           f"bounds={manifest['bounds']}")
+    if shipper:
+        print(f"[bevy] SELF-CONTAINED: copied {shipper.files} files (+{shipper.bytes/1e6:.1f} MB) into the pack "
+              f"(tex/ + sidecars); {len(shipper.missing)} referenced textures missing")
     # ---- atomic swap: migrate per-map sidecars the build doesn't regenerate (semantics.json,
     #      grass.bin/grass_sidecar.json, and any loot/tasks/grade already in the live pack), then
     #      retire the old dir and move the staging dir into place. ----

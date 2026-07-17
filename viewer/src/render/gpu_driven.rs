@@ -1599,6 +1599,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         .sidecars
         .volume_meta
         .as_deref()
+        .map(|m| pack.resolve_path(m)) // self-contained packs: pack-relative sidecars
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
         .and_then(|v| {
