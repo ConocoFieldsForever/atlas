@@ -542,7 +542,8 @@ pub fn menu_ui(
                                 } else {
                                     match e.fp_match {
                                         Some(true) => ("READY", OK),
-                                        Some(false) => ("GAME UPDATED - REBUILD", BAD),
+                                        // Game-file hashes changed since this pack was built.
+                                        Some(false) => ("GAME FILES UPDATED", WARN),
                                         None => ("READY (unstamped)", WARN),
                                     }
                                 };
@@ -583,6 +584,34 @@ pub fn menu_ui(
                                             if ui.add_sized([84.0, 30.0], play).clicked() {
                                                 switch.0 = e.pack_dir.clone();
                                             }
+                                            // UPDATE sits BETWEEN delete and play: shown when the
+                                            // game-file hashes no longer match the pack's stamp —
+                                            // re-runs the pipeline so the data catches up.
+                                            if e.fp_match == Some(false) {
+                                                let upd = egui::Button::new(
+                                                    RichText::new(if this_building {
+                                                        "UPDATING..."
+                                                    } else {
+                                                        "UPDATE"
+                                                    })
+                                                    .color(Color32::BLACK)
+                                                    .strong(),
+                                                )
+                                                .fill(WARN)
+                                                .corner_radius(0.0);
+                                                if ui
+                                                    .add_enabled_ui(!any_building, |ui| {
+                                                        ui.add_sized([84.0, 30.0], upd).on_hover_text(
+                                                            "game files changed since this pack was built - \
+                                                             run the pipeline again (data may be out of date)",
+                                                        )
+                                                    })
+                                                    .inner
+                                                    .clicked()
+                                                {
+                                                    start_build = Some(e.key.to_string());
+                                                }
+                                            }
                                             // Tarkov-style destructive button: red fill, black text.
                                             let del_btn = |t: &str| {
                                                 egui::Button::new(
@@ -606,19 +635,6 @@ pub fn menu_ui(
                                                 .clicked()
                                             {
                                                 set_confirm = Some(i);
-                                            }
-                                            if e.fp_match == Some(false) {
-                                                let b = egui::Button::new(
-                                                    RichText::new(if this_building {
-                                                        "BUILDING..."
-                                                    } else {
-                                                        "REBUILD"
-                                                    })
-                                                    .color(WARN),
-                                                );
-                                                if ui.add_enabled(!any_building, b).clicked() {
-                                                    start_build = Some(e.key.to_string());
-                                                }
                                             }
                                         } else {
                                             let b = egui::Button::new(RichText::new(
