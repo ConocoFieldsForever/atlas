@@ -356,7 +356,14 @@ fn main() {
         });
     }
 
-    app.insert_resource(ClearColor(Color::srgb(0.55, 0.58, 0.58))) // overcast horizon stand-in
+    // In-raid: overcast horizon stand-in. Menu mode: the egui menu's near-black #090909 —
+    // the CentralPanel goes transparent when the real-asset 3D CCTV decor is active
+    // (menu_fx), so the 3D clear IS the menu field; setup() also skips the Skybox then.
+    app.insert_resource(if menu_mode {
+        ClearColor(Color::srgb_u8(9, 9, 9))
+    } else {
+        ClearColor(Color::srgb(0.55, 0.58, 0.58))
+    })
         .add_plugins(pick::PickPlugin) // double-LEFT-click raycast-vs-pack-data debug pick
         .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
         .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
@@ -383,8 +390,13 @@ fn main() {
     }
     // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
     // manager. The in-raid panels check for this resource and stand down while it exists.
+    // build_state() also runs the ONE-TIME local extraction of the real CCTV menu prop
+    // (menu::ensure_menu_prop) before anything draws; spawn_menu_prop then loads it (or
+    // silently leaves the vector camera in charge when the files are absent/corrupt).
     if menu_mode {
         app.insert_resource(menu::build_state());
+        app.add_systems(Startup, menu_fx::spawn_menu_prop.after(setup));
+        app.add_systems(Update, menu_fx::menu_prop_update);
     }
 
     app.run();
@@ -534,7 +546,11 @@ fn setup(
     // The experimental shadow toggle needs a real sun (matches the render side's sun_ok gate).
     gfx.shadows_available = sun_from_pack.is_some();
     let sun_dir = sun_from_pack.unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize());
-    let sky = build_sky_cubemap(&mut images, sun_dir);
+    // Menu mode (no pack — same test main() uses): NO skybox — the menu's ClearColor
+    // (#090909, set in main) must be the backdrop behind the transparent egui panel /
+    // the 3D CCTV decor (menu_fx).
+    let menu_mode = pack.is_none();
+    let sky = (!menu_mode).then(|| build_sky_cubemap(&mut images, sun_dir));
 
     let mut cam = commands.spawn((
         Camera3d {
@@ -552,14 +568,6 @@ fn setup(
         Bloom {
             intensity: 0.06, // subtle: sun disk / glints / emissive bleed, not a haze filter
             ..Bloom::NATURAL
-        },
-        // Procedural overcast sky (gradient + soft sun) — brightness is in cd/m^2 and is
-        // multiplied by the camera's physical Exposure (default ev100 9.7 => ~1/1000), so ~900
-        // lands the ~1.0-range texels at parity with the shader's own radiance scale.
-        Skybox {
-            image: sky,
-            brightness: 900.0,
-            rotation: Quat::IDENTITY,
         },
         // Tonemapping is decided below: the REAL game grade LUT (render::grade) replaces the
         // whole tonemap+grade chain when active; the TonyMcMapface + hand ColorGrading
