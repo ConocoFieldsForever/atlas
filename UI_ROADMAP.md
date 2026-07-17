@@ -101,3 +101,33 @@ practical source.** Re-verified against the transcripts and the code:
 - layers_panel is at/near the 16-system-param limit — bundle new params into a SystemParam.
 - No game-derived assets shipped in the exe (vector icons or user-extracted-at-runtime only).
 - Keep everything hideable; keep the Tarkov gear-screen visual language.
+
+## Loot-run planner — shipped v1 + roadmap (2026-07-17)
+
+Shipped v1 (planner.rs, Navigation tab "LOOT PLAN"):
+- [x] Orienteering solver: cheapest-insertion by value density -> 2-opt -> real A* legs
+      with budget repair; ONE bounded Dijkstra reachability field prunes off-mesh loot
+      (solve ~250 ms for 10 stops on interchange).
+- [x] Knobs: min item value, stop cap, walking budget; honors avoid-bosses/PMCs/scavs.
+- [x] Ends at the best extract (re-picked after stops settle); ordered stop list with
+      values + leg metres; gold stop orbs; tour drawn via the route machinery.
+- [x] Menu INTEL strip: tarkov.dev sync age (loot/tasks/icons) + SYNC NOW job
+      (tools/sync_intel.py -> build_loot + build_tasks + fetch_icons -> packs/shared).
+
+Roadmap (in rough priority order):
+- [ ] TIME model, not just distance: loot.json containers carry `t` (loot seconds); budget
+      the raid in MINUTES (walk speed + looting time + extract buffer), show ETA per stop.
+- [ ] Key awareness: skip locked-room loot unless its key is marked owned (locks/keys data
+      exists per map); "keys I have" checklist that unlocks those candidates.
+- [ ] Container-type weighting: safes/registers vs crates value multipliers; dedupe stops
+      within N metres into one "cluster" stop (5x adjacent fuel tanks = one stop).
+- [ ] Task integration: fold TRACKED task objectives into the tour as mandatory stops
+      (prize-collecting with required nodes) — quest + loot in one run.
+- [ ] Multiple plan variants like routes (greedy vs balanced vs safe) with value/dist/risk
+      trade-off list; risk score = summed avoid-zone exposure along the tour.
+- [ ] Spawn-aware start presets: pick an actual PMC spawn as start (spawn list exists).
+- [ ] Numbered stop badges on the map (world-to-viewport egui overlay like inspect cards).
+- [ ] Persist/share plans (JSON in the pack dir; "copy plan" for squadmates).
+- [ ] Live re-plan: after walking past stop K, re-solve the remainder from here.
+- [ ] Data: fetch --tasks-all icons once (3.5k items) so every stop row gets item art;
+      surface per-map loot-data age on the map cards (already on the INTEL strip).
