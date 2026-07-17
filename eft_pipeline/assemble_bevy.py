@@ -696,23 +696,24 @@ def main():
     # brick the pack at load time (serde_json rejects non-finite numbers).
     json.dump(manifest, open(os.path.join(OUT, 'manifest.json'), 'w'), indent=1, allow_nan=False)
 
-    # ---- GLOBAL sidecars: ship the all-maps catalogs + the game grade LUT into every pack so a
-    #      new map is complete out of the box (loot/quests/grade were previously hand-copied and
-    #      silently missing on new maps). Per-map sidecars (semantics.json via extract_semantics,
-    #      grass via build_grass, volume via the SH bake) still have their own steps.
+    # ---- GLOBAL sidecars: the all-maps catalogs (tarkov.dev loot/tasks) + the game grade LUT are
+    #      map-AGNOSTIC, so they live ONCE in packs/shared/ (above the packs; the viewer resolves
+    #      pack-local -> shared -> cwd). Refreshed here when the upstream copy is newer. Per-map
+    #      sidecars (gamedata/semantics/grass/volume) still have their own steps.
     tk_out = os.path.join(beamng, 'tarkmap', 'out')
+    shared = os.path.join(os.path.dirname(FINAL_OUT), 'shared')
+    os.makedirs(shared, exist_ok=True)
     for src, dst in ((os.path.join(tk_out, 'loot.json'), 'loot.json'),
                      (os.path.join(tk_out, 'tasks.json'), 'tasks.json'),
                      (os.path.join(tk_out, 'eft_grade_lut.bin'), 'grade_lut.bin')):
-        if not os.path.exists(src):  # fall back to a sibling pack's copy (out/ may lack loot.json)
-            sib = next((q for q in glob.glob(os.path.join(os.path.dirname(OUT), '*.eftpack', dst))
-                        if os.path.abspath(q) != os.path.abspath(os.path.join(OUT, dst))), None)
-            src = sib or src
-        if os.path.exists(src) and not os.path.exists(os.path.join(OUT, dst)):
-            shutil.copy2(src, os.path.join(OUT, dst))
-            print(f"[bevy] sidecar: {dst} <- {src}")
-        elif not os.path.exists(os.path.join(OUT, dst)):
-            print(f"[bevy] sidecar MISSING: {dst} (no {src}) — copy manually or the viewer loses that layer")
+        tgt = os.path.join(shared, dst)
+        if os.path.exists(src) and (
+            not os.path.exists(tgt) or os.path.getmtime(src) > os.path.getmtime(tgt)
+        ):
+            shutil.copy2(src, tgt)
+            print(f"[bevy] shared sidecar: {dst} <- {src}")
+        elif not os.path.exists(tgt):
+            print(f"[bevy] shared sidecar MISSING: {dst} (no {src}) — the viewer loses that layer")
     print("[bevy] remaining per-map steps: extract_semantics.py -> semantics.json; SH bake -> volume; build_grass")
 
     mb = lambda f: os.path.getsize(f) / 1e6 if os.path.exists(f) else 0

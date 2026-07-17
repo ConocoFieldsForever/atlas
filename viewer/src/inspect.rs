@@ -80,6 +80,8 @@ pub fn icon_slug(name: &str) -> String {
 struct IconCache {
     /// `<pack>/icons`, resolved from `LoadedPack` on first use.
     root: Option<std::path::PathBuf>,
+    /// `packs/shared/icons` — the cross-map icon store (icons are item-keyed, not map-keyed).
+    shared: Option<std::path::PathBuf>,
     tex: std::collections::HashMap<String, Option<bevy_egui::egui::TextureHandle>>,
 }
 
@@ -94,12 +96,20 @@ impl IconCache {
         use bevy_egui::egui;
         if self.root.is_none() {
             self.root = pack.as_ref().map(|p| p.0.root.join("icons"));
+            self.shared = pack
+                .as_ref()
+                .and_then(|p| p.0.root.parent())
+                .map(|p| p.join("shared").join("icons"));
         }
         let root = self.root.as_ref()?;
         if let Some(hit) = self.tex.get(slug) {
             return hit.clone();
         }
-        let loaded = image::open(root.join(format!("{slug}.png")))
+        let file = format!("{slug}.png");
+        let loaded = image::open(root.join(&file))
+            .or_else(|_| {
+                image::open(self.shared.as_ref().map(|s| s.join(&file)).unwrap_or_default())
+            })
             .ok()
             .map(|img| {
                 let rgba = img.into_rgba8();

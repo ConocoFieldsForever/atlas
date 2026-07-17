@@ -313,11 +313,13 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
             pack_dir: Some(dir.clone()),
             size_bytes: size,
             built_days: age_days(&manifest),
-            intel_days: age_days(&p.join("loot.json")),
+            intel_days: age_days(&p.join("loot.json"))
+                .or_else(|| age_days(std::path::Path::new("packs/shared/loot.json"))),
             has_volume,
             has_grass: p.join("grass.bin").exists(),
             has_gamedata: p.join("gamedata.json").exists(),
-            has_icons: p.join("icons").is_dir(),
+            has_icons: p.join("icons").is_dir()
+                || std::path::Path::new("packs/shared/icons").is_dir(),
             fp_match,
         });
     }

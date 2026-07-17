@@ -65,6 +65,7 @@ pub fn load_grade_lut(pack_root: Option<&std::path::Path>) -> Option<GradeLutCpu
     let candidates: Vec<std::path::PathBuf> = [
         std::env::var("EFT_GRADE_LUT").ok().map(std::path::PathBuf::from),
         pack_root.map(|r| r.join("grade_lut.bin")),
+        pack_root.and_then(|r| r.parent()).map(|p| p.join("shared").join("grade_lut.bin")),
         Some(std::path::PathBuf::from(
             "C:/Users/user/beamng_blender_pipeline/tarkmap/out/eft_grade_lut.bin",
         )),

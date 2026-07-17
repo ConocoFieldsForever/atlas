@@ -1201,6 +1201,12 @@ fn resolve_sidecar(env_key: &str, file: &str, root: &Path, lost: &str) -> Option
     if pb.is_file() {
         return Some(pb);
     }
+    // Shared tier (packs/shared/): map-agnostic sidecars (tasks.json) live above the packs.
+    if let Some(shared) = root.parent().map(|p| p.join("shared").join(file)) {
+        if shared.is_file() {
+            return Some(shared);
+        }
+    }
     let cwd = PathBuf::from(file);
     if cwd.is_file() {
         return Some(cwd);

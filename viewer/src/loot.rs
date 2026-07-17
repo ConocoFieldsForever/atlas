@@ -93,6 +93,13 @@ fn resolve_loot_json(pack: &Option<Res<LoadedPack>>) -> Option<PathBuf> {
         if pb.is_file() {
             return Some(pb);
         }
+        // Shared tier: tarkov.dev data is map-agnostic (all-maps files) — it lives ABOVE the
+        // packs in packs/shared/ so it isn't duplicated per map. Pack-local still wins (override).
+        if let Some(shared) = lp.0.root.parent().map(|p| p.join("shared").join("loot.json")) {
+            if shared.is_file() {
+                return Some(shared);
+            }
+        }
     }
     let cwd = PathBuf::from("loot.json");
     if cwd.is_file() {
