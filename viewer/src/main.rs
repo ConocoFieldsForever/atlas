@@ -19,6 +19,7 @@ mod navigate_panel;
 mod pathfind;
 mod paths;
 mod pick;
+mod planner;
 mod poi;
 mod render;
 mod tasks_panel;
@@ -438,6 +439,7 @@ fn main() {
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
         .add_plugins(tasks_panel::TasksPanelPlugin) // revamped Tasks tab: catalog + icon cache (router calls tasks_panel_ui)
         .add_plugins(pathfind::PathfindPlugin) // in-process CPU routing over the baked nav grid (nav.rs)
+        .add_plugins(planner::PlannerPlugin) // loot-run orienteering planner (Navigation tab)
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack

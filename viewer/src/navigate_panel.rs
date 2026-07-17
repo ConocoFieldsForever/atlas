@@ -29,10 +29,18 @@ use crate::ui::RightPanelTab;
 use crate::ui_theme as theme;
 
 /// Panel-local state: the row whose route is being COMPUTED right now (immediate feedback while
-/// `RouteStatus::Pending`; once Ok the highlight is driven by `RouteResult::dest_label` instead).
-#[derive(Default)]
+/// `RouteStatus::Pending`; once Ok the highlight is driven by `RouteResult::dest_label` instead)
+/// + the loot-plan knobs.
 pub struct NavUiState {
     pending: Option<Entity>,
+    plan_min_value: i64,
+    plan_stops: usize,
+    plan_budget: f32,
+}
+impl Default for NavUiState {
+    fn default() -> Self {
+        Self { pending: None, plan_min_value: 100_000, plan_stops: 10, plan_budget: 1500.0 }
+    }
 }
 
 /// One extract row, resolved from the marker entities each frame (cheap: a handful of extracts).
@@ -61,6 +69,8 @@ pub fn navigate_tab(
     mut route: MessageWriter<RouteRequest>,
     mut route_result: ResMut<RouteResult>,
     mut route_opts: ResMut<RouteOpts>,
+    plan: Res<crate::planner::PlanResult>,
+    mut plan_req: MessageWriter<crate::planner::PlanRequest>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     extracts: Query<
         (
@@ -249,6 +259,121 @@ pub fn navigate_tab(
                     ..Default::default()
                 });
             }
+
+            // ===== LOOT PLAN (orienteering: max value under a walking budget, ends at an extract) =====
+            ui.add_space(theme::SP_SM);
+            egui::CollapsingHeader::new(theme::section_header("LOOT PLAN", plan.stops.len()))
+                .id_salt("nav_lootplan")
+                .default_open(false)
+                // Auto-open while a plan is computing / live (collapses again on clear).
+                .open((!matches!(plan.status, crate::planner::PlanStatus::Idle)).then_some(true))
+                .show(ui, |ui| {
+                    use crate::planner::{PlanRequest, PlanStatus};
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                    // knobs
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("min value").size(theme::SIZE_SMALL).color(theme::MUTED));
+                        egui::ComboBox::from_id_salt("plan_minv")
+                            .selected_text(format!("{}k \u{20BD}", ui_state.plan_min_value / 1000))
+                            .show_ui(ui, |ui| {
+                                for v in [50_000i64, 100_000, 150_000, 200_000, 300_000] {
+                                    ui.selectable_value(&mut ui_state.plan_min_value, v, format!("{}k \u{20BD}", v / 1000));
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("stops").size(theme::SIZE_SMALL).color(theme::MUTED));
+                        ui.add(egui::Slider::new(&mut ui_state.plan_stops, 4..=18));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("budget").size(theme::SIZE_SMALL).color(theme::MUTED));
+                        ui.add(egui::Slider::new(&mut ui_state.plan_budget, 500.0..=3000.0).suffix(" m").step_by(50.0));
+                    });
+                    let full = egui::vec2(ui.available_width(), 26.0);
+                    if ui
+                        .add_enabled(ready, egui::Button::new(
+                            RichText::new("PLAN LOOT RUN").size(theme::SIZE_LABEL).strong()
+                                .color(if ready { theme::ACCENT } else { theme::FAINT }))
+                            .min_size(full).corner_radius(0.0))
+                        .on_hover_text("pick the highest-value loot tour that fits the budget, ending at an extract \u{00B7} honors the avoid options")
+                        .clicked()
+                    {
+                        plan_req.write(PlanRequest {
+                            min_value: ui_state.plan_min_value,
+                            max_stops: ui_state.plan_stops,
+                            budget_m: ui_state.plan_budget,
+                        });
+                    }
+                    match &plan.status {
+                        PlanStatus::Idle => {}
+                        PlanStatus::Pending => {
+                            ui.label(RichText::new("optimizing\u{2026}").size(theme::SIZE_SMALL).color(theme::ACCENT));
+                        }
+                        PlanStatus::Error(e) => {
+                            ui.label(RichText::new(e.as_str()).size(theme::SIZE_CAPTION).color(theme::DANGER_TEXT));
+                        }
+                        PlanStatus::Ok => {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "\u{2248}{}k \u{20BD}  \u{00B7}  {:.0} m  \u{00B7}  exits {}",
+                                        plan.total_value / 1000,
+                                        plan.total_dist,
+                                        plan.extract
+                                    ))
+                                    .size(theme::SIZE_SMALL)
+                                    .color(theme::OK),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui.small_button(RichText::new("clear").size(10.0)).clicked() {
+                                        plan_req.write(PlanRequest { min_value: 0, max_stops: 0, budget_m: 0.0 });
+                                        route.write(RouteRequest::default());
+                                    }
+                                });
+                            });
+                            for (i, st) in plan.stops.iter().enumerate() {
+                                let row = ui
+                                    .horizontal(|ui| {
+                                        ui.label(
+                                            RichText::new(format!("{:>2}.", i + 1))
+                                                .size(theme::SIZE_CAPTION)
+                                                .color(theme::FAINT),
+                                        );
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            ui.label(
+                                                RichText::new(format!("+{:.0} m", st.leg))
+                                                    .size(theme::SIZE_TINY)
+                                                    .color(theme::FAINT),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!("{}k", st.value / 1000))
+                                                    .size(theme::SIZE_CAPTION)
+                                                    .color(theme::BEIGE),
+                                            );
+                                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&st.name)
+                                                            .size(theme::SIZE_CAPTION)
+                                                            .color(theme::BONE),
+                                                    )
+                                                    .truncate()
+                                                    .selectable(false),
+                                                );
+                                            });
+                                        });
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("fly to this stop");
+                                if row.clicked() {
+                                    cam_cmd.fly_to = Some(st.pos);
+                                }
+                            }
+                        }
+                    }
+                });
 
             ui.add_space(theme::SP_MD);
 

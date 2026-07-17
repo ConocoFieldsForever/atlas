@@ -373,6 +373,115 @@ impl NavGrid {
         Some(path)
     }
 
+    /// Single-source Dijkstra COST FIELD from `from`, expanded until `g_limit` metres (no dest, no
+    /// heuristic). The field lives in `s` (generation-stamped `g`); query it with [`Self::field_dist`].
+    /// One bounded flood lets a planner test reachability/distance of MANY points without ever
+    /// paying an exhaustive failed A* per unreachable point. Returns false if the start won't snap.
+    pub fn dijkstra_field(&self, from: Vec3, g_limit: f32, s: &mut Scratch) -> bool {
+        let Some((sc, sl)) = self.snap_start(from.x, from.y, from.z, 16) else {
+            return false;
+        };
+        let k = self.k;
+        let nx = self.nx as i64;
+        let nz = self.nz as i64;
+        s.gen = s.gen.wrapping_add(1);
+        let gen = s.gen;
+        s.heap.clear();
+        let start = sc * k + sl;
+        s.g[start] = 0.0;
+        s.open_gen[start] = gen;
+        // Plain g-ordered heap (heuristic = 0): reuse the shared helpers with a zero heur.
+        let zero = |_c: usize| 0.0f32;
+        heap_push(&mut s.heap, start, &s.g, gen, &s.open_gen, &zero, k, self.nx);
+        while let Some(cur) = heap_pop(&mut s.heap, &s.g, &s.open_gen, gen, &zero, k, self.nx) {
+            if s.closed_gen[cur] == gen {
+                continue;
+            }
+            s.closed_gen[cur] = gen;
+            if s.g[cur] > g_limit {
+                continue; // beyond the budget ring — don't expand further
+            }
+            let c = cur / k;
+            let l = cur % k;
+            let (ix, iz) = ((c % self.nx) as i64, (c / self.nx) as i64);
+            let h_cur = self.h_lay(c, l);
+            let blk_c = self.blk[cur];
+            for d in 0..8 {
+                if (blk_c >> d) & 1 != 0 {
+                    continue;
+                }
+                let (dx, dz) = (NB[d].0 as i64, NB[d].1 as i64);
+                let (jx, jz) = (ix + dx, iz + dz);
+                if jx < 0 || jz < 0 || jx >= nx || jz >= nz {
+                    continue;
+                }
+                let nc = (jz * nx + jx) as usize;
+                let nl = self.best_layer(nc, h_cur);
+                if nl < 0 {
+                    continue;
+                }
+                let nl = nl as usize;
+                let h_n = self.h_lay(nc, nl);
+                let up = h_n - h_cur;
+                let forced = self.door[nc] == 1;
+                if !forced && (up > self.climb || -up > self.drop_max) {
+                    continue;
+                }
+                if dx != 0 && dz != 0 {
+                    let a = (iz * nx + jx) as usize;
+                    let b = (jz * nx + ix) as usize;
+                    if self.best_layer(a, h_cur) < 0 && self.best_layer(b, h_cur) < 0 && !forced {
+                        continue;
+                    }
+                }
+                let nn = nc * k + nl;
+                let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                let step = (horiz * horiz + (up * VERT) * (up * VERT)).sqrt();
+                let ng = s.g[cur] + step;
+                let known = s.open_gen[nn] == gen;
+                if !known || ng < s.g[nn] {
+                    s.g[nn] = ng;
+                    s.open_gen[nn] = gen;
+                    heap_push(&mut s.heap, nn, &s.g, gen, &s.open_gen, &zero, k, self.nx);
+                }
+            }
+        }
+        true
+    }
+
+    /// Walkable distance to `pos` read from a [`Self::dijkstra_field`] in `s` — None if `pos`
+    /// wasn't reached (unreachable, or beyond the flood's g_limit). Checks every layer of the
+    /// cell and its 3x3 ring (seam/shelf tolerance), keeping the best stamped g.
+    pub fn field_dist(&self, s: &Scratch, pos: Vec3) -> Option<f32> {
+        let gen = s.gen;
+        let (cx, cz) = self.cell_of_xz(pos.x, pos.z);
+        let mut best: Option<f32> = None;
+        for dz in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (jx, jz) = (cx + dx, cz + dz);
+                if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                    continue;
+                }
+                let c = (jz * self.nx as i64 + jx) as usize;
+                for l in 0..self.k {
+                    let n = c * self.k + l;
+                    if s.open_gen[n] == gen && best.is_none_or(|b| s.g[n] < b) {
+                        best = Some(s.g[n]);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    #[inline]
+    fn cell_of_xz(&self, x: f32, z: f32) -> (i64, i64) {
+        (
+            ((x - self.min_x) / self.res).round() as i64,
+            ((z - self.min_z) / self.res).round() as i64,
+        )
+    }
+
     /// Route a->b: snap the start, try dest layers nearest b.y. Returns (polyline, walkable length).
     /// The reported length is the REAL walked metres (avoid penalties shape the path, not the number).
     pub fn path(

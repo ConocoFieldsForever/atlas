@@ -47,20 +47,38 @@ pub struct BuildJob {
 
 impl BuildJob {
     pub fn spawn(key: &str, game_dir: &str) -> std::io::Result<Self> {
+        Self::spawn_script(key, game_dir, "tools/build_map.py", true)
+    }
+
+    /// The menu's tarkov.dev INTEL refresh (tools/sync_intel.py) — same streaming-job shape as a
+    /// map build, no map args.
+    pub fn spawn_intel() -> std::io::Result<Self> {
+        Self::spawn_script("__intel__", "", "tools/sync_intel.py", false)
+    }
+
+    fn spawn_script(
+        key: &str,
+        game_dir: &str,
+        script: &str,
+        key_as_args: bool,
+    ) -> std::io::Result<Self> {
         use std::io::BufRead;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console popping over the menu
         let root = crate::paths::repo_root().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "python kit not found (tools/build_map.py) beside the exe or in the cwd",
+                "python kit not found (tools/ beside the exe or in the cwd)",
             )
         })?;
-        let mut child = std::process::Command::new(crate::paths::python_exe(root))
-            .current_dir(root) // kit-relative paths inside build_map.py resolve from its root
+        let mut cmd = std::process::Command::new(crate::paths::python_exe(root));
+        cmd.current_dir(root) // kit-relative paths inside the script resolve from its root
             .env("EFT_GAME_DATA", game_dir) // menu-selected install drives the pipeline
-            .arg("tools/build_map.py")
-            .args(key.split([',', ' ']).filter(|s| !s.is_empty()))
+            .arg(script);
+        if key_as_args {
+            cmd.args(key.split([',', ' ']).filter(|s| !s.is_empty()));
+        }
+        let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW)
@@ -151,12 +169,14 @@ impl BuildJob {
         let stage = l
             .iter()
             .rev()
-            .find(|s| s.starts_with("[STAGE") || s.starts_with("[BUILD"))
+            .find(|s| s.starts_with("[STAGE") || s.starts_with("[BUILD") || s.starts_with("[SYNC"))
             .cloned()
             .unwrap_or_else(|| "starting...".into());
         let lines: Vec<String> = l.iter().rev().take(tail).cloned().collect();
         let finished = l.iter().rev().any(|s| s.starts_with("[exit"));
-        let ok = l.iter().any(|s| s.starts_with("[BUILD OK]"))
+        let ok = l
+            .iter()
+            .any(|s| s.starts_with("[BUILD OK]") || s.starts_with("[SYNC OK]"))
             || self.done.load(std::sync::atomic::Ordering::SeqCst);
         (stage, lines.into_iter().rev().collect(), finished, ok)
     }
@@ -180,6 +200,22 @@ pub struct MenuState {
     pub show_log: bool,
     /// Footer editor buffer for the game-install path.
     pub game_dir_edit: String,
+    /// The one in-flight tarkov.dev INTEL sync (tools/sync_intel.py), if any.
+    pub sync: Option<BuildJob>,
+    /// INTEL strip stats: (loot.json age days, tasks.json age days, cached icon count).
+    pub intel: (Option<f64>, Option<f64>, usize),
+    /// Outcome note of the last finished sync ("refreshed" / failure), shown until the next one.
+    pub sync_note: Option<(String, bool)>,
+}
+
+/// Shared tarkov.dev data freshness: (loot.json age d, tasks.json age d, icon count).
+pub fn intel_status() -> (Option<f64>, Option<f64>, usize) {
+    let sh = crate::paths::shared_dir();
+    (
+        age_days(&sh.join("loot.json")),
+        age_days(&sh.join("tasks.json")),
+        std::fs::read_dir(sh.join("icons")).map(|d| d.count()).unwrap_or(0),
+    )
 }
 
 /// The standard map roster (dataset key -> display name). Packs on disk that aren't in this
@@ -520,6 +556,9 @@ pub fn build_state() -> MenuState {
         show_rebuild: None,
         build,
         show_log: false,
+        sync: None,
+        intel: intel_status(),
+        sync_note: None,
     }
 }
 
@@ -600,6 +639,77 @@ pub fn menu_ui(
                     );
                     ui.label(RichText::new("PACKS ON DISK").color(DIM).size(11.0));
                 });
+            });
+
+            // ---- INTEL strip: tarkov.dev data freshness + one-click refresh. Overlays (loot
+            // values, tasks, icons) are only as good as their last sync — surface it. ----
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("INTEL").color(BEIGE).size(11.0).strong());
+                let (loot_d, tasks_d, icons) = state.intel;
+                let age_txt = |d: Option<f64>| match d {
+                    Some(d) if d < 1.0 => format!("{:.0} h ago", (d * 24.0).max(1.0)),
+                    Some(d) => format!("{d:.0} d ago"),
+                    None => "never".to_string(),
+                };
+                // Stale warning: prices move per wipe/week — amber past 7 days, red past 21.
+                let worst = loot_d.unwrap_or(f64::MAX).max(tasks_d.unwrap_or(f64::MAX));
+                let age_col = if worst > 21.0 {
+                    theme::DANGER_TEXT
+                } else if worst > 7.0 {
+                    theme::WARN
+                } else {
+                    theme::OK
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "tarkov.dev synced {}  \u{00B7}  tasks {}  \u{00B7}  {} icons",
+                        age_txt(loot_d),
+                        age_txt(tasks_d),
+                        icons
+                    ))
+                    .color(age_col)
+                    .size(11.0),
+                );
+                // Sync job lifecycle: idle button -> streaming stage -> outcome note.
+                if let Some(job) = &state.sync {
+                    let (stage, _, finished, ok) = job.snapshot(1);
+                    if finished {
+                        state.sync_note = Some(if ok {
+                            ("intel refreshed".to_string(), true)
+                        } else {
+                            ("sync FAILED (see log)".to_string(), false)
+                        });
+                        state.intel = intel_status();
+                        state.sync = None;
+                    } else {
+                        ui.label(RichText::new(format!("syncing\u{2026}  {stage}")).color(theme::ACCENT).size(11.0));
+                        if ui.small_button(RichText::new("cancel").size(10.0)).clicked() {
+                            job.cancel();
+                        }
+                    }
+                } else {
+                    if ui
+                        .add(egui::Button::new(RichText::new("SYNC NOW").size(11.0).color(BEIGE)))
+                        .on_hover_text("re-pull loot values, tasks and item icons from tarkov.dev (network)")
+                        .clicked()
+                    {
+                        match BuildJob::spawn_intel() {
+                            Ok(j) => {
+                                state.sync_note = None;
+                                state.sync = Some(j);
+                            }
+                            Err(e) => state.sync_note = Some((format!("sync failed to start: {e}"), false)),
+                        }
+                    }
+                    if let Some((note, ok)) = &state.sync_note {
+                        ui.label(
+                            RichText::new(note.as_str())
+                                .color(if *ok { theme::OK } else { theme::DANGER_TEXT })
+                                .size(11.0),
+                        );
+                    }
+                }
             });
         });
 
