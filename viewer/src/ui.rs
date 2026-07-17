@@ -298,8 +298,17 @@ struct GfxUiParams<'w, 's> {
     cam: Query<'w, 's, &'static Transform, With<crate::render::CullCamera>>,
     /// Typed gamedata.json zone state — the footer credits the game files when it's live.
     gamedata: Res<'w, crate::poi::GameDataZones>,
-    /// Scene-inactive markers, counted next to the "hide inactive" filter checkbox.
-    inactive: Query<'w, 's, (), bevy::prelude::With<crate::poi::SceneInactive>>,
+    /// Scene-inactive markers, counted next to the "hide inactive" filter checkbox (walls
+    /// excluded — a zone would otherwise count twice: marker + wall).
+    inactive: Query<
+        'w,
+        's,
+        (),
+        (
+            bevy::prelude::With<crate::poi::SceneInactive>,
+            bevy::prelude::Without<crate::poi::ZoneWall>,
+        ),
+    >,
 }
 
 #[cfg(feature = "egui")]
@@ -320,13 +329,19 @@ fn layers_panel(
         Option<&crate::poi::MarkerValue>,
         Option<&crate::poi::SceneInactive>,
     )>,
-    poi_q: Query<&crate::poi::PoiLayer>,
+    // Zone-wall ribbons share their zone's `PoiLayer` for visibility but are scenery — keep
+    // them out of the per-layer marker counts and the extract-routing destinations (a wall's
+    // transform is identity; it would route the tour through the world origin).
+    poi_q: Query<&crate::poi::PoiLayer, Without<crate::poi::ZoneWall>>,
     loot_q: Query<&crate::loot::LootClass>,
-    extracts: Query<(
-        &crate::poi::PoiLayer,
-        &GlobalTransform,
-        Option<&crate::poi::ExtractFaction>,
-    )>,
+    extracts: Query<
+        (
+            &crate::poi::PoiLayer,
+            &GlobalTransform,
+            Option<&crate::poi::ExtractFaction>,
+        ),
+        Without<crate::poi::ZoneWall>,
+    >,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
     mut server_cmd: MessageWriter<crate::pathfind::ServerCmd>,
