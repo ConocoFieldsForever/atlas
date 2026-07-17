@@ -41,6 +41,8 @@ pub struct BuildJob {
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Some(exit-ok) once the child has been reaped.
     pub result: Option<bool>,
+    /// Wall-clock build start — feeds the loading bar's ESTIMATED TIME readout.
+    pub started: std::time::Instant,
 }
 
 impl BuildJob {
@@ -123,6 +125,7 @@ impl BuildJob {
                 log,
                 done,
                 result: None,
+                started: std::time::Instant::now(),
             });
         }
     }
@@ -173,6 +176,8 @@ pub struct MenuState {
     pub show_rebuild: Option<usize>,
     /// The one in-flight pipeline build, if any.
     pub build: Option<BuildJob>,
+    /// Build panel: raw log tail visible? Collapsed by default; auto-expands on failure.
+    pub show_log: bool,
     /// Footer editor buffer for the game-install path.
     pub game_dir_edit: String,
 }
@@ -442,6 +447,7 @@ pub fn build_state() -> MenuState {
         confirm_delete: None,
         show_rebuild: None,
         build,
+        show_log: false,
     }
 }
 
@@ -473,6 +479,16 @@ pub fn menu_ui(
     use bevy_egui::egui::{self, Color32, RichText};
     let Some(mut state) = state else { return };
     let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    // The menu animates without input now (camera LED blink / servo slew / idle patrol and
+    // the loading-bar pulse): keep frames coming even when no events arrive, at a faster
+    // cadence while a pipeline build is streaming.
+    let build_running = state.build.as_ref().is_some_and(|b| b.result.is_none());
+    ctx.request_repaint_after(std::time::Duration::from_millis(if build_running {
+        50
+    } else {
+        80
+    }));
 
     // EFT gear-screen scheme: near-black field, charcoal panels with 1px steel borders,
     // thin uppercase type, desaturated bone/beige text, muted green/red state colors.
@@ -519,6 +535,10 @@ pub fn menu_ui(
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(BG).inner_margin(24.0))
         .show(ctx, |ui| {
+            // Backdrop decor: wall-mounted CCTV servo-tracking the cursor (menu_fx). Painted
+            // FIRST so every widget added later layers over it (same-layer paint order); it is
+            // pure painter output — no widget, no Sense — so it can never steal clicks.
+            crate::menu_fx::security_camera(ui, ui.max_rect());
 
             let mut delete_now: Option<usize> = None;
             let mut rescan = false;
@@ -534,6 +554,9 @@ pub fn menu_ui(
                 .filter(|b| b.result.is_none())
                 .map(|b| b.key.clone());
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // Right gutter: keep the map rows clear of the camera decor zone top-right
+                // (the camera is painted behind, so without this it would never be seen).
+                ui.set_max_width((ui.available_width() - 166.0).max(430.0));
                 for i in 0..state.entries.len() {
                     let e = &state.entries[i];
                     let installed = e.pack_dir.is_some();
@@ -702,25 +725,38 @@ pub fn menu_ui(
                     Ok(job) => {
                         info!("menu: building '{key}' via tools/build_map.py");
                         state.build = Some(job);
+                        state.show_log = false; // fresh panel starts with the log collapsed
                     }
                     Err(e) => error!("menu: failed to start build for {key}: {e}"),
                 }
             }
 
-            // ---- Build progress (Tarkov task-log style): stage header + streaming tail ----
+            // ---- Build progress (EFT loader style): segmented bar + stage line; the raw
+            // streaming tail stays collapsed behind SHOW LOG and auto-expands on failure ----
             let mut clear_build = false;
+            let mut toggle_log = false;
+            let mut expand_log = false;
             // Auto-refresh the map rows the moment the pipeline finishes (the panel itself
-            // stays up until CLOSE so the log remains readable). result doubles as the
-            // "already rescanned" latch.
+            // stays up until CLOSE so the result remains readable). result doubles as the
+            // "already rescanned" latch; a failure force-expands the log tail so the error
+            // lines are visible without a click.
             if let Some(job) = &mut state.build {
                 let (_, _, finished, ok) = job.snapshot(0);
                 if finished && job.result.is_none() {
                     job.result = Some(ok);
                     rescan = true;
+                    if !ok {
+                        expand_log = true;
+                    }
                 }
             }
+            if expand_log {
+                state.show_log = true;
+            }
+            let show_log = state.show_log;
             if let Some(job) = &state.build {
                 let (stage, tail, finished, ok) = job.snapshot(12);
+                let failed = finished && !ok;
                 ui.add_space(10.0);
                 egui::Frame::new()
                     .fill(HEADER)
@@ -733,9 +769,6 @@ pub fn menu_ui(
                                     .color(BONE)
                                     .strong(),
                             );
-                            ui.label(RichText::new(&stage).color(
-                                if stage.contains("FAILED") { BAD } else { BEIGE },
-                            ));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -746,12 +779,19 @@ pub fn menu_ui(
                                         if ui.button("CLOSE").clicked() {
                                             clear_build = true;
                                         }
-                                    } else {
-                                        ui.spinner();
-                                        if ui.button(RichText::new("CANCEL").color(BAD)).clicked()
-                                        {
-                                            job.cancel();
-                                        }
+                                    } else if ui
+                                        .button(RichText::new("CANCEL").color(BAD))
+                                        .clicked()
+                                    {
+                                        job.cancel();
+                                    }
+                                    // The tail is hidden by default — the loader bar carries
+                                    // the status; the raw log is one click away.
+                                    if ui
+                                        .button(if show_log { "HIDE LOG" } else { "SHOW LOG" })
+                                        .clicked()
+                                    {
+                                        toggle_log = true;
                                     }
                                     // Full captured log (the panel shows only a tail) — for
                                     // diagnosing which stage failed / sharing the output.
@@ -761,8 +801,8 @@ pub fn menu_ui(
                                 },
                             );
                         });
-                        // Loading bar driven by the [STAGE i/N] markers: finished stages count
-                        // full, the running stage counts half; [BUILD OK] pins 100%.
+                        // Progress from the [STAGE i/N] markers: finished stages count full,
+                        // the running stage counts half; [BUILD OK] pins 100%.
                         let frac = if stage.starts_with("[BUILD OK]") || (finished && ok) {
                             1.0
                         } else {
@@ -780,29 +820,51 @@ pub fn menu_ui(
                                 })
                                 .unwrap_or(0.0)
                         };
-                        ui.add_space(6.0);
-                        ui.add(
-                            egui::ProgressBar::new(frac)
-                                .desired_width(f32::INFINITY)
-                                .desired_height(14.0)
-                                .corner_radius(0.0)
-                                .fill(if finished && !ok { BAD } else { BEIGE })
-                                .text(
-                                    RichText::new(format!("{:.0}%", frac * 100.0))
-                                        .color(Color32::BLACK)
-                                        .size(10.0),
-                                ),
+                        // "LOADING OBJECTS..." style stage line for the loader bar: the text
+                        // between the [STAGE] marker and its status suffix, uppercased and
+                        // ASCII-whitelisted (menu glyph set is plain ASCII only).
+                        let stage_txt = if failed {
+                            "BUILD FAILED".to_string()
+                        } else if finished {
+                            "BUILD COMPLETE".to_string()
+                        } else {
+                            let mut s = stage
+                                .split(']')
+                                .nth(1)
+                                .unwrap_or("")
+                                .split(':')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_ascii_uppercase();
+                            s.retain(|c| c.is_ascii_graphic() || c == ' ');
+                            s.truncate(38);
+                            if s.is_empty() {
+                                s = "STARTING".into();
+                            }
+                            s.push_str("...");
+                            s
+                        };
+                        ui.add_space(8.0);
+                        crate::menu_fx::eft_loading_bar(
+                            ui,
+                            frac,
+                            &stage_txt,
+                            job.started.elapsed().as_secs_f32(),
+                            failed,
                         );
-                        ui.add_space(4.0);
-                        for line in &tail {
-                            ui.label(
-                                RichText::new(line).color(DIM).size(11.0).monospace(),
-                            );
+                        if show_log {
+                            ui.add_space(6.0);
+                            for line in &tail {
+                                ui.label(
+                                    RichText::new(line).color(DIM).size(11.0).monospace(),
+                                );
+                            }
                         }
                     });
-                if finished && !ok {
-                    // leave the panel up so the failure tail stays readable
-                }
+            }
+            if toggle_log {
+                state.show_log = !state.show_log;
             }
             if clear_build {
                 state.build = None;

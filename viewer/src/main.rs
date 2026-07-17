@@ -13,6 +13,7 @@ mod eftpack;
 mod inspect;
 mod loot;
 mod menu;
+mod menu_fx;
 mod pathfind;
 mod paths;
 mod pick;
