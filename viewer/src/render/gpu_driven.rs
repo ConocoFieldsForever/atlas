@@ -265,6 +265,11 @@ pub const MAT_FLAG_RFA: u32 = 1 << 6;
 /// viewer rendered ONLY layer 0 at full strength: parking lots whose layer 0 is `road_sand`
 /// tiled a loud rust-orange blotch grid instead of the game's asphalt/gravel/sand mix.
 pub const MAT_FLAG_VP: u32 = 1 << 7;
+/// `GpuMaterial::flags` bit: puddle whose shape MASK is in the LUMA (rgb) channel, not alpha.
+/// City_puddle_atlas ships alpha≡1.0 with the coverage in red (the game's Decal/Water Deferred
+/// Decal samples `.r`); without this the puddle feathers on a constant-1 alpha and the whole quad
+/// renders as a solid slab. Detected at load by `puddle_alpha_is_constant`.
+pub const MAT_FLAG_PUDDLE_LUMA: u32 = 1 << 8;
 /// `GpuMaterial::detail_flags` bit0: this material has a detail ALBEDO texture.
 pub const DETAIL_FLAG_ALBEDO: u32 = 1 << 0;
 /// `GpuMaterial::detail_flags` bit1: this material has a detail NORMAL texture.
@@ -1049,6 +1054,10 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             // the surface can't z-fight with the unsorted blend pass.
             if albedo_index != NO_ALBEDO {
                 flags |= MAT_FLAG_BLEND;
+                // Route the puddle shape mask to luma when its alpha is constant (atlas puddles).
+                if mat.albedo.as_deref().is_some_and(puddle_alpha_is_constant) {
+                    flags |= MAT_FLAG_PUDDLE_LUMA;
+                }
             }
         }
         // Emissive (windows / monitors / signs / lamps): resolve the texture into the SAME
@@ -2493,6 +2502,23 @@ fn prepare_gpu_buffers(
 /// format makes the sampler return linear. On ANY read/decode failure returns a 1x1 magenta
 /// placeholder so the bindless-array index stays aligned with materials.json â€” a shifted
 /// index would texture the whole map wrong with no error.
+/// True when a puddle albedo's ALPHA channel is (near) constant — so the puddle shape mask lives
+/// in the RGB/luma channel instead (City_puddle_atlas ships alpha≡1.0). Sampled on a big stride
+/// (only ~38 water textures per map, at load). Undecodable -> false (assume the alpha mask).
+fn puddle_alpha_is_constant(path: &str) -> bool {
+    let Ok(img) = image::open(path) else {
+        return false;
+    };
+    let rgba = img.to_rgba8();
+    let (mut lo, mut hi) = (255u8, 0u8);
+    for px in rgba.pixels().step_by(101) {
+        let a = px.0[3];
+        lo = lo.min(a);
+        hi = hi.max(a);
+    }
+    (hi - lo) < 13 // < ~0.05 of full range
+}
+
 fn load_albedo_texture(
     device: &RenderDevice,
     queue: &RenderQueue,
