@@ -163,6 +163,21 @@ impl Default for PosHud {
     }
 }
 
+/// Which settings group the right panel shows. Selected by the vertical icon toolbar; the
+/// content panels (layers/camera/tasks) all render into the SAME `SidePanel::right` slot and
+/// early-return when they aren't the active tab, so only one shows per frame.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub enum RightPanelTab {
+    /// Map-overlay visibility (loot/spawns/extracts/hazards/quests/…) — the original panel.
+    #[default]
+    Visibility,
+    /// Camera settings (FOV, exposure, fly speed, walk mode).
+    Camera,
+    /// Task / quest tracker (revamped module).
+    Tasks,
+}
+
 pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
@@ -172,11 +187,23 @@ impl Plugin for UiPlugin {
             .init_resource::<PlanList>()
             .init_resource::<Bookmarks>()
             .init_resource::<PosHud>()
+            // EFT_TAB=camera|tasks|vis seeds the initial right-panel tab (screenshots / power users).
+            .insert_resource(match std::env::var("EFT_TAB").as_deref() {
+                Ok("camera") => RightPanelTab::Camera,
+                Ok("tasks") => RightPanelTab::Tasks,
+                _ => RightPanelTab::Visibility,
+            })
             .add_systems(Update, (apply_loot_visibility, load_bookmarks));
         // egui UI MUST run in EguiPrimaryContextPass (between egui's begin/end frame); in
         // plain Update the context has no fonts yet and `ctx_mut()` panics (bevy_egui 0.37).
+        // toolbar_panel FIRST (rightmost narrow rail) then the tab content (to its left).
         #[cfg(feature = "egui")]
-        app.add_systems(bevy_egui::EguiPrimaryContextPass, (layers_panel, pos_hud));
+        app.add_systems(
+            bevy_egui::EguiPrimaryContextPass,
+            // .chain(): egui panel STACKING follows .show() order, so the toolbar must run first
+            // (rightmost rail) and the content panel second (to its left).
+            (toolbar_panel, layers_panel, camera_panel, pos_hud).chain(),
+        );
     }
 }
 
@@ -285,6 +312,9 @@ fn min_value_label(v: i64) -> String {
 struct GfxUiParams<'w, 's> {
     gfx: ResMut<'w, crate::render::GfxSettings>,
     map_switch: ResMut<'w, crate::MapSwitch>,
+    /// Active toolbar tab — layers_panel early-returns unless this is `Visibility` (bundled here
+    /// to keep layers_panel under the 16-system-param limit).
+    tab: Res<'w, RightPanelTab>,
     /// Present only in start-menu mode (bare launch) — the panel stands down entirely.
     menu: Option<Res<'w, crate::menu::MenuState>>,
     pack: Option<Res<'w, crate::render::LoadedPack>>,
@@ -355,6 +385,9 @@ fn layers_panel(
     use crate::poi::PoiLayer;
     if gfx_ui.menu.is_some() {
         return; // start-menu mode: menu.rs owns the whole screen
+    }
+    if *gfx_ui.tab != RightPanelTab::Visibility {
+        return; // another tab owns the content panel this frame
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -1290,6 +1323,181 @@ fn pos_hud(
                     });
                 });
         });
+}
+
+/// Vertical icon toolbar (a thin rail on the window's right edge). Each vector-drawn icon
+/// selects which settings group the content panel shows. Shown BEFORE the content panels so it
+/// occupies the outermost (rightmost) slot.
+#[cfg(feature = "egui")]
+fn toolbar_panel(
+    mut contexts: bevy_egui::EguiContexts,
+    mut tab: ResMut<RightPanelTab>,
+    menu: Option<Res<crate::menu::MenuState>>,
+) {
+    use bevy_egui::egui::{self, Color32};
+    if menu.is_some() {
+        return; // start menu owns the screen
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    const RAIL: Color32 = Color32::from_rgb(16, 16, 15);
+    const ACTIVE: Color32 = Color32::from_rgb(199, 178, 153); // beige
+    const IDLE: Color32 = Color32::from_rgb(120, 116, 108);
+    let cur = *tab;
+    egui::SidePanel::right("toolbar")
+        .exact_width(40.0)
+        .resizable(false)
+        .frame(egui::Frame::new().fill(RAIL).inner_margin(egui::Margin::symmetric(4, 8)))
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            // (tab, icon-id) — draw an icon button; returns true on click.
+            let mut btn = |ui: &mut egui::Ui, this: RightPanelTab, kind: u8, tip: &str| {
+                let (rect, resp) =
+                    ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+                let active = cur == this;
+                let col = if active { ACTIVE } else { IDLE };
+                if active {
+                    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(34, 33, 30));
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(26, 25, 23));
+                }
+                paint_tool_icon(ui.painter(), rect, kind, col);
+                resp.on_hover_text(tip).clicked()
+            };
+            if btn(ui, RightPanelTab::Visibility, 0, "Visibility layers") {
+                *tab = RightPanelTab::Visibility;
+            }
+            if btn(ui, RightPanelTab::Camera, 1, "Camera") {
+                *tab = RightPanelTab::Camera;
+            }
+            if btn(ui, RightPanelTab::Tasks, 2, "Tasks") {
+                *tab = RightPanelTab::Tasks;
+            }
+        });
+}
+
+/// Vector icon inside `rect`: 0 = eye, 1 = camera, 2 = tasks/checklist. Painter primitives only
+/// (no image assets — keeps the shippable exe free of game-derived art).
+#[cfg(feature = "egui")]
+fn paint_tool_icon(
+    painter: &bevy_egui::egui::Painter,
+    rect: bevy_egui::egui::Rect,
+    kind: u8,
+    c: bevy_egui::egui::Color32,
+) {
+    use bevy_egui::egui::{self, Color32, Stroke};
+    let ctr = rect.center();
+    let s = Stroke::new(1.6, c);
+    match kind {
+        0 => {
+            // eye: lens (two arcs approximated by an ellipse outline) + pupil
+            let pts: Vec<egui::Pos2> = (0..=20)
+                .map(|i| {
+                    let t = i as f32 / 20.0 * std::f32::consts::TAU;
+                    egui::pos2(ctr.x + t.cos() * 9.0, ctr.y + t.sin() * 5.0)
+                })
+                .collect();
+            painter.add(egui::Shape::closed_line(pts, s));
+            painter.circle_filled(ctr, 2.6, c);
+        }
+        1 => {
+            // camera: body + top viewfinder bump + lens
+            let body = egui::Rect::from_center_size(ctr, egui::vec2(20.0, 13.0));
+            painter.rect_stroke(body, 1.0, s, egui::StrokeKind::Middle);
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(ctr.x - 5.0, body.top() - 3.0), egui::vec2(7.0, 3.0)),
+                0.0,
+                c,
+            );
+            painter.circle_stroke(ctr, 4.2, s);
+            painter.circle_filled(egui::pos2(body.right() - 2.5, body.top() + 2.5), 1.0, c);
+        }
+        _ => {
+            // tasks: three rows, each a small box + a line (a checklist)
+            for r in 0..3 {
+                let y = rect.top() + 9.0 + r as f32 * 7.5;
+                let bx = egui::Rect::from_min_size(egui::pos2(rect.left() + 5.0, y - 2.5), egui::vec2(5.0, 5.0));
+                painter.rect_stroke(bx, 0.0, Stroke::new(1.3, c), egui::StrokeKind::Middle);
+                if r == 0 {
+                    // a check in the first box
+                    painter.line_segment([egui::pos2(bx.left() + 1.0, y), egui::pos2(bx.center().x, bx.bottom() - 1.0)], Stroke::new(1.3, c));
+                    painter.line_segment([egui::pos2(bx.center().x, bx.bottom() - 1.0), egui::pos2(bx.right(), bx.top())], Stroke::new(1.3, c));
+                }
+                painter.line_segment(
+                    [egui::pos2(bx.right() + 3.0, y), egui::pos2(rect.right() - 5.0, y)],
+                    Stroke::new(1.4, if r == 0 { c } else { Color32::from_rgb(90, 87, 80) }),
+                );
+            }
+        }
+    }
+}
+
+/// Camera-settings tab: FOV, exposure, fly speed (scroll-adjustable), walk-mode toggle. Renders
+/// into the same content slot as layers_panel, gated on the active tab.
+#[cfg(feature = "egui")]
+fn camera_panel(
+    mut contexts: bevy_egui::EguiContexts,
+    tab: Res<RightPanelTab>,
+    menu: Option<Res<crate::menu::MenuState>>,
+    mut cam: ResMut<crate::CameraSettings>,
+    mut gfx: ResMut<crate::render::GfxSettings>,
+) {
+    use bevy_egui::egui::{self, Color32, RichText};
+    if menu.is_some() || *tab != RightPanelTab::Camera {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    const BONE: Color32 = Color32::from_rgb(215, 211, 203);
+    const DIM: Color32 = Color32::from_rgb(120, 116, 108);
+    // Clone-edit-compare so merely rendering the sliders doesn't dirty change detection every
+    // frame (only real edits write back — same discipline as the graphics panel).
+    let mut fov = cam.fov_deg;
+    let mut fly = cam.fly_speed;
+    let mut walk = cam.walk_mode;
+    let mut expo = gfx.grade_exposure;
+    egui::SidePanel::right("map_layers")
+        .default_width(300.0)
+        .frame(egui::Frame::new().fill(Color32::from_rgb(18, 18, 17)).inner_margin(10.0))
+        .show(ctx, |ui| {
+            ui.label(RichText::new("CAMERA").color(BONE).size(16.0).strong());
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("FIELD OF VIEW").color(DIM).size(11.0));
+            ui.add(egui::Slider::new(&mut fov, 20.0..=110.0).suffix("\u{00B0}").text(""));
+            ui.add_space(6.0);
+
+            ui.label(RichText::new("EXPOSURE").color(DIM).size(11.0));
+            ui.add(egui::Slider::new(&mut expo, 0.2..=4.0).text(""));
+            ui.add_space(6.0);
+
+            ui.label(RichText::new("FLY SPEED  (scroll wheel)").color(DIM).size(11.0));
+            ui.add(egui::Slider::new(&mut fly, 2.0..=1500.0).logarithmic(true).suffix(" m/s").text(""));
+            ui.add_space(10.0);
+
+            ui.checkbox(&mut walk, "Walk mode (ground-follow + jump)");
+            ui.label(
+                RichText::new(
+                    "walk locomotion lands next; scroll will scale walk speed + jump height",
+                )
+                .color(DIM)
+                .size(10.0),
+            );
+        });
+    if fov != cam.fov_deg {
+        cam.fov_deg = fov;
+    }
+    if fly != cam.fly_speed {
+        cam.fly_speed = fly;
+    }
+    if walk != cam.walk_mode {
+        cam.walk_mode = walk;
+    }
+    if expo != gfx.grade_exposure {
+        gfx.grade_exposure = expo;
+    }
 }
 
 /// Section header text: name + a dim count of markers in that section.

@@ -72,6 +72,59 @@ pub struct CameraCommand {
     pub fly_to: Option<Vec3>,
 }
 
+/// Camera-tab settings (the toolbar's camera panel edits these; the flycam systems read them).
+/// Decoupled from the private `FlyCam` like `CameraCommand`.
+#[derive(Resource)]
+pub struct CameraSettings {
+    /// Vertical FOV in degrees (applied to the perspective projection).
+    pub fov_deg: f32,
+    /// Base fly-move speed (m/s); the scroll wheel scales this live.
+    pub fly_speed: f32,
+    /// Walk mode (ground-follow + jump) vs free-fly. Walk locomotion is phase 2; the toggle
+    /// lives here now so the panel + persistence exist.
+    pub walk_mode: bool,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self {
+            fov_deg: 60.0,   // Bevy's default PerspectiveProjection fov (0.25π ≈ 45°? no — ~60)
+            fly_speed: 40.0, // matches the old FlyCam::default speed
+            walk_mode: false,
+        }
+    }
+}
+
+/// Scroll wheel scales the fly speed live (up = faster), clamped to a sane band. Ignored while
+/// the pointer is over the UI (scrolling a panel must not change speed).
+fn flycam_scroll(
+    scroll: Res<bevy::input::mouse::AccumulatedMouseScroll>,
+    pointer_on_ui: Res<inspect::PointerOnUi>,
+    mut settings: ResMut<CameraSettings>,
+) {
+    if pointer_on_ui.0 || scroll.delta.y == 0.0 {
+        return;
+    }
+    // ~1.15x per notch; clamp so it never crawls or teleports.
+    let factor = 1.15f32.powf(scroll.delta.y);
+    settings.fly_speed = (settings.fly_speed * factor).clamp(2.0, 4000.0);
+}
+
+/// Apply the camera-tab FOV to the perspective projection when it changes.
+fn apply_camera_fov(
+    settings: Res<CameraSettings>,
+    mut q: Query<&mut Projection, With<CullCamera>>,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    for mut proj in &mut q {
+        if let Projection::Perspective(p) = &mut *proj {
+            p.fov = settings.fov_deg.clamp(20.0, 120.0).to_radians();
+        }
+    }
+}
+
 /// UI map dropdown target: when set, `apply_map_switch` restarts the viewer into that pack.
 /// (The GPU-driven path builds its buffers/bind-groups exactly once by design — a process swap
 /// is the honest, robust map switch; the new instance inherits the current env settings.)
@@ -371,11 +424,12 @@ fn main() {
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
         .add_plugins(pathfind::PathfindPlugin) // on-demand routing via the :8091 GPU pathfind server
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
+        .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack
         .add_systems(Startup, setup)
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain())
         .add_systems(Update, (apply_camera_command, auto_screenshot))
-        .add_systems(Update, (apply_gfx_camera, apply_map_switch));
+        .add_systems(Update, (apply_gfx_camera, apply_map_switch, flycam_scroll, apply_camera_fov));
 
     #[cfg(feature = "egui")]
     {
@@ -696,6 +750,7 @@ fn flycam_move(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
     ui_kb: Res<inspect::UiWantsKeyboard>,
+    settings: Res<CameraSettings>,
     mut q: Query<(&mut Transform, &FlyCam)>,
 ) {
     // Typing 'wasd' into the marker-search box must not fly the camera (Codex review).
@@ -726,7 +781,9 @@ fn flycam_move(
             v -= Vec3::Y;
         }
         if v != Vec3::ZERO {
-            let mut speed = cam.speed;
+            // Base speed comes from the camera-tab setting (scroll-wheel adjustable), not the
+            // fixed FlyCam::speed; shift still boosts.
+            let mut speed = settings.fly_speed;
             if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
                 speed *= cam.boost;
             }
