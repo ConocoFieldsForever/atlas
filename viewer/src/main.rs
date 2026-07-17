@@ -251,7 +251,20 @@ fn main() {
                     // EFT_HIDDEN=1: render without showing a window (headless EFT_SHOT
                     // verification runs — GPU screenshot capture works on an invisible
                     // window; pair with EFT_UNCAPPED so the focus-idle gate doesn't stall).
+                    // Bevy re-shows the window after the first present, so belt-and-braces:
+                    // also park it far off-screen and skip the taskbar.
                     visible: !std::env::var("EFT_HIDDEN")
+                        .map(|v| v.trim() == "1")
+                        .unwrap_or(false),
+                    position: if std::env::var("EFT_HIDDEN")
+                        .map(|v| v.trim() == "1")
+                        .unwrap_or(false)
+                    {
+                        WindowPosition::At(IVec2::new(-20000, -20000))
+                    } else {
+                        WindowPosition::Automatic
+                    },
+                    skip_taskbar: std::env::var("EFT_HIDDEN")
                         .map(|v| v.trim() == "1")
                         .unwrap_or(false),
                     ..default()
