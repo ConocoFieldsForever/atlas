@@ -1981,7 +1981,7 @@ fn prepare_gpu_buffers(
         // Terrain CONTROL maps are blend weights (data, not color): load them LINEAR — the sRGB
         // decode would gamma-warp the weights toward the dominant layer (visible splat banding).
         let (tex, view) = if cpu.ctrl_tex_linear.contains(&(i as u32)) {
-            load_normal_texture(&render_device, &render_queue, path) // linear Rgba8Unorm loader
+            load_data_texture(&render_device, &render_queue, path) // linear, never BC (weights)
         } else {
             load_albedo_texture(&render_device, &render_queue, path)
         };
@@ -2468,6 +2468,11 @@ fn load_albedo_texture(
         Ok(img) => {
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
+            if bc_wanted(device, w, h) {
+                let (mips, chain) = build_mip_chain(w, h, &rgba);
+                let payload = bc3_cached_chain(path, w, h, mips, &chain);
+                return upload_bc3(device, queue, w, h, mips, &payload, true, "eft_albedo");
+            }
             upload_rgba8_srgb(device, queue, w.max(1), h.max(1), &rgba, "eft_albedo")
         }
         Err(e) => {
@@ -2497,11 +2502,38 @@ fn load_normal_texture(
         Ok(img) => {
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
+            // BC3 keeps all three tangent channels (the shader reads .rgb incl. z), unlike BC5.
+            if bc_wanted(device, w, h) {
+                let (mips, chain) = build_mip_chain(w, h, &rgba);
+                let payload = bc3_cached_chain(path, w, h, mips, &chain);
+                return upload_bc3(device, queue, w, h, mips, &payload, false, "eft_normal");
+            }
             upload_rgba8_linear(device, queue, w.max(1), h.max(1), &rgba, "eft_normal")
         }
         Err(e) => {
             warn!("gpu-driven Phase2b: normal '{path}' failed to load ({e}); using flat placeholder");
             upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing")
+        }
+    }
+}
+
+/// DATA textures (terrain control maps, vp heights masks): LINEAR and NEVER block-compressed —
+/// they are exact blend weights, and BC3's palette interpolation would warp them (visible splat
+/// banding). Small population (~35 textures), negligible VRAM.
+fn load_data_texture(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    path: &str,
+) -> (Texture, TextureView) {
+    match image::open(path) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            upload_rgba8_linear(device, queue, w.max(1), h.max(1), &rgba, "eft_data")
+        }
+        Err(e) => {
+            warn!("gpu-driven: data map '{path}' failed to load ({e}); using placeholder");
+            upload_rgba8_linear(device, queue, 1, 1, &[0u8, 0, 0, 255], "eft_data_missing")
         }
     }
 }
@@ -2535,6 +2567,109 @@ fn build_mip_chain(width: u32, height: u32, rgba: &[u8]) -> (u32, Vec<u8>) {
         prev = next;
     }
     (mips, data)
+}
+
+/// BC3-compress a full RGBA8 mip chain (texpresso RangeFit — fast; the source PNGs were
+/// decoded FROM the game's own BC textures, so re-encoding is quality-parity with the game).
+/// Returns the concatenated per-mip BC3 payload. Каждый mip padded to 4x4 blocks by texpresso;
+/// create_texture_with_data expects exactly ceil(w/4)*ceil(h/4)*16 per level, which matches.
+fn bc3_compress_chain(width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u8> {
+    let fmt = texpresso::Format::Bc3;
+    let params = texpresso::Params {
+        algorithm: texpresso::Algorithm::RangeFit,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for l in 0..mips {
+        let (mw, mh) = ((width >> l).max(1) as usize, (height >> l).max(1) as usize);
+        let n = mw * mh * 4;
+        let size = fmt.compressed_size(mw, mh);
+        let base = out.len();
+        out.resize(base + size, 0);
+        fmt.compress(&chain[off..off + n], mw, mh, params, &mut out[base..]);
+        off += n;
+    }
+    out
+}
+
+/// Load-or-build the BC3 disk cache for a texture path: `<path>.bc3c` = [w,h,mips: u32 LE] +
+/// concatenated BC3 mips. Invalidated when the source is newer. VRAM: 4 bytes/px -> 1 byte/px
+/// (the albedo+normal arrays were ~16 GB uncompressed on lighthouse). EFT_TEX_BC=0 disables.
+fn bc3_cached_chain(path: &str, width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u8> {
+    let cache = format!("{path}.bc3c");
+    if let (Ok(cm), Ok(sm)) = (std::fs::metadata(&cache), std::fs::metadata(path)) {
+        if cm.modified().ok() >= sm.modified().ok() {
+            if let Ok(bytes) = std::fs::read(&cache) {
+                if bytes.len() > 12 {
+                    let w = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                    let h = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    let m = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                    if (w, h, m) == (width, height, mips) {
+                        return bytes[12..].to_vec();
+                    }
+                }
+            }
+        }
+    }
+    let payload = bc3_compress_chain(width, height, mips, chain);
+    let mut file = Vec::with_capacity(12 + payload.len());
+    file.extend_from_slice(&width.to_le_bytes());
+    file.extend_from_slice(&height.to_le_bytes());
+    file.extend_from_slice(&mips.to_le_bytes());
+    file.extend_from_slice(&payload);
+    let _ = std::fs::write(&cache, &file); // best-effort cache (read-only dirs just re-encode)
+    payload
+}
+
+/// True when BC compression should be used for this texture (feature present, not disabled,
+/// large enough to matter — tiny placeholders/dummies stay RGBA8).
+fn bc_wanted(device: &RenderDevice, width: u32, height: u32) -> bool {
+    use bevy::render::settings::WgpuFeatures;
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *DISABLED
+        .get_or_init(|| std::env::var("EFT_TEX_BC").map(|v| v.trim() == "0").unwrap_or(false));
+    !off && width >= 64
+        && height >= 64
+        && device.features().contains(WgpuFeatures::TEXTURE_COMPRESSION_BC)
+}
+
+/// Upload a pre-built BC3 mip payload as a texture (sRGB or linear view of the same bits).
+fn upload_bc3(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    width: u32,
+    height: u32,
+    mips: u32,
+    payload: &[u8],
+    srgb: bool,
+    label: &'static str,
+) -> (Texture, TextureView) {
+    let tex = device.create_texture_with_data(
+        queue,
+        &TextureDescriptor {
+            label: Some(label),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: if srgb {
+                TextureFormat::Bc3RgbaUnormSrgb
+            } else {
+                TextureFormat::Bc3RgbaUnorm
+            },
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::default(),
+        payload,
+    );
+    let view = tex.create_view(&TextureViewDescriptor::default());
+    (tex, view)
 }
 
 fn upload_rgba8_srgb(
