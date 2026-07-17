@@ -1,0 +1,30 @@
+# Release workflow — MIRRORS scripts/release.ps1, which must be proven locally FIRST.
+# workflow_dispatch ONLY (no on: push): this never runs until manually triggered, so no
+# CI credits are spent by accident (user directive). GitHub runners have no usable GPU, so
+# the only smoke here is --version; the render smoke stays a local-only step.
+# CI builds the EXE + code kit zips ONLY — packs/game-derived data never touch CI
+# (see LICENSE-NOTES.md).
+name: release
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (locked)
+        run: cargo build --release --locked
+      - name: Version smoke (runners have no GPU)
+        run: .\target\release\eft_viewer.exe --version
+      - name: Assemble dist (skip build + render smoke; both done above / locally)
+        shell: powershell
+        run: .\scripts\release.ps1 -Full -SkipBuild -SkipRenderSmoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eft_viewer-win64
+          path: |
+            dist/*.zip
+            dist/*.sha256
