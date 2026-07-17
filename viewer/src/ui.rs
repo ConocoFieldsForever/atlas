@@ -1242,11 +1242,12 @@ fn layers_panel(
 fn pos_hud(
     mut contexts: bevy_egui::EguiContexts,
     hud: Res<PosHud>,
+    menu: Option<Res<crate::menu::MenuState>>,
     cams: Query<&Transform, With<crate::render::CullCamera>>,
 ) {
     use bevy_egui::egui::{self, Color32, RichText};
-    if !hud.0 {
-        return;
+    if !hud.0 || menu.is_some() {
+        return; // hidden in start-menu mode (no raid context)
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;

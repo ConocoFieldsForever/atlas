@@ -44,11 +44,12 @@ pub struct BuildJob {
 }
 
 impl BuildJob {
-    pub fn spawn(key: &str) -> std::io::Result<Self> {
+    pub fn spawn(key: &str, game_dir: &str) -> std::io::Result<Self> {
         use std::io::BufRead;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console popping over the menu
         let mut child = std::process::Command::new("python")
+            .env("EFT_GAME_DATA", game_dir) // menu-selected install drives the pipeline
             .arg("tools/build_map.py")
             .args(key.split([',', ' ']).filter(|s| !s.is_empty()))
             .stdout(std::process::Stdio::piped())
@@ -154,6 +155,8 @@ pub struct MenuState {
     pub show_rebuild: Option<usize>,
     /// The one in-flight pipeline build, if any.
     pub build: Option<BuildJob>,
+    /// Footer editor buffer for the game-install path.
+    pub game_dir_edit: String,
 }
 
 /// The standard map roster (dataset key -> display name). Packs on disk that aren't in this
@@ -310,20 +313,104 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
     (entries, total)
 }
 
+/// Small persisted viewer config beside the packs (survives relaunches/map switches).
+fn config_path() -> &'static str {
+    "eft_viewer.config.json"
+}
+
+fn config_game_dir() -> Option<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+    v.get("gameData").and_then(|s| s.as_str()).map(str::to_string)
+}
+
+pub fn save_config_game_dir(dir: &str) {
+    let mut v: serde_json::Value = std::fs::read_to_string(config_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v["gameData"] = serde_json::Value::String(dir.to_string());
+    let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
+/// Looks like an EscapeFromTarkov_Data dir? (has level files / globalgamemanagers)
+pub fn valid_game_dir(dir: &str) -> bool {
+    let p = std::path::Path::new(dir);
+    p.join("globalgamemanagers").exists()
+        || p.join("level0").exists()
+        || std::fs::read_dir(p)
+            .map(|rd| {
+                rd.flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("sharedassets"))
+            })
+            .unwrap_or(false)
+}
+
+/// BSG launcher registry entry -> "<InstallLocation>\EscapeFromTarkov_Data".
+fn registry_game_dir() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov",
+            "/v",
+            "InstallLocation",
+        ])
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let loc = s
+        .lines()
+        .find(|l| l.trim_start().starts_with("InstallLocation"))?
+        .split("REG_SZ")
+        .nth(1)?
+        .trim()
+        .to_string();
+    (!loc.is_empty()).then(|| format!(r"{loc}\EscapeFromTarkov_Data"))
+}
+
+/// Autodetect priority: EFT_GAME_DATA env > saved config > launcher registry > drive probe.
+pub fn detect_game_dir() -> String {
+    if let Ok(d) = std::env::var("EFT_GAME_DATA") {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    if let Some(d) = config_game_dir().filter(|d| valid_game_dir(d)) {
+        return d;
+    }
+    if let Some(d) = registry_game_dir().filter(|d| valid_game_dir(d)) {
+        return d;
+    }
+    for drive in ["C", "D", "E", "F", "G"] {
+        for tail in [
+            r"\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data",
+            r"\Battlestate Games\EFT\EscapeFromTarkov_Data",
+            r"\Games\Escape from Tarkov\EscapeFromTarkov_Data",
+        ] {
+            let d = format!("{drive}:{tail}");
+            if valid_game_dir(&d) {
+                return d;
+            }
+        }
+    }
+    r"C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data".to_string()
+}
+
 pub fn build_state() -> MenuState {
-    let game_dir = std::env::var("EFT_GAME_DATA").unwrap_or_else(|_| {
-        r"C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data".to_string()
-    });
+    let game_dir = detect_game_dir();
     let game_fp = game_fingerprint(&game_dir);
     let (entries, total_bytes) = scan(&game_fp);
     // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook).
     let build = std::env::var("EFT_MENU_BUILD")
         .ok()
         .filter(|s| !s.is_empty())
-        .and_then(|k| BuildJob::spawn(&k).ok());
+        .and_then(|k| BuildJob::spawn(&k, &game_dir).ok());
     MenuState {
         entries,
         game_fp,
+        game_dir_edit: game_dir.clone(),
         game_dir,
         total_bytes,
         confirm_delete: None,
@@ -373,6 +460,18 @@ pub fn menu_ui(
     const OK: Color32 = Color32::from_rgb(127, 174, 106);
     const WARN: Color32 = Color32::from_rgb(200, 140, 50);
     const BAD: Color32 = Color32::from_rgb(176, 65, 62);
+
+    // EFT UI is all hard corners — square every widget while the menu owns the screen.
+    ctx.style_mut(|s| {
+        let z = egui::CornerRadius::ZERO;
+        s.visuals.widgets.noninteractive.corner_radius = z;
+        s.visuals.widgets.inactive.corner_radius = z;
+        s.visuals.widgets.hovered.corner_radius = z;
+        s.visuals.widgets.active.corner_radius = z;
+        s.visuals.widgets.open.corner_radius = z;
+        s.visuals.window_corner_radius = z;
+        s.visuals.menu_corner_radius = z;
+    });
 
     egui::TopBottomPanel::top("menu_header")
         .frame(egui::Frame::new().fill(HEADER).inner_margin(egui::Margin::symmetric(24, 10)))
@@ -465,15 +564,26 @@ pub fn menu_ui(
                                             if ui.add_sized([84.0, 30.0], play).clicked() {
                                                 switch.0 = e.pack_dir.clone();
                                             }
+                                            // Tarkov-style destructive button: red fill, black text.
+                                            let del_btn = |t: &str| {
+                                                egui::Button::new(
+                                                    RichText::new(t).color(Color32::BLACK).strong(),
+                                                )
+                                                .fill(BAD)
+                                                .corner_radius(0.0)
+                                            };
                                             if confirm_idx == Some(i) {
                                                 if ui
-                                                    .button(RichText::new("CONFIRM DELETE").color(BAD))
+                                                    .add_sized([120.0, 30.0], del_btn("CONFIRM"))
                                                     .clicked()
                                                 {
                                                     delete_now = Some(i);
                                                 }
                                             } else if ui
-                                                .add_enabled(!this_building, egui::Button::new("DELETE"))
+                                                .add_enabled_ui(!this_building, |ui| {
+                                                    ui.add_sized([84.0, 30.0], del_btn("DELETE"))
+                                                })
+                                                .inner
                                                 .clicked()
                                             {
                                                 set_confirm = Some(i);
@@ -533,7 +643,7 @@ pub fn menu_ui(
 
             // Kick a build (one at a time; tools/build_map.py streams staged output).
             if let Some(key) = start_build {
-                match BuildJob::spawn(&key) {
+                match BuildJob::spawn(&key, &state.game_dir) {
                     Ok(job) => {
                         info!("menu: building '{key}' via tools/build_map.py");
                         state.build = Some(job);
@@ -604,15 +714,39 @@ pub fn menu_ui(
 
             ui.add_space(8.0);
             ui.separator();
+            // Game install path: autodetected (env > saved > registry > probe), editable here;
+            // SET validates, persists to eft_viewer.config.json and re-fingerprints the packs.
             ui.horizontal(|ui| {
+                ui.label(RichText::new("GAME INSTALL").color(DIM).size(11.0));
+                let mut edit = state.game_dir_edit.clone();
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit)
+                        .desired_width(520.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                state.game_dir_edit = edit;
+                let dirty = state.game_dir_edit != state.game_dir;
+                if ui
+                    .add_enabled(dirty, egui::Button::new(RichText::new("SET").color(BONE)))
+                    .clicked()
+                {
+                    if valid_game_dir(&state.game_dir_edit) {
+                        state.game_dir = state.game_dir_edit.clone();
+                        save_config_game_dir(&state.game_dir);
+                        state.game_fp = game_fingerprint(&state.game_dir);
+                        let (entries, total) = scan(&state.game_fp);
+                        state.entries = entries;
+                        state.total_bytes = total;
+                    } else {
+                        error!("menu: '{}' does not look like EscapeFromTarkov_Data", state.game_dir_edit);
+                    }
+                }
                 match &state.game_fp {
                     Some(fp) => ui.label(
-                        RichText::new(format!("game install: {} [{}]", state.game_dir, &fp[..8]))
-                            .color(DIM)
-                            .size(11.0),
+                        RichText::new(format!("[{}]", &fp[..8])).color(OK).size(11.0),
                     ),
                     None => ui.label(
-                        RichText::new(format!("game install not found at {}", state.game_dir))
+                        RichText::new("NOT FOUND - set the EscapeFromTarkov_Data path")
                             .color(WARN)
                             .size(11.0),
                     ),
