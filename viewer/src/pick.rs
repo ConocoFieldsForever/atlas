@@ -112,22 +112,29 @@ fn pick_system(
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
     pack: Option<Res<LoadedPack>>,
     pointer_on_ui: Res<crate::inspect::PointerOnUi>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut readout: Query<&mut Text, With<PickReadout>>,
 ) {
-    // ---- double-click gate -------------------------------------------------
+    // ---- click gate --------------------------------------------------------
     // Ignore clicks landing on egui panels (Codex review: UI double-clicks were triggering the
     // expensive full-geometry raycast).
     if !mouse.just_pressed(MouseButton::Left) || pointer_on_ui.0 {
         return;
     }
+    // SHIFT-click PLACES the route start (single click, on the clicked floor); a plain DOUBLE-click
+    // identifies geometry. Both share the one full-geometry raycast below.
+    let place_start = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let now = time.elapsed_secs();
     let is_double = (now - state.last_left) <= DOUBLE_CLICK_SECS;
     state.last_left = now;
-    if !is_double {
-        return; // first (or lone) click — arm and wait for the second
+    if !place_start && !is_double {
+        return; // first (or lone) plain click — arm and wait for the second
     }
-    // Consume, so a third rapid click needs two fresh presses to re-fire.
-    state.last_left = f32::NEG_INFINITY;
+    if is_double {
+        // Consume, so a third rapid click needs two fresh presses to re-fire.
+        state.last_left = f32::NEG_INFINITY;
+    }
 
     let set_text = |readout: &mut Query<&mut Text, With<PickReadout>>, s: String| {
         if let Ok(mut t) = readout.single_mut() {
@@ -303,6 +310,17 @@ fn pick_system(
             .unwrap_or("?");
         let role = material_role(h.material_id);
         let wp = ro + rd * h.t;
+        if place_start {
+            // SHIFT-click: drop the route start on the clicked surface.
+            start_pt.0 = Some(wp);
+            let line = format!(
+                "START set  ({:.1}, {:.1}, {:.1})  \u{2014} routes begin here",
+                wp.x, wp.y, wp.z
+            );
+            info!("{line}");
+            set_text(&mut readout, line);
+            return;
+        }
         let line = format!(
             "PICK  {mesh}  #{id}  inst {inst}  mat {mat} {role}  d={dist:.1}m  ({x:.1}, {y:.1}, {z:.1})",
             mesh = mesh_name,
