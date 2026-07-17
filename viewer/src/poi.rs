@@ -1207,6 +1207,10 @@ fn resolve_sidecar(env_key: &str, file: &str, root: &Path, lost: &str) -> Option
             return Some(shared);
         }
     }
+    let shared = crate::paths::shared_dir().join(file);
+    if shared.is_file() {
+        return Some(shared);
+    }
     let cwd = PathBuf::from(file);
     if cwd.is_file() {
         return Some(cwd);
@@ -1385,8 +1389,11 @@ fn spawn_pois(
     // cross-check (a tarkov.dev lock within 2 m names the door's `key_id`).
     let mut lock_keys: Vec<(Vec3, String)> = Vec::new();
     let key = map_key(&lp.0.manifest.dataset);
-    if let Some(mn) = std::fs::read_to_string(root.join("loot.json"))
-        .ok()
+    // ONE loot.json resolver for the whole app (loot.rs: env > pack > pack-parent shared >
+    // shared_dir > cwd) - poi.rs used to re-implement a subset (audit A6).
+    let loot_path = crate::loot::resolve_loot_json(Some(lp.0.root.as_path()));
+    if let Some(mn) = loot_path
+        .and_then(|pb| std::fs::read_to_string(pb).ok())
         .and_then(|s| serde_json::from_str::<LootFile>(&s).ok())
         .and_then(|mut f| f.maps.remove(&key))
     {

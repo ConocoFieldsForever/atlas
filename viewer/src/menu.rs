@@ -48,7 +48,14 @@ impl BuildJob {
         use std::io::BufRead;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console popping over the menu
-        let mut child = std::process::Command::new("python")
+        let root = crate::paths::repo_root().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "python kit not found (tools/build_map.py) beside the exe or in the cwd",
+            )
+        })?;
+        let mut child = std::process::Command::new(crate::paths::python_exe(root))
+            .current_dir(root) // kit-relative paths inside build_map.py resolve from its root
             .env("EFT_GAME_DATA", game_dir) // menu-selected install drives the pipeline
             .arg("tools/build_map.py")
             .args(key.split([',', ' ']).filter(|s| !s.is_empty()))
@@ -251,9 +258,14 @@ fn age_days(path: &std::path::Path) -> Option<f64> {
 pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
     let mut entries: Vec<MapEntry> = Vec::new();
     let mut total = 0u64;
-    let installed = |key: &str| format!("packs/{key}.eftpack");
+    let installed = |key: &str| {
+        crate::paths::packs_root()
+            .join(format!("{key}.eftpack"))
+            .to_string_lossy()
+            .into_owned()
+    };
     // Known roster first, then any extra packs on disk.
-    let mut extra: Vec<String> = std::fs::read_dir("packs")
+    let mut extra: Vec<String> = std::fs::read_dir(crate::paths::packs_root())
         .map(|rd| {
             rd.flatten()
                 .filter_map(|e| {
@@ -314,21 +326,22 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
             size_bytes: size,
             built_days: age_days(&manifest),
             intel_days: age_days(&p.join("loot.json"))
-                .or_else(|| age_days(std::path::Path::new("packs/shared/loot.json"))),
+                .or_else(|| age_days(&crate::paths::shared_dir().join("loot.json"))),
             has_volume,
             has_grass: p.join("grass.bin").exists(),
             has_gamedata: p.join("gamedata.json").exists(),
             has_icons: p.join("icons").is_dir()
-                || std::path::Path::new("packs/shared/icons").is_dir(),
+                || crate::paths::shared_dir().join("icons").is_dir(),
             fp_match,
         });
     }
     (entries, total)
 }
 
-/// Small persisted viewer config beside the packs (survives relaunches/map switches).
-fn config_path() -> &'static str {
-    "eft_viewer.config.json"
+/// Small persisted viewer config beside the EXE (portable-app style; cwd fallback for old
+/// installs) — resolution in paths::config_path.
+fn config_path() -> std::path::PathBuf {
+    crate::paths::config_path()
 }
 
 fn config_game_dir() -> Option<String> {
@@ -660,9 +673,16 @@ pub fn menu_ui(
             }
             if let Some(i) = delete_now {
                 if let Some(dir) = state.entries[i].pack_dir.clone() {
-                    match std::fs::remove_dir_all(&dir) {
-                        Ok(()) => info!("menu: deleted {dir}"),
-                        Err(e) => error!("menu: delete {dir} failed: {e}"),
+                    // Safety: only ever delete inside the resolved packs root (entry paths are
+                    // built from it, but belt-and-braces against future edits).
+                    let p = std::path::Path::new(&dir);
+                    if p.starts_with(crate::paths::packs_root()) {
+                        match std::fs::remove_dir_all(p) {
+                            Ok(()) => info!("menu: deleted {dir}"),
+                            Err(e) => error!("menu: delete {dir} failed: {e}"),
+                        }
+                    } else {
+                        error!("menu: refusing to delete outside packs root: {dir}");
                     }
                     rescan = true;
                 }
