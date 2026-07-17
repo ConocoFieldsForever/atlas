@@ -2464,13 +2464,25 @@ fn load_albedo_texture(
     queue: &RenderQueue,
     path: &str,
 ) -> (Texture, TextureView) {
-    match image::open(path) {
-        Ok(img) => {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            // Content-hash first: a shared-cache hit skips PNG decode AND BC encode entirely.
+            let hash = fnv64(&bytes);
+            if bc_enabled(device) {
+                if let Some((w, h, mips, payload)) = texcache_read(hash) {
+                    return upload_bc3(device, queue, w, h, mips, &payload, true, "eft_albedo");
+                }
+            }
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                warn!("gpu-driven M3: albedo '{path}' failed to decode; using placeholder");
+                return upload_rgba8_srgb(device, queue, 1, 1, &[255u8, 0, 255, 255], "eft_albedo_missing");
+            };
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
             if bc_wanted(device, w, h) {
                 let (mips, chain) = build_mip_chain(w, h, &rgba);
-                let payload = bc3_cached_chain(path, w, h, mips, &chain);
+                let payload = bc3_compress_chain(w, h, mips, &chain);
+                texcache_write(hash, w, h, mips, &payload);
                 return upload_bc3(device, queue, w, h, mips, &payload, true, "eft_albedo");
             }
             upload_rgba8_srgb(device, queue, w.max(1), h.max(1), &rgba, "eft_albedo")
@@ -2498,14 +2510,25 @@ fn load_normal_texture(
     queue: &RenderQueue,
     path: &str,
 ) -> (Texture, TextureView) {
-    match image::open(path) {
-        Ok(img) => {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let hash = fnv64(&bytes);
+            if bc_enabled(device) {
+                if let Some((w, h, mips, payload)) = texcache_read(hash) {
+                    return upload_bc3(device, queue, w, h, mips, &payload, false, "eft_normal");
+                }
+            }
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                warn!("gpu-driven Phase2b: normal '{path}' failed to decode; flat placeholder");
+                return upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing");
+            };
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
             // BC3 keeps all three tangent channels (the shader reads .rgb incl. z), unlike BC5.
             if bc_wanted(device, w, h) {
                 let (mips, chain) = build_mip_chain(w, h, &rgba);
-                let payload = bc3_cached_chain(path, w, h, mips, &chain);
+                let payload = bc3_compress_chain(w, h, mips, &chain);
+                texcache_write(hash, w, h, mips, &payload);
                 return upload_bc3(device, queue, w, h, mips, &payload, false, "eft_normal");
             }
             upload_rgba8_linear(device, queue, w.max(1), h.max(1), &rgba, "eft_normal")
@@ -2593,33 +2616,55 @@ fn bc3_compress_chain(width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u
     out
 }
 
-/// Load-or-build the BC3 disk cache for a texture path: `<path>.bc3c` = [w,h,mips: u32 LE] +
-/// concatenated BC3 mips. Invalidated when the source is newer. VRAM: 4 bytes/px -> 1 byte/px
-/// (the albedo+normal arrays were ~16 GB uncompressed on lighthouse). EFT_TEX_BC=0 disables.
-fn bc3_cached_chain(path: &str, width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u8> {
-    let cache = format!("{path}.bc3c");
-    if let (Ok(cm), Ok(sm)) = (std::fs::metadata(&cache), std::fs::metadata(path)) {
-        if cm.modified().ok() >= sm.modified().ok() {
-            if let Ok(bytes) = std::fs::read(&cache) {
-                if bytes.len() > 12 {
-                    let w = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-                    let h = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-                    let m = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-                    if (w, h, m) == (width, height, mips) {
-                        return bytes[12..].to_vec();
-                    }
-                }
-            }
-        }
+/// Cross-map BC3 texture cache, keyed by CONTENT HASH of the source PNG bytes — the same game
+/// texture extracted into several map datasets (different filenames, identical bytes) encodes
+/// ONCE and every map reuses it. Lives in packs/shared/texcache/<fnv64>.bc3c =
+/// [w,h,mips: u32 LE] + concatenated BC3 mips. Content addressing self-invalidates.
+fn texcache_path(hash: u64) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("packs/shared/texcache/{hash:016x}.bc3c"))
+}
+
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1_0000_0001_B3);
     }
-    let payload = bc3_compress_chain(width, height, mips, chain);
+    h
+}
+
+/// Cache read: (w, h, mips, payload) when present.
+fn texcache_read(hash: u64) -> Option<(u32, u32, u32, Vec<u8>)> {
+    let bytes = std::fs::read(texcache_path(hash)).ok()?;
+    if bytes.len() <= 12 {
+        return None;
+    }
+    let w = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let h = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let m = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    Some((w, h, m, bytes[12..].to_vec()))
+}
+
+fn texcache_write(hash: u64, width: u32, height: u32, mips: u32, payload: &[u8]) {
+    let p = texcache_path(hash);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let mut file = Vec::with_capacity(12 + payload.len());
     file.extend_from_slice(&width.to_le_bytes());
     file.extend_from_slice(&height.to_le_bytes());
     file.extend_from_slice(&mips.to_le_bytes());
-    file.extend_from_slice(&payload);
-    let _ = std::fs::write(&cache, &file); // best-effort cache (read-only dirs just re-encode)
-    payload
+    file.extend_from_slice(payload);
+    let _ = std::fs::write(&p, &file); // best-effort (read-only fs just re-encodes next launch)
+}
+
+/// Feature+env gate alone (no dims) — used to probe the shared cache BEFORE decoding.
+fn bc_enabled(device: &RenderDevice) -> bool {
+    use bevy::render::settings::WgpuFeatures;
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *DISABLED
+        .get_or_init(|| std::env::var("EFT_TEX_BC").map(|v| v.trim() == "0").unwrap_or(false));
+    !off && device.features().contains(WgpuFeatures::TEXTURE_COMPRESSION_BC)
 }
 
 /// True when BC compression should be used for this texture (feature present, not disabled,

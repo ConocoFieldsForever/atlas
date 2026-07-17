@@ -89,7 +89,8 @@ def main():
             if k:
                 ids.add(k)                        # key template id -> key item icon
 
-    lj = jload(os.path.join(PACK, "loot.json"))
+    lj = jload(os.path.join(PACK, "loot.json")) or jload(
+        os.path.join(os.path.dirname(PACK), "shared", "loot.json"))
     mkey = MAP
     if lj:
         maps = lj.get("maps") or {}
@@ -121,7 +122,8 @@ def main():
         for it in gql(Q % ("ids", lst)).get("items") or []:
             items.setdefault(it["name"], it)
     from PIL import Image
-    out_dir = os.path.join(PACK, "icons")
+    # Icons are ITEM-keyed, not map-keyed: cache into the cross-map shared store.
+    out_dir = os.path.join(os.path.dirname(PACK), "shared", "icons")
     os.makedirs(out_dir, exist_ok=True)
     n_new = n_have = n_fail = 0
     for name, it in sorted(items.items()):
