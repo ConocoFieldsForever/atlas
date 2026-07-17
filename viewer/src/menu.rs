@@ -511,7 +511,13 @@ pub fn menu_ui(
             let mut set_rebuild: Option<usize> = None;
             let mut start_build: Option<String> = None;
             let confirm_idx = state.confirm_delete;
-            let building_key = state.build.as_ref().map(|b| b.key.clone());
+            // A FINISHED job (result latched) no longer blocks buttons — the log panel lingers
+            // until CLOSE, but DELETE/BUILD on the rows must come back as soon as it's done.
+            let building_key = state
+                .build
+                .as_ref()
+                .filter(|b| b.result.is_none())
+                .map(|b| b.key.clone());
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for i in 0..state.entries.len() {
                     let e = &state.entries[i];
