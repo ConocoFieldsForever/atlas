@@ -813,6 +813,7 @@ fn layers_panel(
                                             start: None,
                                             dests,
                                             optimize_order: true,
+                                            ..Default::default()
                                         });
                                     }
                                 }

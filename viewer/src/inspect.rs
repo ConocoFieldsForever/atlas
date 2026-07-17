@@ -170,12 +170,19 @@ impl Plugin for InspectPlugin {
 fn pick_markers(
     mouse: Res<ButtonInput<MouseButton>>,
     pointer_on_ui: Res<PointerOnUi>,
+    keys: Res<ButtonInput<KeyCode>>,
+    place: Res<crate::pathfind::PlaceMode>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
     markers: Query<(Entity, &GlobalTransform, &PickRadius, &ViewVisibility, &MarkerInfo)>,
     mut open: ResMut<OpenCards>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || pointer_on_ui.0 {
+        return;
+    }
+    // A position-placement click (armed place mode, or the shift-click shortcut) must not ALSO
+    // open a marker card — one click, one action (pick.rs owns that click).
+    if place.0 || keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
         return;
     }
     let Ok(window) = windows.single() else {
@@ -316,7 +323,7 @@ fn draw_cards(
                             RichText::new(d).color(crate::ui_theme::TEXT_BRIGHT).size(crate::ui_theme::SIZE_LABEL),
                         );
                     }
-                    // One-click route from the camera to this marker (pathfind server), plus
+                    // One-click route from your position to this marker (in-process CPU A*), plus
                     // pin/unpin into the raid plan (the panel's "Raid plan" section lists the
                     // pins; ui::PlanList). Pin state keys off the marker ENTITY, so re-clicking
                     // the same marker toggles rather than duplicating.
@@ -327,6 +334,8 @@ fn draw_cards(
                                 start: None,
                                 dests: vec![tf.translation()],
                                 optimize_order: false,
+                                labels: vec![info.title.clone()],
+                                ..Default::default()
                             });
                         }
                         let pinned = plan.pins.iter().any(|p| p.entity == e);
