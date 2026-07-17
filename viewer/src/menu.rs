@@ -723,6 +723,38 @@ pub fn menu_ui(
                                 },
                             );
                         });
+                        // Loading bar driven by the [STAGE i/N] markers: finished stages count
+                        // full, the running stage counts half; [BUILD OK] pins 100%.
+                        let frac = if stage.starts_with("[BUILD OK]") || (finished && ok) {
+                            1.0
+                        } else {
+                            stage
+                                .strip_prefix("[STAGE ")
+                                .and_then(|s| s.split(']').next())
+                                .and_then(|s| {
+                                    let (i, n) = s.split_once('/')?;
+                                    let i: f32 = i.trim().parse().ok()?;
+                                    let n: f32 = n.trim().parse().ok()?;
+                                    let done_stage = stage.contains(": done")
+                                        || stage.contains(": skipped");
+                                    Some(((i - 1.0 + if done_stage { 1.0 } else { 0.5 }) / n)
+                                        .clamp(0.0, 1.0))
+                                })
+                                .unwrap_or(0.0)
+                        };
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(f32::INFINITY)
+                                .desired_height(14.0)
+                                .corner_radius(0.0)
+                                .fill(if finished && !ok { BAD } else { BEIGE })
+                                .text(
+                                    RichText::new(format!("{:.0}%", frac * 100.0))
+                                        .color(Color32::BLACK)
+                                        .size(10.0),
+                                ),
+                        );
                         ui.add_space(4.0);
                         for line in &tail {
                             ui.label(
