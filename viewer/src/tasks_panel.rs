@@ -393,7 +393,8 @@ pub struct TasksUiState {
 impl Default for TasksUiState {
     fn default() -> Self {
         Self {
-            search: String::new(),
+            // EFT_TASK_SEARCH seeds the search box (screenshots / power users), mirroring EFT_TAB.
+            search: std::env::var("EFT_TASK_SEARCH").unwrap_or_default(),
             this_map_only: true,
             done: std::collections::HashSet::new(),
         }
@@ -463,8 +464,6 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
     const BONE: Color32 = theme::BONE;
     const MUTED: Color32 = theme::MUTED;
     const CARD_BORDER: Color32 = theme::BORDER;
-    const KAPPA: Color32 = theme::KAPPA;
-    const LK: Color32 = theme::CYAN;
     const FIR: Color32 = theme::OK;
     const TRACKED: Color32 = theme::TRACKED; // quest purple accent when tracked
 
@@ -525,18 +524,16 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             .hint_text("Search tasks / traders / items\u{2026}"),
     );
 
-    // ---- FILTER ROW (reuses the tracker's own filter fields, so it composes with poi.rs) — one
-    // compact row: Kappa / Lightkeeper toggles + a level cap (0 = any). ----
+    // ---- LEVEL FILTER (the Kappa / Lightkeeper toggles were dropped: niche Tarkov jargon the user
+    // didn't want. The kappa_only / lk_only flags stay in the model, defaulting off, so they can be
+    // reinstated later without touching the filter loop below.) ----
     ui.horizontal(|ui| {
-        ui.checkbox(&mut tr.kappa_only, RichText::new("Kappa").size(12.0));
-        ui.checkbox(&mut tr.lk_only, RichText::new("LK").size(12.0))
-            .on_hover_text("Lightkeeper chain only");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("Lvl").size(11.0).color(MUTED));
-            ui.add(egui::DragValue::new(&mut tr.max_level).range(0..=79).speed(1.0))
-                .on_hover_text("hide tasks above this level (0 = any)");
-            ui.label(RichText::new("\u{2264}").size(11.0).color(MUTED));
-        });
+        ui.label(RichText::new("Max level").size(12.0).color(MUTED));
+        ui.add(egui::DragValue::new(&mut tr.max_level).range(0..=79).speed(1.0))
+            .on_hover_text("hide tasks whose required level is above this (0 = show every level)");
+        if tr.max_level == 0 {
+            ui.label(RichText::new("(any)").size(11.0).color(theme::FAINT));
+        }
     });
 
     // ---- FILTER + GROUP the catalog by trader ----
@@ -684,11 +681,11 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                     for t in tasks {
                         let tracked = tr.active.contains(&t.id);
                         let card_border = if tracked { TRACKED } else { CARD_BORDER };
-                        // Density pass: ONE compact card per task. The old layout spent ~7 rows/task
-                        // on a title row, a separate meta row, a redundant "required items" section,
-                        // then an "objectives" section that re-walked the same objectives. Now the
-                        // header folds Lvl/Kappa/LK/progress to the right, and EACH objective is one
-                        // wrapped paragraph carrying its tag + text + item icons + go/route inline.
+                        // One card per task: a DARK title bar (name + Track toggle on the right), a
+                        // thin meta line, then a SUBTASK TABLE — each objective is a row with a fixed
+                        // left ICON gutter (big, left-aligned item art) and a click-to-toggle text
+                        // column. No checkboxes anywhere: the title's Track button drives tracking and
+                        // clicking an objective line marks it done/not-done.
                         let total = t.objectives.len();
                         let done_n = t
                             .objectives
@@ -696,68 +693,95 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                             .enumerate()
                             .filter(|(i, _)| ui_state.done.contains(&obj_key(&t.id, *i)))
                             .count();
+                        let all_done = total > 0 && done_n == total;
                         theme::card(ui, card_border, |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(5.0, 2.0);
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
 
-                            // -- HEADER: [track] name ........ done/total  Lvl  K/LK  [locate] --
+                            // ===== DARK TITLE BAR: quest name (left) + Track toggle (right) =====
+                            egui::Frame::new()
+                                .fill(theme::RAIL)
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        // Place the Track button on the RIGHT first (right_to_left), then
+                                        // let the name fill the remaining space to its left (truncating),
+                                        // so a long name can never push the button off-panel.
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                let btn = if tracked {
+                                                    theme::button_filled("Tracked", TRACKED, Color32::BLACK)
+                                                } else {
+                                                    egui::Button::new(
+                                                        RichText::new("Track").size(12.0).color(theme::BEIGE),
+                                                    )
+                                                    .corner_radius(0.0)
+                                                };
+                                                if ui
+                                                    .add(btn)
+                                                    .on_hover_text(if tracked {
+                                                        "stop tracking (removes its markers + zones)"
+                                                    } else {
+                                                        "track this task (shows its markers + zones on the map)"
+                                                    })
+                                                    .clicked()
+                                                {
+                                                    if tracked {
+                                                        tr.active.remove(&t.id);
+                                                    } else {
+                                                        tr.active.insert(t.id.clone());
+                                                        quests_on = true; // tracking is pointless with the layer off
+                                                    }
+                                                }
+                                                ui.with_layout(
+                                                    egui::Layout::left_to_right(egui::Align::Center),
+                                                    |ui| {
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                RichText::new(&t.name)
+                                                                    .color(if tracked { TRACKED } else { theme::TEXT_BRIGHT })
+                                                                    .size(theme::SIZE_CARD_TITLE)
+                                                                    .strong(),
+                                                            )
+                                                            .truncate(),
+                                                        )
+                                                        .on_hover_text(&t.name);
+                                                    },
+                                                );
+                                            },
+                                        );
+                                    });
+                                });
+
+                            // ===== META: level + progress (left) · locate (right) =====
                             ui.horizontal(|ui| {
-                                let mut on = tracked;
-                                if ui
-                                    .checkbox(&mut on, "")
-                                    .on_hover_text("track this task (focuses the map to it)")
-                                    .changed()
-                                {
-                                    if on {
-                                        tr.active.insert(t.id.clone());
-                                        quests_on = true; // tracking is pointless with the layer off
-                                    } else {
-                                        tr.active.remove(&t.id);
-                                    }
+                                let mut bits: Vec<String> = Vec::new();
+                                if t.min_level > 0 {
+                                    bits.push(format!("Lvl {}", t.min_level));
                                 }
-                                ui.label(
-                                    RichText::new(&t.name)
-                                        .color(if tracked { ACCENT } else { BONE })
-                                        .size(theme::SIZE_BODY)
-                                        .strong(),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        // locate -> fly to the first on-map objective
-                                        if let Some(pos) = cur.and_then(|m| task_first_location(t, m)) {
-                                            if ui
-                                                .small_button(RichText::new("\u{25CF}").size(11.0).color(ACCENT))
-                                                .on_hover_text("fly to this task on the map")
-                                                .clicked()
-                                            {
-                                                cam_cmd.fly_to = Some(pos);
-                                            }
+                                if total > 0 {
+                                    bits.push(format!("{done_n}/{total} done"));
+                                }
+                                if !bits.is_empty() {
+                                    ui.label(
+                                        RichText::new(bits.join("   \u{00B7}   "))
+                                            .size(10.0)
+                                            .color(if all_done { FIR } else { MUTED }),
+                                    );
+                                }
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if let Some(pos) = cur.and_then(|m| task_first_location(t, m)) {
+                                        if ui
+                                            .small_button(RichText::new("locate").size(10.0).color(ACCENT))
+                                            .on_hover_text("fly to this task on the map")
+                                            .clicked()
+                                        {
+                                            cam_cmd.fly_to = Some(pos);
                                         }
-                                        if t.lk {
-                                            ui.label(RichText::new("LK").size(10.0).strong().color(LK))
-                                                .on_hover_text("Lightkeeper chain");
-                                        }
-                                        if t.kappa {
-                                            ui.label(RichText::new("K").size(10.0).strong().color(KAPPA))
-                                                .on_hover_text("Kappa-required");
-                                        }
-                                        if t.min_level > 0 {
-                                            ui.label(RichText::new(format!("L{}", t.min_level)).size(10.0).color(MUTED))
-                                                .on_hover_text("required level");
-                                        }
-                                        if total > 0 {
-                                            ui.label(
-                                                RichText::new(format!("{done_n}/{total}"))
-                                                    .size(10.0)
-                                                    .color(if done_n == total { FIR } else { MUTED }),
-                                            )
-                                            .on_hover_text("objectives checked off (session only)");
-                                        }
-                                    },
-                                );
+                                    }
+                                });
                             });
-
-                            // -- prereqs / off-map note folded into ONE tiny line --
+                            // prereqs / off-map note folded into ONE tiny line
                             let mut note: Vec<String> = Vec::new();
                             if !this_map_only && !t.maps.is_empty() {
                                 note.push(t.maps.iter().map(|m| titlecase_key(m)).collect::<Vec<_>>().join(", "));
@@ -769,7 +793,14 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                 ui.label(RichText::new(note.join("   \u{00B7}   ")).size(9.0).italics().color(MUTED));
                             }
 
-                            // -- OBJECTIVES: one wrapped paragraph each (tag + text + items + go/route) --
+                            ui.add_space(2.0);
+
+                            // ===== SUBTASK TABLE: fixed left icon gutter + click-to-toggle text =====
+                            // GUTTER holds ONE big item icon (or a type-coloured dot when the item has
+                            // no cached art / the objective carries no item) so every row's icon column
+                            // lines up at the same x. Extra item names spill into the text column.
+                            const GUTTER: f32 = 40.0;
+                            const ICON: f32 = 32.0;
                             for (i, o) in t.objectives.iter().enumerate() {
                                 let key = obj_key(&t.id, i);
                                 let is_done = ui_state.done.contains(&key);
@@ -780,75 +811,111 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                 if let Some(qi) = &o.quest_item { names.push(qi.as_str()); }
                                 if let Some(mi) = &o.marker_item { names.push(mi.as_str()); }
 
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 2.0);
-                                    // check off (client-side progress feel)
-                                    let mut d = is_done;
-                                    if ui.checkbox(&mut d, "").changed() {
-                                        if d { ui_state.done.insert(key.clone()); }
-                                        else { ui_state.done.remove(&key); }
-                                    }
-                                    // typed tag (the action verb — replaces the old "Need/Hand in" badge)
-                                    ui.label(RichText::new(tag).size(9.0).strong().color(dot))
-                                        .on_hover_text(o.kind.as_str());
-                                    // description text (strikethrough when done)
-                                    if !o.desc.is_empty() {
-                                        let dt = RichText::new(&o.desc).size(11.0);
-                                        ui.label(if is_done { dt.strikethrough().color(MUTED) } else { dt.color(BONE) });
-                                    }
-                                    if o.count > 1 {
-                                        ui.label(RichText::new(format!("\u{00D7}{}", o.count)).size(10.0).strong().color(BONE));
-                                    }
-                                    if o.fir {
-                                        ui.label(RichText::new("FIR").size(9.0).strong().color(FIR))
-                                            .on_hover_text("Found In Raid");
-                                    }
-                                    if o.optional {
-                                        ui.label(RichText::new("opt").size(9.0).italics().color(MUTED))
-                                            .on_hover_text("optional objective");
-                                    }
-                                    // inline item icons (small; cap the "any X" enumerations)
-                                    const CAP: usize = 6;
-                                    for name in names.iter().take(CAP) {
-                                        let slug = crate::inspect::icon_slug(name);
-                                        if let Some(tex) = icons.get(ui.ctx(), icon_root.as_deref(), icon_shared.as_deref(), &slug) {
-                                            let sz = tex.size_vec2();
-                                            let s = 16.0 / sz.y.max(1.0);
-                                            ui.image((tex.id(), sz * s)).on_hover_text(*name);
-                                        } else {
-                                            theme::chip(ui, &short_item(name), MUTED).on_hover_text(*name);
+                                ui.horizontal_top(|ui| {
+                                    // -- LEFT: fixed-width icon gutter, left-aligned --
+                                    let mut first_has_icon = false;
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(GUTTER, ICON),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.set_min_width(GUTTER);
+                                            if let Some(name) = names.first() {
+                                                let slug = crate::inspect::icon_slug(name);
+                                                if let Some(tex) = icons.get(
+                                                    ui.ctx(),
+                                                    icon_root.as_deref(),
+                                                    icon_shared.as_deref(),
+                                                    &slug,
+                                                ) {
+                                                    let sz = tex.size_vec2();
+                                                    let s = ICON / sz.y.max(1.0);
+                                                    ui.image((tex.id(), sz * s)).on_hover_text(*name);
+                                                    first_has_icon = true;
+                                                }
+                                            }
+                                            if !first_has_icon {
+                                                // type-coloured dot keeps the gutter column aligned
+                                                ui.label(RichText::new("\u{25CF}").size(14.0).color(dot))
+                                                    .on_hover_text(o.kind.as_str());
+                                            }
+                                        },
+                                    );
+
+                                    // -- RIGHT: text column (click the line to toggle done) --
+                                    ui.vertical(|ui| {
+                                        ui.spacing_mut().item_spacing = egui::vec2(5.0, 2.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(RichText::new(tag).size(9.0).strong().color(dot))
+                                                .on_hover_text(o.kind.as_str());
+                                            let body = if o.desc.is_empty() {
+                                                "(objective)".to_string()
+                                            } else {
+                                                o.desc.clone()
+                                            };
+                                            let rt = if is_done {
+                                                RichText::new(body).size(11.5).strikethrough().color(MUTED)
+                                            } else {
+                                                RichText::new(body).size(11.5).color(BONE)
+                                            };
+                                            let resp = ui
+                                                .add(egui::Label::new(rt).sense(egui::Sense::click()))
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text("click to mark done / not done");
+                                            if resp.clicked() {
+                                                if is_done { ui_state.done.remove(&key); }
+                                                else { ui_state.done.insert(key.clone()); }
+                                            }
+                                            if o.count > 1 {
+                                                ui.label(RichText::new(format!("\u{00D7}{}", o.count)).size(10.0).strong().color(BONE));
+                                            }
+                                            if o.fir {
+                                                ui.label(RichText::new("FIR").size(9.0).strong().color(FIR))
+                                                    .on_hover_text("Found In Raid");
+                                            }
+                                            if o.optional {
+                                                ui.label(RichText::new("opt").size(9.0).italics().color(MUTED))
+                                                    .on_hover_text("optional objective");
+                                            }
+                                            // Extra item names (beyond the one shown as the gutter icon),
+                                            // or the single item's name when it had no icon — as chips so
+                                            // nothing is lost.
+                                            let skip = if first_has_icon { 1 } else { 0 };
+                                            for name in names.iter().skip(skip) {
+                                                theme::chip(ui, &short_item(name), MUTED).on_hover_text(*name);
+                                            }
+                                        });
+                                        // secondary: kill targets / extract / go / route
+                                        if !o.targets.is_empty() || o.exit.is_some() || here.is_some() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                if !o.targets.is_empty() {
+                                                    ui.label(RichText::new(o.targets.join(", ")).size(9.0).color(MUTED))
+                                                        .on_hover_text("kill targets");
+                                                }
+                                                if let Some(exit) = &o.exit {
+                                                    ui.label(RichText::new(format!("@{exit}")).size(9.0).color(MUTED))
+                                                        .on_hover_text("extract");
+                                                }
+                                                if let Some(pos) = here {
+                                                    if ui.small_button(RichText::new("go").size(10.0))
+                                                        .on_hover_text("fly here").clicked()
+                                                    {
+                                                        cam_cmd.fly_to = Some(pos);
+                                                    }
+                                                    if ui
+                                                        .add_enabled(pf_running, egui::Button::new(RichText::new("route").size(10.0)))
+                                                        .on_hover_text("route here").clicked()
+                                                    {
+                                                        route.write(RouteRequest { start: None, dests: vec![pos], optimize_order: false });
+                                                    }
+                                                }
+                                            });
                                         }
-                                    }
-                                    if names.len() > CAP {
-                                        ui.label(RichText::new(format!("+{}", names.len() - CAP)).size(10.0).color(MUTED));
-                                    }
-                                    // kill targets / extract, inline
-                                    if !o.targets.is_empty() {
-                                        ui.label(RichText::new(o.targets.join(", ")).size(9.0).color(MUTED))
-                                            .on_hover_text("kill targets");
-                                    }
-                                    if let Some(exit) = &o.exit {
-                                        ui.label(RichText::new(format!("@{exit}")).size(9.0).color(MUTED))
-                                            .on_hover_text("extract");
-                                    }
-                                    // go / route when this objective has an on-map location
-                                    if let Some(pos) = here {
-                                        if ui.small_button(RichText::new("go").size(10.0))
-                                            .on_hover_text("fly here").clicked()
-                                        {
-                                            cam_cmd.fly_to = Some(pos);
-                                        }
-                                        if ui
-                                            .add_enabled(pf_running, egui::Button::new(RichText::new("rt").size(10.0)))
-                                            .on_hover_text("route here").clicked()
-                                        {
-                                            route.write(RouteRequest { start: None, dests: vec![pos], optimize_order: false });
-                                        }
-                                    }
+                                    });
                                 });
+                                ui.add_space(3.0);
                             }
                         });
-                        ui.add_space(3.0);
+                        ui.add_space(5.0);
                     }
                 });
             }
