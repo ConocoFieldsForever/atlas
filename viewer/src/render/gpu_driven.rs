@@ -946,6 +946,12 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         let vp_params = softcutout_params(&mat.vp);
         if vp_params.is_some() {
             flags |= MAT_FLAG_SOFTCUTOUT | MAT_FLAG_BLEND;
+            // A SoftCutout surface's transparency IS its COLOR_0-based coverage, so it must NOT
+            // also carry the hard alpha-test: the extractor sometimes tags these role=cutout with
+            // an authored _Cutoff of 1.3 (from the softCutout param), and alpha never exceeds 1.0,
+            // so the cutout discard would nuke EVERY fragment -> invisible road (ground_zero
+            // Sandbox_road_01). Clear it; the softcutout coverage path owns visibility.
+            flags &= !MAT_FLAG_CUTOUT;
         }
         // Vert-Paint 3-layer splat (BOTH the SoftCutout decal AND the opaque "Solid" variant):
         // build the VpGpu entry so the fragment blends the game's 3 layers by COLOR_0.rgb ×

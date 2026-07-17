@@ -501,14 +501,20 @@ fn setup(
     } else {
         match pack.as_ref() {
             Some(p) => {
-                let c = p.0.bounds_center();
+                // Open NEAR the map's content (median instance position), not a whole-map
+                // overview: a neighborhood-scale framing that's consistent across ALL maps —
+                // small maps (factory) open close, big maps (streets) pull back — but always
+                // looking at populated geometry, never the empty AABB center out over the sea.
+                let anchor = p.0.content_anchor();
                 let ext = p.0.bounds_extent().max(1.0);
-                // Stand back ~1.34*ext; the far plane must clear the cam->far-corner
-                // distance (~3*ext) with margin or the map center clips (Codex P1).
+                // Ground/plaza-level framing near the populated center, capped so a big dense map
+                // (ground_zero downtown, streets) doesn't open up at skyscraper-facade height. A
+                // short back-distance + low height = "standing in the neighborhood", not overview.
+                let d = (ext * 0.10).clamp(30.0, 90.0);
                 (
-                    c,
-                    c + Vec3::new(0.0, ext * 0.6, ext * 1.2),
-                    (ext * 6.0).max(2000.0),
+                    anchor,
+                    anchor + Vec3::new(0.0, d * 0.5, d),
+                    (ext * 6.0).max(2000.0), // far plane still clears the whole map
                 )
             }
             None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0), 2000.0),
