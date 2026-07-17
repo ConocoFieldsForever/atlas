@@ -1,28 +1,28 @@
-//! pathfind.rs — ON-DEMAND routing via the local `:8091` GPU pathfind server.
+//! pathfind.rs — in-process routing over the baked nav grid (see `nav.rs`).
 //!
-//! The viewer never pathfinds itself. It POSTs a start + destination(s) to the resident NVIDIA-Warp
-//! MapWorker (`pathfind_server.py`, GraphQL) ONLY when asked — a `RouteRequest` event from the UI
-//! (a button / hotkey), never per-frame — so the GPU churns only per query, not while idle. The
-//! request runs on an async task thread (blocking HTTP, off the render thread); the returned
-//! floor-snapped polyline is drawn with immediate-mode `Gizmos` until a new/empty request replaces
-//! it. Server URL from `EFT_PATHFIND_URL` (default `http://127.0.0.1:8091/graphql`); if the server
-//! is down the status carries the error so the UI can say so instead of hanging.
+//! REPLACES the old external NVIDIA-Warp GPU server (`:8091` GraphQL). Routing now runs on the CPU,
+//! in-process, via `crate::nav::NavGrid` — so it works on EVERY GPU (or none), ships inside the exe,
+//! and needs no Python/CUDA/server process. A `RouteRequest` (from a UI button, marker click, or the
+//! Tasks panel) kicks off ONE async task on the compute pool (so a big chain never hitches the render
+//! frame); the returned floor-snapped polyline is drawn with immediate-mode `Gizmos` until a new or
+//! empty request replaces it.
 //!
-//! Query selection: 1 dest -> `path`; N dests + optimize -> `chain` (server picks the visiting
-//! order); N dests keep-order -> `tour`. All map to one flattened polyline for drawing.
+//! `PathfindServer` / `ServerCmd` / `ServerStatus` are kept for UI compatibility but no longer mean an
+//! external process — `Running` now just means "the nav grid for this map is loaded" (routing ready).
 
+use crate::nav::{NavGrid, Scratch};
 use crate::render::{CullCamera, LoadedPack};
 use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
+use std::sync::Arc;
 
-/// Ask the server to route from `start` (or the camera if `None`) through `dests`. An EMPTY
-/// `dests` clears the current route. Sent by the UI via `MessageWriter<RouteRequest>` (Bevy 0.17
-/// renamed buffered events to "messages").
+/// Ask to route from `start` (or the camera if `None`) through `dests`. EMPTY `dests` clears the
+/// route. Sent by the UI via `MessageWriter<RouteRequest>` (Bevy 0.17 buffered events = "messages").
 #[derive(Message, Clone)]
 pub struct RouteRequest {
     pub start: Option<Vec3>,
     pub dests: Vec<Vec3>,
-    /// true -> `chain` (server re-orders for shortest tour); false -> `tour` (keep the given order).
+    /// true -> cheapest visiting order (`chain`); false -> keep the given order (`tour`).
     pub optimize_order: bool,
 }
 
@@ -34,7 +34,7 @@ pub enum RouteStatus {
     Error(String),
 }
 
-/// The current route (a flattened, floor-snapped polyline) + its status, for drawing + UI readout.
+/// The current route (flattened, floor-snapped polyline) + its status, for drawing + the UI readout.
 #[derive(Resource)]
 pub struct RouteResult {
     pub points: Vec<Vec3>,
@@ -47,18 +47,15 @@ impl Default for RouteResult {
     }
 }
 
-#[derive(Resource)]
-struct PathfindConfig {
-    url: String,
-    /// Pathfinding is OFF by default (no server dependency / no :8091 calls). Enable with
-    /// `EFT_PATHFIND=1` (or implicitly by setting `EFT_ROUTE=...` for a scripted route).
-    enabled: bool,
-}
+/// The loaded nav grid for the CURRENT map. `None` = this pack has no baked nav -> routing off.
+#[derive(Resource, Default)]
+pub struct Nav(pub Option<Arc<NavGrid>>);
 
 #[derive(Resource, Default)]
 struct PathfindTask(Option<Task<Result<(Vec<Vec3>, f32), String>>>);
 
-/// Live state of the local :8091 pathfind server, so the UI can show it + Start/Stop it.
+/// Kept for UI compatibility. `Running` = nav grid loaded (routing available); `Stopped` = none.
+/// (`Starting` is unused now — there is no external process to warm up.)
 #[derive(Clone, PartialEq, Default)]
 pub enum ServerStatus {
     #[default]
@@ -67,7 +64,7 @@ pub enum ServerStatus {
     Running,
 }
 
-/// UI -> server control. The viewer can spawn/kill the pathfind server process itself.
+/// UI -> nav control. `Start` (re)loads the pack's nav grid; `Stop` unloads it. No process anymore.
 #[derive(Message)]
 pub enum ServerCmd {
     Start,
@@ -77,72 +74,75 @@ pub enum ServerCmd {
 #[derive(Resource, Default)]
 pub struct PathfindServer {
     pub status: ServerStatus,
-    /// The child process WE started (None if the server is external or stopped). Killed on Stop.
-    child: Option<std::process::Child>,
-    /// Seconds until the next /health poll.
-    check_timer: f32,
-    /// In-flight health-check task (GET /health -> bool reachable).
-    check: Option<Task<bool>>,
 }
-
 impl PathfindServer {
-    /// Kill + reap the child WE spawned (no-op for an external server). Used by the UI Stop
-    /// button and by the map switch so a relaunch doesn't orphan the server process.
-    pub fn stop_owned_child(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        self.status = ServerStatus::Stopped;
-        self.check = None;
-    }
+    /// No external process to reap anymore (routing is in-process) — kept so existing callers (the
+    /// map-switch teardown) compile unchanged.
+    pub fn stop_owned_child(&mut self) {}
 }
 
 pub struct PathfindPlugin;
 impl Plugin for PathfindPlugin {
     fn build(&self, app: &mut App) {
-        let url = std::env::var("EFT_PATHFIND_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8091/graphql".to_string());
-        // OFF by default: only route when explicitly enabled, so the viewer has no :8091 dependency
-        // and never touches the pathfind server unless asked.
-        let enabled = std::env::var("EFT_PATHFIND").map(|v| v.trim() == "1").unwrap_or(false)
-            || std::env::var("EFT_ROUTE").is_ok();
         app.add_message::<RouteRequest>()
             .add_message::<ServerCmd>()
-            .insert_resource(PathfindConfig { url, enabled })
             .init_resource::<RouteResult>()
             .init_resource::<PathfindTask>()
             .init_resource::<PathfindServer>()
+            .init_resource::<Nav>()
             .add_systems(
                 Update,
-                // chained: the tuple order IS the dataflow (cmd -> health -> request -> poll ->
-                // draw); unordered they could interleave and draw one-frame-stale routes.
-                (
-                    handle_server_cmd,
-                    poll_server_health,
-                    debug_route,
-                    dispatch_route,
-                    poll_route,
-                    draw_route,
-                )
-                    .chain(),
+                // chained: nav-load -> scripted-route -> dispatch -> poll -> draw (dataflow order).
+                (manage_nav, debug_route, dispatch_route, poll_route, draw_route).chain(),
             );
     }
 }
 
-/// dataset "interchange_v2" -> pathfind map id "interchange" (strip a `_vN` suffix).
-fn map_key(dataset: &str) -> String {
-    if let Some((base, ver)) = dataset.rsplit_once("_v") {
-        if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit()) {
-            return base.to_string();
+/// Load the pack's nav grid once it appears; `ServerCmd` re-loads / unloads it (UI Start/Stop).
+fn manage_nav(
+    mut ev: MessageReader<ServerCmd>,
+    pack: Option<Res<LoadedPack>>,
+    mut nav: ResMut<Nav>,
+    mut server: ResMut<PathfindServer>,
+    mut tried: Local<bool>,
+) {
+    if !*tried {
+        if let Some(p) = pack.as_ref() {
+            *tried = true;
+            load_nav(&p.0.root, &mut nav, &mut server);
         }
     }
-    dataset.to_string()
+    for cmd in ev.read() {
+        match cmd {
+            ServerCmd::Start => {
+                if let Some(p) = pack.as_ref() {
+                    load_nav(&p.0.root, &mut nav, &mut server);
+                }
+            }
+            ServerCmd::Stop => {
+                nav.0 = None;
+                server.status = ServerStatus::Stopped;
+            }
+        }
+    }
+}
+
+fn load_nav(root: &std::path::Path, nav: &mut Nav, server: &mut PathfindServer) {
+    match NavGrid::load(root) {
+        Some(g) => {
+            nav.0 = Some(Arc::new(g));
+            server.status = ServerStatus::Running;
+        }
+        None => {
+            nav.0 = None;
+            server.status = ServerStatus::Stopped;
+            info!("nav: no nav grid in this pack — routing unavailable (bake_nav runs in the map build)");
+        }
+    }
 }
 
 /// Headless-QA aid: `EFT_ROUTE="x,y,z;x,y,z;..."` fires ONE route request a few frames in (first
-/// point = start, rest = dests) so a screenshot can show a real drawn route without clicking. Runs
-/// once, then disables itself. No-op unless the env is set.
+/// point = start, rest = dests) so a screenshot can show a real drawn route without clicking.
 fn debug_route(
     mut frame: Local<u32>,
     mut done: Local<bool>,
@@ -177,53 +177,56 @@ fn debug_route(
     info!("pathfind: EFT_ROUTE debug route requested ({} points)", pts.len());
 }
 
-/// On a request, kick off ONE async HTTP query (replacing any in-flight one). Empty dests = clear.
+/// On a request, kick off ONE async CPU route (replacing any in-flight one). Empty dests = clear.
 fn dispatch_route(
     mut ev: MessageReader<RouteRequest>,
-    cfg: Res<PathfindConfig>,
-    server: Res<PathfindServer>,
-    pack: Option<Res<LoadedPack>>,
+    nav: Res<Nav>,
     cam: Query<&GlobalTransform, With<CullCamera>>,
     mut task: ResMut<PathfindTask>,
     mut result: ResMut<RouteResult>,
 ) {
-    // Only the most recent request in the frame matters.
     let Some(req) = ev.read().last().cloned() else {
         return;
     };
     if req.dests.is_empty() {
-        // clear
         task.0 = None;
         result.points.clear();
         result.dist = 0.0;
         result.status = RouteStatus::Idle;
         return;
     }
-    // Routing needs the server up. `cfg.enabled` (EFT_PATHFIND=1 / EFT_ROUTE) force-dispatches for
-    // scripted/testing runs; otherwise gate on the health-checked status so a down server gives a
-    // clear "start it" message (Start it from the Pathfinding panel) instead of a raw HTTP failure.
-    if server.status != ServerStatus::Running && !cfg.enabled {
+    let Some(grid) = nav.0.clone() else {
         result.points.clear();
-        result.status = RouteStatus::Error(
-            "pathfind server not running \u{2014} Start it in the Pathfinding panel".to_string(),
-        );
-        return;
-    }
-    let Some(pack) = pack else {
+        result.dist = 0.0;
+        result.status =
+            RouteStatus::Error("no route data for this map (nav is baked during the map build)".to_string());
         return;
     };
     let start = req
         .start
         .or_else(|| cam.single().ok().map(|t| t.translation()))
         .unwrap_or(Vec3::ZERO);
-    let map = map_key(&pack.0.manifest.dataset);
-    let url = cfg.url.clone();
     let dests = req.dests.clone();
     let optimize = req.optimize_order;
     result.status = RouteStatus::Pending;
-    // Blocking HTTP on a task thread — off the render loop; dropping the old task cancels it.
-    let t = AsyncComputeTaskPool::get()
-        .spawn(async move { run_query(&url, &map, start, &dests, optimize) });
+    // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
+    let t = AsyncComputeTaskPool::get().spawn(async move {
+        let mut s = Scratch::new(grid.nodes());
+        let routed = if dests.len() == 1 {
+            grid.path(start, dests[0], &mut s)
+        } else if optimize {
+            grid.chain(start, &dests, &mut s)
+        } else {
+            let mut pts = Vec::with_capacity(dests.len() + 1);
+            pts.push(start);
+            pts.extend_from_slice(&dests);
+            grid.tour(&pts, &mut s)
+        };
+        match routed {
+            Some((pts, dist)) => Ok((crate::nav::simplify(&pts, grid.res * 0.4), dist)),
+            None => Err("no walkable path found".to_string()),
+        }
+    });
     task.0 = Some(t);
 }
 
@@ -236,89 +239,19 @@ fn poll_route(mut task: ResMut<PathfindTask>, mut result: ResMut<RouteResult>) {
         task.0 = None;
         match res {
             Ok((points, dist)) => {
+                info!("pathfind: route ok — {} pts, {:.1} m", points.len(), dist);
                 result.points = points;
                 result.dist = dist;
                 result.status = RouteStatus::Ok;
             }
             Err(e) => {
+                warn!("pathfind: {e}");
                 result.points.clear();
                 result.dist = 0.0;
                 result.status = RouteStatus::Error(e);
             }
         }
     }
-}
-
-/// Blocking GraphQL POST to the pathfind server. Returns the flattened polyline + walkable length.
-fn run_query(
-    url: &str,
-    map: &str,
-    start: Vec3,
-    dests: &[Vec3],
-    optimize: bool,
-) -> Result<(Vec<Vec3>, f32), String> {
-    let arr = |p: Vec3| serde_json::json!([p.x, p.y, p.z]);
-    let (query, field, vars) = if dests.len() == 1 {
-        (
-            "query P($m:String!,$s:[Float!]!,$d:[Float!]!){ path(map:$m,start:$s,dest:$d){ ok points dist } }",
-            "path",
-            serde_json::json!({"m": map, "s": arr(start), "d": arr(dests[0])}),
-        )
-    } else if optimize {
-        (
-            "query C($m:String!,$s:[Float!]!,$d:[[Float!]!]!){ chain(map:$m,start:$s,dests:$d){ ok legs{points dist} dist } }",
-            "chain",
-            serde_json::json!({"m": map, "s": arr(start), "d": dests.iter().map(|p| arr(*p)).collect::<Vec<_>>()}),
-        )
-    } else {
-        let mut pts: Vec<serde_json::Value> = vec![arr(start)];
-        pts.extend(dests.iter().map(|p| arr(*p)));
-        (
-            "query T($m:String!,$p:[[Float!]!]!){ tour(map:$m,points:$p){ ok legs{points dist} dist } }",
-            "tour",
-            serde_json::json!({"m": map, "p": pts}),
-        )
-    };
-    let body = serde_json::json!({"query": query, "variables": vars}).to_string();
-    let resp = ureq::post(url)
-        .set("Content-Type", "application/json")
-        .timeout(std::time::Duration::from_secs(60))
-        .send_string(&body)
-        .map_err(|e| format!("pathfind server unreachable at {url} — is it running? ({e})"))?;
-    let text = resp
-        .into_string()
-        .map_err(|e| format!("read failed: {e}"))?;
-    let j: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("bad JSON: {e}"))?;
-    if let Some(errs) = j.get("errors") {
-        return Err(format!("server error: {errs}"));
-    }
-    let node = &j["data"][field];
-    if !node["ok"].as_bool().unwrap_or(false) {
-        return Err("no walkable path found".to_string());
-    }
-    let dist = node["dist"].as_f64().unwrap_or(0.0) as f32;
-    let mut points = Vec::new();
-    if let Some(pts) = node["points"].as_array() {
-        points.extend(pts.iter().map(json_vec3)); // single `path`
-    } else if let Some(legs) = node["legs"].as_array() {
-        for lg in legs {
-            if let Some(pts) = lg["points"].as_array() {
-                points.extend(pts.iter().map(json_vec3)); // `chain`/`tour` legs
-            }
-        }
-    }
-    Ok((points, dist))
-}
-
-fn json_vec3(v: &serde_json::Value) -> Vec3 {
-    let a = v.as_array();
-    let g = |i: usize| {
-        a.and_then(|a| a.get(i))
-            .and_then(|x| x.as_f64())
-            .unwrap_or(0.0) as f32
-    };
-    Vec3::new(g(0), g(1), g(2))
 }
 
 /// Draw the current route each frame (immediate-mode; the polyline is static once computed):
@@ -339,98 +272,4 @@ fn draw_route(mut gizmos: Gizmos, result: Res<RouteResult>) {
             Color::srgb(0.1, 1.0, 0.6),
         );
     }
-}
-
-/// Spawn the pathfind server process (`python pathfind_server.py`). Both paths are ENV-ONLY
-/// (`EFT_PATHFIND_PYTHON` / `EFT_PATHFIND_SCRIPT`) — the old machine-specific defaults are gone
-/// (portability PR1); without the envs the feature reports "server script not configured".
-fn spawn_server() -> std::io::Result<std::process::Child> {
-    let python = std::env::var("EFT_PATHFIND_PYTHON").unwrap_or_else(|_| "python".to_string());
-    let script = std::env::var("EFT_PATHFIND_SCRIPT").map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "EFT_PATHFIND_SCRIPT not set (pathfind server is optional; see docs)",
-        )
-    })?;
-    // Canonicalize BEFORE current_dir: a relative script path would otherwise dangle once the
-    // child's cwd moves to the script's parent (Codex finding).
-    let script = std::fs::canonicalize(&script).unwrap_or_else(|_| std::path::PathBuf::from(&script));
-    let mut cmd = std::process::Command::new(&python);
-    cmd.arg(&script);
-    if let Some(dir) = script.parent() {
-        cmd.current_dir(dir);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW — don't pop a console
-    }
-    cmd.spawn()
-}
-
-/// UI Start/Stop of the server process (the viewer owns the child it spawns).
-fn handle_server_cmd(mut ev: MessageReader<ServerCmd>, mut server: ResMut<PathfindServer>) {
-    for cmd in ev.read() {
-        match cmd {
-            ServerCmd::Start => {
-                if server.child.is_none() && server.status != ServerStatus::Running {
-                    match spawn_server() {
-                        Ok(child) => {
-                            info!("pathfind: started server (pid {})", child.id());
-                            server.child = Some(child);
-                            server.status = ServerStatus::Starting;
-                            server.check_timer = 0.0; // health-poll immediately
-                        }
-                        Err(e) => error!("pathfind: failed to start server: {e}"),
-                    }
-                }
-            }
-            ServerCmd::Stop => {
-                server.stop_owned_child();
-            }
-        }
-    }
-}
-
-/// Periodically GET `/health` so the UI reflects the true server state — including an
-/// externally-started server or the ~30 s BVH-load window (process up, not yet answering).
-fn poll_server_health(
-    time: Res<Time>,
-    cfg: Res<PathfindConfig>,
-    mut server: ResMut<PathfindServer>,
-) {
-    if let Some(t) = server.check.as_mut() {
-        if let Some(reachable) = block_on(future::poll_once(t)) {
-            server.check = None;
-            // Reap a self-exited child (crash / port conflict): try_wait() returns Some(status)
-            // once it died — without this the panel showed "Starting…" forever (Codex review).
-            if let Some(c) = server.child.as_mut() {
-                if let Ok(Some(status)) = c.try_wait() {
-                    warn!("pathfind: server process exited ({status})");
-                    server.child = None;
-                }
-            }
-            server.status = if reachable {
-                ServerStatus::Running
-            } else if server.child.is_some() {
-                ServerStatus::Starting // our process is alive but not answering yet
-            } else {
-                ServerStatus::Stopped
-            };
-        }
-        return;
-    }
-    server.check_timer -= time.delta_secs();
-    if server.check_timer > 0.0 {
-        return;
-    }
-    server.check_timer = 1.5;
-    let health = cfg.url.replace("/graphql", "/health");
-    server.check = Some(AsyncComputeTaskPool::get().spawn(async move {
-        ureq::get(&health)
-            .timeout(std::time::Duration::from_secs(2))
-            .call()
-            .map(|r| r.status() == 200)
-            .unwrap_or(false)
-    }));
 }
