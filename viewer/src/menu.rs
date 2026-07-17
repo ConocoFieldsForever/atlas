@@ -124,6 +124,17 @@ impl BuildJob {
         let _ = self.child.lock().unwrap().kill();
     }
 
+    /// Entire captured log (for the COPY LOG button — the panel only shows a tail).
+    pub fn full_log(&self) -> String {
+        let l = self.log.lock().unwrap();
+        let mut s = String::with_capacity(l.iter().map(|x| x.len() + 1).sum());
+        for line in l.iter() {
+            s.push_str(line);
+            s.push('\n');
+        }
+        s
+    }
+
     /// (last stage marker, tail lines, finished?, success?)
     pub fn snapshot(&self, tail: usize) -> (String, Vec<String>, bool, bool) {
         let l = self.log.lock().unwrap();
@@ -687,6 +698,11 @@ pub fn menu_ui(
                                         {
                                             job.cancel();
                                         }
+                                    }
+                                    // Full captured log (the panel shows only a tail) — for
+                                    // diagnosing which stage failed / sharing the output.
+                                    if ui.button("COPY LOG").clicked() {
+                                        ui.ctx().copy_text(job.full_log());
                                     }
                                 },
                             );
