@@ -253,25 +253,6 @@ fn vis_for(t: &LayerToggles, cls: &str, val: Option<&crate::poi::MarkerValue>) -
     }
 }
 
-/// Vivid, distinct legend colour per loot class (doubles as the on-map key).
-#[cfg(feature = "egui")]
-fn class_color(cls: &str) -> bevy_egui::egui::Color32 {
-    use bevy_egui::egui::Color32;
-    match cls {
-        "weapon" => Color32::from_rgb(214, 92, 72),
-        "medical" => Color32::from_rgb(92, 200, 122),
-        "safe" => Color32::from_rgb(235, 190, 74),
-        "register" => Color32::from_rgb(84, 162, 235),
-        "bag" => Color32::from_rgb(205, 150, 92),
-        "crate" => Color32::from_rgb(196, 162, 108),
-        "tech" => Color32::from_rgb(176, 112, 226),
-        "furniture" => Color32::from_rgb(162, 138, 116),
-        "stash" => Color32::from_rgb(150, 150, 150),
-        "body" => Color32::from_rgb(222, 74, 74),
-        _ => Color32::from_rgb(180, 180, 180),
-    }
-}
-
 #[cfg(feature = "egui")]
 fn titlecase(s: &str) -> String {
     let mut c = s.chars();
@@ -404,12 +385,12 @@ fn layers_panel(
     // never dirties change detection from mere rendering.
     let mut bm = gfx_ui.bookmarks.clone();
     let mut hud_on = gfx_ui.hud.0;
-    const ACCENT: Color32 = Color32::from_rgb(232, 194, 122); // warm tactical amber
-    const HDR: Color32 = Color32::from_rgb(160, 164, 160);
-    const MUTED: Color32 = Color32::from_rgb(120, 122, 120);
-    const DIMCOUNT: Color32 = Color32::from_rgb(110, 112, 110);
-    const PANEL_BG: Color32 = Color32::from_rgb(20, 22, 23);
-    const KEYCARD: Color32 = Color32::from_rgb(184, 115, 235); // violet = Color::srgb(0.72,0.45,0.92)
+    // All colors come from the single source of truth (ui_theme); these are thin local aliases so
+    // the panel body reads cleanly. No drifted literal values live here anymore.
+    use crate::ui_theme as theme;
+    const ACCENT: Color32 = theme::ACCENT;
+    const MUTED: Color32 = theme::MUTED;
+    const KEYCARD: Color32 = theme::VIOLET;
 
     // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
     // dim number after each row so the planner can gauge density without enabling the layer.
@@ -423,22 +404,19 @@ fn layers_panel(
     }
     let loot_total: usize = loot_counts.values().sum();
 
-    // Style ONLY this panel's frame (a global ctx.set_style() was painting a fullscreen white
-    // layer over the 3D scene). Per-widget RichText below carries the rest of the look.
-    let frame = egui::Frame::side_top_panel(&ctx.style())
-        .fill(PANEL_BG)
-        .inner_margin(egui::Margin::same(14));
+    // Theme-standard side-panel frame (square, charcoal, panel margin). Per-widget RichText below
+    // carries the rest of the look; global egui defaults are themed once in `apply_global_style`.
     egui::SidePanel::right("map_layers")
         .resizable(false)
-        .frame(frame)
+        .frame(theme::panel_frame())
         .default_width(248.0)
         .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+            ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
 
             // ---- STICKY header + search (stay put while the sections scroll) ----
-            ui.add_space(2.0);
+            ui.add_space(theme::SP_XS);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("MAP  LAYERS").color(ACCENT).size(17.0).strong());
+                ui.label(theme::title("MAP  LAYERS"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("hide all")
@@ -686,7 +664,7 @@ fn layers_panel(
                         gfx_ui.plan.pins = alive;
                     }
                     let n_pins = gfx_ui.plan.pins.len();
-                    CollapsingHeader::new(section_hdr("Raid plan", n_pins, HDR))
+                    CollapsingHeader::new(section_hdr("Raid plan", n_pins))
                         .id_salt("sec_plan")
                         .default_open(true)
                         .show(ui, |ui| {
@@ -782,7 +760,7 @@ fn layers_panel(
                     } else {
                         "Loot".to_string()
                     };
-                    CollapsingHeader::new(section_hdr(&loot_name, loot_total, HDR))
+                    CollapsingHeader::new(section_hdr(&loot_name, loot_total))
                         .id_salt("sec_loot")
                         .default_open(true)
                         .show(ui, |ui| {
@@ -795,13 +773,16 @@ fn layers_panel(
                                 let n = loot_counts.get(cls).copied().unwrap_or(0);
                                 ui.horizontal(|ui| {
                                     ui.add_space(10.0);
-                                    let swatch =
-                                        if loot_on { class_color(cls) } else { Color32::from_gray(70) };
-                                    ui.label(RichText::new("\u{25CF}").color(swatch).size(12.0));
+                                    let sw = if loot_on {
+                                        theme::loot_class_color(cls)
+                                    } else {
+                                        Color32::from_gray(70)
+                                    };
+                                    theme::swatch(ui, sw);
                                     ui.add_enabled_ui(loot_on, |ui| {
                                         ui.checkbox(on, titlecase(cls));
                                     });
-                                    count_tag(ui, n, DIMCOUNT);
+                                    theme::count_tag(ui, n);
                                 });
                             }
                             // ---- MIN VALUE — ONE filter shared by the containers above and Map
@@ -838,7 +819,7 @@ fn layers_panel(
                                         "hide markers disabled in the game scene \
                                          (inactive exfils, low-power minefields, \u{2026})",
                                     );
-                                count_tag(ui, gfx_ui.inactive.iter().count(), DIMCOUNT);
+                                theme::count_tag(ui, gfx_ui.inactive.iter().count());
                             });
                         });
 
@@ -849,7 +830,7 @@ fn layers_panel(
                         + poi_counts[PoiLayer::Extract as usize]
                         + poi_counts[PoiLayer::Door as usize]
                         + poi_counts[PoiLayer::Interactable as usize];
-                    CollapsingHeader::new(section_hdr("Spawns & POIs", spawn_total, HDR))
+                    CollapsingHeader::new(section_hdr("Spawns & POIs", spawn_total))
                         .id_salt("sec_spawns")
                         .default_open(false)
                         .show(ui, |ui| {
@@ -873,7 +854,7 @@ fn layers_panel(
                         + poi_counts[PoiLayer::LooseLoot as usize]
                         + poi_counts[PoiLayer::Minefield as usize]
                         + poi_counts[PoiLayer::SniperZone as usize];
-                    CollapsingHeader::new(section_hdr("Map Intel", intel_total, HDR))
+                    CollapsingHeader::new(section_hdr("Map Intel", intel_total))
                         .id_salt("sec_intel")
                         .default_open(false)
                         .show(ui, |ui| {
@@ -925,7 +906,6 @@ fn layers_panel(
                     CollapsingHeader::new(section_hdr(
                         "Quests",
                         poi_counts[PoiLayer::Quest as usize],
-                        HDR,
                     ))
                     .id_salt("sec_quests")
                     .default_open(false)
@@ -939,20 +919,16 @@ fn layers_panel(
                     });
 
                     // ===== PATHFINDING (server start/stop) =====
-                    CollapsingHeader::new(RichText::new("Pathfinding").color(HDR).size(12.0).strong())
+                    CollapsingHeader::new(section_hdr("Pathfinding", 0))
                         .id_salt("sec_pathfind")
                         .default_open(false)
                         .show(ui, |ui| {
+                            // State colours from the shared tokens: running=OK green, starting=amber
+                            // accent (in-progress), stopped=faint — same semantics as everywhere else.
                             let (dot, txt, col) = match server.status {
-                                ServerStatus::Running => {
-                                    ("\u{25CF}", "server running", Color32::from_rgb(120, 210, 130))
-                                }
-                                ServerStatus::Starting => {
-                                    ("\u{25CF}", "server starting\u{2026}", ACCENT)
-                                }
-                                ServerStatus::Stopped => {
-                                    ("\u{25CF}", "server stopped", Color32::from_gray(130))
-                                }
+                                ServerStatus::Running => ("\u{25CF}", "server running", theme::OK),
+                                ServerStatus::Starting => ("\u{25CF}", "server starting\u{2026}", ACCENT),
+                                ServerStatus::Stopped => ("\u{25CF}", "server stopped", theme::FAINT),
                             };
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(dot).color(col).size(11.0));
@@ -1007,9 +983,7 @@ fn layers_panel(
                     // Edits go through a local copy so change-detection only fires on a real
                     // tweak (a bare &mut through ResMut would mark the resource changed every
                     // frame the sliders render).
-                    CollapsingHeader::new(
-                        RichText::new("Graphics (experimental)").color(HDR).size(12.0).strong(),
-                    )
+                    CollapsingHeader::new(section_hdr("Graphics (experimental)", 0))
                     .id_salt("sec_gfx")
                     .default_open(false)
                     .show(ui, |ui| {
@@ -1142,7 +1116,7 @@ fn pos_hud(
     menu: Option<Res<crate::menu::MenuState>>,
     cams: Query<&Transform, With<crate::render::CullCamera>>,
 ) {
-    use bevy_egui::egui::{self, Color32, RichText};
+    use bevy_egui::egui::{self, RichText};
     if !hud.0 || menu.is_some() {
         return; // hidden in start-menu mode (no raid context)
     }
@@ -1158,8 +1132,8 @@ fn pos_hud(
     let fwd = *tf.forward();
     let yaw_deg = fwd.x.atan2(-fwd.z).to_degrees();
     let pitch_deg = fwd.y.clamp(-1.0, 1.0).asin().to_degrees();
-    let dim = Color32::from_rgb(160, 164, 160);
-    let bright = Color32::from_rgb(230, 245, 230);
+    let dim = crate::ui_theme::SECTION;
+    let bright = crate::ui_theme::TEXT_BRIGHT;
     let pos_s = format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z);
     let ang_s = format!("{:.1} {:.1}", yaw_deg, pitch_deg);
     // One-line capture of the FULL camera pose (position + look angle) for reproducing a view.
@@ -1171,7 +1145,7 @@ fn pos_hud(
         .fixed_pos(egui::pos2(8.0, 36.0))
         .show(ctx, |ui| {
             egui::Frame::new()
-                .fill(Color32::from_rgba_unmultiplied(0, 0, 0, 153))
+                .fill(crate::ui_theme::HUD_BG)
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -1198,103 +1172,35 @@ fn toolbar_panel(
     mut tab: ResMut<RightPanelTab>,
     menu: Option<Res<crate::menu::MenuState>>,
 ) {
-    use bevy_egui::egui::{self, Color32};
+    use bevy_egui::egui;
+    use crate::ui_theme as theme;
     if menu.is_some() {
-        return; // start menu owns the screen
+        return; // start menu owns the screen (and themes egui itself)
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    const RAIL: Color32 = Color32::from_rgb(16, 16, 15);
-    const ACTIVE: Color32 = Color32::from_rgb(199, 178, 153); // beige
-    const IDLE: Color32 = Color32::from_rgb(120, 116, 108);
+    // Theme egui's own defaults once per frame (square corners, spacing, widget fills + text) so
+    // every in-raid panel/card/button matches without per-widget restyling. toolbar_panel is the
+    // first UI system in the raid chain, so this runs before the content panels each frame.
+    theme::apply_global_style(ctx);
     let cur = *tab;
     egui::SidePanel::right("toolbar")
         .exact_width(40.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(RAIL).inner_margin(egui::Margin::symmetric(4, 8)))
+        .frame(egui::Frame::new().fill(theme::RAIL).inner_margin(egui::Margin::symmetric(4, 8)))
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
-            // (tab, icon-id) — draw an icon button; returns true on click.
-            let mut btn = |ui: &mut egui::Ui, this: RightPanelTab, kind: u8, tip: &str| {
-                let (rect, resp) =
-                    ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
-                let active = cur == this;
-                let col = if active { ACTIVE } else { IDLE };
-                if active {
-                    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(34, 33, 30));
-                } else if resp.hovered() {
-                    ui.painter().rect_filled(rect, 0.0, Color32::from_rgb(26, 25, 23));
-                }
-                paint_tool_icon(ui.painter(), rect, kind, col);
-                resp.on_hover_text(tip).clicked()
-            };
-            if btn(ui, RightPanelTab::Visibility, 0, "Visibility layers") {
+            if theme::rail_button(ui, cur == RightPanelTab::Visibility, 0, "Visibility layers") {
                 *tab = RightPanelTab::Visibility;
             }
-            if btn(ui, RightPanelTab::Camera, 1, "Camera") {
+            if theme::rail_button(ui, cur == RightPanelTab::Camera, 1, "Camera") {
                 *tab = RightPanelTab::Camera;
             }
-            if btn(ui, RightPanelTab::Tasks, 2, "Tasks") {
+            if theme::rail_button(ui, cur == RightPanelTab::Tasks, 2, "Tasks") {
                 *tab = RightPanelTab::Tasks;
             }
         });
-}
-
-/// Vector icon inside `rect`: 0 = eye, 1 = camera, 2 = tasks/checklist. Painter primitives only
-/// (no image assets — keeps the shippable exe free of game-derived art).
-#[cfg(feature = "egui")]
-fn paint_tool_icon(
-    painter: &bevy_egui::egui::Painter,
-    rect: bevy_egui::egui::Rect,
-    kind: u8,
-    c: bevy_egui::egui::Color32,
-) {
-    use bevy_egui::egui::{self, Color32, Stroke};
-    let ctr = rect.center();
-    let s = Stroke::new(1.6, c);
-    match kind {
-        0 => {
-            // eye: lens (two arcs approximated by an ellipse outline) + pupil
-            let pts: Vec<egui::Pos2> = (0..=20)
-                .map(|i| {
-                    let t = i as f32 / 20.0 * std::f32::consts::TAU;
-                    egui::pos2(ctr.x + t.cos() * 9.0, ctr.y + t.sin() * 5.0)
-                })
-                .collect();
-            painter.add(egui::Shape::closed_line(pts, s));
-            painter.circle_filled(ctr, 2.6, c);
-        }
-        1 => {
-            // camera: body + top viewfinder bump + lens
-            let body = egui::Rect::from_center_size(ctr, egui::vec2(20.0, 13.0));
-            painter.rect_stroke(body, 1.0, s, egui::StrokeKind::Middle);
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(ctr.x - 5.0, body.top() - 3.0), egui::vec2(7.0, 3.0)),
-                0.0,
-                c,
-            );
-            painter.circle_stroke(ctr, 4.2, s);
-            painter.circle_filled(egui::pos2(body.right() - 2.5, body.top() + 2.5), 1.0, c);
-        }
-        _ => {
-            // tasks: three rows, each a small box + a line (a checklist)
-            for r in 0..3 {
-                let y = rect.top() + 9.0 + r as f32 * 7.5;
-                let bx = egui::Rect::from_min_size(egui::pos2(rect.left() + 5.0, y - 2.5), egui::vec2(5.0, 5.0));
-                painter.rect_stroke(bx, 0.0, Stroke::new(1.3, c), egui::StrokeKind::Middle);
-                if r == 0 {
-                    // a check in the first box
-                    painter.line_segment([egui::pos2(bx.left() + 1.0, y), egui::pos2(bx.center().x, bx.bottom() - 1.0)], Stroke::new(1.3, c));
-                    painter.line_segment([egui::pos2(bx.center().x, bx.bottom() - 1.0), egui::pos2(bx.right(), bx.top())], Stroke::new(1.3, c));
-                }
-                painter.line_segment(
-                    [egui::pos2(bx.right() + 3.0, y), egui::pos2(rect.right() - 5.0, y)],
-                    Stroke::new(1.4, if r == 0 { c } else { Color32::from_rgb(90, 87, 80) }),
-                );
-            }
-        }
-    }
 }
 
 /// Camera-settings tab: FOV, exposure, fly speed (scroll-adjustable), walk-mode toggle. Renders
@@ -1307,15 +1213,15 @@ fn camera_panel(
     mut cam: ResMut<crate::CameraSettings>,
     mut gfx: ResMut<crate::render::GfxSettings>,
 ) {
-    use bevy_egui::egui::{self, Color32, RichText};
+    use bevy_egui::egui::{self, RichText};
+    use crate::ui_theme as theme;
     if menu.is_some() || *tab != RightPanelTab::Camera {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    const BONE: Color32 = Color32::from_rgb(215, 211, 203);
-    const DIM: Color32 = Color32::from_rgb(120, 116, 108);
+    const DIM: bevy_egui::egui::Color32 = theme::MUTED;
     // Clone-edit-compare so merely rendering the sliders doesn't dirty change detection every
     // frame (only real edits write back — same discipline as the graphics panel).
     let mut fov = cam.fov_deg;
@@ -1324,10 +1230,10 @@ fn camera_panel(
     let mut expo = gfx.grade_exposure;
     egui::SidePanel::right("map_layers")
         .default_width(300.0)
-        .frame(egui::Frame::new().fill(Color32::from_rgb(18, 18, 17)).inner_margin(10.0))
+        .frame(theme::panel_frame())
         .show(ctx, |ui| {
-            ui.label(RichText::new("CAMERA").color(BONE).size(16.0).strong());
-            ui.add_space(8.0);
+            ui.label(theme::title("CAMERA"));
+            ui.add_space(theme::SP_MD);
 
             ui.label(RichText::new("FIELD OF VIEW").color(DIM).size(11.0));
             ui.add(egui::Slider::new(&mut fov, 20.0..=110.0).suffix("\u{00B0}").text(""));
@@ -1344,7 +1250,7 @@ fn camera_panel(
             ui.checkbox(&mut walk, "Walk mode (ground-follow + jump)");
             ui.label(
                 RichText::new(
-                    "walk locomotion lands next; scroll will scale walk speed + jump height",
+                    "WASD walk, Space jump, Shift sprint; scroll scales walk speed + jump height",
                 )
                 .color(DIM)
                 .size(10.0),
@@ -1374,7 +1280,7 @@ fn tasks_tab(
     menu: Option<Res<crate::menu::MenuState>>,
     mut params: crate::tasks_panel::TasksPanelParams,
 ) {
-    use bevy_egui::egui::{self, Color32};
+    use bevy_egui::egui;
     if menu.is_some() || *tab != RightPanelTab::Tasks {
         return;
     }
@@ -1383,33 +1289,17 @@ fn tasks_tab(
     };
     egui::SidePanel::right("map_layers")
         .default_width(320.0)
-        .frame(egui::Frame::new().fill(Color32::from_rgb(18, 18, 17)).inner_margin(10.0))
+        .frame(crate::ui_theme::panel_frame())
         .show(ctx, |ui| {
             crate::tasks_panel::tasks_panel_ui(ui, &mut params);
         });
 }
 
-/// Section header text: name + a dim count of markers in that section.
+/// Section header text: name + a dim count of markers in that section. Thin wrapper over the shared
+/// `ui_theme::section_header` so every section title (here + the Tasks tab) is one style.
 #[cfg(feature = "egui")]
-fn section_hdr(name: &str, count: usize, col: bevy_egui::egui::Color32) -> bevy_egui::egui::RichText {
-    use bevy_egui::egui::RichText;
-    if count > 0 {
-        RichText::new(format!("{name}   \u{00B7} {count}")).color(col).size(12.0).strong()
-    } else {
-        RichText::new(name).color(col).size(12.0).strong()
-    }
-}
-
-/// Right-aligned dim marker count for a row.
-#[cfg(feature = "egui")]
-fn count_tag(ui: &mut bevy_egui::egui::Ui, n: usize, col: bevy_egui::egui::Color32) {
-    use bevy_egui::egui::{Align, Layout, RichText};
-    if n == 0 {
-        return;
-    }
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.label(RichText::new(n.to_string()).size(10.0).color(col));
-    });
+fn section_hdr(name: &str, count: usize) -> bevy_egui::egui::RichText {
+    crate::ui_theme::section_header(name, count)
 }
 
 /// Turn every overlay layer off (the panel's "hide all" quick action).
@@ -1457,19 +1347,8 @@ fn layer_toggle_mut(t: &mut LayerToggles, l: crate::poi::PoiLayer) -> &mut bool 
     }
 }
 
-/// egui swatch colour for a POI layer (matches the on-map marker colour).
-#[cfg(feature = "egui")]
-fn poi_swatch(l: crate::poi::PoiLayer) -> bevy_egui::egui::Color32 {
-    let (c, _, _) = crate::poi::poi_look(l);
-    let s = c.to_srgba();
-    bevy_egui::egui::Color32::from_rgb(
-        (s.red * 255.0) as u8,
-        (s.green * 255.0) as u8,
-        (s.blue * 255.0) as u8,
-    )
-}
-
-/// One POI toggle row: colour swatch + checkbox + a right-aligned dim marker count.
+/// One POI toggle row: colour swatch + checkbox + a right-aligned dim marker count. Uses the shared
+/// theme swatch (colour from `poi::poi_look`, matching the on-map marker) + count tag.
 #[cfg(feature = "egui")]
 fn poi_row(
     ui: &mut bevy_egui::egui::Ui,
@@ -1478,11 +1357,10 @@ fn poi_row(
     l: crate::poi::PoiLayer,
     counts: &[usize; 16],
 ) {
-    use bevy_egui::egui::{Color32, RichText};
     ui.horizontal(|ui| {
-        ui.add_space(2.0);
-        ui.label(RichText::new("\u{25CF}").color(poi_swatch(l)).size(12.0));
+        ui.add_space(crate::ui_theme::SP_XS);
+        crate::ui_theme::swatch(ui, crate::ui_theme::poi_color(l));
         ui.checkbox(on, label);
-        count_tag(ui, counts[l as usize], Color32::from_rgb(110, 112, 110));
+        crate::ui_theme::count_tag(ui, counts[l as usize]);
     });
 }

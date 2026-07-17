@@ -24,11 +24,14 @@ use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimensio
 use bevy::window::PrimaryWindow;
 use bevy_egui::egui::{self, Color32, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
 
-// ---- shared palette (kept in step with menu.rs) ----
-const KHAKI: Color32 = Color32::from_rgb(207, 203, 184); // filled loader segment (bone/khaki)
-const RED: Color32 = Color32::from_rgb(176, 65, 62); // menu BAD / camera LED
-const TXT: Color32 = Color32::from_rgb(199, 195, 183);
-const DIM: Color32 = Color32::from_rgb(110, 107, 100);
+// ---- shared UI palette: sourced from the single source of truth (ui_theme). The wall-CCTV
+// prop's own material colours (BODY/DARK/SEAM/METAL, inside `security_camera`) stay local — they
+// are a physical object's finish, not UI design tokens. ----
+use crate::ui_theme as theme;
+const KHAKI: Color32 = theme::BEIGE; // filled loader segment (tactical beige = PLAY / active tab)
+const RED: Color32 = theme::DANGER; // failed-loader recolour / camera LED
+const TXT: Color32 = theme::BONE;
+const DIM: Color32 = theme::MUTED;
 
 fn scale_rgb(c: Color32, f: f32) -> Color32 {
     Color32::from_rgb(
@@ -57,9 +60,9 @@ pub fn eft_loading_bar(
     const SEGS: usize = 12; // the game loader reads as ~10-14 wide segments
     const GAP: f32 = 2.0;
     const BAR_H: f32 = 18.0;
-    const EMPTY: Color32 = Color32::from_rgb(23, 23, 21);
-    const EDGE: Color32 = Color32::from_rgb(43, 42, 38);
-    const FRAME: Color32 = Color32::from_rgb(74, 72, 65);
+    const EMPTY: Color32 = theme::INSET; // unfilled segment well
+    const EDGE: Color32 = theme::BORDER; // segment edge
+    const FRAME: Color32 = theme::BORDER_STRONG; // bar frame
 
     let frac = frac.clamp(0.0, 1.0);
     let eta = if failed || frac < 0.05 || elapsed_secs < 2.0 {
