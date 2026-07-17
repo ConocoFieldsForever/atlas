@@ -1256,7 +1256,20 @@ fn pos_hud(
         return;
     };
     let p = tf.translation;
-    let coords = format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z);
+    // Camera ANGLE from the transform forward (same convention as FlyCam yaw/pitch and
+    // apply_camera_command): yaw = atan2(fwd.x, -fwd.z), pitch = asin(fwd.y). Degrees for reading.
+    let fwd = *tf.forward();
+    let yaw_deg = fwd.x.atan2(-fwd.z).to_degrees();
+    let pitch_deg = fwd.y.clamp(-1.0, 1.0).asin().to_degrees();
+    let dim = Color32::from_rgb(160, 164, 160);
+    let bright = Color32::from_rgb(230, 245, 230);
+    let pos_s = format!("{:.1} {:.1} {:.1}", p.x, p.y, p.z);
+    let ang_s = format!("{:.1} {:.1}", yaw_deg, pitch_deg);
+    // One-line capture of the FULL camera pose (position + look angle) for reproducing a view.
+    let capture = format!(
+        "pos={:.2},{:.2},{:.2} yaw={:.2} pitch={:.2} fwd={:.3},{:.3},{:.3}",
+        p.x, p.y, p.z, yaw_deg, pitch_deg, fwd.x, fwd.y, fwd.z
+    );
     egui::Area::new(egui::Id::new("pos_hud"))
         .fixed_pos(egui::pos2(8.0, 36.0))
         .show(ctx, |ui| {
@@ -1265,18 +1278,14 @@ fn pos_hud(
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new("POS")
-                                .size(11.0)
-                                .color(Color32::from_rgb(160, 164, 160)),
-                        );
-                        ui.label(
-                            RichText::new(&coords)
-                                .size(13.0)
-                                .color(Color32::from_rgb(230, 245, 230)),
-                        );
+                        ui.label(RichText::new("POS").size(11.0).color(dim));
+                        ui.label(RichText::new(&pos_s).size(13.0).color(bright));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("YAW/PITCH").size(11.0).color(dim));
+                        ui.label(RichText::new(&ang_s).size(13.0).color(bright));
                         if ui.small_button("copy").clicked() {
-                            ui.ctx().copy_text(coords.clone());
+                            // Copy the FULL pose so the exact angle is captured, not just xyz.
+                            ui.ctx().copy_text(capture.clone());
                         }
                     });
                 });

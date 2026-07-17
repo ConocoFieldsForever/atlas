@@ -381,9 +381,8 @@ fn main() {
     {
         // NOTE: bevy_egui's plugin ctor / context-access API drift between point
         // releases; adjust these two lines if they don't match your bevy_egui 0.37.x.
-        app.add_plugins(bevy_egui::EguiPlugin::default())
-            // egui UI runs in EguiPrimaryContextPass, not Update (else ctx_mut() panics: no fonts).
-            .add_systems(bevy_egui::EguiPrimaryContextPass, stats_ui);
+        // egui UI runs in EguiPrimaryContextPass, not Update (else ctx_mut() panics: no fonts).
+        app.add_plugins(bevy_egui::EguiPlugin::default());
         if menu_mode {
             app.add_systems(bevy_egui::EguiPrimaryContextPass, menu::menu_ui);
         }
@@ -752,31 +751,4 @@ fn auto_screenshot(mut commands: Commands, mut frames: Local<u32>) {
             .observe(save_to_disk(path.clone()));
         info!("auto-screenshot -> {path}");
     }
-}
-
-#[cfg(feature = "egui")]
-fn stats_ui(
-    mut contexts: bevy_egui::EguiContexts,
-    pack: Option<Res<LoadedPack>>,
-    menu: Option<Res<menu::MenuState>>,
-) {
-    if menu.is_some() {
-        return; // start menu owns the screen
-    }
-    let Ok(ctx) = contexts.ctx_mut() else {
-        return;
-    };
-    bevy_egui::egui::Window::new("pack").show(ctx, |ui| match pack.as_ref() {
-        Some(p) => {
-            ui.label(format!("dataset: {}", p.0.manifest.dataset));
-            ui.label(format!("meshes:  {}", p.0.manifest.meshes.len()));
-            ui.label(format!("instances: {}", p.0.instances.len()));
-            ui.label(format!("materials: {}", p.0.materials.len()));
-            let mirrors = p.0.instances.iter().filter(|i| i.is_mirror()).count();
-            ui.label(format!("mirrored: {mirrors}"));
-        }
-        None => {
-            ui.label("no pack loaded");
-        }
-    });
 }
