@@ -1,16 +1,27 @@
-//! eft::menu_fx — vector-drawn start-menu decor + custom widgets. Everything here is pure
-//! egui painter geometry (rects/circles/lines/polys): no image assets, nothing game-derived.
+//! eft::menu_fx — start-menu decor + custom widgets.
 //!
 //! * [`eft_loading_bar`] — game-loader-style segmented progress bar for the build panel:
 //!   khaki segments with 1px edges, pulsing frontier segment, stage text + percent upper-left,
 //!   ESTIMATED TIME mm:ss upper-right, small midpoint tick.
-//! * [`security_camera`] — main-menu-vibe wall CCTV in the top-right that servo-tracks the
-//!   mouse cursor (yaw/pitch clamped cone, exponential slew), blinking red LED, idle patrol
-//!   sweep when the pointer leaves the window.
+//! * [`security_camera`] — vector-drawn wall CCTV (egui painter only) in the top-right that
+//!   servo-tracks the mouse cursor (yaw/pitch clamped cone, exponential slew), blinking red
+//!   LED, idle patrol sweep when the pointer leaves the window. This is the SHIPPED look and
+//!   the permanent fallback.
+//! * [`spawn_menu_prop`] / [`menu_prop_update`] — the REAL game CCTV (Street_Camera_01 from
+//!   lighthouse) as a 3D cursor-tracking prop, when a MACHINE-LOCAL extraction exists in
+//!   packs/shared/menu/ (camera.bin + camera.png, written by tools/extract_menu_prop.py —
+//!   packs/ is gitignored, the asset is never committed/shipped). Menu mode only; when the
+//!   files are absent/corrupt the [`MenuCamProp`] resource is never inserted and menu.rs
+//!   keeps painting the vector camera instead (exactly one of the two ever renders).
 //!
 //! Palette mirrors menu.rs (near-black field / charcoal panels / bone text) but runs a step
 //! dimmer so the decor stays background. ASCII-only labels (glyph whitelist).
 
+use bevy::asset::RenderAssetUsages;
+use bevy::mesh::Indices;
+use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
+use bevy::window::PrimaryWindow;
 use bevy_egui::egui::{self, Color32, Rect, Shape, Stroke, StrokeKind, pos2, vec2};
 
 // ---- shared palette (kept in step with menu.rs) ----
@@ -133,9 +144,8 @@ pub fn eft_loading_bar(
 /// * both angles slew with a frame-rate-independent exponential (servo feel, not glued).
 /// * pointer outside the window -> slow idle patrol sweep instead.
 ///
-/// FUTURE (comment only, deliberately not implemented): a variant could swap the vector body
-/// for a user-extracted Tagilla-helmet sprite from packs/shared/menu/ when present. No asset
-/// loading here — vector-only is what ships.
+/// This vector body is what SHIPS; when a machine-local packs/shared/menu extraction exists,
+/// menu.rs skips this call and the real 3D prop ([`spawn_menu_prop`]) renders instead.
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
     use std::f32::consts::{PI, TAU};
     const BODY: Color32 = Color32::from_rgb(42, 42, 40); // #2a2a28
@@ -284,5 +294,289 @@ pub fn security_camera(ui: &egui::Ui, panel: Rect) {
         p.circle_filled(led, 2.1, Color32::from_rgb(226, 82, 74));
     } else {
         p.circle_filled(led, 1.8, Color32::from_rgb(58, 34, 32));
+    }
+}
+
+// ============================ real-asset 3D menu prop ============================
+//
+// The REAL Street_Camera_01 CCTV from the lighthouse dataset, spawned as a Bevy 3D
+// entity parented to the menu camera. Loaded from packs/shared/menu/camera.{bin,png}
+// (machine-local extraction — tools/extract_menu_prop.py; packs/ is gitignored so the
+// game asset is never committed or shipped). Bevy's png/gltf features are OFF in this
+// build, so BOTH the mesh and the texture are built manually from raw bytes (the same
+// pattern as main.rs build_sky_cubemap): Mesh::new + insert_attribute, and image-crate
+// decode -> Image::new(Rgba8UnormSrgb).
+
+/// Tracking cone + servo feel: ported 1:1 from the vector `security_camera` above.
+const YAW_MAX: f32 = 40.0 * std::f32::consts::PI / 180.0;
+const PITCH_MAX: f32 = 25.0 * std::f32::consts::PI / 180.0;
+/// Servo slew rate (alpha = 1 - e^(-K*dt), frame-rate independent).
+const SLEW_K: f32 = 6.0;
+/// LED blink period/duty: 0.8 s cycle, on for the first half (matches the vector LED).
+const LED_PERIOD: f32 = 0.8;
+const LED_ON: f32 = 0.4;
+/// Camera-space framing: prop distance in front of the menu camera, and the on-screen
+/// anchor (px from the right edge / from the top) it is steered onto each frame.
+/// menu.rs reserves a 166 px right gutter (+24 px CentralPanel margin) for the decor.
+const PROP_DIST: f32 = 3.5;
+const GUTTER_CENTER_FROM_RIGHT: f32 = 24.0 + 166.0 * 0.5;
+const PROP_CENTER_FROM_TOP: f32 = 170.0;
+/// Target world size of the prop's largest axis, meters (in game it stands ~0.47 m).
+const PROP_SIZE_M: f32 = 0.5;
+/// Menu camera vertical FOV — must match the `PerspectiveProjection::default()` the
+/// menu-mode `setup` (main.rs) leaves on the camera.
+const MENU_FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
+
+/// Present ONLY when the real-asset prop actually spawned; menu.rs uses its absence to
+/// fall back to the vector `security_camera` (never both).
+#[derive(Resource)]
+pub struct MenuCamProp {
+    prop: Entity,
+    led_mat: Handle<StandardMaterial>,
+    yaw: f32,
+    pitch: f32,
+    /// Last LED state actually written to the material (only mutate the asset on edges,
+    /// so the material isn't re-uploaded every frame).
+    led_on: bool,
+}
+
+struct PropData {
+    mesh: Mesh,
+    image: Image,
+    /// Half-extents of the CENTERED mesh (raw dataset units) — drives scale + LED anchor.
+    half: Vec3,
+}
+
+/// Parse packs/shared/menu/camera.bin + camera.png. Any structural problem returns None
+/// (the caller falls back to the vector camera) with an ASCII diagnostic on stderr.
+///
+/// camera.bin layout (little-endian, written by tools/extract_menu_prop.py):
+///   [u32 vert_count][u32 index_count]
+///   [pos f32x3 * n][normal f32x3 * n][uv f32x2 * n][indices u32 * m]
+fn load_prop_data(dir: &std::path::Path) -> Option<PropData> {
+    let bin = match std::fs::read(dir.join("camera.bin")) {
+        Ok(b) => b,
+        Err(_) => return None, // absent = the normal shipped state; stay quiet
+    };
+    if bin.len() < 8 {
+        eprintln!("menu prop: camera.bin truncated ({} bytes)", bin.len());
+        return None;
+    }
+    let nv = u32::from_le_bytes(bin[0..4].try_into().unwrap()) as usize;
+    let ni = u32::from_le_bytes(bin[4..8].try_into().unwrap()) as usize;
+    let expect = 8 + nv * 32 + ni * 4;
+    if nv == 0 || ni == 0 || ni % 3 != 0 || nv > 4_000_000 || bin.len() != expect {
+        eprintln!(
+            "menu prop: camera.bin corrupt (verts {nv} indices {ni} len {} expect {expect})",
+            bin.len()
+        );
+        return None;
+    }
+    let f = |off: usize| f32::from_le_bytes(bin[off..off + 4].try_into().unwrap());
+    let (pos_off, nrm_off, uv_off, idx_off) = (8, 8 + nv * 12, 8 + nv * 24, 8 + nv * 32);
+    let mut pos = Vec::with_capacity(nv);
+    let mut nrm = Vec::with_capacity(nv);
+    let mut uv = Vec::with_capacity(nv);
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    for i in 0..nv {
+        let p = [f(pos_off + i * 12), f(pos_off + i * 12 + 4), f(pos_off + i * 12 + 8)];
+        if !p.iter().all(|v| v.is_finite()) {
+            eprintln!("menu prop: camera.bin has non-finite positions");
+            return None;
+        }
+        lo = lo.min(Vec3::from(p));
+        hi = hi.max(Vec3::from(p));
+        pos.push(p);
+        nrm.push([f(nrm_off + i * 12), f(nrm_off + i * 12 + 4), f(nrm_off + i * 12 + 8)]);
+        uv.push([f(uv_off + i * 8), f(uv_off + i * 8 + 4)]);
+    }
+    let mut idx = Vec::with_capacity(ni);
+    for i in 0..ni {
+        let v = u32::from_le_bytes(bin[idx_off + i * 4..idx_off + i * 4 + 4].try_into().unwrap());
+        if v as usize >= nv {
+            eprintln!("menu prop: camera.bin index {v} out of range ({nv} verts)");
+            return None;
+        }
+        idx.push(v);
+    }
+    let half = ((hi - lo) * 0.5).max(Vec3::splat(1e-4));
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, nrm);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uv);
+    mesh.insert_indices(Indices::U32(idx));
+
+    // Albedo: manual decode (bevy's png asset feature is off in this trimmed build).
+    let png = std::fs::read(dir.join("camera.png")).ok()?;
+    let decoded = match image::load_from_memory(&png) {
+        Ok(d) => d.to_rgba8(),
+        Err(e) => {
+            eprintln!("menu prop: camera.png decode failed: {e}");
+            return None;
+        }
+    };
+    let (w, h) = decoded.dimensions();
+    let image = Image::new(
+        Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        decoded.into_raw(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    Some(PropData { mesh, image, half })
+}
+
+/// Startup (menu mode only, after main.rs `setup`): spawn the real CCTV as a child of the
+/// menu camera, plus a red LED sphere on the lens hood and a small fill light (the menu
+/// world only has the dim analytic key light — without a fill the prop reads near-black).
+/// No asset on disk -> no resource -> menu.rs paints the vector camera as before.
+pub fn spawn_menu_prop(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    cam: Query<Entity, With<crate::FlyCam>>,
+) {
+    let dir = crate::paths::shared_dir().join("menu");
+    let Some(data) = load_prop_data(&dir) else {
+        eprintln!("menu prop: no local extraction in packs/shared/menu - using the vector camera");
+        return;
+    };
+    let Ok(cam_e) = cam.single() else {
+        eprintln!("menu prop: no camera entity; keeping the vector camera");
+        return;
+    };
+
+    let half = data.half;
+    let scale = PROP_SIZE_M / (half.max_element() * 2.0);
+    let verts = data.mesh.count_vertices();
+
+    let body_mat = materials.add(StandardMaterial {
+        base_color_texture: Some(images.add(data.image)),
+        perceptual_roughness: 0.7,
+        // Double-sided: dataset OBJs are UnityPy X-flipped with reversed winding (the pack
+        // pipeline conjugates that per instance; a standalone prop must not cull on it).
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    let led_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.08, 0.02, 0.02),
+        emissive: LinearRgba::new(14.0, 0.9, 0.8, 1.0), // HDR-hot so Bloom halos it
+        ..default()
+    });
+
+    // Mount geometry (centered raw units): wall plate at +Y, housing below center, lens
+    // facing +Z. The LED sits on the right flank of the lens hood.
+    let led_pos = Vec3::new(half.x * 0.45, -half.y * 0.35, half.z * 0.8);
+    let led_r = half.max_element() * 0.045;
+
+    let prop = commands
+        .spawn((
+            Mesh3d(meshes.add(data.mesh)),
+            MeshMaterial3d(body_mat),
+            // Placed/steered every frame by menu_prop_update; this is just a sane seed.
+            Transform::from_translation(Vec3::new(2.2, 0.9, -PROP_DIST))
+                .with_scale(Vec3::splat(scale)),
+        ))
+        .id();
+    let led = commands
+        .spawn((
+            Mesh3d(meshes.add(Sphere::new(led_r))),
+            MeshMaterial3d(led_mat.clone()),
+            Transform::from_translation(led_pos),
+        ))
+        .id();
+    // Fill light: camera-space up-left of the prop, so the housing front reads. Menu-only
+    // world => nothing else is close enough to catch it.
+    let fill = commands
+        .spawn((
+            PointLight {
+                color: Color::srgb(1.0, 0.97, 0.9),
+                intensity: 500_000.0,
+                range: 12.0,
+                shadows_enabled: false,
+                ..default()
+            },
+            Transform::from_translation(Vec3::new(0.9, 1.8, -1.8)),
+        ))
+        .id();
+    commands.entity(prop).add_child(led);
+    commands.entity(cam_e).add_child(prop);
+    commands.entity(cam_e).add_child(fill);
+    commands.insert_resource(MenuCamProp {
+        prop,
+        led_mat,
+        yaw: 0.0,
+        pitch: -0.05,
+        led_on: true,
+    });
+    eprintln!("menu prop: real CCTV loaded ({verts} verts) from packs/shared/menu");
+}
+
+/// Per-frame (menu mode only): steer the prop onto the right-gutter screen anchor for the
+/// CURRENT window size, servo-track the cursor (idle patrol sweep when it is outside the
+/// window), and blink the LED. Same constants/feel as the vector `security_camera`.
+pub fn menu_prop_update(
+    prop: Option<ResMut<MenuCamProp>>,
+    time: Res<Time>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut transforms: Query<&mut Transform>,
+) {
+    let Some(mut st) = prop else { return };
+    let Ok(win) = windows.single() else { return };
+    let (w, h) = (win.width().max(1.0), win.height().max(1.0));
+    let t = time.elapsed_secs();
+    let dt = time.delta_secs().min(0.1);
+
+    // ---- target pose: cursor NDC -> clamped yaw/pitch; no cursor -> idle patrol ----
+    let (yaw_t, pitch_t) = match win.cursor_position() {
+        Some(c) => {
+            let nx = (2.0 * c.x / w - 1.0).clamp(-1.0, 1.0);
+            let ny_up = (1.0 - 2.0 * c.y / h).clamp(-1.0, 1.0);
+            // +yaw turns the lens screen-right; +pitch (rot_x) tilts it down, so cursor-up
+            // (ny_up > 0) needs a negative pitch.
+            (nx * YAW_MAX, -ny_up * PITCH_MAX)
+        }
+        // Idle patrol: slow side-to-side sweep with a faint nod (vector-cam constants).
+        None => (
+            (t * 0.5).sin() * YAW_MAX * 0.85,
+            (t * 0.23).sin() * 0.05 - 0.06,
+        ),
+    };
+    let a = 1.0 - (-SLEW_K * dt).exp();
+    st.yaw += (yaw_t - st.yaw) * a;
+    st.pitch += (pitch_t - st.pitch) * a;
+
+    // ---- camera-space framing: put the prop at the right-gutter anchor at PROP_DIST ----
+    // Perspective: at distance d the view half-height is d*tan(fov/2); x/y follow from the
+    // anchor's NDC. Recomputed per frame so window resizes keep it glued to the gutter.
+    let half_h = PROP_DIST * (MENU_FOV_Y * 0.5).tan();
+    let half_w = half_h * (w / h);
+    let ndc_x = 2.0 * (w - GUTTER_CENTER_FROM_RIGHT) / w - 1.0;
+    let ndc_y = 1.0 - 2.0 * PROP_CENTER_FROM_TOP.min(h * 0.35) / h;
+    if let Ok(mut tf) = transforms.get_mut(st.prop) {
+        tf.translation = Vec3::new(ndc_x * half_w, ndc_y * half_h, -PROP_DIST);
+        tf.rotation = Quat::from_rotation_y(st.yaw) * Quat::from_rotation_x(st.pitch);
+    }
+
+    // ---- LED blink: hard 0.8 s on/off; mutate the material asset only on edges ----
+    let on = t.rem_euclid(LED_PERIOD) < LED_ON;
+    if on != st.led_on {
+        st.led_on = on;
+        if let Some(m) = materials.get_mut(&st.led_mat) {
+            m.emissive = if on {
+                LinearRgba::new(14.0, 0.9, 0.8, 1.0)
+            } else {
+                LinearRgba::new(0.02, 0.002, 0.002, 1.0)
+            };
+        }
     }
 }

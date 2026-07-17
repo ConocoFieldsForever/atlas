@@ -429,8 +429,80 @@ pub fn detect_game_dir() -> String {
     r"C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data".to_string()
 }
 
+/// One-time, menu-startup extraction of the real CCTV menu prop (menu_fx 3D decor):
+/// if packs/shared/menu/camera.{bin,png} are missing and the game install resolves, run
+/// tools/extract_menu_prop.py SYNCHRONOUSLY (dataset-first, UnityPy game-file fallback)
+/// before the menu scans packs. Bounded wait (~30 s): on timeout the child is left to
+/// finish on its own (files then exist for the NEXT launch) and this launch just uses the
+/// vector camera. Any failure falls through silently to the vector camera — the menu
+/// always draws. Runs before Bevy's first frame, so a short block here is invisible.
+fn ensure_menu_prop(game_dir: &str) {
+    let menu_dir = crate::paths::shared_dir().join("menu");
+    if menu_dir.join("camera.bin").is_file() && menu_dir.join("camera.png").is_file() {
+        return; // already extracted on this machine — never re-run
+    }
+    if !valid_game_dir(game_dir) {
+        eprintln!("menu prop: game install not found - keeping the vector camera");
+        return;
+    }
+    let Some(root) = crate::paths::repo_root() else {
+        return; // no python kit beside the exe/cwd — shipped-lite bundle, vector camera
+    };
+    let script = root.join("tools").join("extract_menu_prop.py");
+    if !script.is_file() {
+        return;
+    }
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    eprintln!("menu prop: extracting the real CCTV prop (one-time, local-only)...");
+    let child = std::process::Command::new(crate::paths::python_exe(root))
+        .current_dir(root)
+        .env("EFT_GAME_DATA", game_dir)
+        .arg("tools/extract_menu_prop.py")
+        .arg("--out")
+        .arg(&menu_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::process::Stdio::inherit()) // its ASCII [menu-prop] lines go to our console
+        .stderr(std::process::Stdio::inherit())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("menu prop: could not start extractor: {e}");
+            return;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                eprintln!(
+                    "menu prop: extractor finished ({})",
+                    if status.success() { "ok" } else { "failed - vector camera" }
+                );
+                return;
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Never kill it: let it finish in the background so the files are
+                    // there next launch; this launch simply keeps the vector camera.
+                    eprintln!("menu prop: extractor still running after 30s - vector camera this launch");
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => {
+                eprintln!("menu prop: extractor wait failed: {e}");
+                return;
+            }
+        }
+    }
+}
+
 pub fn build_state() -> MenuState {
     let game_dir = detect_game_dir();
+    // Real-asset menu decor: one-time local extraction BEFORE the pack scan / first frame.
+    ensure_menu_prop(&game_dir);
     let game_fp = game_fingerprint(&game_dir);
     let (entries, total_bytes) = scan(&game_fp);
     // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook).
@@ -475,9 +547,14 @@ pub fn menu_ui(
     mut contexts: bevy_egui::EguiContexts,
     state: Option<ResMut<MenuState>>,
     mut switch: ResMut<crate::MapSwitch>,
+    // Present only when the real-asset 3D CCTV spawned (menu_fx::spawn_menu_prop): flips
+    // the CentralPanel transparent so the 3D world shows through, and suppresses the
+    // vector-drawn camera (exactly one of the two decors ever renders).
+    prop3d: Option<Res<crate::menu_fx::MenuCamProp>>,
 ) {
     use bevy_egui::egui::{self, Color32, RichText};
     let Some(mut state) = state else { return };
+    let real_prop = prop3d.is_some();
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
     // The menu animates without input now (camera LED blink / servo slew / idle patrol and
@@ -532,13 +609,24 @@ pub fn menu_ui(
             });
         });
 
+    // With the real 3D prop active the CentralPanel goes TRANSPARENT: the 3D world behind
+    // (menu-mode ClearColor is the same #090909, set in main.rs) becomes the field and the
+    // prop shows through the right gutter. Header/cards keep their own opaque fills, so the
+    // list looks identical either way.
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(BG).inner_margin(24.0))
+        .frame(
+            egui::Frame::new()
+                .fill(if real_prop { Color32::TRANSPARENT } else { BG })
+                .inner_margin(24.0),
+        )
         .show(ctx, |ui| {
             // Backdrop decor: wall-mounted CCTV servo-tracking the cursor (menu_fx). Painted
             // FIRST so every widget added later layers over it (same-layer paint order); it is
             // pure painter output — no widget, no Sense — so it can never steal clicks.
-            crate::menu_fx::security_camera(ui, ui.max_rect());
+            // Skipped when the REAL 3D prop is rendering in its place (never both).
+            if !real_prop {
+                crate::menu_fx::security_camera(ui, ui.max_rect());
+            }
 
             let mut delete_now: Option<usize> = None;
             let mut rescan = false;
