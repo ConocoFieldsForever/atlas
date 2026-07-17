@@ -11,22 +11,21 @@ group the right panel shows — the panel becomes a switchable container instead
 scroll. State: a `RightPanelTab` enum resource (`Layers | Camera | Tasks | …`), default
 `Layers` (current behavior). Tarkov gear-screen styling (square, charcoal, beige active tab).
 
-- [ ] `RightPanelTab` resource + toolbar widget (egui vertical strip, icon buttons).
-- [ ] Route the existing MAP LAYERS content behind the `Layers` tab (no behavior change).
-- [ ] Active-tab highlight; tooltips on hover.
+- [x] `RightPanelTab` resource + toolbar widget (egui vertical strip, vector icon buttons).
+- [x] Route the existing MAP LAYERS content behind the eye tab (tab-gated early return).
+- [x] Active-tab highlight; tooltips on hover.
 - Icons: vector-drawn in egui (no image assets — keep the redistribution story clean), or a
   tiny embedded glyph set. Camera / eye / clipboard-check shapes.
 
 ## 1. Camera tab (icon: camera)
 
 ### 1a. Camera settings (right panel, under the Camera tab)
-- [ ] **FOV** slider (perspective vertical FOV; wire to `Projection`).
-- [ ] **Exposure** slider (already have `GfxSettings.grade_exposure` — surface it here; today
-      only env `EFT_GRADE_EXPOSURE`). Consider also bloom intensity, fog, sky-refl (some
-      already exist under "Graphics (experimental)" — decide: move them here or cross-link).
+- [x] **FOV** slider (wired to Projection via CameraSettings + apply_camera_fov).
+- [x] **Exposure** slider (GfxSettings.grade_exposure). TODO: fold in bloom/fog/sky-refl from
+      "Graphics (experimental)" later.
 - [ ] Near/far, and a "reset framing" button (re-run content_anchor).
 
-### 1b. Fly-cam scroll-wheel speed  ← QUICK WIN, do first
+### 1b. Fly-cam scroll-wheel speed  [DONE]
 - [ ] Scroll wheel adjusts fly-cam `speed` (multiplicative, clamped). Up = faster, down =
       slower. Persist across the session. HUD or tab shows the current speed.
 
