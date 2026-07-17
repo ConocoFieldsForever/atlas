@@ -14,6 +14,7 @@ mod inspect;
 mod loot;
 mod menu;
 mod pathfind;
+mod paths;
 mod pick;
 mod poi;
 mod render;
@@ -270,10 +271,17 @@ fn main() {
                 ..default()
             })
             .set(AssetPlugin {
-                // Assets live in <viewer-crate>/assets; anchor to the crate dir so
-                // `cargo run` from the workspace root (the documented launch dir)
-                // resolves shaders regardless of cwd (Codex P1 — shader not found).
-                file_path: concat!(env!("CARGO_MANIFEST_DIR"), "/assets").to_string(),
+                // Shipped bundle: assets/ sits beside the exe (portability PR1). Dev
+                // `cargo run` (exe in target/release, no assets/ there) falls back to
+                // the compile-time crate dir so shader hot-editing keeps working.
+                file_path: {
+                    let exe_assets = paths::exe_dir().join("assets");
+                    if exe_assets.is_dir() {
+                        exe_assets.to_string_lossy().into_owned()
+                    } else {
+                        concat!(env!("CARGO_MANIFEST_DIR"), "/assets").to_string()
+                    }
+                },
                 ..default()
             }),
     )

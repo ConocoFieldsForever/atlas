@@ -80,7 +80,7 @@ fn class_look(cls: &str) -> (Color, Vec3) {
 ///   2. `<pack-dir>/loot.json` — co-located with the pack, so the pack is a
 ///      self-contained bundle you can hand to a friend,
 ///   3. `./loot.json` (cwd).
-fn resolve_loot_json(pack: &Option<Res<LoadedPack>>) -> Option<PathBuf> {
+pub(crate) fn resolve_loot_json(pack_root: Option<&std::path::Path>) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("EFT_LOOT_JSON") {
         let pb = PathBuf::from(&p);
         if pb.is_file() {
@@ -88,18 +88,22 @@ fn resolve_loot_json(pack: &Option<Res<LoadedPack>>) -> Option<PathBuf> {
         }
         warn!("loot: EFT_LOOT_JSON='{p}' is not a file — ignoring");
     }
-    if let Some(lp) = pack {
-        let pb = lp.0.root.join("loot.json");
+    if let Some(root) = pack_root {
+        let pb = root.join("loot.json");
         if pb.is_file() {
             return Some(pb);
         }
         // Shared tier: tarkov.dev data is map-agnostic (all-maps files) — it lives ABOVE the
         // packs in packs/shared/ so it isn't duplicated per map. Pack-local still wins (override).
-        if let Some(shared) = lp.0.root.parent().map(|p| p.join("shared").join("loot.json")) {
+        if let Some(shared) = root.parent().map(|p| p.join("shared").join("loot.json")) {
             if shared.is_file() {
                 return Some(shared);
             }
         }
+    }
+    let shared = crate::paths::shared_dir().join("loot.json");
+    if shared.is_file() {
+        return Some(shared);
     }
     let cwd = PathBuf::from("loot.json");
     if cwd.is_file() {
@@ -114,7 +118,7 @@ fn spawn_loot(
     mut materials: ResMut<Assets<StandardMaterial>>,
     pack: Option<Res<LoadedPack>>,
 ) {
-    let Some(path) = resolve_loot_json(&pack) else {
+    let Some(path) = resolve_loot_json(pack.as_ref().map(|lp| lp.0.root.as_path())) else {
         warn!(
             "loot: no loot.json found (set EFT_LOOT_JSON, or drop loot.json next to the .eftpack) — no loot overlay"
         );

@@ -425,7 +425,7 @@ fn layers_panel(
                 let dir = cur_pack_root
                     .as_deref()
                     .and_then(|r| std::path::Path::new(r).parent().map(|p| p.to_path_buf()))
-                    .unwrap_or_else(|| std::path::PathBuf::from("packs"));
+                    .unwrap_or_else(|| crate::paths::packs_root().to_path_buf());
                 let mut v: Vec<(String, String)> = std::fs::read_dir(&dir)
                     .into_iter()
                     .flatten()

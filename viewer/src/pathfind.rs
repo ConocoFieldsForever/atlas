@@ -341,17 +341,23 @@ fn draw_route(mut gizmos: Gizmos, result: Res<RouteResult>) {
     }
 }
 
-/// Spawn the pathfind server process (`python pathfind_server.py`). Paths are env-overridable
-/// (`EFT_PATHFIND_PYTHON` / `EFT_PATHFIND_SCRIPT`) with the known local defaults; no console window.
+/// Spawn the pathfind server process (`python pathfind_server.py`). Both paths are ENV-ONLY
+/// (`EFT_PATHFIND_PYTHON` / `EFT_PATHFIND_SCRIPT`) — the old machine-specific defaults are gone
+/// (portability PR1); without the envs the feature reports "server script not configured".
 fn spawn_server() -> std::io::Result<std::process::Child> {
-    let python = std::env::var("EFT_PATHFIND_PYTHON")
-        .unwrap_or_else(|_| "C:/Users/user/anaconda3/python.exe".to_string());
-    let script = std::env::var("EFT_PATHFIND_SCRIPT").unwrap_or_else(|_| {
-        "C:/Users/user/beamng_blender_pipeline/tarkmap/pathfind_server.py".to_string()
-    });
+    let python = std::env::var("EFT_PATHFIND_PYTHON").unwrap_or_else(|_| "python".to_string());
+    let script = std::env::var("EFT_PATHFIND_SCRIPT").map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "EFT_PATHFIND_SCRIPT not set (pathfind server is optional; see docs)",
+        )
+    })?;
+    // Canonicalize BEFORE current_dir: a relative script path would otherwise dangle once the
+    // child's cwd moves to the script's parent (Codex finding).
+    let script = std::fs::canonicalize(&script).unwrap_or_else(|_| std::path::PathBuf::from(&script));
     let mut cmd = std::process::Command::new(&python);
     cmd.arg(&script);
-    if let Some(dir) = std::path::Path::new(&script).parent() {
+    if let Some(dir) = script.parent() {
         cmd.current_dir(dir);
     }
     #[cfg(windows)]

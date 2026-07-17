@@ -2621,7 +2621,9 @@ fn bc3_compress_chain(width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u
 /// ONCE and every map reuses it. Lives in packs/shared/texcache/<fnv64>.bc3c =
 /// [w,h,mips: u32 LE] + concatenated BC3 mips. Content addressing self-invalidates.
 fn texcache_path(hash: u64) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("packs/shared/texcache/{hash:016x}.bc3c"))
+    crate::paths::shared_dir()
+        .join("texcache")
+        .join(format!("{hash:016x}.bc3c"))
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
