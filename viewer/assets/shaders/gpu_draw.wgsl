@@ -368,6 +368,15 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
 // `level` — the LOCAL exposure (luma of the SH reflection) — so it can NEVER exceed how lit the spot
 // actually is. Indoors (dark SH probe) the "sky" stays dark; only sky-exposed outdoor surfaces get
 // the bright reflection. This is what keeps interior glossy floors from blowing out.
+// f32-safe sine for world-space wave phases: sin() of a raw world-scaled coordinate reaches
+// ±1200 rad at map edges, where GPU fast-sin collapses into STRUCTURED PRECISION NOISE — this
+// was the sea's screen-space checkerboard AND the km-scale dark "shadow streak" beat bands
+// (survived every shading A/B; pinned by zeroing the ripple). fract() first keeps the argument
+// in the accurate [0,2π) domain; the input is in CYCLES (phase/2π).
+fn rsin(phase_cycles: f32) -> f32 {
+    return sin(fract(phase_cycles) * 6.2831853);
+}
+
 fn sky_reflect(R: vec3<f32>, level: f32) -> vec3<f32> {
     let up = clamp(R.y * 0.5 + 0.5, 0.0, 1.0);
     let horizon = vec3<f32>(0.66, 0.72, 0.82);
@@ -600,6 +609,15 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // op — MUST run here in uniform control flow, before any non-uniform discard). Equals
     // fwidth(albedo.a) for textured cutouts since tint.a is flat per material.
     let cutout_aw = max(fwidth(tex.a * m.tint.a), 1e-3);
+    // Pixel footprint on the world XZ plane (meters/pixel) — derivative op, so computed HERE in
+    // uniform control flow. Deep water band-limits its procedural ripple with this: an octave
+    // whose cycles-per-pixel nears Nyquist fades out instead of aliasing (the un-limited sines
+    // re-emerged as kilometer-scale interference BEATS — broad dark fresnel bands that read as
+    // giant "shadow streaks" across the sea, plus fine moiré at grazing angles).
+    let wxz_footprint = max(
+        abs(dpdx(o.world_pos.xz)) + abs(dpdy(o.world_pos.xz)),
+        vec2<f32>(1e-6),
+    );
 
     // --- Shading normal (Phase 2b normal mapping) --------------------------------
     // Computed ONCE here, in UNIFORM control flow, BEFORE any discard. BOTH the normal
@@ -951,17 +969,52 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let d = distance(view.world_position.xyz, o.world_pos);
         let ripple_amp = 0.06 / (1.0 + d * 0.004);
         let wp = o.world_pos.xz * 0.35;
-        let dxy = (vec2<f32>(sin(wp.x + wp.y * 0.6), sin(wp.x * 0.7 - wp.y))
-                 + 0.5 * vec2<f32>(sin(wp.x * 3.1 + wp.y * 2.3), sin(wp.y * 3.7 - wp.x * 2.9)))
+        // Nyquist band-limit per octave (shader-side "mip" for the procedural sines): fade an
+        // octave to zero as its cycles-per-pixel pass 1/4 -> 1/2. The old amplitude-only distance
+        // fade left the FREQUENCY aliasing: undersampled sines beat into kilometer-scale dark
+        // fresnel bands ("shadow streaks") + fine moiré at altitude/grazing views. Derivative
+        // footprint (wxz_footprint, uniform-flow above) covers distance AND grazing angle with
+        // no tuned distance constants; shore-level close-ups keep both octaves untouched.
+        let cyc = 0.35 * max(wxz_footprint.x, wxz_footprint.y) / 6.2831853;
+        // Conservative gates (fade well before Nyquist): the screen-derivative footprint
+        // UNDERestimates at extreme grazing on this one giant quad, so 0.25..0.5 still let a
+        // ~2px wave alias faintly. Near-shore footprints are centimeters — unaffected.
+        let w1 = 1.0 - smoothstep(0.10, 0.22, cyc);        // base octave (~18 m wavelength)
+        let w2 = 1.0 - smoothstep(0.10, 0.22, cyc * 3.4);  // detail octave (~5 m wavelength)
+        let wc = wp / 6.2831853; // phase in CYCLES for the f32-safe rsin (see rsin above)
+        let dxy = (w1 * vec2<f32>(rsin(wc.x + wc.y * 0.6), rsin(wc.x * 0.7 - wc.y))
+                 + 0.5 * w2 * vec2<f32>(rsin(wc.x * 3.1 + wc.y * 2.3), rsin(wc.y * 3.7 - wc.x * 2.9)))
                  * ripple_amp;
-        let Nw = normalize(N + vec3<f32>(dxy.x, 0.0, dxy.y));
+        // Base the water normal on WORLD UP, not the interpolated mesh/map normal: the sea mesh's
+        // per-vertex normals crosshatch at the quad-grid period (fine screen stripes + the wide
+        // dark fresnel bands the user reported as "shadow streaks" — verified by red-paint diag +
+        // pixel sampling: the pattern lives in this branch and survives ripple/SSAO/sh_env A/Bs).
+        // EFT water is horizontal; the game's shader owns the surface with its own wave normals,
+        // which the band-limited ripple above emulates.
+        let Nup = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0), !front);
+        let Nw = normalize(Nup + vec3<f32>(dxy.x, 0.0, dxy.y));
         let Rw = reflect(-V, Nw);
         let NwV = max(dot(Nw, V), 1e-3);
         let wf = 0.02 + 0.98 * pow(1.0 - NwV, 5.0);
-        let refl = max(sh_env, sky_reflect(Rw, refl_level));
+        // Sample the water's SH terms one probe layer ABOVE the surface: sea-level probes straddle
+        // the water plane (below-water = occluded/dark, above = bright sky), and their trilinear
+        // alternation at the probe-grid period (~5 m) checkerboarded the whole sea — the pattern
+        // rode in through refl_level (the sky_reflect luma anchor), which the red-paint diagnostic
+        // + pixel sampling pinned to this branch after ripple/mesh-normal/sh_env-max A/Bs all
+        // came back byte-identical. The surface's environment is the AIR above it by definition.
+        // _hw variant (blind trilinear): the vis-weighted 8-tap alternates with the bake's
+        // visibility texture even above the surface; open sky needs no leak protection.
+        let p_air = o.world_pos + vec3<f32>(0.0, max(sh.spacing.y, 1.0), 0.0);
+        let gi_w = max(sh_irradiance_hw(p_air, Nw), ambient_floor) * sh.vol_min.w;
+        let env_w = max(sh_irradiance_hw(p_air, Rw), ambient_floor) * sh.vol_min.w;
+        let lvl_w = dot(env_w, vec3<f32>(0.2126, 0.7152, 0.0722));
+        let refl = max(env_w, sky_reflect(Rw, lvl_w));
         let deep = vec3<f32>(0.015, 0.045, 0.060);
-        let col = deep * gi * (1.0 - wf) + refl * wf + spec_rgb;
-        return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality), 1.0);
+        let col = deep * gi_w * (1.0 - wf) + refl * wf + spec_rgb;
+        // Open water is never indoors: directionality=1 keeps the full outdoor fog. The per-pixel
+        // dom.directionality (unlifted SH) alternated with the probe grid and MODULATED THE FOG
+        // into the residual banding (survived the gi/env/spec eliminations above).
+        return vec4<f32>(apply_fog(col, o.world_pos, 1.0), 1.0);
     }
     // OPAQUE pass: diffuse + GGX glint + the glossy env reflection (matte surfaces: refl_rgb ~0)
     // + emissive, all under the aerial-perspective fog. Cutouts output the fwidth-remapped

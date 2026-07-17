@@ -88,7 +88,8 @@ impl Default for GfxSettings {
             emissive: 1.0,
             shadows: std::env::var("EFT_SHADOWS").map(|v| v.trim() == "1").unwrap_or(false),
             shadows_available: false, // set at startup when sun_dir resolves
-            bloom: true,
+            // EFT_BLOOM=0 disables (debug A/B: bloom's downsample grid can checker bright haze).
+            bloom: !std::env::var("EFT_BLOOM").map(|v| v.trim() == "0").unwrap_or(false),
             bloom_intensity: 0.06,
             grade: true,             // no-op unless grade_available
             grade_available: false,  // set at startup when the LUT loads
