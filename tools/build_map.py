@@ -44,8 +44,10 @@ def run(stage, total, name, cmd, cwd, optional=False):
     print(f"  $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="ascii:replace")
+    env.setdefault("EFT_TARKMAP_ROOT", os.path.join(BBP, "tarkmap"))
+    env.setdefault("EFT_ASSETS_ROOT", os.path.join(BBP, "eft_assets"))
     p = subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="ascii", errors="replace",
     )
     for line in p.stdout:
@@ -132,12 +134,17 @@ def main():
                   "--name", m], VIEWER, optional=True)
         if ok:
             run(5, total, "grass: build grass.bin",
-                [PY, "-m", "eft_pipeline.build_grass", m, "--pack"], VIEWER, optional=True)
+                [PY, "-m", "eft_pipeline.build_grass", "--pack", pack], VIEWER, optional=True)
 
-    # 6: typed gameplay zones (exfils/mines/snipers/doors/loose loot)
-    run(6, total, "gameplay zones",
-        [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_gamedata.py"), m],
-        VIEWER, optional=True)
+    # 6: typed gameplay zones (exfils/mines/snipers/doors/loose loot). The extractor writes
+    # to tarkmap/out/<map>/gamedata.json and only PRINTS the copy step - do the copy here.
+    if run(6, total, "gameplay zones",
+           [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_gamedata.py"), m],
+           VIEWER, optional=True):
+        gd = os.path.join(out_dir, "gamedata.json")
+        if os.path.isfile(gd):
+            shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
+            print("  gamedata.json -> pack", flush=True)
 
     # 7: item icons (network; cached into the pack)
     run(7, total, "item icons",
