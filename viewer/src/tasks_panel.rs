@@ -697,64 +697,54 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                             .filter(|(i, _)| ui_state.done.contains(&obj_key(&t.id, *i)))
                             .count();
                         let all_done = total > 0 && done_n == total;
-                        theme::card(ui, card_border, |ui| {
-                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
-
-                            // ===== DARK TITLE BAR: quest name (left) + Track toggle (right) =====
-                            egui::Frame::new()
-                                .fill(theme::RAIL)
-                                .inner_margin(egui::Margin::symmetric(8, 6))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        // Place the Track button on the RIGHT first (right_to_left), then
-                                        // let the name fill the remaining space to its left (truncating),
-                                        // so a long name can never push the button off-panel.
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                let btn = if tracked {
-                                                    theme::button_filled("Tracked", TRACKED, Color32::BLACK)
-                                                } else {
-                                                    egui::Button::new(
-                                                        RichText::new("Track").size(12.0).color(theme::BEIGE),
-                                                    )
-                                                    .corner_radius(0.0)
-                                                };
-                                                if ui
-                                                    .add(btn)
-                                                    .on_hover_text(if tracked {
-                                                        "stop tracking (removes its markers + zones)"
-                                                    } else {
-                                                        "track this task (shows its markers + zones on the map)"
-                                                    })
-                                                    .clicked()
-                                                {
-                                                    if tracked {
-                                                        tr.active.remove(&t.id);
-                                                    } else {
-                                                        tr.active.insert(t.id.clone());
-                                                        quests_on = true; // tracking is pointless with the layer off
-                                                    }
-                                                }
-                                                ui.with_layout(
-                                                    egui::Layout::left_to_right(egui::Align::Center),
-                                                    |ui| {
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                RichText::new(&t.name)
-                                                                    .color(if tracked { TRACKED } else { theme::TEXT_BRIGHT })
-                                                                    .size(theme::SIZE_CARD_TITLE)
-                                                                    .strong(),
-                                                            )
-                                                            .truncate(),
-                                                        )
-                                                        .on_hover_text(&t.name);
-                                                    },
-                                                );
-                                            },
-                                        );
+                        // Task block: a flush RAIL title bar (no padding around it) sits directly on a
+                        // padded body; ONE border is painted around both (below) so the flush title
+                        // reads as part of the container. Subtask rows inside are divided by separator lines.
+                        ui.spacing_mut().item_spacing.y = 0.0; // title bar + body touch (no seam gap)
+                        let title_resp = egui::Frame::new().fill(theme::RAIL).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                // Track button on the RIGHT first (right_to_left); the name fills the space
+                                // to its left and truncates, so a long name never pushes the button off.
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let btn = if tracked {
+                                        theme::button_filled("Tracked", TRACKED, Color32::BLACK)
+                                    } else {
+                                        egui::Button::new(RichText::new("Track").size(12.0).color(theme::BEIGE)).corner_radius(0.0)
+                                    };
+                                    if ui
+                                        .add(btn)
+                                        .on_hover_text(if tracked {
+                                            "stop tracking (removes its markers + zones)"
+                                        } else {
+                                            "track this task (shows its markers + zones on the map)"
+                                        })
+                                        .clicked()
+                                    {
+                                        if tracked {
+                                            tr.active.remove(&t.id);
+                                        } else {
+                                            tr.active.insert(t.id.clone());
+                                            quests_on = true; // tracking is pointless with the layer off
+                                        }
+                                    }
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&t.name)
+                                                    .color(if tracked { TRACKED } else { theme::TEXT_BRIGHT })
+                                                    .size(theme::SIZE_CARD_TITLE)
+                                                    .strong(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&t.name);
                                     });
                                 });
+                            });
+                        });
+                        let body_resp = egui::Frame::new().fill(theme::CARD).inner_margin(egui::Margin { left: 10, right: 8, top: 6, bottom: 8 }).corner_radius(0.0).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(6.0, 5.0);
 
                             // ===== META: level + progress (left) · locate (right) =====
                             ui.horizontal(|ui| {
@@ -796,18 +786,19 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                 ui.label(RichText::new(note.join("   \u{00B7}   ")).size(9.0).italics().color(MUTED));
                             }
 
-                            ui.add_space(2.0);
-
                             // ===== SUBTASK TABLE: fixed left icon/glyph gutter + click-to-toggle rows =====
                             // Every row shares a fixed-width left gutter so the art lines up in ONE
                             // column: a 32px item ICON when the item has cached art, else a painter-drawn
                             // TYPE GLYPH (crosshair / door / flag / pin / ...). A DONE row is dimmed whole
                             // and its gutter shows a green check. Clicking the gutter, the tag, OR the
-                            // text toggles done — the whole line is the hit target.
+                            // text toggles done — the whole line is the hit target. A thin separator line
+                            // divides each subtask (and the first from the meta header above).
                             const GUTTER: f32 = 40.0;
                             const ICON: f32 = 32.0;
                             const CHIP_CAP: usize = 3;
+                            ui.spacing_mut().item_spacing.y = 4.0; // snug rows around the divider lines
                             for (i, o) in t.objectives.iter().enumerate() {
+                                ui.separator(); // separating line between subtasks
                                 let key = obj_key(&t.id, i);
                                 let is_done = ui_state.done.contains(&key);
                                 let (tag, dot) = obj_tag(&o.kind);
@@ -945,10 +936,14 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                 if toggle {
                                     if is_done { ui_state.done.remove(&key); } else { ui_state.done.insert(key.clone()); }
                                 }
-                                ui.add_space(3.0);
                             }
                         });
-                        ui.add_space(5.0);
+                        // ONE border around the whole block (flush title bar + body) so the title reads
+                        // as part of the container; TRACKED purple when tracked, else steel.
+                        let block = title_resp.response.rect.union(body_resp.response.rect);
+                        ui.painter().rect_stroke(block, 0.0, egui::Stroke::new(1.0, card_border), egui::StrokeKind::Inside);
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0); // restore for the next task
+                        ui.add_space(6.0);
                     }
                 });
             }
