@@ -1,0 +1,4 @@
+# OPTIONAL + LEGACY: only for grade/make_grade_lut.py (PCHIP film-curve REFIT).
+# The authentic game-fit LUT ships prebuilt (eft_grade_lut.bin) / regenerates via
+# make_grade_lut_game.py which needs no scipy.
+scipy>=1.11

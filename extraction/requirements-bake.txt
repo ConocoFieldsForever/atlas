@@ -1,0 +1,4 @@
+# OPTIONAL: GPU SH lighting bake (extraction/bake/bake_volume2.py).
+# Requires an NVIDIA GPU + CUDA driver at runtime. Without this, map builds skip the
+# lighting bake and the viewer renders with flat ambient (documented degrade).
+warp-lang>=1.5       # validated with warp 1.12
