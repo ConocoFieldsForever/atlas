@@ -943,14 +943,16 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         // flat WHITE tint; they get a dark wet sheen instead. Both classes ALSO blend (force
         // MAT_FLAG_BLEND even for the 16 SoftCutout materials the extractor marked OPAQUE, so
         // they feather in the P2 pass instead of hard-slabbing in P1).
+        // SoftCutout is the "Custom/Vert Paint SoftCutout DECAL" shader ONLY — role=decal
+        // (RenderType Transparent; _AlphaStrength 1.3/1.7). It feathers into terrain via COLOR_0
+        // coverage in the BLEND pass. The "Vert Paint Shader SOLID" variant shares the softCutout
+        // PARAM triple but is an OPAQUE 3-layer splat with NO alpha gate: force-blending it made
+        // coverage clamp to 0 (astr=0) -> whole courtyard/ground slabs rendered INVISIBLE (the
+        // ground_zero "yellow cube" was sky/bloom through the hole). Gate on role=="decal"; the
+        // COLOR_0 coverage path owns a real decal's visibility, so clear its hard cutout too.
         let vp_params = softcutout_params(&mat.vp);
-        if vp_params.is_some() {
+        if vp_params.is_some() && mat.role == "decal" {
             flags |= MAT_FLAG_SOFTCUTOUT | MAT_FLAG_BLEND;
-            // A SoftCutout surface's transparency IS its COLOR_0-based coverage, so it must NOT
-            // also carry the hard alpha-test: the extractor sometimes tags these role=cutout with
-            // an authored _Cutoff of 1.3 (from the softCutout param), and alpha never exceeds 1.0,
-            // so the cutout discard would nuke EVERY fragment -> invisible road (ground_zero
-            // Sandbox_road_01). Clear it; the softcutout coverage path owns visibility.
             flags &= !MAT_FLAG_CUTOUT;
         }
         // Vert-Paint 3-layer splat (BOTH the SoftCutout decal AND the opaque "Solid" variant):
@@ -1030,6 +1032,14 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
                     });
                 }
             }
+        }
+        // Vert-Paint SOLID splats have NO alpha test — they render OPAQUE with their 3-layer
+        // splat. The Otsu alpha-coverage detector mis-tags some as role=cutout with an impossible
+        // _Cutoff (1.3) because their albedo alpha is SMOOTHNESS, not hole-coverage; left set, the
+        // cutout discard (alpha < 0.5*1.3) would nuke every fragment. Clear it for any non-decal
+        // vp material (genuine SoftCutout decals kept their softcutout path above).
+        if (flags & MAT_FLAG_VP) != 0 && mat.role != "decal" {
+            flags &= !MAT_FLAG_CUTOUT;
         }
         if mat.role == "water" {
             flags |= MAT_FLAG_WATER;
