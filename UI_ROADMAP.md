@@ -29,17 +29,15 @@ scroll. State: a `RightPanelTab` enum resource (`Layers | Camera | Tasks | …`)
 - [ ] Scroll wheel adjusts fly-cam `speed` (multiplicative, clamped). Up = faster, down =
       slower. Persist across the session. HUD or tab shows the current speed.
 
-### 1c. Walking camera mode
-- [ ] Toggle **Walk mode** vs **Fly mode**. Walk = eye-height constrained (~1.7 m over the
-      ground), WASD along the ground plane, mouse-look, **jump** (space), gravity.
-      - Ground follow: sample terrain/mesh height under the camera. Options: (a) reuse the
-        pathfind/nav mesh if available, (b) raycast down against world geometry, (c) simple
-        terrain-height sample. Pick the cheapest that feels right; a raid planner doesn't need
-        perfect collision — floor-follow + jump is enough.
-- [ ] **Scroll wheel in walk mode** scales walk/sprint speed AND jump height together by a
-      factor (scroll up = faster + jumps higher = "more player-like / juiced"). One knob,
-      fun. Clamp to sane bounds.
-- [ ] Sprint (shift) in walk mode; the scroll factor multiplies both walk and sprint.
+### 1c. Walking camera mode  [DONE]
+- [x] Walk mode (CameraSettings.walk_mode / EFT_WALK=1): eye-height 1.7 m, yaw-only WASD on
+      the ground plane, jump (Space) + gravity, sprint (shift). walk_ground.rs: a prebuilt
+      2.5D XZ-bucketed WORLD-triangle grid (near-horizontal faces only), ground_height =
+      highest surface below feet+STEP_UP -> correct floor in multi-story buildings. Built
+      lazily on first activation (~1.2s, 24.5M tris on lighthouse) via ComputeTaskPool.
+- [x] Scroll in walk mode scales walk_speed (clamp 1.5..12); jump_velocity = sqrt(2*G*K*speed)
+      so apex height scales linearly with speed -> one scroll juices move + hop together.
+- [x] Sprint (shift) x1.8 in walk mode.
 
 ## 2. Visibility tab (icon: eye)
 

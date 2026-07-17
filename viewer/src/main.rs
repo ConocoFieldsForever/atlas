@@ -21,6 +21,7 @@ mod poi;
 mod render;
 mod tasks_panel;
 mod ui;
+mod walk_ground;
 
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
 use bevy::input::mouse::AccumulatedMouseMotion;
@@ -81,8 +82,10 @@ pub struct CameraSettings {
     pub fov_deg: f32,
     /// Base fly-move speed (m/s); the scroll wheel scales this live.
     pub fly_speed: f32,
-    /// Walk mode (ground-follow + jump) vs free-fly. Walk locomotion is phase 2; the toggle
-    /// lives here now so the panel + persistence exist.
+    /// Base WALK speed (m/s); the scroll wheel scales this in walk mode, and jump height rides
+    /// off it (scroll faster -> move faster + jump higher).
+    pub walk_speed: f32,
+    /// Walk mode (ground-follow + jump) vs free-fly.
     pub walk_mode: bool,
 }
 
@@ -91,7 +94,8 @@ impl Default for CameraSettings {
         Self {
             fov_deg: 60.0,   // Bevy's default PerspectiveProjection fov (0.25π ≈ 45°? no — ~60)
             fly_speed: 40.0, // matches the old FlyCam::default speed
-            walk_mode: false,
+            walk_speed: 5.0, // human-ish
+            walk_mode: std::env::var("EFT_WALK").map(|v| v.trim() == "1").unwrap_or(false),
         }
     }
 }
@@ -108,7 +112,13 @@ fn flycam_scroll(
     }
     // ~1.15x per notch; clamp so it never crawls or teleports.
     let factor = 1.15f32.powf(scroll.delta.y);
-    settings.fly_speed = (settings.fly_speed * factor).clamp(2.0, 4000.0);
+    if settings.walk_mode {
+        // In walk mode the wheel juices walk speed (and jump height rides off it) into a
+        // human-ish band, so a fast scroll makes the walk cam quicker AND jump higher.
+        settings.walk_speed = (settings.walk_speed * factor).clamp(1.5, 12.0);
+    } else {
+        settings.fly_speed = (settings.fly_speed * factor).clamp(2.0, 4000.0);
+    }
 }
 
 /// Apply the camera-tab FOV to the perspective projection when it changes.
@@ -429,9 +439,14 @@ fn main() {
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack
         .add_systems(Startup, setup)
-        .add_systems(Update, (cursor_grab, flycam_look, flycam_move).chain())
+        // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
+        // exclusive by walk_mode) so they can't race the shared Transform.
+        .add_systems(Update, (cursor_grab, flycam_look, flycam_move, walk_move).chain())
         .add_systems(Update, (apply_camera_command, auto_screenshot))
-        .add_systems(Update, (apply_gfx_camera, apply_map_switch, flycam_scroll, apply_camera_fov));
+        .add_systems(
+            Update,
+            (apply_gfx_camera, apply_map_switch, flycam_scroll, apply_camera_fov, build_walk_ground),
+        );
 
     #[cfg(feature = "egui")]
     {
@@ -651,6 +666,7 @@ fn setup(
             pitch,
             ..default()
         },
+        walk_ground::WalkState::default(), // per-camera walk locomotion state (inert until walk mode)
     ));
     // Display chain: the REAL game grade LUT (render::grade — Hejl + film curves + Fahrenheit
     // fit, baked FROM THE GAME and identical on every map) replaces Bevy's tonemapping when
@@ -756,7 +772,8 @@ fn flycam_move(
     mut q: Query<(&mut Transform, &FlyCam)>,
 ) {
     // Typing 'wasd' into the marker-search box must not fly the camera (Codex review).
-    if ui_kb.0 {
+    // In walk mode, walk_move owns locomotion — fly is inert.
+    if ui_kb.0 || settings.walk_mode {
         return;
     }
     let dt = time.delta_secs();
@@ -791,6 +808,106 @@ fn flycam_move(
             }
             tf.translation += v.normalize() * speed * dt;
         }
+    }
+}
+
+/// Lazily build the walk-mode ground grid the first time walk mode is enabled (fly-only users
+/// never pay the ~250-400 MB + build cost). One-shot: skips once the resource exists.
+fn build_walk_ground(
+    mut commands: Commands,
+    settings: Res<CameraSettings>,
+    grid: Option<Res<walk_ground::GroundGrid>>,
+    pack: Option<Res<LoadedPack>>,
+) {
+    if !settings.walk_mode || grid.is_some() {
+        return;
+    }
+    let Some(pack) = pack else { return };
+    info!("walk_ground: building walkable-surface grid (first walk-mode activation)…");
+    commands.insert_resource(walk_ground::GroundGrid::build(&pack.0));
+}
+
+/// Walk locomotion: yaw-only WASD on the ground plane at `walk_speed`, ground-follow (stairs glide),
+/// gravity + Space jump (jump height rides off walk_speed). Gated on `walk_mode`; fly is inert then.
+fn walk_move(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    ui_kb: Res<inspect::UiWantsKeyboard>,
+    settings: Res<CameraSettings>,
+    grid: Option<Res<walk_ground::GroundGrid>>,
+    mut q: Query<(&mut Transform, &FlyCam, &mut walk_ground::WalkState), With<CullCamera>>,
+) {
+    use walk_ground::{EYE_HEIGHT, GRAVITY, KILL_DROP, STEP_UP};
+    if !settings.walk_mode {
+        return;
+    }
+    let Some(grid) = grid else { return }; // still building
+    let dt = time.delta_secs().min(0.05); // clamp big frame gaps so jumps don't over-integrate
+    let typing = ui_kb.0;
+    for (mut tf, cam, mut ws) in &mut q {
+        // Horizontal: yaw-only (looking up/down must not change ground speed). Forward/right from
+        // the FlyCam yaw, flattened onto XZ (matches Quat::from_axis_angle(Y, yaw)).
+        let (s, c) = cam.yaw.sin_cos();
+        let fwd = Vec3::new(-s, 0.0, -c);
+        let right = Vec3::new(c, 0.0, -s);
+        let mut h = Vec3::ZERO;
+        if !typing {
+            if keys.pressed(KeyCode::KeyW) { h += fwd; }
+            if keys.pressed(KeyCode::KeyS) { h -= fwd; }
+            if keys.pressed(KeyCode::KeyD) { h += right; }
+            if keys.pressed(KeyCode::KeyA) { h -= right; }
+        }
+        if h != Vec3::ZERO {
+            let mut spd = settings.walk_speed;
+            if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+                spd *= 1.8; // sprint
+            }
+            tf.translation += h.normalize() * spd * dt;
+        }
+
+        // Jump (behind the typing guard so Space in a text field doesn't launch).
+        if !typing && keys.just_pressed(KeyCode::Space) && ws.grounded {
+            ws.vy = walk_ground::jump_velocity(settings.walk_speed);
+            ws.grounded = false;
+        }
+
+        // Vertical integration + ground resolve.
+        let (x, z) = (tf.translation.x, tf.translation.z);
+        let feet_y = tf.translation.y - EYE_HEIGHT;
+        let ground = grid.ground_height(x, z, feet_y, STEP_UP);
+        ws.vy -= GRAVITY * dt;
+        let mut new_y = tf.translation.y + ws.vy * dt;
+        match ground {
+            Some(g) => {
+                let target = g + EYE_HEIGHT;
+                ws.last_ground_y = g;
+                ws.has_ground = true;
+                if ws.vy <= 0.0 && new_y <= target {
+                    // Land / stand: settle exactly, and while grounded exp-smooth toward the
+                    // surface so stepping up curbs/treads glides instead of snapping.
+                    let follow = 1.0 - (-15.0 * dt).exp();
+                    new_y = tf.translation.y + (target - tf.translation.y) * follow;
+                    // Snap the last little bit to avoid perpetual approach.
+                    if (new_y - target).abs() < 0.01 {
+                        new_y = target;
+                    }
+                    ws.vy = 0.0;
+                    ws.grounded = true;
+                } else {
+                    ws.grounded = false; // airborne (rising, or above target)
+                }
+            }
+            None => {
+                // Void under the feet: keep falling. Fell-through-world backstop -> snap back.
+                ws.grounded = false;
+                if ws.has_ground && new_y < ws.last_ground_y - KILL_DROP {
+                    new_y = ws.last_ground_y + EYE_HEIGHT;
+                    ws.vy = 0.0;
+                    ws.grounded = true;
+                }
+            }
+        }
+        tf.translation.y = new_y;
     }
 }
 
