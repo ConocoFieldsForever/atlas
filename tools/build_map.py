@@ -97,6 +97,12 @@ def main():
 
     # 2: lights (optional; some maps have none / are fleet-handled)
     lv = LIGHT_LEVELS.get(m)
+    if lv is None and m in ("streets", "ground_zero") and not any(
+        f.startswith("lights_") for f in os.listdir(dataset) if f.endswith(".json")
+    ):
+        print(f"[STAGE 2/{total}] WARNING: {m} splits lights across many scenes and none are "
+              f"extracted - the bake will be SKY-ONLY (dark interiors). Run the fleet light "
+              f"merge first for full lighting.", flush=True)
     if lv is not None and not any(
         f.startswith("lights_") for f in os.listdir(dataset) if f.endswith(".json")
     ):
@@ -115,9 +121,9 @@ def main():
             os.path.join(BBP, "tarkmap"))
     else:
         print(f"[STAGE 3/{total}] bake lighting: skipped (volume2 exists)", flush=True)
-    # promote volume2.* -> volume.* (assemble reads volume.*)
-    for src, dst in [("volume2.bin", "volume.bin"), ("volume2.json", "volume.json"),
-                     ("volume2.vis.bin", "volume.vis.bin")]:
+    # promote volume2.* -> volume.* (assemble reads volume.*). vis.bin is NOT promoted:
+    # nothing in the native viewer reads it (legacy web-viewer artifact; provenance audit).
+    for src, dst in [("volume2.bin", "volume.bin"), ("volume2.json", "volume.json")]:
         s = os.path.join(out_dir, src)
         if os.path.isfile(s):
             shutil.copyfile(s, os.path.join(out_dir, dst))
