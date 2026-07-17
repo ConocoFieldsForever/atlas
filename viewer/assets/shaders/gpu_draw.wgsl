@@ -967,7 +967,10 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // distance (raw sin ripples alias into sparkle at km range — and fog owns the far look anyway).
     if (is_water && !has_albedo) {
         let d = distance(view.world_position.xyz, o.world_pos);
-        let ripple_amp = 0.06 / (1.0 + d * 0.004);
+        // Amp falls off hard past ~250 m: the derivative footprint underreads on this one
+        // 6.8 km quad at grazing, so the Nyquist gates alone leave faint residue; beyond a
+        // few hundred meters fog owns the look and the game's sea reads flat anyway.
+        let ripple_amp = (0.06 / (1.0 + d * 0.004)) * (1.0 - smoothstep(150.0, 350.0, d));
         let wp = o.world_pos.xz * 0.35;
         // Nyquist band-limit per octave (shader-side "mip" for the procedural sines): fade an
         // octave to zero as its cycles-per-pixel pass 1/4 -> 1/2. The old amplitude-only distance
