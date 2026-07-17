@@ -358,12 +358,11 @@ fn layers_panel(
     >,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
-    mut server_cmd: MessageWriter<crate::pathfind::ServerCmd>,
     route_result: Res<crate::pathfind::RouteResult>,
     server: Res<crate::pathfind::PathfindServer>,
 ) {
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
-    use crate::pathfind::{RouteRequest, ServerCmd, ServerStatus};
+    use crate::pathfind::{RouteRequest, ServerStatus};
     use crate::poi::PoiLayer;
     if gfx_ui.menu.is_some() {
         return; // start-menu mode: menu.rs owns the whole screen
@@ -918,42 +917,27 @@ fn layers_panel(
                         );
                     });
 
-                    // ===== PATHFINDING (server start/stop) =====
+                    // ===== PATHFINDING (in-process CPU routing over the baked nav grid) =====
                     CollapsingHeader::new(section_hdr("Pathfinding", 0))
                         .id_salt("sec_pathfind")
                         .default_open(false)
                         .show(ui, |ui| {
-                            // State colours from the shared tokens: running=OK green, starting=amber
-                            // accent (in-progress), stopped=faint — same semantics as everywhere else.
-                            let (dot, txt, col) = match server.status {
-                                ServerStatus::Running => ("\u{25CF}", "server running", theme::OK),
-                                ServerStatus::Starting => ("\u{25CF}", "server starting\u{2026}", ACCENT),
-                                ServerStatus::Stopped => ("\u{25CF}", "server stopped", theme::FAINT),
+                            // `Running` now means the pack's nav grid is loaded (routing is available);
+                            // there is no external server anymore — it runs on the CPU, in-process.
+                            let ready = server.status == ServerStatus::Running;
+                            let (dot, txt, col) = if ready {
+                                ("\u{25CF}", "routing ready (CPU, in-process)", theme::OK)
+                            } else {
+                                ("\u{25CF}", "no route data for this map", theme::FAINT)
                             };
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(dot).color(col).size(11.0));
                                 ui.label(RichText::new(txt).color(col).size(12.0));
                             });
-                            let running = server.status == ServerStatus::Running;
-                            let starting = server.status == ServerStatus::Starting;
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(!running && !starting, egui::Button::new("Start server"))
-                                    .clicked()
-                                {
-                                    server_cmd.write(ServerCmd::Start);
-                                }
-                                if ui
-                                    .add_enabled(running || starting, egui::Button::new("Stop server"))
-                                    .clicked()
-                                {
-                                    server_cmd.write(ServerCmd::Stop);
-                                }
-                            });
-                            // One-click route from the camera through every extract — the `chain`
-                            // query re-orders the stops, so the nearest extract comes first.
+                            // One-click route from your location through every extract — the chain
+                            // re-orders the stops, so the nearest extract comes first.
                             if ui
-                                .add_enabled(running, egui::Button::new("Route: nearest extract"))
+                                .add_enabled(ready, egui::Button::new("Route: nearest extract"))
                                 .clicked()
                             {
                                 let dests: Vec<Vec3> = extracts
@@ -970,9 +954,11 @@ fn layers_panel(
                                 }
                             }
                             ui.label(
-                                RichText::new(
-                                    "on-demand routing via the local :8091 GPU server (first query loads the map \u{2248}30 s)",
-                                )
+                                RichText::new(if ready {
+                                    "runs on the CPU in-process (no GPU/server) \u{2014} routes from your location (walk position or camera)"
+                                } else {
+                                    "this map has no baked nav grid \u{2014} rebuild it from the start menu to enable routing"
+                                })
                                 .size(10.0)
                                 .italics()
                                 .color(MUTED),

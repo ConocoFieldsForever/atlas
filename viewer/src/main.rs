@@ -14,6 +14,7 @@ mod inspect;
 mod loot;
 mod menu;
 mod menu_fx;
+mod nav;
 mod pathfind;
 mod paths;
 mod pick;
@@ -435,7 +436,7 @@ fn main() {
         .add_plugins(inspect::InspectPlugin) // left-click a marker -> floating info card (\u{2715} to close)
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
         .add_plugins(tasks_panel::TasksPanelPlugin) // revamped Tasks tab: catalog + icon cache (router calls tasks_panel_ui)
-        .add_plugins(pathfind::PathfindPlugin) // on-demand routing via the :8091 GPU pathfind server
+        .add_plugins(pathfind::PathfindPlugin) // in-process CPU routing over the baked nav grid (nav.rs)
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack
