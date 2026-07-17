@@ -20,9 +20,15 @@ mapping drops 75% of lighthouse Slice_5_4's clumps into the sea).
 Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 (20 B), pack space.
         <pack>/grass_sidecar.json = {count, albedo, tint}
 
-  python -m eft_pipeline.build_grass --pack packs/interchange.eftpack
+  python -m eft_pipeline.build_grass --pack packs/interchange.eftpack [--self-contained]
+
+SELF-CONTAINED packs (redistribution PR3): when the resolved albedo already lives INSIDE the
+pack (terrain_layers/ was copied in by assemble_bevy --self-contained) the sidecar gets the
+PACK-RELATIVE path; with --self-contained an outside albedo is COPIED into the pack as
+grass_albedo.png. Otherwise the legacy absolute-path contract is unchanged (the viewer
+resolves relative sidecar paths against the pack dir, absolute passes through).
 """
-import os, sys, json, struct, argparse, re, glob
+import os, sys, json, struct, argparse, re, glob, shutil
 import numpy as np
 
 FLAG_TERRAIN = 1 << 1
@@ -202,21 +208,52 @@ def main():
                     help="keep ~1/N^2 of the nonzero density cells (deterministic hash-selected, "
                          "no parity bias). Default 1 = every nonzero cell: the 512-res grids "
                          "(1.37m cells) already bound the count (~435k lighthouse, ~217k interchange)")
+    ap.add_argument("--self-contained", action="store_true",
+                    help="redistribution PR3: keep every path written into grass_sidecar.json "
+                         "pack-relative, copying the grass albedo into the pack when it does not "
+                         "already live there")
     a = ap.parse_args()
     pack = a.pack
     mani, mb, ib = load_pack(pack)
-    # per-pack terrain_layers dir (manifest sidecar is an absolute path to its manifest.json).
+    # per-pack terrain_layers dir (manifest sidecar is the path to its manifest.json; legacy
+    # packs wrote it ABSOLUTE, self-contained packs write it PACK-RELATIVE -> resolve against
+    # the pack dir, mirroring the viewer's Pack::resolve_path).
     # Maps with no terrain sidecar or no density grids (indoor maps: Factory, Labs) simply have
     # no grass — SKIP cleanly (write nothing, exit 0) so the all-maps build fleet doesn't abort.
     # A map that HAS density grids but yields zero clumps still hard-fails below (that's a bug).
     tl_side = (mani.get("sidecars") or {}).get("terrainLayers")
     if not tl_side:
         print(f"[grass] {pack}: no terrainLayers sidecar — grassless map, skipping"); return
+    if not os.path.isabs(tl_side):
+        tl_side = os.path.join(pack, tl_side)
     TL = os.path.dirname(tl_side)
+
+    def _density_names(d):
+        return sorted({m.group(1)
+                       for f in glob.glob(os.path.join(d, "grass_density_Slice_*.bin"))
+                       if (m := re.search(r"(Slice_\d+_\d+)", os.path.basename(f)))})
+
     # discover slice names from the density files (interchange: 4, lighthouse: 6, ...)
-    names = sorted({m.group(1)
-                    for f in glob.glob(os.path.join(TL, "grass_density_Slice_*.bin"))
-                    if (m := re.search(r"(Slice_\d+_\d+)", os.path.basename(f)))})
+    names = _density_names(TL)
+    # SELF-CONTAINED gap: build_map runs the density EXTRACTOR after assemble copied
+    # terrain_layers into the pack, so a first-ever build finds no density grids in the pack
+    # copy. Fall back to the dataset's terrain_layers (manifest.datasetPath provenance) and,
+    # under --self-contained, mirror the density files into the pack so it stays complete.
+    ds_tl = os.path.join(mani.get("datasetPath") or "", "terrain_layers")
+    if not names and os.path.normcase(os.path.normpath(TL)) != os.path.normcase(os.path.normpath(ds_tl)):
+        ds_names = _density_names(ds_tl) if os.path.isdir(ds_tl) else []
+        if ds_names:
+            if a.self_contained:
+                os.makedirs(TL, exist_ok=True)
+                for f in glob.glob(os.path.join(ds_tl, "grass_density_Slice_*.bin")):
+                    shutil.copy2(f, os.path.join(TL, os.path.basename(f)))
+                print(f"[grass] self-contained: mirrored {len(ds_names)} dataset density slices "
+                      f"into {TL}")
+                names = _density_names(TL)
+            else:
+                print(f"[grass] density grids not in {TL} - reading from dataset {ds_tl}")
+                TL = ds_tl
+                names = ds_names
     if not names:
         print(f"[grass] {pack}: no grass_density_Slice_*.bin under {TL} — grassless map, skipping")
         return
@@ -315,14 +352,39 @@ def main():
     if alb is None:
         alb = _fallback_albedo(TL)
         print(f"[grass] no grass albedo in {TL}, using cross-map fallback {alb}")
+    # sidecar path contract (redistribution PR3): an albedo already INSIDE the pack (assemble
+    # --self-contained copied terrain_layers in) is written PACK-RELATIVE — the viewer resolves
+    # relative sidecar paths against the pack dir. --self-contained copies an outside albedo
+    # into the pack as grass_albedo.png. Otherwise the legacy absolute path is kept verbatim.
+    pack_abs = os.path.abspath(pack)
+    alb_abs = os.path.abspath(alb)
+    try:
+        rel = os.path.relpath(alb_abs, pack_abs)
+    except ValueError:                                    # different drive on Windows
+        rel = None
+    if rel is not None and rel.split(os.sep)[0] != ".." and not os.path.isabs(rel):
+        alb_out = rel.replace("\\", "/")
+        print(f"[grass] albedo inside pack -> pack-relative {alb_out}")
+    elif a.self_contained and os.path.exists(alb_abs):
+        shutil.copy2(alb_abs, os.path.join(pack_abs, "grass_albedo.png"))
+        alb_out = "grass_albedo.png"
+        print(f"[grass] self-contained: copied {alb_abs} -> {alb_out}")
+    else:
+        if a.self_contained:
+            print(f"[grass] WARNING: --self-contained but albedo {alb_abs} does not exist - "
+                  f"keeping the legacy absolute path")
+        alb_out = alb_abs.replace("\\", "/")
     tint = [0.7, 0.75, 0.55]
     try:
-        g = json.load(open(mani["sidecars"]["grassJson"]))
+        gj = mani["sidecars"]["grassJson"]
+        if gj and not os.path.isabs(gj):
+            gj = os.path.join(pack, gj)                   # self-contained packs: pack-relative sidecar
+        g = json.load(open(gj))
         sl = next(iter(g.get("slices", {}).values()), {})
         tint = sl.get("tint", tint)
     except Exception:
         pass
-    json.dump({"count": total, "albedo": alb.replace("\\", "/"), "tint": tint},
+    json.dump({"count": total, "albedo": alb_out, "tint": tint},
               open(os.path.join(pack, "grass_sidecar.json"), "w"), indent=1)
     print(f"[grass] TOTAL {total} clumps ({skipped_road} skipped under roads) -> {pack}/grass.bin ({len(recs)//20} recs, {len(recs)/1e6:.1f} MB)")
 

@@ -5,7 +5,9 @@ full game extraction is a separate, much longer step; the menu surfaces that cas
 Stages print `[STAGE i/N] name` markers and stream child output unbuffered so the menu's
 progress panel can display them live. Exit 0 = pack ready (stamped). ASCII output only.
 
-Usage: python tools/build_map.py <map> [--dry-run]
+Usage: python tools/build_map.py <map> [--dry-run] [--self-contained]
+  --self-contained: redistribution PR3 — passed through to assemble_bevy + build_grass so
+  the emitted pack copies its textures/sidecars in and references them pack-relative.
 Env (contract per extraction/README.md; unset -> legacy dev-machine defaults):
   EFT_TARKMAP_ROOT = the dir CONTAINING maps/ and out/ (a "tarkmap dir")
   EFT_ASSETS_ROOT  = the datasets dir (default: <EFT_TARKMAP_ROOT>/../eft_assets)
@@ -103,8 +105,10 @@ def dataset_name(m):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry = "--dry-run" in sys.argv
+    self_contained = "--self-contained" in sys.argv
+    sc_flag = ["--self-contained"] if self_contained else []
     if not args:
-        print("usage: build_map.py <map> [--dry-run]")
+        print("usage: build_map.py <map> [--dry-run] [--self-contained]")
         sys.exit(2)
     m = args[0]
     dsname = dataset_name(m)
@@ -117,9 +121,13 @@ def main():
 
     print(f"[BUILD] map={m} dataset={dsname} dataset_dir={dataset}", flush=True)
     if dry:
+        # --self-contained is noted on the stages it changes (assemble + grass emit
+        # pack-relative, copied-in textures/sidecars instead of absolute references).
+        sc_note = " (self-contained)" if self_contained else ""
         for i, name in enumerate(
-            ["check dataset", "extract lights", "bake lighting (GPU)", "assemble pack",
-             "grass", "gameplay zones", "item icons", "stamp fingerprint"], 1):
+            ["check dataset", "extract lights", "bake lighting (GPU)",
+             "assemble pack" + sc_note, "grass" + sc_note,
+             "gameplay zones", "item icons", "stamp fingerprint"], 1):
             print(f"[STAGE {i}/{total}] {name}", flush=True)
             time.sleep(0.6)
             print(f"[STAGE {i}/{total}] {name}: done (0s)", flush=True)
@@ -172,7 +180,8 @@ def main():
             shutil.copyfile(s, os.path.join(out_dir, dst))
 
     # 4: assemble the pack (atomic; auto-ships loot/tasks/grade sidecars)
-    run(4, total, "assemble pack", [PY, "-m", "eft_pipeline.assemble_bevy", m], VIEWER)
+    run(4, total, "assemble pack",
+        [PY, "-m", "eft_pipeline.assemble_bevy", m] + sc_flag, VIEWER)
 
     # 5: grass (outdoor maps)
     if m in INDOOR_NO_GRASS:
@@ -183,7 +192,8 @@ def main():
                   "--name", dsname], VIEWER, optional=True)
         if ok:
             run(5, total, "grass: build grass.bin",
-                [PY, "-m", "eft_pipeline.build_grass", "--pack", pack], VIEWER, optional=True)
+                [PY, "-m", "eft_pipeline.build_grass", "--pack", pack] + sc_flag,
+                VIEWER, optional=True)
 
     # 6: typed gameplay zones (exfils/mines/snipers/doors/loose loot). The extractor writes
     # to tarkmap/out/<map>/gamedata.json and only PRINTS the copy step - do the copy here.
