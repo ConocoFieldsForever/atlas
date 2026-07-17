@@ -216,10 +216,6 @@ pub struct GameDataZones {
     pub hazard_zones: Vec<(Vec<Vec3>, bool)>,
     /// Typed transit footprints — Transits toggle.
     pub transits: Vec<(Vec<Vec3>, bool)>,
-    /// Typed quest/visit trigger zones — Quests toggle (tracker-independent: they are scene
-    /// truth, not task-bound; the tasks.json outlines stay tracker-gated in
-    /// `draw_quest_outlines`).
-    pub quest_zones: Vec<(Vec<Vec3>, bool)>,
 }
 
 pub struct PoiPlugin;
@@ -1598,16 +1594,15 @@ fn spawn_pois(
                 gd_zones.hazard_zones.push((pts, z.active));
             }
         }
+        // Quest TRIGGER markers only. The zone FOOTPRINTS (walls + outlines) are intentionally NOT
+        // built here: gamedata triggers carry no task id, so they can't be limited to the currently
+        // tracked quest. Tracked-quest zones come from the tasks.json path below (`QuestMarkerTask`
+        // walls + `draw_quest_outlines`), which the tracker focuses. (User: only show tracked
+        // quests' zones — a raw scene-truth footprint for every quest is exactly the clutter to avoid.)
         for z in &gd.quest_triggers {
             let ent = spawn(&mut commands, PoiLayer::Quest, z.pos, gd_trigger_info(z), None);
             if !z.active {
                 commands.entity(ent).insert(SceneInactive);
-            }
-            if z.outline.len() >= 3 {
-                let pts: Vec<Vec3> = z.outline.iter().map(|a| Vec3::from(*a)).collect();
-                wall(&mut commands, &mut meshes, PoiLayer::Quest, &pts,
-                     poi_look(PoiLayer::Quest).0, z.active);
-                gd_zones.quest_zones.push((pts, z.active));
             }
         }
         // Transit MARKERS stay tarkov.dev (loot.json `transits`, richer copy: destination +
@@ -1940,19 +1935,20 @@ fn apply_poi_visibility(
 fn apply_quest_visibility(
     toggles: Res<LayerToggles>,
     tracker: Res<QuestTracker>,
-    mut q: Query<(&QuestMarkerTask, &mut Visibility)>,
+    mut q: Query<(&QuestMarkerTask, Option<&ZoneWall>, &mut Visibility)>,
 ) {
     if !toggles.is_changed() && !tracker.is_changed() {
         return;
     }
-    for (task, mut vis) in &mut q {
+    for (task, is_zone, mut vis) in &mut q {
+        let tracked = tracker.active.contains(&task.0);
+        // Zone FOOTPRINTS (walls) show ONLY for a tracked quest — no "show all when nothing tracked"
+        // fallback, so the map stays clean until you track something (user: don't display quest
+        // zones unless they're from a tracked quest). Point MARKERS keep the fallback: with nothing
+        // tracked, all quest markers show so you can discover quests; tracking then focuses to them.
         let show = toggles.quests
-            && (tracker.active.is_empty() || tracker.active.contains(&task.0));
-        *vis = if show {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
+            && if is_zone.is_some() { tracked } else { tracker.active.is_empty() || tracked };
+        *vis = if show { Visibility::Visible } else { Visibility::Hidden };
     }
 }
 
@@ -1992,7 +1988,6 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
         (toggles.sniper_zones, &zones.sniper_zones, poi_look(PoiLayer::SniperZone).0),
         (toggles.hazards, &zones.hazard_zones, poi_look(PoiLayer::Hazard).0),
         (toggles.transits, &zones.transits, poi_look(PoiLayer::Transit).0),
-        (toggles.quests, &zones.quest_zones, poi_look(PoiLayer::Quest).0),
     ] {
         if !on {
             continue;
