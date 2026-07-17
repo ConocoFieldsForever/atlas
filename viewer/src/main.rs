@@ -878,6 +878,12 @@ fn walk_move(
                 spd *= 1.8; // sprint
             }
             tf.translation += h.normalize() * spd * dt;
+            // Player-sized collision: push the body capsule back out of any wall it entered so you
+            // can't run through walls/fences. Purely horizontal (feet height is unchanged here).
+            let feet_y = tf.translation.y - EYE_HEIGHT;
+            let fixed = grid.resolve_walls(tf.translation, feet_y);
+            tf.translation.x = fixed.x;
+            tf.translation.z = fixed.y;
         }
 
         // Jump (behind the typing guard so Space in a text field doesn't launch).
