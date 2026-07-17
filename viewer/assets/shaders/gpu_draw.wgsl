@@ -956,11 +956,15 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         // is dark from above and a mirror only toward grazing — like a real puddle.
         let wf = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);      // water fresnel (F0≈0.02..0.04)
         let refl = max(sh_env, sky_env);                   // crisp bright sky mirror
-        let raw = albedo.a / max(m.tint.a, 1e-3);          // ~ puddle_noise coverage in [0,1]
-        let mask = smoothstep(0.12, 0.45, raw);            // feathered puddle shape
+        // Feather across the texture's OWN soft alpha gradient. (The old raw=albedo.a/tint.a
+        // INFLATED it ~3.2x — tint.a≈0.31 — so smoothstep(0.12,0.45) snapped everything above
+        // texture-alpha 0.14 to fully opaque, collapsing the soft shape into HARD polygon edges.)
+        let mask = smoothstep(0.04, 0.55, albedo.a);       // soft puddle shape from the mask itself
         let body = m.tint.rgb * gi;                        // dark wet film, GI-lit
         let col = body * (1.0 - wf) + refl * wf + spec_rgb;
-        let a = mask * clamp(0.45 + 0.55 * wf, 0.0, 1.0);  // shape-masked; grazing -> opaque mirror
+        // Thin film head-on (road shows through -> subtle wet sheen, not a solid dark slab),
+        // ramping to a mirror at grazing where fresnel dominates.
+        let a = mask * clamp(0.20 + 0.7 * wf, 0.0, 1.0);
         return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality), a);
     }
     // Glass / plain decal: env reflection (glass is glossy -> strong) + the GGX glint make it read as
