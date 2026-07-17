@@ -717,16 +717,20 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     var vp_smooth = -1.0;
     if ((m.flags & MAT_FLAG_VP) != 0u) {
         let v = vp_table[m._pad2];
-        // Un-bake layer 0's ST from the mesh UV to recover the raw UV (guard degenerate scales).
-        let s0 = select(v.uv0.xy, vec2<f32>(1.0), abs(v.uv0.xy) < vec2<f32>(1e-4));
-        let raw_uv = (o.uv - v.uv0.zw) / s0;
-        let raw_dx = duv_dx / s0;
-        let raw_dy = duv_dy / s0;
-        // Heights control mask (R/G/B = per-layer coverage) at the RAW uv — sampling each layer's
-        // tiled uv instead was noise-at-3-scales fighting itself (web-viewer parity note).
+        // Relative transforms from the BAKED base UV (layer0 ST baked in, then V-FLIPPED —
+        // assemble_bevy v_baked = 1-(v*sy0+oy0)) to each layer's / the heights mask's own frame.
+        // detail_xform is the SAME V-flip-aware math the detail maps already validate; the naive
+        // `(uv - zw)/xy` un-bake ignored the flip and shifted layers/heights by up to half a
+        // tile on 136 shipped materials (Codex audit C2).
+        let x1 = detail_xform(v.uv0, v.uv1);
+        let x2 = detail_xform(v.uv0, v.uv2);
+        let xh = detail_xform(v.uv0, vec4<f32>(1.0, 1.0, 0.0, 0.0));
+        // Heights control mask (R/G/B = per-layer coverage) in its own frame — sampling each
+        // layer's tiled uv instead was noise-at-3-scales fighting itself (web-viewer parity).
         var h = vec3<f32>(1.0);
         if (v.tex.w != MAT_ALBEDO_NONE) {
-            h = textureSampleGrad(albedo_tex[v.tex.w], albedo_samp, raw_uv, raw_dx, raw_dy).rgb;
+            h = textureSampleGrad(albedo_tex[v.tex.w], albedo_samp, o.uv * xh.xy + xh.zw,
+                                  duv_dx * xh.xy, duv_dy * xh.xy).rgb;
         }
         let hw = h * o.color.rgb;
         let hs = hw.x + hw.y + hw.z;
@@ -737,13 +741,13 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
             w = pow(max(hw, vec3<f32>(1e-4)), vec3<f32>(max(v.tint0.w, 1.0)));
             w = w / max(w.x + w.y + w.z, 1e-4);
         }
-        let u1 = raw_uv * v.uv1.xy + v.uv1.zw;
-        let u2 = raw_uv * v.uv2.xy + v.uv2.zw;
+        let u1 = o.uv * x1.xy + x1.zw;
+        let u2 = o.uv * x2.xy + x2.zw;
         let a0 = textureSampleGrad(albedo_tex[v.tex.x], albedo_samp, o.uv, duv_dx, duv_dy);
         let a1 = textureSampleGrad(albedo_tex[v.tex.y], albedo_samp, u1,
-                                   raw_dx * v.uv1.xy, raw_dy * v.uv1.xy);
+                                   duv_dx * x1.xy, duv_dy * x1.xy);
         let a2 = textureSampleGrad(albedo_tex[v.tex.z], albedo_samp, u2,
-                                   raw_dx * v.uv2.xy, raw_dy * v.uv2.xy);
+                                   duv_dx * x2.xy, duv_dy * x2.xy);
         var spl = w.x * a0.rgb * v.tint0.rgb + w.y * a1.rgb * v.tint1.rgb + w.z * a2.rgb * v.tint2.rgb;
         // Near-black resolve (dark layer tints / bad mask) falls back to layer 0 (web parity).
         if (dot(spl, vec3<f32>(0.299, 0.587, 0.114)) < 0.02) {

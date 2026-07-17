@@ -183,7 +183,7 @@ fn configure_lighting(
         .and_then(|v| {
             v.get("sun_dir").and_then(|s| s.as_array()).and_then(|a| {
                 Some(Vec3::new(
-                    -(a.first()?.as_f64()? as f32),
+                    a.first()?.as_f64()? as f32, // volume.json sun_dir is ALREADY viewer-space (bake conjugates); flipping again mirrored sun/shadows vs the SH radiance (audit C1)
                     a.get(1)?.as_f64()? as f32,
                     a.get(2)?.as_f64()? as f32,
                 ))
