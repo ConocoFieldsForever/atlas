@@ -203,8 +203,77 @@ impl Plugin for UiPlugin {
             // .chain(): egui panel STACKING follows .show() order, so the toolbar must run first
             // (rightmost rail) and the content panels second (to its left). layers/camera/tasks
             // share the "map_layers" slot and each early-returns unless it's the active tab.
-            (toolbar_panel, layers_panel, camera_panel, tasks_tab, pos_hud).chain(),
+            // fit_camera_viewport LAST: once all right-side panels are laid out, shrink the 3D
+            // camera viewport to the free central area so the scene re-centers instead of hiding
+            // behind the panel.
+            (toolbar_panel, layers_panel, camera_panel, tasks_tab, pos_hud, fit_camera_viewport)
+                .chain(),
         );
+    }
+}
+
+/// Re-center the 3D scene in the area egui leaves free (the window minus the right-side rail +
+/// content panel) so it isn't just hidden behind the panel. We do NOT shrink the camera's viewport:
+/// bevy_egui derives egui's own screen size from this camera's render target, so shrinking it feeds
+/// back into `available_rect` and collapses the panel. Instead we apply an OFF-AXIS (lens-shift)
+/// projection via `sub_camera_view`, which changes only the projection matrix — the render target
+/// (and thus egui) stays the full window. Shifting the rendered content left by half the panel width
+/// puts whatever WAS at window-center at the center of the free region. `world_to_viewport` /
+/// `viewport_to_world` read the same shifted matrix, so marker billboards + the pick ray stay
+/// consistent. Cleared in start-menu mode or when nothing occupies the sides.
+#[cfg(feature = "egui")]
+fn fit_camera_viewport(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut cam: Query<&mut bevy::camera::Camera, With<crate::render::CullCamera>>,
+) {
+    if menu.is_some() {
+        if let Ok(mut c) = cam.single_mut() {
+            if c.sub_camera_view.is_some() {
+                c.sub_camera_view = None; // menu owns the whole screen — no shift
+            }
+        }
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    let avail = ctx.available_rect(); // free central region (egui points), stable: we never shrink the target
+    let ppp = ctx.pixels_per_point();
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let win_w = window.resolution.physical_width() as f32;
+    let win_h = window.resolution.physical_height() as f32;
+    if win_w < 1.0 || win_h < 1.0 {
+        return;
+    }
+    let vis_w = (avail.width() * ppp).clamp(0.0, win_w);
+    let panel_w = (win_w - vis_w).max(0.0);
+    let Ok(mut camera) = cam.single_mut() else {
+        return;
+    };
+    // No side panel (e.g. hide-all) -> centered full-window, no shift.
+    if panel_w < 4.0 {
+        if camera.sub_camera_view.is_some() {
+            camera.sub_camera_view = None;
+        }
+        return;
+    }
+    // Lens-shift the content left by panel_w/2 px (offset.x on a full-window virtual sensor).
+    let sub = bevy::camera::SubCameraView {
+        full_size: UVec2::new(win_w as u32, win_h as u32),
+        offset: Vec2::new(panel_w * 0.5, 0.0),
+        size: UVec2::new(win_w as u32, win_h as u32),
+    };
+    let same = matches!(
+        &camera.sub_camera_view,
+        Some(s) if s.full_size == sub.full_size && s.size == sub.size
+            && (s.offset - sub.offset).abs().max_element() < 0.5
+    );
+    if !same {
+        camera.sub_camera_view = Some(sub);
     }
 }
 
