@@ -550,6 +550,26 @@ impl Pack {
         )
     }
 
+    /// "Where the map's content actually is" — the per-axis MEDIAN of every instance's world
+    /// translation. Used for the initial camera framing so it opens NEAR populated geometry on
+    /// EVERY map, not at the AABB center (which for many maps sits in ocean / dead space off the
+    /// playable area). Median (not mean) rejects far backdrop / skybox / sea-plane outliers that
+    /// would otherwise drag the anchor into emptiness. Falls back to the AABB center when the pack
+    /// has no instances.
+    pub fn content_anchor(&self) -> Vec3 {
+        if self.instances.is_empty() {
+            return self.bounds_center();
+        }
+        let mut xs: Vec<f32> = self.instances.iter().map(|i| i.affine[3]).collect();
+        let mut ys: Vec<f32> = self.instances.iter().map(|i| i.affine[7]).collect();
+        let mut zs: Vec<f32> = self.instances.iter().map(|i| i.affine[11]).collect();
+        let med = |v: &mut [f32]| -> f32 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        };
+        Vec3::new(med(&mut xs), med(&mut ys), med(&mut zs))
+    }
+
     /// Half-diagonal of the world AABB (initial camera standoff).
     pub fn bounds_extent(&self) -> f32 {
         let b = &self.manifest.bounds;
