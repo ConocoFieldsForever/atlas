@@ -21,6 +21,7 @@ mod poi;
 mod render;
 mod tasks_panel;
 mod ui;
+mod ui_theme;
 mod walk_ground;
 
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};

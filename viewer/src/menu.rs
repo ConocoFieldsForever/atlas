@@ -567,36 +567,30 @@ pub fn menu_ui(
         80
     }));
 
-    // EFT gear-screen scheme: near-black field, charcoal panels with 1px steel borders,
-    // thin uppercase type, desaturated bone/beige text, muted green/red state colors.
-    const BG: Color32 = Color32::from_rgb(9, 9, 9);
-    const HEADER: Color32 = Color32::from_rgb(16, 16, 16);
-    const CARD: Color32 = Color32::from_rgb(20, 20, 19);
-    const BORDER: Color32 = Color32::from_rgb(48, 47, 44);
-    const BONE: Color32 = Color32::from_rgb(215, 211, 203);
-    const BEIGE: Color32 = Color32::from_rgb(199, 178, 153);
-    const DIM: Color32 = Color32::from_rgb(110, 107, 100);
-    const OK: Color32 = Color32::from_rgb(127, 174, 106);
-    const WARN: Color32 = Color32::from_rgb(200, 140, 50);
-    const BAD: Color32 = Color32::from_rgb(176, 65, 62);
+    // EFT gear-screen scheme, all tokens from the single source of truth (ui_theme). Local aliases
+    // keep the menu body readable; no drifted literal values live here anymore.
+    use crate::ui_theme as theme;
+    const BG: Color32 = theme::BG; // near-black field (authentic EFT loading-screen 10,10,10)
+    const HEADER: Color32 = theme::RAIL; // header bar + build-panel fill
+    const CARD: Color32 = theme::CARD; // map-row card (raised over BG, warm charcoal)
+    const BORDER: Color32 = theme::BORDER; // 1px warm steel
+    const BONE: Color32 = theme::BONE;
+    const BEIGE: Color32 = theme::BEIGE;
+    const DIM: Color32 = theme::MUTED;
+    const OK: Color32 = theme::OK;
+    const WARN: Color32 = theme::WARN;
+    const BAD: Color32 = theme::DANGER;
 
-    // EFT UI is all hard corners — square every widget while the menu owns the screen.
-    ctx.style_mut(|s| {
-        let z = egui::CornerRadius::ZERO;
-        s.visuals.widgets.noninteractive.corner_radius = z;
-        s.visuals.widgets.inactive.corner_radius = z;
-        s.visuals.widgets.hovered.corner_radius = z;
-        s.visuals.widgets.active.corner_radius = z;
-        s.visuals.widgets.open.corner_radius = z;
-        s.visuals.window_corner_radius = z;
-        s.visuals.menu_corner_radius = z;
-    });
+    // Theme egui's own defaults once (square corners, spacing, widget fills + text, selection).
+    // Modifies the existing dark style in place — never replaces it (that flips egui to its light
+    // theme and paints a fullscreen pale layer, the historical bug).
+    theme::apply_global_style(ctx);
 
     egui::TopBottomPanel::top("menu_header")
         .frame(egui::Frame::new().fill(HEADER).inner_margin(egui::Margin::symmetric(24, 10)))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("TARKOV STASH").color(BONE).size(24.0).strong());
+                ui.label(RichText::new("TARKOV STASH").color(BONE).size(theme::SIZE_DISPLAY).strong());
                 ui.add_space(14.0);
                 ui.label(RichText::new("|  MAP").color(BEIGE).size(13.0));
                 ui.label(RichText::new("SELECT LOCATION").color(DIM).size(13.0));
@@ -656,7 +650,7 @@ pub fn menu_ui(
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.set_min_height(34.0);
-                                let title = RichText::new(e.title).size(19.0).strong().color(
+                                let title = RichText::new(e.title).size(theme::SIZE_ROW_TITLE).strong().color(
                                     if installed { BEIGE } else { DIM },
                                 );
                                 ui.add_sized([220.0, 30.0], egui::Label::new(title));
@@ -685,9 +679,7 @@ pub fn menu_ui(
                                             .color(DIM)
                                             .size(11.0),
                                     );
-                                    let tick = |on: bool, s: &str| {
-                                        RichText::new(s).size(11.0).color(if on { OK } else { DIM })
-                                    };
+                                    let tick = |on: bool, s: &str| theme::tick(on, s);
                                     ui.label(tick(e.has_volume, "light"));
                                     ui.label(tick(e.has_grass, "grass"));
                                     ui.label(tick(e.has_gamedata, "zones"));
@@ -700,11 +692,7 @@ pub fn menu_ui(
                                             building_key.as_deref() == Some(e.key);
                                         let any_building = building_key.is_some();
                                         if installed {
-                                            let play = egui::Button::new(
-                                                RichText::new("PLAY").strong().color(Color32::BLACK),
-                                            )
-                                            .fill(BEIGE)
-                                            .corner_radius(0.0);
+                                            let play = theme::primary_button("PLAY");
                                             if ui.add_sized([84.0, 30.0], play).clicked() {
                                                 switch.0 = e.pack_dir.clone();
                                             }
@@ -712,17 +700,11 @@ pub fn menu_ui(
                                             // game-file hashes no longer match the pack's stamp —
                                             // re-runs the pipeline so the data catches up.
                                             if e.fp_match == Some(false) {
-                                                let upd = egui::Button::new(
-                                                    RichText::new(if this_building {
-                                                        "UPDATING..."
-                                                    } else {
-                                                        "UPDATE"
-                                                    })
-                                                    .color(Color32::BLACK)
-                                                    .strong(),
-                                                )
-                                                .fill(WARN)
-                                                .corner_radius(0.0);
+                                                let upd = theme::warn_button(if this_building {
+                                                    "UPDATING..."
+                                                } else {
+                                                    "UPDATE"
+                                                });
                                                 if ui
                                                     .add_enabled_ui(!any_building, |ui| {
                                                         ui.add_sized([84.0, 30.0], upd).on_hover_text(
@@ -737,13 +719,7 @@ pub fn menu_ui(
                                                 }
                                             }
                                             // Tarkov-style destructive button: red fill, black text.
-                                            let del_btn = |t: &str| {
-                                                egui::Button::new(
-                                                    RichText::new(t).color(Color32::BLACK).strong(),
-                                                )
-                                                .fill(BAD)
-                                                .corner_radius(0.0)
-                                            };
+                                            let del_btn = |t: &str| theme::danger_button(t);
                                             if confirm_idx == Some(i) {
                                                 if ui
                                                     .add_sized([120.0, 30.0], del_btn("CONFIRM"))

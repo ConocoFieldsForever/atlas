@@ -456,17 +456,18 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
         server,
     } = p;
 
-    // ---- Tarkov gear-screen palette (charcoal cards, bone/beige text, amber accent, square) ----
-    const ACCENT: Color32 = Color32::from_rgb(232, 194, 122); // warm amber
-    const BONE: Color32 = Color32::from_rgb(208, 200, 178);
-    const HDR: Color32 = Color32::from_rgb(160, 164, 160);
-    const MUTED: Color32 = Color32::from_rgb(122, 124, 118);
-    const CARD_BG: Color32 = Color32::from_rgb(26, 28, 29);
-    const CARD_BORDER: Color32 = Color32::from_rgb(58, 60, 55);
-    const KAPPA: Color32 = Color32::from_rgb(212, 175, 95);
-    const LK: Color32 = Color32::from_rgb(120, 200, 210);
-    const FIR: Color32 = Color32::from_rgb(126, 190, 120);
-    const TRACKED: Color32 = Color32::from_rgb(150, 138, 232); // quest purple accent when tracked
+    // ---- Palette: all from the single source of truth (ui_theme); thin local aliases keep the
+    // body readable. This file's BONE/MUTED/CARD used to DRIFT from menu.rs/ui.rs — now unified. ----
+    use crate::ui_theme as theme;
+    const ACCENT: Color32 = theme::ACCENT;
+    const BONE: Color32 = theme::BONE;
+    const HDR: Color32 = theme::SECTION;
+    const MUTED: Color32 = theme::MUTED;
+    const CARD_BORDER: Color32 = theme::BORDER;
+    const KAPPA: Color32 = theme::KAPPA;
+    const LK: Color32 = theme::CYAN;
+    const FIR: Color32 = theme::OK;
+    const TRACKED: Color32 = theme::TRACKED; // quest purple accent when tracked
 
     // Local copies for the clone-edit-compare write-back (see module doc).
     let mut tr = (**tracker).clone();
@@ -487,7 +488,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
 
     // ---- HEADER ----
     ui.horizontal(|ui| {
-        ui.label(RichText::new("TASKS").color(ACCENT).size(17.0).strong());
+        ui.label(theme::title("TASKS"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if !tr.active.is_empty()
                 && ui
@@ -633,7 +634,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             );
         }
         RouteStatus::Error(e) => {
-            ui.label(RichText::new(e.as_str()).size(10.0).color(Color32::from_rgb(210, 96, 84)));
+            ui.label(RichText::new(e.as_str()).size(theme::SIZE_CAPTION).color(theme::DANGER_TEXT));
         }
         RouteStatus::Idle => {}
     }
@@ -673,26 +674,14 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                 return;
             }
             for (trader, tasks) in &groups {
-                CollapsingHeader::new(
-                    RichText::new(format!("{trader}   \u{00B7} {}", tasks.len()))
-                        .color(HDR)
-                        .size(12.0)
-                        .strong(),
-                )
+                CollapsingHeader::new(theme::section_header(trader, tasks.len()))
                 .id_salt(format!("trader_{trader}"))
                 .default_open(true)
                 .show(ui, |ui| {
                     for t in tasks {
                         let tracked = tr.active.contains(&t.id);
-                        let frame = egui::Frame::new()
-                            .fill(CARD_BG)
-                            .inner_margin(egui::Margin::same(8))
-                            .corner_radius(0.0)
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                if tracked { TRACKED } else { CARD_BORDER },
-                            ));
-                        frame.show(ui, |ui| {
+                        let card_border = if tracked { TRACKED } else { CARD_BORDER };
+                        theme::card(ui, card_border, |ui| {
                             ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
 
                             // -- title row: [track] name .............. [locate] --
@@ -816,12 +805,8 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                             ui.image((tex.id(), sz * s)).on_hover_text(*name);
                                         } else {
                                             missing_icons += 1;
-                                            ui.label(
-                                                RichText::new(short_item(name))
-                                                    .size(10.0)
-                                                    .color(MUTED),
-                                            )
-                                            .on_hover_text(*name);
+                                            theme::chip(ui, &short_item(name), MUTED)
+                                                .on_hover_text(*name);
                                         }
                                     }
                                     if names.len() > CAP {

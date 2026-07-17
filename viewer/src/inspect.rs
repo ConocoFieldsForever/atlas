@@ -236,7 +236,7 @@ fn draw_cards(
     mut icons: ResMut<IconCache>,
     pack: Option<Res<crate::render::LoadedPack>>,
 ) {
-    use bevy_egui::egui::{self, Align, Align2, Button, Color32, Layout, RichText};
+    use bevy_egui::egui::{self, Align, Align2, Button, Layout, RichText};
 
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -267,11 +267,13 @@ fn draw_cards(
             .fixed_pos(egui::pos2(screen.x, screen.y))
             .pivot(Align2::CENTER_BOTTOM)
             .show(ctx, |ui| {
+                // Square, warm-charcoal translucent billboard (was the ONE rounded card in the UI —
+                // squared to match the EFT hard-corner design language). Tokens from ui_theme.
                 let frame = egui::Frame::new()
-                    .fill(Color32::from_rgba_unmultiplied(18, 20, 21, 236))
+                    .fill(crate::ui_theme::CARD_TRANSLUCENT)
                     .inner_margin(egui::Margin::same(10))
-                    .corner_radius(6.0)
-                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(64, 68, 70)));
+                    .corner_radius(0.0)
+                    .stroke(egui::Stroke::new(1.0, crate::ui_theme::BORDER));
                 frame.show(ui, |ui| {
                     ui.set_min_width(150.0);
                     ui.set_max_width(260.0);
@@ -286,10 +288,15 @@ fn draw_cards(
                             let s = 22.0 / sz.y.max(1.0);
                             ui.image((tex.id(), sz * s));
                         }
-                        ui.label(RichText::new(&info.title).color(accent).size(15.0).strong());
+                        ui.label(
+                            RichText::new(&info.title)
+                                .color(accent)
+                                .size(crate::ui_theme::SIZE_CARD_TITLE)
+                                .strong(),
+                        );
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             let x = Button::new(
-                                RichText::new("\u{00D7}").size(18.0).color(Color32::from_gray(170)),
+                                RichText::new("\u{00D7}").size(18.0).color(crate::ui_theme::SECTION),
                             )
                             .frame(false);
                             if ui.add(x).clicked() {
@@ -297,15 +304,17 @@ fn draw_cards(
                             }
                         });
                     });
-                    // Subtitle (muted gray, smaller).
+                    // Subtitle (muted, smaller).
                     ui.label(
                         RichText::new(&info.subtitle)
-                            .color(Color32::from_gray(150))
-                            .size(11.0),
+                            .color(crate::ui_theme::MUTED)
+                            .size(crate::ui_theme::SIZE_SMALL),
                     );
-                    // Detail lines (near-white, small).
+                    // Detail lines (bright bone, small).
                     for d in &info.detail {
-                        ui.label(RichText::new(d).color(Color32::from_gray(228)).size(12.0));
+                        ui.label(
+                            RichText::new(d).color(crate::ui_theme::TEXT_BRIGHT).size(crate::ui_theme::SIZE_LABEL),
+                        );
                     }
                     // One-click route from the camera to this marker (pathfind server), plus
                     // pin/unpin into the raid plan (the panel's "Raid plan" section lists the
@@ -427,15 +436,11 @@ fn ray_sphere(ro: Vec3, rd: Vec3, center: Vec3, radius: f32) -> Option<f32> {
     Some(if t0 >= 0.0 { t0 } else { 0.0 })
 }
 
-/// bevy `Color` -> egui `Color32` (sRGB bytes), matching ui.rs `poi_swatch`.
+/// bevy `Color` -> egui `Color32` (sRGB bytes). Delegates to the shared `ui_theme::color32` so every
+/// marker->swatch/accent conversion in the app matches.
 #[cfg(feature = "egui")]
 fn color32(color: Color) -> bevy_egui::egui::Color32 {
-    let s = color.to_srgba();
-    bevy_egui::egui::Color32::from_rgb(
-        (s.red * 255.0) as u8,
-        (s.green * 255.0) as u8,
-        (s.blue * 255.0) as u8,
-    )
+    crate::ui_theme::color32(color)
 }
 
 /// Thousands-separated money string, e.g. 262500 -> "262,500" (sign preserved).
