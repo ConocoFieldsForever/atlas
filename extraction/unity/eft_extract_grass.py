@@ -43,9 +43,11 @@ OUTROOT = os.environ.get("EFT_ASSETS_ROOT") or (
     os.path.join(os.path.dirname(_TK), "eft_assets") if _TK else
     os.path.join(os.getcwd(), "eft_assets"))
 
-# plausible detail-grid resolutions (side of the square int32 array). Both extracted maps use 512;
-# other resolutions are accepted so a future map with a denser grid extracts instead of vanishing.
-_SIDES = (256, 512, 1024, 2048)
+# plausible detail-grid resolutions (side of the square int32 array). interchange/lighthouse use 512;
+# customs uses 448 + 640 (verified: sharedassets17 payloads 803,500 B / 1,639,092 B with aligned count
+# fields 200704=448^2 @ +544 / 409600=640^2 @ +552). Other resolutions are accepted so a future map
+# with a denser grid extracts instead of vanishing; build_grass infers side from the file size.
+_SIDES = (256, 448, 512, 640, 1024, 2048)
 _MAX_TAIL = 4096          # bytes of trailing fields allowed after the density array
 _MAX_CELL_VALUE = 65535   # sanity ceiling for per-cell instance counts
 
@@ -184,13 +186,21 @@ def extract_grass_density(data_root, lv, out_dir):
     result = {}
     for slice_name, pids in sorted(slice_pids.items()):
         ss = {proto_side[p] for p in pids}
+        side = max(ss)
         if len(ss) != 1:
-            print(f"  grass density {slice_name}: MIXED grid sides {sorted(ss)} - skipped")
-            continue
-        side = ss.pop()
+            # customs: one slice mixes 448^2 and 640^2 prototype grids. All grids of a slice share
+            # the SAME normalized UV footprint (the consumer samples u=(cx+.5)/side, v=1-(cy+.5)/side),
+            # so nearest-resample the coarser grids UP to the finest side and sum there. Upsampling
+            # replicates counts (footprint-exact, deterministic); never downsample — that would smear
+            # the road/building-excluding boundaries the grids exist to preserve.
+            print(f"  grass density {slice_name}: MIXED grid sides {sorted(ss)} - nearest-resampled to {side}")
         acc = np.zeros((side, side), np.uint32)
         for p in sorted(pids):                       # SUM instance counts across this slice's detail types
-            acc += proto[p].astype(np.uint32)
+            g = proto[p].astype(np.uint32)
+            if g.shape[0] != side:                   # nearest neighbour in the shared normalized UV space
+                idx = (np.arange(side, dtype=np.int64) * g.shape[0]) // side
+                g = g[np.ix_(idx, idx)]
+            acc += g
         grid = np.clip(acc, 0, 255).astype(np.uint8)
         grid.tofile(os.path.join(out_dir, f"grass_density_{slice_name}.bin"))
         result[slice_name] = {"dims": [side, side], "nonzero": round(float((grid > 0).mean()), 4)}
