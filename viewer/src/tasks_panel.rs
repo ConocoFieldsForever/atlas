@@ -917,16 +917,35 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                                         .on_hover_text("extract");
                                                 }
                                                 if let Some(pos) = here {
+                                                    // go/route AUTO-TRACK the task: tracking is what
+                                                    // shows its markers + TRIGGER-REGION zones on the
+                                                    // map (poi.rs draws tracked tasks' objective
+                                                    // outlines/walls) — flying or routing to an
+                                                    // objective without seeing its region is useless.
+                                                    let mut engage = |tr: &mut crate::ui::QuestTracker, quests_on: &mut bool| {
+                                                        if !tr.active.contains(&t.id) {
+                                                            tr.active.insert(t.id.clone());
+                                                        }
+                                                        *quests_on = true;
+                                                    };
                                                     if ui.small_button(RichText::new("go").size(10.0))
-                                                        .on_hover_text("fly here").clicked()
+                                                        .on_hover_text("fly here (tracks the task so its zones show)").clicked()
                                                     {
+                                                        engage(&mut tr, &mut quests_on);
                                                         cam_cmd.fly_to = Some(pos);
                                                     }
                                                     if ui
                                                         .add_enabled(pf_running, egui::Button::new(RichText::new("route").size(10.0)))
-                                                        .on_hover_text("route here").clicked()
+                                                        .on_hover_text("route here (tracks the task so its zones show)").clicked()
                                                     {
-                                                        route.write(RouteRequest { start: None, dests: vec![pos], optimize_order: false, ..Default::default() });
+                                                        engage(&mut tr, &mut quests_on);
+                                                        route.write(RouteRequest {
+                                                            start: None,
+                                                            dests: vec![pos],
+                                                            optimize_order: false,
+                                                            labels: vec![t.name.clone()],
+                                                            ..Default::default()
+                                                        });
                                                     }
                                                 }
                                             });
