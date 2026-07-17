@@ -65,6 +65,73 @@ pub struct MarkerValue(pub i64);
 #[derive(Component)]
 pub struct SceneInactive;
 
+/// Tag on the translucent zone-wall ribbon entities so the panel's per-layer marker COUNTS
+/// and the "route: nearest extract" destination query can exclude them (a wall shares its
+/// zone's `PoiLayer` for visibility, but it is scenery, not a marker: no `MarkerInfo`, never
+/// pickable, its transform is identity with world-space verts).
+#[derive(Component)]
+pub struct ZoneWall;
+
+/// User-specified zone-wall height: "extrude the boundary line upwards … only go up about
+/// 1.5 m", fading to fully transparent at the top.
+const WALL_HEIGHT: f32 = 1.5;
+/// Wall opacity at the BASE of the fade ramp (alpha 0 at the top).
+const WALL_BASE_ALPHA: f32 = 0.35;
+
+/// Triangle-strip-style ribbon around a closed outline: base ring = the (terrain-draped)
+/// outline verts, top ring = the same verts +`height` Y; vertex colours carry the layer
+/// colour with an alpha ramp (base_alpha -> 0), so one shared unlit
+/// `AlphaMode::Blend`/`cull_mode: None` white material renders every wall (Bevy multiplies
+/// vertex colours into the material). Blend alpha also disables depth WRITE, so walls never
+/// occlude markers.
+fn zone_wall_mesh(outline: &[Vec3], color: Color, base_alpha: f32) -> Mesh {
+    use bevy::asset::RenderAssetUsages;
+    use bevy::mesh::Indices;
+    use bevy::render::render_resource::PrimitiveTopology;
+    let n = outline.len();
+    let lin = color.to_linear();
+    let mut pos = Vec::with_capacity(n * 2);
+    let mut col = Vec::with_capacity(n * 2);
+    let mut nrm = Vec::with_capacity(n * 2);
+    for p in outline {
+        pos.push([p.x, p.y, p.z]);
+        pos.push([p.x, p.y + WALL_HEIGHT, p.z]);
+        col.push([lin.red, lin.green, lin.blue, base_alpha]);
+        col.push([lin.red, lin.green, lin.blue, 0.0]);
+        // unlit material ignores normals; present only to satisfy the mesh vertex layout.
+        nrm.push([0.0, 1.0, 0.0]);
+        nrm.push([0.0, 1.0, 0.0]);
+    }
+    let mut idx = Vec::with_capacity(n * 6);
+    for i in 0..n {
+        let a = (i * 2) as u32;
+        let b = (((i + 1) % n) * 2) as u32;
+        idx.extend_from_slice(&[a, b, a + 1, a + 1, b, b + 1]);
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::RENDER_WORLD);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, nrm);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, col);
+    mesh.insert_indices(Indices::U32(idx));
+    mesh
+}
+
+/// Even-odd point-in-polygon test on the XZ plane (zone footprints are XZ polygons; Y is
+/// terrain drape). Used to prune tarkov.dev hazard POINTS that a typed zone already covers.
+fn point_in_poly_xz(p: Vec3, poly: &[Vec3]) -> bool {
+    let n = poly.len();
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.z > p.z) != (b.z > p.z) && p.x < a.x + (p.z - a.z) / (b.z - a.z) * (b.x - a.x) {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// true iff an (optionally value-tagged) marker passes the min-value filter. `min == 0` means the
 /// filter is off; untagged markers always pass; tagged-but-unpriced (value 0) markers hide under
 /// an active filter — an unknown-value marker is exactly the clutter the filter exists to cut.
@@ -145,6 +212,14 @@ pub struct GameDataZones {
     pub exfils: Vec<(String, Vec<Vec3>, bool)>,
     pub minefields: Vec<(Vec<Vec3>, bool)>,
     pub sniper_zones: Vec<(Vec<Vec3>, bool)>,
+    /// Directional-mine blast boxes + special compound zones — Hazards toggle.
+    pub hazard_zones: Vec<(Vec<Vec3>, bool)>,
+    /// Typed transit footprints — Transits toggle.
+    pub transits: Vec<(Vec<Vec3>, bool)>,
+    /// Typed quest/visit trigger zones — Quests toggle (tracker-independent: they are scene
+    /// truth, not task-bound; the tasks.json outlines stay tracker-gated in
+    /// `draw_quest_outlines`).
+    pub quest_zones: Vec<(Vec<Vec3>, bool)>,
 }
 
 pub struct PoiPlugin;
@@ -438,6 +513,18 @@ struct GameDataFile {
     /// POOLS — the small curated set the client actually ships (gun racks / safes / piles).
     #[serde(default)]
     loose_points: Vec<GdLoose>,
+    /// Directional-mine (claymore) blast zones — largest child BoxCollider per mine.
+    #[serde(default)]
+    mines_directional: Vec<GdZone>,
+    /// Typed quest/visit trigger zones (PlaceItemTrigger / ExperienceTrigger / Flare…).
+    #[serde(default)]
+    quest_triggers: Vec<GdZone>,
+    /// Special compound zones (LighthouseTraderZone) — shown on the Hazard layer.
+    #[serde(default)]
+    trader_zones: Vec<GdZone>,
+    /// Transit outlines already ship inside `transit_points`.
+    #[serde(default)]
+    transit_points: Vec<GdZone>,
 }
 fn default_true() -> bool {
     true
@@ -457,12 +544,17 @@ struct GdExfil {
     #[serde(default = "default_true")]
     active: bool,
 }
-/// A typed zone (Minefield / SniperFiringZone) with its collider footprint.
+/// A typed zone (Minefield / SniperFiringZone / MineDirectional / quest trigger / trader
+/// zone) with its collider footprint.
 #[derive(Deserialize)]
 struct GdZone {
     pos: [f32; 3],
     #[serde(default)]
     name: Option<String>,
+    /// Zone flavour: the mine model ("MON-50") on `mines_directional`, the trigger class
+    /// ("place_item"/"visit"/"flare"/"quest") on `quest_triggers`; absent elsewhere.
+    #[serde(default)]
+    kind: Option<String>,
     #[serde(default)]
     outline: Vec<[f32; 3]>,
     /// Pre-subdivision footprint [w, d] m — the outline itself may be terrain-subdivided, so
@@ -565,11 +657,9 @@ fn gd_zone_info(l: PoiLayer, z: &GdZone) -> MarkerInfo {
         _ => ("Minefield", "Hazard \u{00B7} game files"),
     };
     let mut detail = Vec::new();
-    // Prefer the extractor's pre-subdivision extent — on a terrain-draped outline the first
-    // three verts lie along ONE edge, so the derived heuristic below would read ~4 x 4 m.
-    if let Some([w, d]) = z.extent.filter(|[w, d]| *w > 1.0 && *d > 1.0) {
-        detail.push(format!("~{:.0} x {:.0} m", w, d));
-    } else if let Some(ext) = outline_extent(&z.outline) {
+    // Pre-subdivision extent preferred — on a terrain-draped outline the first three verts
+    // lie along ONE edge, so the derived heuristic would read ~4 x 4 m.
+    if let Some(ext) = zone_extent_line(z) {
         detail.push(ext);
     }
     // The raw GameObject name distinguishes zones ("Minefield LowPower25", "SniperFiringZone
@@ -585,6 +675,87 @@ fn gd_zone_info(l: PoiLayer, z: &GdZone) -> MarkerInfo {
         subtitle: subtitle.into(),
         detail,
         accent: poi_look(l).0,
+    }
+}
+
+/// Extent line for a zone card: prefer the extractor's pre-subdivision extent, fall back to
+/// the first-three-verts heuristic (correct only on undraped 4-corner outlines).
+fn zone_extent_line(z: &GdZone) -> Option<String> {
+    if let Some([w, d]) = z.extent.filter(|[w, d]| *w > 1.0 && *d > 1.0) {
+        return Some(format!("~{:.0} x {:.0} m", w, d));
+    }
+    outline_extent(&z.outline)
+}
+
+/// Card for a directional mine (gamedata.json `mines_directional`) — the zone is the mine's
+/// blast/trigger box, so the card leads with the mine model (MON-50).
+fn gd_mine_info(z: &GdZone) -> MarkerInfo {
+    let title = z
+        .kind
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|k| format!("{k} directional mine"))
+        .unwrap_or_else(|| "Directional mine".into());
+    let mut detail = Vec::new();
+    if let Some(ext) = zone_extent_line(z) {
+        detail.push(ext);
+    }
+    if !z.active {
+        detail.push("Inactive in scene".into());
+    }
+    detail.push("game files".into());
+    MarkerInfo {
+        title,
+        subtitle: "Hazard \u{00B7} game files".into(),
+        detail,
+        accent: poi_look(PoiLayer::Hazard).0,
+    }
+}
+
+/// Card for a typed quest/visit trigger zone (gamedata.json `quest_triggers`). The title is
+/// the RAW zone id ("qlight_pc1_ucot_kill") — it's the game's quest-zone key, so search hits
+/// it directly.
+fn gd_trigger_info(z: &GdZone) -> MarkerInfo {
+    let kind_line = match z.kind.as_deref() {
+        Some("place_item") => "Place-item zone",
+        Some("visit") => "Visit / exploration zone",
+        Some("flare") => "Flare-signal zone",
+        _ => "Quest trigger",
+    };
+    let mut detail = vec![kind_line.to_string()];
+    if let Some(ext) = zone_extent_line(z) {
+        detail.push(ext);
+    }
+    if !z.active {
+        detail.push("Inactive in scene".into());
+    }
+    MarkerInfo {
+        title: z.name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "Quest zone".into()),
+        subtitle: "Quest zone \u{00B7} game files".into(),
+        detail,
+        accent: poi_look(PoiLayer::Quest).0,
+    }
+}
+
+/// Card for a special compound zone (gamedata.json `trader_zones` — LighthouseTraderZone).
+fn gd_trader_info(z: &GdZone) -> MarkerInfo {
+    let mut detail = Vec::new();
+    if let Some(ext) = zone_extent_line(z) {
+        detail.push(ext);
+    }
+    if !z.active {
+        detail.push("Inactive in scene".into());
+    }
+    MarkerInfo {
+        title: z
+            .name
+            .as_deref()
+            .map(prettify)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Zone".into()),
+        subtitle: "Zone \u{00B7} game files".into(),
+        detail,
+        accent: poi_look(PoiLayer::Hazard).0,
     }
 }
 
@@ -1115,6 +1286,46 @@ fn spawn_pois(
         e
     };
 
+    // ---- ZONE WALLS: one translucent ribbon per zone outline (user spec: the boundary line
+    // extruded 1.5 m up, fading transparent with height). ONE shared unlit white
+    // blend/double-sided material; the layer colour + alpha ramp live in vertex colours.
+    // Walls carry their zone's PoiLayer (+SceneInactive) so the SAME visibility systems that
+    // drive the markers drive them; `ZoneWall` keeps them out of panel counts and routing.
+    let wall_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    let wall = |commands: &mut Commands,
+                meshes: &mut Assets<Mesh>,
+                l: PoiLayer,
+                outline: &[Vec3],
+                color: Color,
+                active: bool|
+     -> Option<Entity> {
+        if outline.len() < 3 {
+            return None;
+        }
+        let e = commands
+            .spawn((
+                Mesh3d(meshes.add(zone_wall_mesh(outline, color, WALL_BASE_ALPHA))),
+                MeshMaterial3d(wall_mat.clone()),
+                Transform::IDENTITY, // verts are world space already
+                l,
+                ZoneWall,
+                bevy::light::NotShadowCaster,
+                Visibility::Hidden,
+            ))
+            .id();
+        if !active {
+            commands.entity(e).insert(SceneInactive);
+        }
+        Some(e)
+    };
+
     // ---- TYPED game data (gamedata.json, extract_gamedata.py) is loaded FIRST because its
     // typed exfils/doors supersede both the tarkov.dev `extracts_dev` list and the
     // name-classified semantics layers below (the classifier's extract layer measured a 71%
@@ -1135,6 +1346,24 @@ fn spawn_pois(
     let gd_loose_pos: Vec<Vec3> = gamedata
         .as_ref()
         .map(|g| g.loose_points.iter().map(|l| Vec3::from(l.pos)).collect())
+        .unwrap_or_default();
+    // Typed hazard-carrying footprints (minefields + sniper zones + mine blast boxes + special
+    // compound zones), known BEFORE the loot.json pass: tarkov.dev "hazards" is a POINT GRID
+    // sampled over these same areas (lighthouse: 344 points, ~5 m spacing over the mine
+    // belts), so any dev point INSIDE a typed footprint is the same hazard already shown as a
+    // zone — skip its marker. Points no typed zone covers always ship (never an empty layer).
+    let hazard_polys: Vec<Vec<Vec3>> = gamedata
+        .as_ref()
+        .map(|g| {
+            g.minefields
+                .iter()
+                .chain(g.sniper_zones.iter())
+                .chain(g.mines_directional.iter())
+                .chain(g.trader_zones.iter())
+                .filter(|z| z.outline.len() >= 3)
+                .map(|z| z.outline.iter().map(|a| Vec3::from(*a)).collect())
+                .collect()
+        })
         .unwrap_or_default();
 
     // ---- spawns + map intel from loot.json (pmc/scav/boss nodes, locks, hazards, ...) ----
@@ -1205,8 +1434,22 @@ fn spawn_pois(
         for tr in &mn.transits {
             spawn(&mut commands, PoiLayer::Transit, tr.pos, transit_info(tr), None);
         }
+        let mut pruned_dev_hazards = 0usize;
         for hz in &mn.hazards {
+            // A typed zone footprint covering this point owns the hazard — the zone (outline
+            // + wall) shows there; the point marker would only stack on top of it.
+            let p = Vec3::from(hz.pos);
+            if hazard_polys.iter().any(|poly| point_in_poly_xz(p, poly)) {
+                pruned_dev_hazards += 1;
+                continue;
+            }
             spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz), None);
+        }
+        if pruned_dev_hazards > 0 {
+            info!(
+                "poi: {pruned_dev_hazards}/{} tarkov.dev hazard points covered by typed zone footprints (pruned)",
+                mn.hazards.len()
+            );
         }
         have_dev_stationary = !mn.stationary.is_empty();
         for st in &mn.stationary {
@@ -1294,11 +1537,10 @@ fn spawn_pois(
                 commands.entity(ent).insert(SceneInactive);
             }
             if e.outline.len() >= 3 {
-                gd_zones.exfils.push((
-                    e.faction.clone(),
-                    e.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
-                    e.active,
-                ));
+                let pts: Vec<Vec3> = e.outline.iter().map(|a| Vec3::from(*a)).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Extract, &pts,
+                     extract_faction_color(&e.faction), e.active);
+                gd_zones.exfils.push((e.faction.clone(), pts, e.active));
             }
         }
         for (zs, layer, sink) in [
@@ -1311,11 +1553,58 @@ fn spawn_pois(
                     commands.entity(ent).insert(SceneInactive);
                 }
                 if z.outline.len() >= 3 {
-                    sink.push((
-                        z.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
-                        z.active,
-                    ));
+                    let pts: Vec<Vec3> = z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                    wall(&mut commands, &mut meshes, layer, &pts, poi_look(layer).0, z.active);
+                    sink.push((pts, z.active));
                 }
+            }
+        }
+        // ---- "anything with a zone" (directional mines / quest triggers / special zones /
+        // transit footprints): marker + wall + baseline on their existing layers.
+        for z in &gd.mines_directional {
+            let ent = spawn(&mut commands, PoiLayer::Hazard, z.pos, gd_mine_info(z), None);
+            if !z.active {
+                commands.entity(ent).insert(SceneInactive);
+            }
+            if z.outline.len() >= 3 {
+                let pts: Vec<Vec3> = z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Hazard, &pts,
+                     poi_look(PoiLayer::Hazard).0, z.active);
+                gd_zones.hazard_zones.push((pts, z.active));
+            }
+        }
+        for z in &gd.trader_zones {
+            let ent = spawn(&mut commands, PoiLayer::Hazard, z.pos, gd_trader_info(z), None);
+            if !z.active {
+                commands.entity(ent).insert(SceneInactive);
+            }
+            if z.outline.len() >= 3 {
+                let pts: Vec<Vec3> = z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Hazard, &pts,
+                     poi_look(PoiLayer::Hazard).0, z.active);
+                gd_zones.hazard_zones.push((pts, z.active));
+            }
+        }
+        for z in &gd.quest_triggers {
+            let ent = spawn(&mut commands, PoiLayer::Quest, z.pos, gd_trigger_info(z), None);
+            if !z.active {
+                commands.entity(ent).insert(SceneInactive);
+            }
+            if z.outline.len() >= 3 {
+                let pts: Vec<Vec3> = z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Quest, &pts,
+                     poi_look(PoiLayer::Quest).0, z.active);
+                gd_zones.quest_zones.push((pts, z.active));
+            }
+        }
+        // Transit MARKERS stay tarkov.dev (loot.json `transits`, richer copy: destination +
+        // conditions); the typed footprints add the zone outline + wall those markers lack.
+        for z in &gd.transit_points {
+            if z.outline.len() >= 3 {
+                let pts: Vec<Vec3> = z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Transit, &pts,
+                     poi_look(PoiLayer::Transit).0, z.active);
+                gd_zones.transits.push((pts, z.active));
             }
         }
         // First-party LOOSE-LOOT points. Priced points feed the min-value filter; unpriced
@@ -1404,10 +1693,15 @@ fn spawn_pois(
             }
         }
         info!(
-            "poi: gamedata live — {} exfils, {} minefields, {} sniper zones replace/extend the dev layers",
+            "poi: gamedata live — {} exfils, {} minefields, {} sniper zones, {} mine zones, \
+             {} quest triggers, {} special zones, {} transit footprints",
             gd.exfils.len(),
             gd.minefields.len(),
-            gd.sniper_zones.len()
+            gd.sniper_zones.len(),
+            gd.mines_directional.len(),
+            gd.quest_triggers.len(),
+            gd.trader_zones.len(),
+            gd.transit_points.len()
         );
     }
     commands.insert_resource(gd_zones);
@@ -1482,9 +1776,17 @@ fn spawn_pois(
                     let Some(p) = z.pos else { continue };
                     let e = spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o), None);
                     commands.entity(e).insert(QuestMarkerTask(t.id.clone()));
+                    let outline: Vec<Vec3> =
+                        z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                    // Wall on the objective footprint too; the `QuestMarkerTask` hands its
+                    // visibility to the tracker-aware pass, exactly like the marker's.
+                    if let Some(w) = wall(&mut commands, &mut meshes, PoiLayer::Quest, &outline,
+                                          poi_look(PoiLayer::Quest).0, true) {
+                        commands.entity(w).insert(QuestMarkerTask(t.id.clone()));
+                    }
                     zones.push(QuestZoneW {
                         pos: Vec3::new(p[0], p[1], p[2]),
-                        outline: z.outline.iter().map(|a| Vec3::new(a[0], a[1], a[2])).collect(),
+                        outline,
                         top: z.top,
                     });
                 }
@@ -1668,20 +1970,22 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
             ring(outline, extract_faction_color(fac));
         }
     }
-    if toggles.minefields {
-        for (outline, active) in &zones.minefields {
-            if hide_inactive && !active {
-                continue;
-            }
-            ring(outline, poi_look(PoiLayer::Minefield).0);
+    // Toggle-driven baseline groups (crisp line under each zone's translucent wall).
+    for (on, list, color) in [
+        (toggles.minefields, &zones.minefields, poi_look(PoiLayer::Minefield).0),
+        (toggles.sniper_zones, &zones.sniper_zones, poi_look(PoiLayer::SniperZone).0),
+        (toggles.hazards, &zones.hazard_zones, poi_look(PoiLayer::Hazard).0),
+        (toggles.transits, &zones.transits, poi_look(PoiLayer::Transit).0),
+        (toggles.quests, &zones.quest_zones, poi_look(PoiLayer::Quest).0),
+    ] {
+        if !on {
+            continue;
         }
-    }
-    if toggles.sniper_zones {
-        for (outline, active) in &zones.sniper_zones {
+        for (outline, active) in list {
             if hide_inactive && !active {
                 continue;
             }
-            ring(outline, poi_look(PoiLayer::SniperZone).0);
+            ring(outline, color);
         }
     }
 }

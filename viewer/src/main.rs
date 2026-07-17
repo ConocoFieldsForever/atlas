@@ -248,6 +248,12 @@ fn main() {
                     title: "EFT Native Viewer".into(),
                     resolution: (1600u32, 900u32).into(),
                     present_mode,
+                    // EFT_HIDDEN=1: render without showing a window (headless EFT_SHOT
+                    // verification runs — GPU screenshot capture works on an invisible
+                    // window; pair with EFT_UNCAPPED so the focus-idle gate doesn't stall).
+                    visible: !std::env::var("EFT_HIDDEN")
+                        .map(|v| v.trim() == "1")
+                        .unwrap_or(false),
                     ..default()
                 }),
                 ..default()

@@ -20,7 +20,11 @@ Zone footprints come from the BoxCollider on the same GameObject: 4 bottom-face 
 through the full world TRS chain (colliders are often unit boxes scaled by the transform).
 The Unity->viewer bridge is the map config's coordinates.global_matrix conjugation reduced to
 points (G3 @ p, the diag(-1,1,1) X-flip) — identical rule as the geometry pipeline; corner
-order is reversed after the flip so outlines stay CCW.
+order is reversed after the flip so outlines stay CCW. "Anything with a zone" ships one:
+MineDirectional blast boxes (largest CHILD BoxCollider — the mine GO itself has none),
+quest/visit trigger zones (PlaceItemTrigger / ExperienceTrigger / FlareShootDetectorZone /
+QuestTrigger, zone id = first script string), the LighthouseTraderZone compound, plus the
+original minefields / sniper zones / exfils / transits.
 
 LOOSE LOOT (first-party): LootPoint MonoBehaviours are the ONLY loose-loot positions the
 client ships — a small curated set (lighthouse: gun racks / gun safes / food piles / car
@@ -95,6 +99,11 @@ DOOR_CLASSES = {"Door": "door", "Trunk": "trunk", "KeycardDoor": "door", "Slidin
 DOOR_STATE = {0: "none", 1: "locked", 2: "shut", 4: "open", 8: "interacting", 16: "breach"}
 # EPlayerSideMask
 SIDE_MASK = {1: "usec", 2: "bear", 3: "pmc", 4: "savage", 5: "usec+savage", 6: "bear+savage", 7: "all"}
+# quest/visit trigger MonoBehaviours ("anything with a zone gets extracted"): each carries its
+# BoxCollider on the SAME GameObject and serializes the quest ZONE ID as the first script
+# field (validated: lighthouse level524 x110, factory level68 x42).
+QUEST_TRIGGER_CLASSES = {"PlaceItemTrigger": "place_item", "ExperienceTrigger": "visit",
+                         "FlareShootDetectorZone": "flare", "QuestTrigger": "quest"}
 
 
 def read_cstr(buf, off):
@@ -158,6 +167,23 @@ def dec_spawn(pl):
 def dec_stationary_name(pl):
     s, _ = read_cstr(pl, 20)
     return (s or "").strip() or None
+
+
+def dec_zone_id(pl):
+    """quest-trigger classes serialize the zone id as the FIRST script field (string @0)."""
+    s, _ = read_cstr(pl, 0)
+    return (s or "").strip() or None
+
+
+def poly_area_xz(pts):
+    """shoelace area of a polygon projected to XZ (picks the mine's real blast box)."""
+    a = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, z1 = pts[i][0], pts[i][2]
+        x2, z2 = pts[(i + 1) % n][0], pts[(i + 1) % n][2]
+        a += x1 * z2 - x2 * z1
+    return abs(a) / 2.0
 
 
 def dec_lootpoint(pl):
@@ -360,6 +386,38 @@ def scan_level(lv, sink):
         c = vec(col, "m_Center", (0, 0, 0))
         return bridge((M @ np.array([*c, 1.0]))[:3])
 
+    # father -> [child transform pids], built LAZILY (reads every Transform typetree, so only
+    # levels that actually hold child-collider zones — MineDirectional — pay for it).
+    kid_map = None
+
+    def child_transforms(tpid):
+        nonlocal kid_map
+        if kid_map is None:
+            kid_map = {}
+            for pid in tr_obj:
+                d = tt(pid, tr_obj)
+                f = (d.get("m_Father") or {}).get("m_PathID", 0) if d else 0
+                if f:
+                    kid_map.setdefault(f, []).append(pid)
+        return kid_map.get(tpid, [])
+
+    def largest_child_box(tpid):
+        """(outline, center, child GO name) of the LARGEST child BoxCollider footprint — a
+        MineDirectional hangs its blast/trigger boxes on child GOs (MON-50_MineTrigger x3 + a
+        small body collider); the largest box IS the danger zone."""
+        best = None
+        for cpid in child_transforms(tpid):
+            cd = tt(cpid, tr_obj)
+            cgo = (cd.get("m_GameObject") or {}).get("m_PathID", 0) if cd else 0
+            cname, _, ccols = go_info(cgo)
+            M2 = world_mat(cpid)
+            for col in ccols:
+                fp = footprint(M2, col)
+                area = poly_area_xz(fp)
+                if best is None or area > best[0]:
+                    best = (area, fp, col_center(M2, col), cname)
+        return (best[1], best[2], best[3]) if best else (None, None, None)
+
     n_hit = 0
     for o in mbs:
         try:
@@ -371,9 +429,10 @@ def scan_level(lv, sink):
             cls = resolve(s.get("m_FileID", 0), s.get("m_PathID", 0))
         except Exception:
             cls = None
-        if cls not in EXFIL_CLASSES and cls not in DOOR_CLASSES and cls not in (
+        if cls not in EXFIL_CLASSES and cls not in DOOR_CLASSES \
+                and cls not in QUEST_TRIGGER_CLASSES and cls not in (
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
-                "SpawnPointMarker", "MineDirectional", "LootPoint"):
+                "SpawnPointMarker", "MineDirectional", "LootPoint", "LighthouseTraderZone"):
             continue
         go_pid = (hdr.get("m_GameObject") or {}).get("m_PathID")
         if not go_pid:
@@ -437,7 +496,29 @@ def scan_level(lv, sink):
                 sink["spawn_points"].append({"pos": tpos, "name": name, "side": None,
                                              "categories_mask": None, "infiltration": None, "lv": lv})
         elif cls == "MineDirectional":
-            sink["mines_directional"].append({"pos": tpos, "lv": lv})
+            # blast/trigger zone = the largest CHILD BoxCollider footprint (the mine GO itself
+            # has none). Kind from the child name ("MON-50_MineTrigger" -> "MON-50").
+            ol, cen, cname = largest_child_box(tpid) if tpid else (None, None, None)
+            kind = (cname or "").split("_MineTrigger")[0] if cname and "_MineTrigger" in cname else None
+            sink["mines_directional"].append({
+                "pos": cen or tpos, "name": name, "kind": kind,
+                "outline": ol or [], "active": active, "lv": lv,
+            })
+        elif cls in QUEST_TRIGGER_CLASSES:
+            box = cols[0] if cols else None
+            sink["quest_triggers"].append({
+                "pos": col_center(M, box) if box else tpos,
+                "name": dec_zone_id(pl) or name,
+                "kind": QUEST_TRIGGER_CLASSES[cls],
+                "outline": footprint(M, box) if box else [],
+                "active": active, "lv": lv,
+            })
+        elif cls == "LighthouseTraderZone":
+            box = cols[0] if cols else None
+            sink["trader_zones"].append({
+                "pos": col_center(M, box) if box else tpos, "name": name,
+                "outline": footprint(M, box) if box else [], "active": active, "lv": lv,
+            })
         elif cls == "LootPoint":
             guid, tps = dec_lootpoint(pl)
             if guid:
@@ -581,7 +662,8 @@ def outline_extent(outline):
     return [round(w, 1), round(h, 1)] if w > 0.05 and h > 0.05 else None
 
 
-def drape_zones(sink, keys=("exfils", "minefields", "sniper_zones", "transit_points")):
+def drape_zones(sink, keys=("exfils", "minefields", "sniper_zones", "transit_points",
+                            "mines_directional", "quest_triggers", "trader_zones")):
     """drape every zone outline in `keys` (and stamp its pre-subdivision extent). Returns
     (draped?, verts_before, verts_after)."""
     field = load_terrain_field()
@@ -768,7 +850,8 @@ def main():
     print(f"[cfg] map={MAP} levels={LEVELS} G3={G3.round(2).tolist()}")
     sink = {k: [] for k in ("exfils", "minefields", "sniper_zones", "doors",
                             "transit_points", "stationary", "spawn_points",
-                            "mines_directional", "loose_points")}
+                            "mines_directional", "loose_points",
+                            "quest_triggers", "trader_zones")}
     t0 = time.time()
     scanned = list(LEVELS)
     for lv in LEVELS:
@@ -783,7 +866,8 @@ def main():
 
     sink["exfils"] = dedupe(sink["exfils"], lambda r: (r["faction"], r["name"]))
     sink["doors"] = dedupe(sink["doors"], lambda r: r["id"] or (r["name"], tuple(r["pos"])))
-    for k in ("minefields", "sniper_zones", "transit_points", "stationary", "mines_directional"):
+    for k in ("minefields", "sniper_zones", "transit_points", "stationary", "mines_directional",
+              "quest_triggers", "trader_zones"):
         sink[k] = dedupe(sink[k], lambda r: (r.get("name"), tuple(r["pos"])))
     sink["spawn_points"] = dedupe(sink["spawn_points"], lambda r: (r.get("name"), tuple(r["pos"])))
 
@@ -812,6 +896,13 @@ def main():
         print(f"  stationary {s['name']:12s} pos={s['pos']}")
     st = Counter(d["state"] for d in sink["doors"])
     print(f"  doors: {len(sink['doors'])} states={dict(st)} with_key={counts['doors_with_key']}")
+    mk = Counter(m.get("kind") for m in sink["mines_directional"])
+    qk = Counter(q.get("kind") for q in sink["quest_triggers"])
+    print(f"  mines_directional: {len(sink['mines_directional'])} kinds={dict(mk)} "
+          f"with_outline={sum(1 for m in sink['mines_directional'] if m.get('outline'))}")
+    print(f"  quest_triggers: {len(sink['quest_triggers'])} kinds={dict(qk)}")
+    for z in sink["trader_zones"]:
+        print(f"  trader_zone {z['name']} pos={z['pos']} outline_pts={len(z['outline'])}")
     for r in sink["loose_points"]:
         top = (r.get("items") or [{}])[0]
         print(f"  loose {str(r['name'])[:28]:28s} pos={r['pos']} slots={r['n']} "
