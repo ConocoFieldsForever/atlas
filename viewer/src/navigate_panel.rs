@@ -266,7 +266,29 @@ pub fn navigate_tab(
                 .max_height(list_h)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
-                    for r in &rows {
+                    // Organized by WHO can use the extract: your faction's first, then Scav,
+                    // then shared/special — each group under a small dim header.
+                    let groups: [(&str, Vec<&Row>); 3] = [
+                        ("PMC", rows.iter().filter(|r| r.tag == "PMC").collect()),
+                        ("SCAV", rows.iter().filter(|r| r.tag == "Scav").collect()),
+                        (
+                            "SHARED & SPECIAL",
+                            rows.iter().filter(|r| r.tag != "PMC" && r.tag != "Scav").collect(),
+                        ),
+                    ];
+                    for (gname, grows) in &groups {
+                        if grows.is_empty() {
+                            continue;
+                        }
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(*gname)
+                                .size(theme::SIZE_TINY)
+                                .strong()
+                                .color(theme::FAINT),
+                        );
+                        for r in grows {
+                            let r: &Row = r;
                         // Highlight: the destination of the CURRENT route (label match — also
                         // covers "nearest" picking its winner), or the row being computed.
                         let is_routed = routed_label.as_deref() == Some(r.label.as_str());
@@ -304,7 +326,9 @@ pub fn navigate_tab(
                                             )
                                             .on_hover_text("inactive in the current scene");
                                         }
-                                        if !r.tag.is_empty() {
+                                        // Faction tag only in the mixed group — inside the pure
+                                        // PMC/SCAV groups the header already says it.
+                                        if !r.tag.is_empty() && r.tag != "PMC" && r.tag != "Scav" {
                                             ui.label(
                                                 RichText::new(&r.tag)
                                                     .size(theme::SIZE_TINY)
@@ -362,6 +386,7 @@ pub fn navigate_tab(
                                 labels: vec![r.label.clone()],
                                 ..Default::default()
                             });
+                        }
                         }
                     }
                 });

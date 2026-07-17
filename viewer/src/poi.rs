@@ -636,9 +636,15 @@ fn outline_extent(outline: &[[f32; 3]]) -> Option<String> {
 }
 
 /// Card for a typed extract (gamedata.json `exfils`). Same look as the tarkov.dev card it
-/// replaces, plus the game-file provenance and an inactive tag.
-fn gd_exfil_info(e: &GdExfil) -> MarkerInfo {
-    let mut info = extract_dev_info(&e.name, &e.faction);
+/// replaces, plus the game-file provenance and an inactive tag. `friendly` is the community name
+/// resolved from the tarkov.dev extract list ("Railway Exfil" for scene id "NW Exfil") — it
+/// becomes the display name, with the raw scene id kept as a detail line.
+fn gd_exfil_info(e: &GdExfil, friendly: Option<&str>) -> MarkerInfo {
+    let display = friendly.unwrap_or(e.name.as_str());
+    let mut info = extract_dev_info(display, &e.faction);
+    if friendly.is_some_and(|f| f != e.name) && !e.name.is_empty() {
+        info.detail.push(format!("Scene id: {}", e.name));
+    }
     if !e.active {
         info.detail.push("Inactive in scene".into());
     }
@@ -1384,6 +1390,10 @@ fn spawn_pois(
     // Every loot.json lock position + its key's display name, for the typed-door proximity
     // cross-check (a tarkov.dev lock within 2 m names the door's `key_id`).
     let mut lock_keys: Vec<(Vec3, String)> = Vec::new();
+    // tarkov.dev extract names + positions: the COMMUNITY names players actually know ("Railway
+    // Exfil", "Emercom Checkpoint"). The typed gamedata exfils carry raw scene ids ("NW Exfil",
+    // "SE Exfil"), so each is renamed to the nearest dev extract within 60 m (XZ) below.
+    let mut dev_extract_names: Vec<(String, Vec3)> = Vec::new();
     let key = map_key(&lp.0.manifest.dataset);
     // ONE loot.json resolver for the whole app (loot.rs: env > pack > pack-parent shared >
     // shared_dir > cwd) - poi.rs used to re-implement a subset (audit A6).
@@ -1479,6 +1489,14 @@ fn spawn_pois(
                 commands.entity(e).insert(MarkerIcon(icon_slug(&lo.n)));
             }
         }
+        // Community extract names for the typed-exfil rename (kept whether or not the dev
+        // markers themselves spawn — the names matter either way).
+        dev_extract_names = mn
+            .extracts_dev
+            .iter()
+            .filter(|ex| !ex.name.is_empty())
+            .map(|ex| (ex.name.clone(), Vec3::from(ex.pos)))
+            .collect();
         // Prefer the clean faction-tagged extract list when it's present — unless the TYPED
         // exfils from gamedata.json already own the Extract layer (they include secret
         // extracts and exact collider footprints; tarkov.dev stays the fallback).
@@ -1540,7 +1558,26 @@ fn spawn_pois(
                 "secret" => Some(ex_secret.clone()),
                 _ => None, // pmc keeps the layer's extract green
             };
-            let ent = spawn(&mut commands, PoiLayer::Extract, e.pos, gd_exfil_info(e), mat);
+            // Rename to the community name: nearest tarkov.dev extract within 60 m (XZ — the Y
+            // conventions differ: collider bottom vs surface point). NON-exclusive on purpose: a
+            // physical extract listed per-faction in the scene ("NW Exfil" pmc + scav) maps both
+            // entries to the one dev extract ("Railway Exfil").
+            let friendly = dev_extract_names
+                .iter()
+                .map(|(n, p)| {
+                    let d = ((p.x - e.pos[0]).powi(2) + (p.z - e.pos[2]).powi(2)).sqrt();
+                    (n, d)
+                })
+                .filter(|(_, d)| *d <= 60.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(n, _)| n.clone());
+            let ent = spawn(
+                &mut commands,
+                PoiLayer::Extract,
+                e.pos,
+                gd_exfil_info(e, friendly.as_deref()),
+                mat,
+            );
             commands.entity(ent).insert(ExtractFaction(e.faction.clone()));
             if !e.active {
                 commands.entity(ent).insert(SceneInactive);
