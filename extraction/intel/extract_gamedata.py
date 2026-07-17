@@ -662,13 +662,26 @@ def outline_extent(outline):
     return [round(w, 1), round(h, 1)] if w > 0.05 and h > 0.05 else None
 
 
-def drape_zones(sink, keys=("exfils", "minefields", "sniper_zones", "transit_points",
-                            "mines_directional", "quest_triggers", "trader_zones")):
-    """drape every zone outline in `keys` (and stamp its pre-subdivision extent). Returns
-    (draped?, verts_before, verts_after)."""
+# Ground-hugging zones (colliders that genuinely sit on the terrain): drape to the ground so
+# the outline follows undulating terrain instead of floating/sinking at the flat collider face.
+DRAPE_KEYS = ("exfils", "transit_points", "quest_triggers", "trader_zones")
+# Elevated collider zones (minefields, sniper zones, directional mines): keep the collider's own
+# world height. Their trigger boxes are frequently TALL volumes whose bottom face reaches the base
+# terrain far below a raised platform (e.g. ground_zero Minefield_LowPower: collider center Y=15.65
+# on a train platform, but bottom face Y<=-0.41 at ground). Draping to terrain snapped the whole
+# zone to the ground far below where the mines actually are. USER PREFERENCE: use the collider's
+# actual height (its center, == the marker `pos`), NOT the terrain drape.
+COLLIDER_HEIGHT_KEYS = ("minefields", "sniper_zones", "mines_directional")
+
+
+def drape_zones(sink):
+    """Place every zone outline (and stamp its pre-subdivision extent):
+      * DRAPE_KEYS          -> subdivide ~4 m and lift to the terrain (ground-hugging zones).
+      * COLLIDER_HEIGHT_KEYS -> keep the collider's OWN height (the marker `pos` Y), never terrain.
+    Returns (terrain_field_loaded?, verts_before, verts_after) for the drape group's logging."""
     field = load_terrain_field()
     before = after = 0
-    for k in keys:
+    for k in DRAPE_KEYS:
         for r in sink[k]:
             ol = r.get("outline") or []
             if len(ol) < 3:
@@ -679,6 +692,22 @@ def drape_zones(sink, keys=("exfils", "minefields", "sniper_zones", "transit_poi
             before += len(ol)
             r["outline"] = drape_outline(ol, field)
             after += len(r["outline"])
+    # Elevated collider zones: FLATTEN each outline to the collider center height (`pos` Y), which
+    # is exactly where the marker sphere sits, so the ring/wall/marker all read at the platform
+    # level. NO terrain sampling, NO subdivision (the footprint is already a horizontal rectangle).
+    for k in COLLIDER_HEIGHT_KEYS:
+        for r in sink[k]:
+            ol = r.get("outline") or []
+            if len(ol) < 3:
+                continue
+            ext = outline_extent(ol)
+            if ext:
+                r["extent"] = ext
+            raw_ys = [p[1] for p in ol]
+            y = round(r["pos"][1], 2)  # collider center height == the marker position
+            print(f"[collider-height] {k} {r.get('name')!r:36s} pos_y={r['pos'][1]:.2f} "
+                  f"footprint_y=[{min(raw_ys):.2f},{max(raw_ys):.2f}] -> outline_y={y}")
+            r["outline"] = [[round(p[0], 2), y, round(p[2], 2)] for p in ol]
     return field is not None, before, after
 
 

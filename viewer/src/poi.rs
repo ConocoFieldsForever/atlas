@@ -1959,10 +1959,13 @@ fn apply_quest_visibility(
 /// Draw the TYPED zone footprints from gamedata.json as closed polygons (immediate mode, the
 /// same idiom as `draw_quest_outlines`): exfil collider footprints in their faction colour with
 /// the Extracts toggle, minefields in hazard red, sniper zones in orange with their own
-/// toggles. Terrain-DRAPED outlines (extraction already subdivided them ~4 m and lifted each
-/// vert to terrain+0.3) get only a token lift against z-fighting; undraped ones (old files,
-/// indoor maps) still sit at the collider's flat bottom face and keep the visible lift. Zones
-/// inactive in the scene follow the panel's "hide inactive" filter like their markers.
+/// toggles. GROUND-hugging outlines (exfils / transits / quest / trader zones) are terrain-DRAPED
+/// at extraction (subdivided ~4 m + lifted to terrain+0.3) and get only a token lift here; the
+/// elevated collider zones (minefields / sniper zones / directional mines) instead sit at their
+/// collider CENTER height — exactly where their marker sphere is — so the ring/wall/marker all read
+/// at the platform, not draped to the ground far below (DEFECT 2 fix). The `draped` flag stays true
+/// (the ground group is still draped), so the token 0.05 lift is right for both. Zones inactive in
+/// the scene follow the panel's "hide inactive" filter like their markers.
 fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles: Res<LayerToggles>) {
     let lift = Vec3::new(0.0, if zones.draped { 0.05 } else { 0.4 }, 0.0);
     let hide_inactive = toggles.hide_inactive;
