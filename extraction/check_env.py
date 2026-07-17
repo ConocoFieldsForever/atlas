@@ -33,8 +33,10 @@ def warn(msg, fix):
 
 def check_deps():
     print("\n== python dependencies ==")
-    if sys.version_info < (3, 9):
-        fail(f"python {sys.version.split()[0]} is too old", "install Python 3.10+ (3.12 recommended)")
+    if sys.version_info < (3, 10):
+        fail(f"python {sys.version.split()[0]} is too old (the toolchain uses 3.10+ syntax, "
+             f"e.g. 'str | None' union annotations)",
+             "install Python 3.10+ (3.12 recommended) and re-run this check with it")
     else:
         ok(f"python {sys.version.split()[0]}")
     # hard requirements (extraction cannot run without these)

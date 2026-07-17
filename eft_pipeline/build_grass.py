@@ -25,9 +25,32 @@ Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 (20 B), pack s
 import os, sys, json, struct, argparse, re, glob
 import numpy as np
 
-# Cross-map albedo fallback for packs whose terrain_layers ship no grass texture.
-FALLBACK_ALBEDO = r"C:/Users/user/beamng_blender_pipeline/eft_assets/interchange_v2/terrain_layers/grass_Grass3_D.png"
 FLAG_TERRAIN = 1 << 1
+
+
+def _fallback_albedo(TL):
+    """Cross-map grass albedo fallback for packs whose own terrain_layers ship no grass
+    texture. The sidecar contract stays an ABSOLUTE path (the viewer reads it verbatim),
+    but it is derived portably at build time instead of a hardcoded dev-machine literal:
+    datasets root = EFT_ASSETS_ROOT, else <EFT_TARKMAP_ROOT>/../eft_assets, else the
+    grandparent of TL (<assets>/<dataset>/terrain_layers). Any sibling dataset's grass
+    albedo qualifies; interchange_v2 (the validated source) is preferred when present."""
+    assets = os.environ.get("EFT_ASSETS_ROOT")
+    if not assets:
+        tk = os.environ.get("EFT_TARKMAP_ROOT")
+        assets = os.path.join(os.path.dirname(tk), "eft_assets") if tk else None
+    if not assets or not os.path.isdir(assets):
+        assets = os.path.dirname(os.path.dirname(os.path.abspath(TL)))
+    for cand in ("grass_Grass3_D.png", "grass_Grass5_512_D.png"):
+        hits = sorted(glob.glob(os.path.join(assets, "*", "terrain_layers", cand)))
+        pref = [h for h in hits
+                if os.path.basename(os.path.dirname(os.path.dirname(h))) == "interchange_v2"]
+        if hits:
+            return os.path.abspath((pref or hits)[0])
+    # nothing found anywhere: keep the legacy sidecar semantics (a best-guess absolute
+    # path that may not exist) so the schema and viewer behavior stay unchanged
+    return os.path.abspath(os.path.join(assets, "interchange_v2", "terrain_layers",
+                                        "grass_Grass3_D.png"))
 # Road/asphalt SURFACE meshes (laid ON the grass terrain; the game grids are road-excluding but
 # leave some road-EDGE cells nonzero, and decal-role roads sit millimetres above the terrain, so
 # a safety mask is kept). Their XZ footprint masks grass. Exclude non-surface props that happen
@@ -290,7 +313,7 @@ def main():
             alb = p
             break
     if alb is None:
-        alb = FALLBACK_ALBEDO
+        alb = _fallback_albedo(TL)
         print(f"[grass] no grass albedo in {TL}, using cross-map fallback {alb}")
     tint = [0.7, 0.75, 0.55]
     try:

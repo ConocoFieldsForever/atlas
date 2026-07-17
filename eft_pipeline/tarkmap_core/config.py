@@ -79,7 +79,18 @@ class MapConfig:
         src = d["source"]
         if "root" not in src: raise ValueError("source.root required")
         if not os.path.isabs(src["root"]):
-            src["root"] = os.path.normpath(os.path.join(ROOT, "..", src["root"]))   # resolve rel to beamng dir
+            # a relative source.root (e.g. "eft_assets/interchange_v2") resolves against the
+            # datasets dir: EFT_ASSETS_ROOT when set (its leading "eft_assets" component is
+            # the datasets dir itself, so strip it), else the tarkmap parent as upstream did.
+            rel = src["root"].replace("\\", "/")
+            assets = os.environ.get("EFT_ASSETS_ROOT")
+            if assets:
+                parts = [p for p in rel.split("/") if p]
+                if parts and parts[0] == "eft_assets":
+                    parts = parts[1:]
+                src["root"] = os.path.normpath(os.path.join(assets, *parts))
+            else:
+                src["root"] = os.path.normpath(os.path.join(ROOT, "..", rel))   # resolve rel to workspace dir
         for sub, default in (("scene", "scene.json"), ("mesh_dir", "meshes"), ("texture_dir", "tex")):
             src.setdefault(sub, default)
 
