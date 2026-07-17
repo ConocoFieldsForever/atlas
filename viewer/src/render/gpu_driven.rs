@@ -3076,15 +3076,15 @@ fn queue_gpu_driven(
         let Some(phase) = transparent_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
-        // M3b1: TWO specializations of the same shader/mesh, selected by `blend_pass`.
-        // They must be distinct keys so the cache yields two distinct pipeline ids.
+        // THREE specializations of the same shader/mesh, selected by `DrawPass` (Opaque / Blend /
+        // Decal). Distinct keys so the cache yields three distinct pipeline ids.
         let opaque_pipeline = pipelines.specialize(
             &pipeline_cache,
             &draw_pipeline,
             EftDrawKey {
                 samples: msaa.samples(),
                 hdr: view.hdr,
-                blend_pass: false,
+                pass: DrawPass::Opaque,
             },
         );
         let blend_pipeline = pipelines.specialize(
@@ -3093,7 +3093,18 @@ fn queue_gpu_driven(
             EftDrawKey {
                 samples: msaa.samples(),
                 hdr: view.hdr,
-                blend_pass: true,
+                pass: DrawPass::Blend,
+            },
+        );
+        // Decal (softcutout road) pipeline: depth-writing so roads occlude the underground
+        // geometry + the Bevy POIs/gizmos below them (DEFECT 1 fix).
+        let decal_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey {
+                samples: msaa.samples(),
+                hdr: view.hdr,
+                pass: DrawPass::Decal,
             },
         );
 
@@ -3117,6 +3128,23 @@ fn queue_gpu_driven(
             });
             for (mesh_idx, center) in &_buffers.blend_meshes {
                 let d = (cam_pos - Vec3::from_array(*center)).length();
+                // DECAL pass FIRST (right after the opaque multidraw, BEFORE the alpha blends):
+                // the softcutout road frags in this mesh draw depth-writing so they occlude the
+                // opaque geometry below (underground ceilings) and the Bevy POIs/gizmos. Meshes
+                // with no softcutout frag draw nothing here (all discarded) — cheap. Fixed sort
+                // key just above the opaque item so every decal writes depth before ANY alpha blend.
+                phase.add(Transparent3d {
+                    entity: (entity, *main_entity),
+                    pipeline: decal_pipeline,
+                    draw_function: draw_fn,
+                    distance: -1.0e29, // after opaque (-1e30), before all alpha blends (-d, d finite)
+                    batch_range: 0..1,
+                    extra_index: PhaseItemExtraIndex::IndirectParametersIndex {
+                        range: *mesh_idx..(*mesh_idx + 1),
+                        batch_set_index: None,
+                    },
+                    indexed: true,
+                });
                 phase.add(Transparent3d {
                     entity: (entity, *main_entity),
                     pipeline: blend_pipeline,
@@ -3135,15 +3163,28 @@ fn queue_gpu_driven(
     }
 }
 
+/// Which of the THREE GPU-driven draw specializations a pipeline is. Part of `EftDrawKey`'s
+/// Hash/Eq so each caches as a SEPARATE pipeline.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum DrawPass {
+    /// P1 OPAQUE: blend None, depth-write ON, no bias, A2C for cutout edges. Discards BLEND frags.
+    Opaque,
+    /// P2 BLEND: alpha blending, depth-write OFF, toward-camera bias, `BLEND_PASS` def. Draws the
+    /// genuinely-translucent materials (glass / water film / plain decals); discards non-BLEND AND
+    /// softcutout frags (softcutout now draws depth-writing in the Decal pass).
+    Blend,
+    /// P1.5 DECAL (POI-occlusion fix): softcutout road/track surfaces. depth-write ON + toward-
+    /// camera bias + alpha-to-coverage, `DECAL_PASS` def. Writes depth so the road OCCLUDES the
+    /// underground geometry (ceilings) AND the Bevy POIs/gizmos below it, while the edge still
+    /// feathers into the terrain via A2C. Discards non-softcutout frags.
+    Decal,
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct EftDrawKey {
     samples: u32,
     hdr: bool,
-    /// M3b1 pass selector. `false` = P1 OPAQUE specialization (blend None, depth-write on,
-    /// default bias, discards BLEND materials). `true` = P2 BLEND specialization (alpha
-    /// blending, depth-write OFF, toward-camera depth bias, `BLEND_PASS` shader_def, discards
-    /// non-BLEND materials). MUST be part of Hash/Eq so P1 and P2 cache as SEPARATE pipelines.
-    blend_pass: bool,
+    pass: DrawPass,
 }
 
 impl SpecializedRenderPipeline for EftDrawPipeline {
@@ -3182,43 +3223,45 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
         // turns OFF depth-write (transparents must not occlude each other or later opaques), and
         // nudges decals TOWARD the camera under reverse-z so they win the coplanar z-test against
         // the ground they lie on. P1 (opaque) keeps the original opaque state exactly.
+        // Toward-camera depth bias for coplanar decals/roads under Bevy REVERSE-Z (near=1.0,
+        // far=0.0, depth_compare GreaterEqual). The rasterizer bias is ADDED to window-space depth
+        // [0,1]; a POSITIVE bias INCREASES depth = pulls the fragment TOWARD the camera (larger
+        // reverse-z value), so the decal beats the coplanar ground P1 wrote and passes GreaterEqual.
+        // (Matches Bevy StandardMaterial: positive depth bias renders "closer to the camera".) A
+        // negative bias would push decals BEHIND the ground and drop them. Shared by Blend AND Decal.
+        // TODO(depth-bias magnitude): CORE_3D_DEPTH_FORMAT is Depth32Float, so the `constant` unit
+        // scales with the polygon's depth exponent and huge Tarkov map distances can make constant:2
+        // too weak. If road markings still z-fight after the first visual test, RAISE magnitude
+        // (constant: 4..16 and/or slope_scale: 2.0..4.0), keeping BOTH positive. Never flip negative.
+        let toward_cam_bias = DepthBiasState {
+            constant: 2,
+            slope_scale: 1.0,
+            clamp: 0.0,
+        };
         let (blend, depth_write_enabled, bias, frag_defs): (
             Option<BlendState>,
             bool,
             DepthBiasState,
             Vec<bevy::shader::ShaderDefVal>,
-        ) = if key.blend_pass {
-            (
+        ) = match key.pass {
+            DrawPass::Opaque => (None, true, DepthBiasState::default(), vec![]),
+            DrawPass::Blend => (
                 Some(BlendState::ALPHA_BLENDING),
                 false,
-                // Depth bias for coplanar decals under Bevy REVERSE-Z (near=1.0, far=0.0,
-                // depth_compare GreaterEqual). The rasterizer bias is ADDED to window-space depth
-                // [0,1]; a POSITIVE bias INCREASES depth = pulls the fragment TOWARD the camera
-                // (larger reverse-z value), so the decal beats the coplanar ground P1 wrote and
-                // passes GreaterEqual. (This matches Bevy StandardMaterial: positive depth bias
-                // renders "closer to the camera".) A negative bias would push decals BEHIND the
-                // ground and drop them.
-                // TODO(M3b1 depth-bias magnitude): CORE_3D_DEPTH_FORMAT is Depth32Float, so the
-                // `constant` unit scales with the polygon's depth exponent and huge Tarkov map
-                // distances can make constant:2 too weak. If road markings still z-fight after the
-                // first visual test, RAISE magnitude (constant: 4..16 and/or slope_scale: 2.0..4.0),
-                // keeping BOTH positive. Do NOT flip to negative â€” that hides decals entirely.
-                DepthBiasState {
-                    constant: 2,
-                    slope_scale: 1.0,
-                    clamp: 0.0,
-                },
+                toward_cam_bias,
                 vec!["BLEND_PASS".into()],
-            )
-        } else {
-            (None, true, DepthBiasState::default(), vec![])
+            ),
+            // DECAL: like Blend for coplanarity (toward-camera bias) but depth-write ON + opaque
+            // color target (A2C feathers the edge from the fragment's coverage-as-alpha). Writing
+            // depth is the whole point — the road then occludes the underground ceiling + POIs.
+            DrawPass::Decal => (None, true, toward_cam_bias, vec!["DECAL_PASS".into()]),
         };
 
         RenderPipelineDescriptor {
-            label: Some(if key.blend_pass {
-                "eft_gpu_draw_blend".into()
-            } else {
-                "eft_gpu_draw_opaque".into()
+            label: Some(match key.pass {
+                DrawPass::Opaque => "eft_gpu_draw_opaque".into(),
+                DrawPass::Blend => "eft_gpu_draw_blend".into(),
+                DrawPass::Decal => "eft_gpu_draw_decal".into(),
             }),
             layout: vec![
                 view_layout,
@@ -3285,10 +3328,11 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             multisample: MultisampleState {
                 count: key.samples,
                 mask: !0,
-                // Opaque pass + MSAA: alpha-to-coverage dithers the cutout coverage ramp the
-                // fragment outputs (grass/foliage edges anti-alias instead of hard 1-bit alias).
-                // Non-cutout opaque materials output alpha 1.0 = full coverage (bit-identical).
-                alpha_to_coverage_enabled: !key.blend_pass && key.samples > 1,
+                // Opaque + Decal passes + MSAA: alpha-to-coverage dithers the coverage ramp the
+                // fragment outputs (grass/foliage cutout edges + softcutout road edges anti-alias
+                // instead of hard 1-bit alias). Non-cutout opaque materials output alpha 1.0 = full
+                // coverage (bit-identical). The Blend pass uses real alpha blending, not A2C.
+                alpha_to_coverage_enabled: key.pass != DrawPass::Blend && key.samples > 1,
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),

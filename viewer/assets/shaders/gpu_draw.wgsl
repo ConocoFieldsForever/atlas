@@ -675,10 +675,19 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // Pass class-discard (M3b1) — AFTER the samples above (Codex P0). Each pass keeps only its
     // class; the discard is fine here because no derivative-requiring op follows it.
     let is_blend = (m.flags & MAT_FLAG_BLEND) != 0u;
+    let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
+#ifdef DECAL_PASS
+    // DECAL pipeline (DEFECT 1 fix): keep ONLY softcutout road/track surfaces. They render here
+    // depth-writing (A2C feather + toward-camera bias) so they occlude the geometry + POIs below.
+    if (!is_softcutout) { discard; }
+#else
 #ifdef BLEND_PASS
-    if (!is_blend) { discard; } // BLEND pipeline: keep only decal/glass/water/alphaMode=BLEND
+    // BLEND pipeline: genuinely-translucent materials EXCEPT softcutout (softcutout draws in the
+    // depth-writing DECAL pass above; leaving it here too would double-draw + re-blend it).
+    if (!is_blend || is_softcutout) { discard; }
 #else
     if (is_blend) { discard; }  // OPAQUE pipeline: keep everything except BLEND (cutout stays)
+#endif
 #endif
 
     var albedo = m.tint; // untextured (sentinel) -> tint over implicit white
@@ -919,29 +928,26 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // water (sea / basins) is OPAQUE (P1) so depth sorts it correctly under glass.
     let is_water = (m.flags & MAT_FLAG_WATER) != 0u;
 
+#ifdef DECAL_PASS
+    // DECAL pass (DEFECT 1 fix): softcutout road/track surfaces, DEPTH-WRITING. Coverage is the
+    // PER-VERTEX COLOR_0.a modulated by the SoftCutout params (tex.a is SMOOTHNESS here, NOT
+    // coverage). Output it as the fragment alpha so alpha-to-coverage feathers the road EDGE into
+    // the terrain while the (near-1) INTERIOR writes solid depth — occluding the underground
+    // ceiling + the Bevy POIs below it. rgb stays the lit road (tex.rgb*tint.rgb); matte (no env
+    // reflection, keeps asphalt from mirroring). The extra ×color.a keeps feather tails soft where
+    // _AlphaStrength (≥2) would re-saturate them (web/WebGPU-viewer parity — the validated look).
+    //   coverage = clamp(color.a*_AlphaStrength - (_Cutoff - _AlphaHeight), 0, 1) * color.a
+    let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0) * o.color.a;
+    return vec4<f32>(apply_fog(lit + spec_rgb, o.world_pos, dom.directionality), coverage);
+#else
 #ifdef BLEND_PASS
     // BLEND pass: emit the REAL computed opacity. Non-premultiplied to match the pipeline's
     // BlendState::ALPHA_BLENDING (src=SrcAlpha, dst=OneMinusSrcAlpha), i.e. Unity _Color*_MainTex.
-    //
-    // Three coverage laws (M3b2), by material class:
-    //  * SoftCutout (Custom/Vert Paint SoftCutout Decal): coverage is the PER-VERTEX COLOR_0.a
-    //    modulated by the SoftCutout params — tex.a is SMOOTHNESS here, NOT coverage. This
-    //    feathers roads / tire-tracks into the terrain (soft edges), fixing the floating-slab /
-    //    solid-quad look. rgb stays the lit (tex.rgb*tint.rgb).
-    //      coverage = clamp(color.a*_AlphaStrength - (_Cutoff - _AlphaHeight), 0, 1)
-    //    (matches the RE'd EFT road shader; NO polygonOffset — the feather + depth-write-off
-    //    handle coplanarity, per tarkmap-road-terrain-matte-and-hole-bake.)
+    // Softcutout roads are DISCARDED up top — they draw depth-writing in the DECAL pass above.
     //  * Water/mirror (role=water): untextured water had albedo=tint=WHITE -> a flat white slab.
     //    Emit a translucent dark wet sheen instead (animated flow deferred).
     //  * Other blend (glass / plain decal): keep the tex.a*tint.a coverage.
-    let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
-    if (is_softcutout) {
-        // Roads/decals are matte ground overlays — no env reflection (keeps asphalt from mirroring).
-        // Extra ×color.a beyond the clamp: keeps feather tails soft where _AlphaStrength (≥2)
-        // would re-saturate them (web/WebGPU-viewer parity — the validated game look).
-        let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0) * o.color.a;
-        return vec4<f32>(apply_fog(lit + spec_rgb, o.world_pos, dom.directionality), coverage);
-    } else if (is_water) {
+    if (is_water) {
         // PUDDLE (textured water — untextured DEEP water is opaque-pass now, see #else path).
         // A thin wet film: albedo.a is the puddle_noise coverage but tex.a*tint.a (tint.a≈0.3)
         // crushed it to ~7% -> divide tint.a back out to recover the mask, remap to a clean
@@ -1032,5 +1038,6 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality),
         select(1.0, cov, is_cut)
     );
+#endif
 #endif
 }
