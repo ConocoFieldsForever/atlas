@@ -389,6 +389,18 @@ pub struct Pack {
 }
 
 impl Pack {
+    /// Resolve a manifest/materials path: SELF-CONTAINED packs (redistribution PR3) write
+    /// pack-relative paths ("tex/foo.png"); legacy packs wrote absolute workspace paths.
+    /// Relative resolves against the pack dir; absolute passes through untouched.
+    pub fn resolve_path(&self, p: &str) -> String {
+        let pb = std::path::Path::new(p);
+        if pb.is_absolute() {
+            p.to_string()
+        } else {
+            self.root.join(pb).to_string_lossy().into_owned()
+        }
+    }
+
     pub fn load(dir: impl AsRef<Path>) -> Result<Pack> {
         let root = dir.as_ref().to_path_buf();
         if !root.is_dir() {

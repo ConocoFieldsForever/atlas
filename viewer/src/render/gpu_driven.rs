@@ -516,8 +516,8 @@ impl ShVolumeCpu {
 /// probes for free (correct: SH interpolates linearly). No float conversion: just move the
 /// 2-byte halfs. Probe order (x-fastest -> y -> z) == wgpu 3D texel order, so pi -> texel copies.
 fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
-    let meta_path = pack.manifest.sidecars.volume_meta.as_deref()?;
-    let bin_path = pack.manifest.sidecars.volume.as_deref()?;
+    let meta_path = &pack.resolve_path(pack.manifest.sidecars.volume_meta.as_deref()?);
+    let bin_path = &pack.resolve_path(pack.manifest.sidecars.volume.as_deref()?);
 
     let meta_str = match std::fs::read_to_string(meta_path) {
         Ok(s) => s,
@@ -1152,7 +1152,13 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     };
     // (ctrl_tex_linear is declared above the material loop — vp heights masks share it.)
     'terrain: {
-        let Some(tl_path) = pack.manifest.sidecars.terrain_layers.as_deref() else {
+        let tl_path_owned = pack
+            .manifest
+            .sidecars
+            .terrain_layers
+            .as_deref()
+            .map(|p| pack.resolve_path(p));
+        let Some(tl_path) = tl_path_owned.as_deref() else {
             warn!("gpu-driven terrain: no terrainLayers sidecar — terrain stays single-layer");
             break 'terrain;
         };
@@ -1610,6 +1616,17 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         None => info!("gpu-driven #5 shadows: no valid sun_dir in volume.json — shadows disabled"),
     }
 
+    // SELF-CONTAINED packs (PR3): every texture path collected above (albedo/normal/emissive/
+    // detail/vp/heights/terrain/grass) may be pack-relative - resolve once here against the
+    // pack dir. Absolute (legacy) paths pass through untouched; dedup already happened on the
+    // raw strings, which stays consistent within one pack.
+    for v in [&mut albedo_paths, &mut normal_paths] {
+        for s in v.iter_mut() {
+            if !std::path::Path::new(s.as_str()).is_absolute() {
+                *s = pack.resolve_path(s);
+            }
+        }
+    }
     commands.insert_resource(ExtractedCpuData(Arc::new(CpuData {
         vertex_data,
         index_data,

@@ -182,6 +182,23 @@ fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Trans
 }
 
 fn main() {
+    // --version/--help fast path BEFORE any Bevy/GPU init: CI runners have no usable GPU, so
+    // this is the only smoke test a workflow can run (redistribution PR5).
+    if let Some(flag) = std::env::args().nth(1) {
+        if matches!(flag.as_str(), "--version" | "-V") {
+            println!("eft_viewer {} ({})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_NAME"));
+            return;
+        }
+        if matches!(flag.as_str(), "--help" | "-h") {
+            println!(
+                "eft_viewer [<pack-dir>] [m0|gpu]\n\
+                 no args: start menu (scans <exe>/packs).  env: EFT_PACK, EFT_RENDER, EFT_SHADOWS,\n\
+                 EFT_GRADE/EFT_GRADE_EXPOSURE, EFT_FOG, EFT_UNCAPPED, EFT_HIDDEN, EFT_SHOT,\n\
+                 EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0. Docs: README_DIST.md"
+            );
+            return;
+        }
+    }
     // ---- parse argv: pack dir + optional render-path token ----
     // Pack selection order: explicit argv[1] > EFT_PACK env > first existing default pack.
     // Default map is LIGHTHOUSE (falls back to interchange if its pack isn't built), so a
