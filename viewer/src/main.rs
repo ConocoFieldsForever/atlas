@@ -592,8 +592,19 @@ fn setup(
     };
 
     let dir = (target - cam_pos).normalize_or_zero();
-    let yaw = dir.x.atan2(-dir.z);
-    let pitch = dir.y.asin();
+    let mut yaw = dir.x.atan2(-dir.z);
+    let mut pitch = dir.y.asin();
+    let mut cam_pos = cam_pos;
+    // EFT_POSE="x,y,z,yaw_deg,pitch_deg" reproduces an EXACT camera pose (the POS HUD's copy
+    // button emits this) — for reproducing a user-reported view precisely in a screenshot.
+    if let Ok(s) = std::env::var("EFT_POSE") {
+        let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if p.len() == 5 {
+            cam_pos = Vec3::new(p[0], p[1], p[2]);
+            yaw = p[3].to_radians();
+            pitch = p[4].to_radians();
+        }
+    }
 
     // Sky sun direction: same volume.json sidecar + X-flip the SH/shadow path uses
     // (gpu_driven::extract_pack_to_render_world), so the skybox sun disk, the baked GI, and the
@@ -654,7 +665,10 @@ fn setup(
             far,
             ..default()
         }),
-        Transform::from_translation(cam_pos).looking_at(target, Vec3::Y),
+        // Build rotation from yaw/pitch (the FlyCam convention) so it matches FlyCam.{yaw,pitch}
+        // exactly — for the normal path these derive from `target`, and EFT_POSE overrides them.
+        Transform::from_translation(cam_pos)
+            .with_rotation(Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(Vec3::X, pitch)),
         // The custom instancing path is incompatible with Bevy's GPU indirect
         // draw preprocessing; opt this view out (matches the bevy example).
         NoIndirectDrawing,
