@@ -382,7 +382,7 @@ fn layers_panel(
     server: Res<crate::pathfind::PathfindServer>,
 ) {
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
-    use crate::pathfind::{RouteRequest, RouteStatus, ServerCmd, ServerStatus};
+    use crate::pathfind::{RouteRequest, ServerCmd, ServerStatus};
     use crate::poi::PoiLayer;
     if gfx_ui.menu.is_some() {
         return; // start-menu mode: menu.rs owns the whole screen
@@ -920,9 +920,10 @@ fn layers_panel(
                             }
                         });
 
-                    // ===== TASKS / QUESTS =====
+                    // ===== QUESTS (visibility only; tracking/filters/objectives live in the
+                    //       Tasks tab — the checklist icon in the toolbar) =====
                     CollapsingHeader::new(section_hdr(
-                        "Tasks / Quests",
+                        "Quests",
                         poi_counts[PoiLayer::Quest as usize],
                         HDR,
                     ))
@@ -930,149 +931,11 @@ fn layers_panel(
                     .default_open(false)
                     .show(ui, |ui| {
                         poi_row(ui, &mut toggles.quests, "Show quest markers", PoiLayer::Quest, &poi_counts);
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut tracker.kappa_only, "Kappa");
-                            ui.checkbox(&mut tracker.lk_only, "Lightkeeper");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add(egui::DragValue::new(&mut tracker.max_level).range(0..=79));
-                            ui.label(RichText::new("\u{2264} Lvl").size(12.0).color(MUTED));
-                        });
-
-                        let (kappa_only, lk_only, max_level) =
-                            (tracker.kappa_only, tracker.lk_only, tracker.max_level);
-                        let shown: Vec<&crate::poi::QuestEntry> = quest_data
-                            .tasks
-                            .iter()
-                            .filter(|t| {
-                                if kappa_only && !t.kappa {
-                                    return false;
-                                }
-                                if lk_only && !t.lk {
-                                    return false;
-                                }
-                                if max_level > 0 {
-                                    if let Some(ml) = t.min_level {
-                                        if ml > max_level {
-                                            return false;
-                                        }
-                                    }
-                                }
-                                true
-                            })
-                            .collect();
-                        ui.add_space(2.0);
                         ui.label(
-                            RichText::new(format!("{} tasks", shown.len())).size(10.0).color(MUTED),
+                            RichText::new("track tasks, items + objectives in the Tasks tab")
+                                .size(10.0)
+                                .color(MUTED),
                         );
-                        egui::ScrollArea::vertical()
-                            .id_salt("quest_list")
-                            .max_height(240.0)
-                            .show(ui, |ui| {
-                                for t in &shown {
-                                    ui.horizontal(|ui| {
-                                        let mut on = tracker.active.contains(&t.id);
-                                        if ui.checkbox(&mut on, "").changed() {
-                                            if on {
-                                                tracker.active.insert(t.id.clone());
-                                            } else {
-                                                tracker.active.remove(&t.id);
-                                            }
-                                        }
-                                        let name =
-                                            if t.name.is_empty() { "Task" } else { t.name.as_str() };
-                                        if ui
-                                            .selectable_label(false, RichText::new(name).size(13.0))
-                                            .clicked()
-                                        {
-                                            if let Some(pos) = t
-                                                .objectives
-                                                .first()
-                                                .and_then(|o| o.zones.first())
-                                                .map(|z| z.pos)
-                                            {
-                                                cam_cmd.fly_to = Some(pos);
-                                            }
-                                        }
-                                    });
-                                    let mut tags = if t.trader.is_empty() {
-                                        String::new()
-                                    } else {
-                                        t.trader.clone()
-                                    };
-                                    if let Some(ml) = t.min_level.filter(|&l| l > 0) {
-                                        if !tags.is_empty() {
-                                            tags.push_str("  \u{00B7}  ");
-                                        }
-                                        tags.push_str(&format!("Lvl {ml}"));
-                                    }
-                                    if t.kappa {
-                                        if !tags.is_empty() {
-                                            tags.push_str("  \u{00B7}  ");
-                                        }
-                                        tags.push_str("Kappa");
-                                    }
-                                    if !tags.is_empty() {
-                                        ui.label(RichText::new(tags).size(10.0).color(MUTED));
-                                    }
-                                }
-                            });
-
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Route active").clicked() {
-                                let dests: Vec<Vec3> = quest_data
-                                    .tasks
-                                    .iter()
-                                    .filter(|t| tracker.active.contains(&t.id))
-                                    .flat_map(|t| {
-                                        t.objectives
-                                            .iter()
-                                            .filter_map(|o| o.zones.first().map(|z| z.pos))
-                                    })
-                                    .collect();
-                                if !dests.is_empty() {
-                                    route_writer.write(RouteRequest {
-                                        start: None,
-                                        dests,
-                                        optimize_order: true,
-                                    });
-                                }
-                            }
-                            if ui.button("Clear route").clicked() {
-                                route_writer.write(RouteRequest {
-                                    start: None,
-                                    dests: Vec::new(),
-                                    optimize_order: false,
-                                });
-                            }
-                        });
-                        ui.add_space(2.0);
-                        match &route_result.status {
-                            RouteStatus::Pending => {
-                                ui.label(RichText::new("routing\u{2026}").size(11.0).color(ACCENT));
-                            }
-                            RouteStatus::Ok => {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "Route  {:.0} m  ({} stops)",
-                                        route_result.dist,
-                                        route_result.points.len()
-                                    ))
-                                    .size(11.0)
-                                    .color(Color32::from_gray(210)),
-                                );
-                            }
-                            RouteStatus::Error(e) => {
-                                ui.label(
-                                    RichText::new(e.as_str())
-                                        .size(10.0)
-                                        .color(Color32::from_rgb(210, 96, 84)),
-                                );
-                            }
-                            RouteStatus::Idle => {}
-                        }
                     });
 
                     // ===== PATHFINDING (server start/stop) =====
