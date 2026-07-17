@@ -15,6 +15,7 @@ mod loot;
 mod menu;
 mod menu_fx;
 mod nav;
+mod navigate_panel;
 mod pathfind;
 mod paths;
 mod pick;

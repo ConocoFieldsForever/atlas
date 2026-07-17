@@ -113,18 +113,26 @@ fn pick_system(
     pack: Option<Res<LoadedPack>>,
     pointer_on_ui: Res<crate::inspect::PointerOnUi>,
     keys: Res<ButtonInput<KeyCode>>,
+    mut place: ResMut<crate::pathfind::PlaceMode>,
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut readout: Query<&mut Text, With<PickReadout>>,
 ) {
+    // Esc cancels an armed place-position mode (checked before the click gate so it works
+    // without any click).
+    if place.0 && keys.just_pressed(KeyCode::Escape) {
+        place.0 = false;
+    }
     // ---- click gate --------------------------------------------------------
     // Ignore clicks landing on egui panels (Codex review: UI double-clicks were triggering the
     // expensive full-geometry raycast).
     if !mouse.just_pressed(MouseButton::Left) || pointer_on_ui.0 {
         return;
     }
-    // SHIFT-click PLACES the route start (single click, on the clicked floor); a plain DOUBLE-click
-    // identifies geometry. Both share the one full-geometry raycast below.
-    let place_start = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    // An ARMED place mode (Navigation tab "PLACE ON MAP") makes the next single click place the
+    // route start on the clicked surface; SHIFT-click does the same without arming (power users).
+    // A plain DOUBLE-click identifies geometry. All share the one full-geometry raycast below.
+    let place_start =
+        place.0 || keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let now = time.elapsed_secs();
     let is_double = (now - state.last_left) <= DOUBLE_CLICK_SECS;
     state.last_left = now;
@@ -311,10 +319,11 @@ fn pick_system(
         let role = material_role(h.material_id);
         let wp = ro + rd * h.t;
         if place_start {
-            // SHIFT-click: drop the route start on the clicked surface.
+            // Drop the route start ("you are here") on the clicked surface; disarm the mode.
             start_pt.0 = Some(wp);
+            place.0 = false;
             let line = format!(
-                "START set  ({:.1}, {:.1}, {:.1})  \u{2014} routes begin here",
+                "POSITION set  ({:.1}, {:.1}, {:.1})  \u{2014} routes begin here",
                 wp.x, wp.y, wp.z
             );
             info!("{line}");
@@ -335,6 +344,13 @@ fn pick_system(
         );
         info!("{line}  | candidates: {cand_str}");
         set_text(&mut readout, line);
+    } else if place_start {
+        // Armed placement but the ray hit no surface (sky / off-map): stay armed so the next
+        // click can try again, and say so instead of dumping an identify readout.
+        set_text(
+            &mut readout,
+            "POSITION  no surface there \u{2014} click on the map geometry (Esc cancels)".to_string(),
+        );
     } else if let Some(&(inst_idx, t_near)) = candidates.first() {
         // No triangle hit, but the ray passed through some bounding spheres —
         // report the nearest as a sphere-only near-miss.

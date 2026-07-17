@@ -423,7 +423,7 @@ pub struct TasksPanelParams<'w, 's> {
     pub pack: Option<Res<'w, crate::render::LoadedPack>>,
     /// "fly to" an objective location.
     pub cam_cmd: ResMut<'w, crate::CameraCommand>,
-    /// "route here" / "route tracked" (the :8091 pathfind server).
+    /// "route here" / "route tracked" (in-process CPU routing, nav.rs).
     pub route: MessageWriter<'w, crate::pathfind::RouteRequest>,
     /// Last route status/length for the readout.
     pub route_result: Res<'w, crate::pathfind::RouteResult>,
@@ -643,7 +643,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
     }
     if !pf_running {
         ui.label(
-            RichText::new("start the pathfind server (Layers tab) to enable routing")
+            RichText::new("no route data for this map \u{2014} rebuild it from the start menu")
                 .size(9.0)
                 .italics()
                 .color(MUTED),

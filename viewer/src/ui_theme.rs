@@ -341,7 +341,7 @@ pub fn color32(color: bevy::prelude::Color) -> Color32 {
 
 /// One 32x32 rail icon button. Draws the active/hover background, paints the vector icon in the
 /// active-beige / idle-muted color, and returns true on click. `kind`: 0 = eye (visibility),
-/// 1 = camera, 2 = tasks/checklist.
+/// 1 = camera, 2 = tasks/checklist, 3 = navigation (route pin).
 pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, tip: &str) -> bool {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
     // Idle icons sit at SECTION grey (brighter than the old dim MUTED): the rail is easy to miss, so
@@ -360,11 +360,28 @@ pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, tip: &str) -> bool
     resp.on_hover_text(tip).clicked()
 }
 
-/// Vector icon inside `rect`: 0 = eye, 1 = camera, 2 = tasks/checklist. Painter primitives only (no
-/// image assets — keeps the shippable exe free of game-derived art).
+/// Vector icon inside `rect`: 0 = eye, 1 = camera, 2 = tasks/checklist, 3 = navigation (a location
+/// pin with a dashed route leading to it). Painter primitives only (no image assets — keeps the
+/// shippable exe free of game-derived art).
 pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: Color32) {
     let ctr = rect.center();
     let s = Stroke::new(1.6, c);
+    match kind {
+        3 => {
+            // navigation: dashed route from bottom-left up to a location pin at top-right
+            let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);
+            for (a, b) in [((-9.0, 9.0), (-6.0, 7.0)), ((-4.0, 5.5), (-1.0, 3.5)), ((1.0, 2.0), (3.0, 0.5))] {
+                painter.line_segment([p(a.0, a.1), p(b.0, b.1)], Stroke::new(1.5, c));
+            }
+            // pin: head ring + tail down to its tip
+            painter.circle_stroke(p(4.5, -5.0), 3.6, s);
+            painter.circle_filled(p(4.5, -5.0), 1.2, c);
+            painter.line_segment([p(1.6, -2.6), p(4.5, 1.2)], s);
+            painter.line_segment([p(7.4, -2.6), p(4.5, 1.2)], s);
+            return;
+        }
+        _ => {}
+    }
     match kind {
         0 => {
             // eye: lens ellipse outline + pupil
