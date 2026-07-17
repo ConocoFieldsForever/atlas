@@ -419,3 +419,109 @@ pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: C
         }
     }
 }
+
+// ============================================================================================
+// OBJECTIVE GLYPHS — tiny vector icons for the Tasks panel's subtask gutter, one per objective
+// TYPE, so an objective with no cached item art still reads at a glance (KILL = crosshair, EXFIL =
+// door+arrow, MARK = flag, GO TO = pin, HAND IN / PLANT = deposit, FIND / PICK UP = magnifier).
+// Painter primitives only (no assets), matching `paint_tool_icon`. `kind` is the raw tasks.json
+// objective type (same strings `tasks_panel::obj_tag` switches on).
+// ============================================================================================
+
+/// A centred completion check (used when an objective is marked done — replaces its gutter icon).
+pub fn paint_check(painter: &egui::Painter, rect: egui::Rect, c: Color32) {
+    let ctr = rect.center();
+    let s = Stroke::new(2.2, c);
+    painter.line_segment(
+        [egui::pos2(ctr.x - 6.0, ctr.y + 0.5), egui::pos2(ctr.x - 1.5, ctr.y + 5.5)],
+        s,
+    );
+    painter.line_segment(
+        [egui::pos2(ctr.x - 1.5, ctr.y + 5.5), egui::pos2(ctr.x + 7.0, ctr.y - 6.0)],
+        s,
+    );
+}
+
+/// A ~18px objective-type glyph centred in `rect`, drawn in `c`.
+pub fn paint_obj_glyph(painter: &egui::Painter, rect: egui::Rect, kind: &str, c: Color32) {
+    let ctr = rect.center();
+    let s = Stroke::new(1.5, c);
+    let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);
+    match kind {
+        // KILL — crosshair (ring + 4 ticks).
+        "shoot" => {
+            painter.circle_stroke(ctr, 5.5, s);
+            for (a, b) in [((-9.0, 0.0), (-5.5, 0.0)), ((9.0, 0.0), (5.5, 0.0)),
+                           ((0.0, -9.0), (0.0, -5.5)), ((0.0, 9.0), (0.0, 5.5))] {
+                painter.line_segment([p(a.0, a.1), p(b.0, b.1)], s);
+            }
+            painter.circle_filled(ctr, 1.2, c);
+        }
+        // EXFIL — a doorway with an arrow leaving it.
+        "extract" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(p(-3.0, 0.0), egui::vec2(8.0, 15.0)),
+                0.0, s, StrokeKind::Middle,
+            );
+            painter.line_segment([p(-1.0, 0.0), p(8.0, 0.0)], s);
+            painter.line_segment([p(4.0, -3.5), p(8.0, 0.0)], s);
+            painter.line_segment([p(4.0, 3.5), p(8.0, 0.0)], s);
+        }
+        // MARK — a pennant flag.
+        "mark" => {
+            painter.line_segment([p(-6.0, -8.0), p(-6.0, 8.0)], s);
+            painter.add(egui::Shape::convex_polygon(
+                vec![p(-6.0, -8.0), p(7.0, -4.0), p(-6.0, 0.0)],
+                c,
+                Stroke::NONE,
+            ));
+        }
+        // GO TO / VISIT — a map pin.
+        "visit" => {
+            painter.circle_stroke(p(0.0, -3.0), 5.0, s);
+            painter.circle_filled(p(0.0, -3.0), 1.6, c);
+            painter.line_segment([p(-3.4, 0.4), p(0.0, 8.5)], s);
+            painter.line_segment([p(3.4, 0.4), p(0.0, 8.5)], s);
+        }
+        // HAND IN — down-arrow into an inbox tray.
+        "giveItem" | "giveQuestItem" => {
+            painter.line_segment([p(-7.0, 7.0), p(7.0, 7.0)], s);
+            painter.line_segment([p(-7.0, 3.0), p(-7.0, 7.0)], s);
+            painter.line_segment([p(7.0, 3.0), p(7.0, 7.0)], s);
+            painter.line_segment([p(0.0, -8.0), p(0.0, 3.0)], s);
+            painter.line_segment([p(-3.5, -0.5), p(0.0, 3.0)], s);
+            painter.line_segment([p(3.5, -0.5), p(0.0, 3.0)], s);
+        }
+        // PLANT — down-arrow into a box.
+        "plantItem" | "plantQuestItem" => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(p(0.0, 4.0), egui::vec2(14.0, 9.0)),
+                0.0, s, StrokeKind::Middle,
+            );
+            painter.line_segment([p(0.0, -9.0), p(0.0, -1.0)], s);
+            painter.line_segment([p(-3.0, -4.0), p(0.0, -1.0)], s);
+            painter.line_segment([p(3.0, -4.0), p(0.0, -1.0)], s);
+        }
+        // FIND / PICK UP — a magnifier.
+        "findItem" | "findQuestItem" => {
+            painter.circle_stroke(p(-2.0, -2.0), 5.0, s);
+            painter.line_segment([p(1.8, 1.8), p(7.0, 7.0)], Stroke::new(2.0, c));
+        }
+        // BUILD — a small bolt/gear dot.
+        "buildWeapon" => {
+            painter.circle_stroke(ctr, 5.5, s);
+            for k in 0..6 {
+                let a = k as f32 / 6.0 * std::f32::consts::TAU;
+                painter.line_segment(
+                    [p(a.cos() * 5.5, a.sin() * 5.5), p(a.cos() * 8.0, a.sin() * 8.0)],
+                    s,
+                );
+            }
+        }
+        // Everything else (SKILL / TRADER / QUEST / SELL / USE / XP / DO) — a neutral ringed dot.
+        _ => {
+            painter.circle_stroke(ctr, 4.5, s);
+            painter.circle_filled(ctr, 1.6, c);
+        }
+    }
+}
