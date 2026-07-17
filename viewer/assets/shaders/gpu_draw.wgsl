@@ -152,6 +152,7 @@ const MAT_FLAG_TERRAIN: u32 = 16u;        // bit4: MicroSplat terrain (splat-ble
 const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary albedo/normal; never on terrain)
 const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW tex.a (smoothness-in-alpha)
 const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpGpu at _pad2)
+const MAT_FLAG_PUDDLE_LUMA: u32 = 256u;   // bit8: puddle shape mask in luma(rgb), not alpha (atlas)
 const DETAIL_HAS_ALBEDO: u32 = 1u;        // detail_flags bit0: has detail albedo texture
 const DETAIL_HAS_NORMAL: u32 = 2u;        // detail_flags bit1: has detail normal texture
 const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed in linear space
@@ -948,23 +949,24 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     //    Emit a translucent dark wet sheen instead (animated flow deferred).
     //  * Other blend (glass / plain decal): keep the tex.a*tint.a coverage.
     if (is_water) {
-        // PUDDLE (textured water — untextured DEEP water is opaque-pass now, see #else path).
-        // A thin wet film: albedo.a is the puddle_noise coverage but tex.a*tint.a (tint.a≈0.3)
-        // crushed it to ~7% -> divide tint.a back out to recover the mask, remap to a clean
-        // feathered SHAPE, and let opacity follow it so edges dissolve into the dry ground.
-        // Energy-balanced fresnel mix (body*(1-wf) + refl*wf): no additive pedestal, so the film
-        // is dark from above and a mirror only toward grazing — like a real puddle.
-        let wf = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);      // water fresnel (F0≈0.02..0.04)
-        let refl = max(sh_env, sky_env);                   // crisp bright sky mirror
-        // Feather across the texture's OWN soft alpha gradient. (The old raw=albedo.a/tint.a
-        // INFLATED it ~3.2x — tint.a≈0.31 — so smoothstep(0.12,0.45) snapped everything above
-        // texture-alpha 0.14 to fully opaque, collapsing the soft shape into HARD polygon edges.)
-        let mask = smoothstep(0.04, 0.55, albedo.a);       // soft puddle shape from the mask itself
-        let body = m.tint.rgb * gi;                        // dark wet film, GI-lit
-        let col = body * (1.0 - wf) + refl * wf + spec_rgb;
-        // Thin film head-on (road shows through -> subtle wet sheen, not a solid dark slab),
-        // ramping to a mirror at grazing where fresnel dominates.
-        let a = mask * clamp(0.20 + 0.7 * wf, 0.0, 1.0);
+        // PUDDLE — the game's `Decal/Water Deferred Decal`, RE'd from its DX11 fragment and
+        // reproduced in the forward BLEND pass. The hardware SrcAlpha/OneMinusSrcAlpha blend gives
+        // result = col*a + road*(1-a) = lerp(road, col, a), matching the decal's G-buffer albedo
+        // lerp — it DARKENS/wets the road, it does NOT paint a black body over it.
+        //   coverage = saturate((mask + COLOR_0.a) * _FadeStrength=1.52)   (soft, no hard cutoff)
+        //   mask channel: LUMA(rgb) for atlas puddles (alpha≡1), else raw tex.a  (per-mat flag)
+        //   F = pow(1 - NdotV*_Fresnel=0.354, 2)  -> ~0.42 head-on..1 grazing (never black)
+        //   reflection gated to the INTERIOR (coverage>0.5); edges only wet-darken.
+        let mask_ch = select(tex.a, dot(tex.rgb, vec3<f32>(0.299, 0.587, 0.114)),
+                             (m.flags & MAT_FLAG_PUDDLE_LUMA) != 0u);
+        let coverage = clamp((mask_ch + o.color.a) * 1.52, 0.0, 1.0);
+        let ndv = max(NdotV, 1e-3);
+        let fr = pow(1.0 - ndv * 0.354, 2.0);              // game _Fresnel
+        let refl = max(sh_env, sky_env) * (fr * 0.88);     // _ReflectionStrength, sharp sky mirror
+        let refl_mix = clamp(ndv * ndv * 2.0 * max(coverage - 0.5, 0.0), 0.0, 1.0) * fr;
+        let wet = m.tint.rgb * gi;                          // dark wet asphalt (grey _Color), GI-lit
+        let col = mix(wet, refl, refl_mix) + spec_rgb;
+        let a = coverage * m.tint.a;                        // _Color.a = overall puddle strength
         return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality), a);
     }
     // Glass / plain decal: env reflection (glass is glossy -> strong) + the GGX glint make it read as
