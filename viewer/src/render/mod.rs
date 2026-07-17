@@ -79,7 +79,11 @@ impl Default for GfxSettings {
             })
             .unwrap_or((1.5, 4.0));
         Self {
-            fog: 1.0,
+            // EFT_FOG=0 for haze-free debug screenshots (A/B comparisons against game captures).
+            fog: std::env::var("EFT_FOG")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(1.0),
             sky_refl: 1.0,
             emissive: 1.0,
             shadows: std::env::var("EFT_SHADOWS").map(|v| v.trim() == "1").unwrap_or(false),

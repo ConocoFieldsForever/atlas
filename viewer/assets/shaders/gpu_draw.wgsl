@@ -151,6 +151,7 @@ const MAT_FLAG_WATER: u32 = 8u;           // bit3: water/mirror (dark wet sheen,
 const MAT_FLAG_TERRAIN: u32 = 16u;        // bit4: MicroSplat terrain (splat-blend 12 layers; slice in _pad2)
 const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary albedo/normal; never on terrain)
 const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW tex.a (smoothness-in-alpha)
+const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpGpu at _pad2)
 const DETAIL_HAS_ALBEDO: u32 = 1u;        // detail_flags bit0: has detail albedo texture
 const DETAIL_HAS_NORMAL: u32 = 2u;        // detail_flags bit1: has detail normal texture
 const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed in linear space
@@ -171,6 +172,24 @@ struct TerrainSplat {
     ctrl_idx: array<u32, 48>,   // up to 16 slices × 3 maps at [slice*3 + k] (slice names from sidecar)
 };
 @group(2) @binding(4) var<storage, read> terrain_splat: TerrainSplat;
+
+// Vert-Paint 3-layer splat table (byte-identical to Rust `VpGpu`, 112 B). One entry per
+// MAT_FLAG_VP material, indexed by `m._pad2`. The EXACT game blend (RE'd from the DX11
+// fragment, validated in the web viewer's _vpsplat.js):
+//   w_i = pow(Heights_i(raw_uv) * COLOR_0_i, blend), normalized;
+//   albedo = Σ w_i · layer_i(uv_i) · tint_i.
+// Layer 0's ST is baked into the mesh UVs (uvTilingBaked), so raw_uv = (uv - uv0.zw)/uv0.xy;
+// the heights mask samples at raw_uv, layer i at raw_uv*uvi.xy+uvi.zw (layer 0 round-trips).
+struct VpGpu {
+    tex: vec4<u32>,     // x,y,z = layer albedo indices; w = heights index or MAT_ALBEDO_NONE
+    uv0: vec4<f32>,     // raw per-layer _MainTex_ST (sx,sy,ox,oy)
+    uv1: vec4<f32>,
+    uv2: vec4<f32>,
+    tint0: vec4<f32>,   // rgb tint; tint0.w = heights blend sharpness
+    tint1: vec4<f32>,
+    tint2: vec4<f32>,
+};
+@group(2) @binding(5) var<storage, read> vp_table: array<VpGpu>;
 
 // --- Phase 1: baked SH-GI irradiance volume (group 3) ------------------------
 // Replaces the flat `ambient + N·L` hack with the RTX-baked spherical-harmonics
@@ -672,6 +691,51 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         albedo = vec4<f32>(acc / max(wsum, 0.002), 1.0) * m.tint;
     }
 
+    // --- Vert-Paint 3-layer splat (Custom/Vert Paint SoftCutout Decal + Shader Solid) --------
+    // Replaces the single layer-0 sample with the game's height-splat blend (see VpGpu above).
+    // Without this, a parking lot whose layer 0 is road_sand tiled a rust-orange blotch grid
+    // where the game blends asphalt/gravel/sand by the painted COLOR_0 weights.
+    // vp_smooth < 0 = "not a vp material" (also gates the matte-roughness override below).
+    var vp_smooth = -1.0;
+    if ((m.flags & MAT_FLAG_VP) != 0u) {
+        let v = vp_table[m._pad2];
+        // Un-bake layer 0's ST from the mesh UV to recover the raw UV (guard degenerate scales).
+        let s0 = select(v.uv0.xy, vec2<f32>(1.0), abs(v.uv0.xy) < vec2<f32>(1e-4));
+        let raw_uv = (o.uv - v.uv0.zw) / s0;
+        let raw_dx = duv_dx / s0;
+        let raw_dy = duv_dy / s0;
+        // Heights control mask (R/G/B = per-layer coverage) at the RAW uv — sampling each layer's
+        // tiled uv instead was noise-at-3-scales fighting itself (web-viewer parity note).
+        var h = vec3<f32>(1.0);
+        if (v.tex.w != MAT_ALBEDO_NONE) {
+            h = textureSampleGrad(albedo_tex[v.tex.w], albedo_samp, raw_uv, raw_dx, raw_dy).rgb;
+        }
+        let hw = h * o.color.rgb;
+        let hs = hw.x + hw.y + hw.z;
+        // Zero coverage (unpainted / "Solid" variant / missing COLOR_0) falls back to the BASE
+        // layer — normalizing near-zero weights washed to an equal 3-way blend (codex fix, web).
+        var w = vec3<f32>(1.0, 0.0, 0.0);
+        if (hs > 1e-5) {
+            w = pow(max(hw, vec3<f32>(1e-4)), vec3<f32>(max(v.tint0.w, 1.0)));
+            w = w / max(w.x + w.y + w.z, 1e-4);
+        }
+        let u1 = raw_uv * v.uv1.xy + v.uv1.zw;
+        let u2 = raw_uv * v.uv2.xy + v.uv2.zw;
+        let a0 = textureSampleGrad(albedo_tex[v.tex.x], albedo_samp, o.uv, duv_dx, duv_dy);
+        let a1 = textureSampleGrad(albedo_tex[v.tex.y], albedo_samp, u1,
+                                   raw_dx * v.uv1.xy, raw_dy * v.uv1.xy);
+        let a2 = textureSampleGrad(albedo_tex[v.tex.z], albedo_samp, u2,
+                                   raw_dx * v.uv2.xy, raw_dy * v.uv2.xy);
+        var spl = w.x * a0.rgb * v.tint0.rgb + w.y * a1.rgb * v.tint1.rgb + w.z * a2.rgb * v.tint2.rgb;
+        // Near-black resolve (dark layer tints / bad mask) falls back to layer 0 (web parity).
+        if (dot(spl, vec3<f32>(0.299, 0.587, 0.114)) < 0.02) {
+            spl = a0.rgb * v.tint0.rgb;
+        }
+        albedo = vec4<f32>(spl, albedo.a) * m.tint;
+        // Smoothness rides the layer alphas; the roughness override below compresses it (matte).
+        vp_smooth = w.x * a0.a + w.y * a1.a + w.z * a2.a;
+    }
+
     // --- #6 Detail albedo (mean-neutralized contrast) ----------------------------
     // Multiply the base albedo by the detail texture, but NEUTRALIZED: the detail map's own average
     // brightness/tint would darken/recolor the whole surface, so we divide out its offline-measured
@@ -784,6 +848,12 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     if ((m.flags & MAT_FLAG_WATER) != 0u) {
         rough = max(rough, 0.10);
     }
+    // Vert-paint ground matte: the splat layers pack smoothness in alpha, but raw 1-smoothness
+    // read near-mirror (wet-glossy road slabs popping off the matte terrain). Compress ×0.30 and
+    // floor at 0.72 — asphalt/dirt are matte in-game (web-viewer-validated constants).
+    if (vp_smooth >= 0.0) {
+        rough = clamp(1.0 - 0.30 * vp_smooth, 0.72, 1.0);
+    }
 
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {
@@ -845,7 +915,9 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
     if (is_softcutout) {
         // Roads/decals are matte ground overlays — no env reflection (keeps asphalt from mirroring).
-        let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0);
+        // Extra ×color.a beyond the clamp: keeps feather tails soft where _AlphaStrength (≥2)
+        // would re-saturate them (web/WebGPU-viewer parity — the validated game look).
+        let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0) * o.color.a;
         return vec4<f32>(apply_fog(lit + spec_rgb, o.world_pos, dom.directionality), coverage);
     } else if (is_water) {
         // PUDDLE (textured water — untextured DEEP water is opaque-pass now, see #else path).

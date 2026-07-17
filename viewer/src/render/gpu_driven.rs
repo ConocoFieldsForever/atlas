@@ -257,6 +257,14 @@ pub const MAT_FLAG_DETAIL: u32 = 1 << 5;
 /// of the constant `roughness`. Only set for role=opaque (glass keeps its authored 0.05; cutout
 /// alpha is coverage, not smoothness); cleared again for terrain-tagged materials.
 pub const MAT_FLAG_RFA: u32 = 1 << 6;
+/// `GpuMaterial::flags` bit: Vert-Paint 3-layer splat (Custom/Vert Paint SoftCutout Decal AND
+/// the opaque "Vert Paint Shader Solid" variant — any material whose `vp.layers` has 3 entries).
+/// The fragment replaces the single-albedo sample with the game's height-splat blend
+/// (`w_i = pow(Heights_i(raw_uv) * COLOR_0_i, blend)`, normalized), reading `VpGpu` at index
+/// `_pad2` (disjoint with terrain's `_pad2` slice — a material is never both). Without this the
+/// viewer rendered ONLY layer 0 at full strength: parking lots whose layer 0 is `road_sand`
+/// tiled a loud rust-orange blotch grid instead of the game's asphalt/gravel/sand mix.
+pub const MAT_FLAG_VP: u32 = 1 << 7;
 /// `GpuMaterial::detail_flags` bit0: this material has a detail ALBEDO texture.
 pub const DETAIL_FLAG_ALBEDO: u32 = 1 << 0;
 /// `GpuMaterial::detail_flags` bit1: this material has a detail NORMAL texture.
@@ -281,6 +289,29 @@ pub struct TerrainSplatGpu {
     /// (Streets-scale maps can carry more slices than Interchange's 4 / Lighthouse's 6.)
     pub ctrl_idx: [u32; 48],
 }
+
+/// Vert-Paint 3-layer splat table entry (group(2) binding(5), storage; one per MAT_FLAG_VP
+/// material, indexed by `GpuMaterial::_pad2`). The EXACT game blend was RE'd from the DX11
+/// fragment and validated in the web viewer (`tarkmap/out/_vpsplat.js`):
+///   `w_i = pow(Heights_i(raw_uv) * COLOR_0_i, blend)` normalized; albedo = Σ w_i·layer_i·tint_i.
+/// Layer 0's ST is baked into the mesh UVs (uvTilingBaked), so the shader un-bakes with `uv0`
+/// to recover the raw UV that the heights mask and layers 1/2 sample from. 112 bytes, 16-aligned.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct VpGpu {
+    /// x,y,z = bindless `albedo_tex` indices of layers 0..2; w = heights control-mask index
+    /// (uploaded LINEAR — it's blend weights, not color) or NO_ALBEDO when absent.
+    pub tex: [u32; 4],
+    /// RAW per-layer `_MainTex_ST` (sx,sy,ox,oy). uv0 is also the baked-in transform.
+    pub uv0: [f32; 4],
+    pub uv1: [f32; 4],
+    pub uv2: [f32; 4],
+    /// rgb = layer tint. tint0.w = heights blend sharpness (`vp.blend`); other w lanes unused.
+    pub tint0: [f32; 4],
+    pub tint1: [f32; 4],
+    pub tint2: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<VpGpu>() == 112);
 
 // ---------------------------------------------------------------------------
 // Phase 1 SH-GI: baked spherical-harmonics irradiance volume.
@@ -674,6 +705,8 @@ pub struct CpuData {
     sh_volume: Option<ShVolumeCpu>,
     /// #1 MicroSplat: the terrain splat table (layer/control bindless indices + per-layer rep).
     terrain: TerrainSplatGpu,
+    /// Vert-Paint 3-layer splat entries (MAT_FLAG_VP materials; `GpuMaterial._pad2` indexes this).
+    vp_table: Vec<VpGpu>,
     /// Bindless albedo indices that are terrain CONTROL maps (blend weights = data, not color):
     /// uploaded LINEAR instead of sRGB so the weights aren't gamma-warped toward one layer.
     ctrl_tex_linear: std::collections::HashSet<u32>,
@@ -847,6 +880,12 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
     // Phase 2b: dedup normal-map paths in the SAME pass (bindless index consistency, like albedo).
     let mut normal_paths: Vec<String> = Vec::new();
     let mut normal_path_to_index: HashMap<String, u32> = HashMap::new();
+    // DATA textures (terrain control maps, vp heights masks): uploaded LINEAR, not sRGB —
+    // the sRGB decode would gamma-warp blend weights. Declared here (not in the terrain block)
+    // because the vp material loop below also registers its heights masks into it.
+    let mut ctrl_tex_linear: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Vert-Paint 3-layer splat table (one entry per MAT_FLAG_VP material; GpuMaterial._pad2 indexes it).
+    let mut vp_table: Vec<VpGpu> = Vec::new();
     // Pack-wide green-flip convention (DirectX Y-down): OR'd with each material's own flag.
     let conv_green_flip = pack.manifest.conventions.normal_map_green_flip;
     for mat in &pack.materials {
@@ -907,6 +946,84 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         let vp_params = softcutout_params(&mat.vp);
         if vp_params.is_some() {
             flags |= MAT_FLAG_SOFTCUTOUT | MAT_FLAG_BLEND;
+        }
+        // Vert-Paint 3-layer splat (BOTH the SoftCutout decal AND the opaque "Solid" variant):
+        // build the VpGpu entry so the fragment blends the game's 3 layers by COLOR_0.rgb ×
+        // heights-mask instead of tiling layer 0 alone (layer0=road_sand parking lots rendered
+        // as a rust-orange blotch grid). All layer albedos must resolve or we skip (fall back
+        // to the old single-layer look rather than splat with a placeholder).
+        let mut vp_index = 0u32;
+        if let Some(vpv) = &mat.vp {
+            let layers = vpv
+                .get("layers")
+                .and_then(|v| v.as_array())
+                .filter(|l| l.len() == 3);
+            if let Some(layers) = layers {
+                let f4 = |v: Option<&serde_json::Value>, d: [f32; 4]| -> [f32; 4] {
+                    v.and_then(|a| a.as_array()).map_or(d, |a| {
+                        let mut out = d;
+                        for (i, x) in a.iter().take(4).enumerate() {
+                            out[i] = x.as_f64().unwrap_or(d[i] as f64) as f32;
+                        }
+                        out
+                    })
+                };
+                let f3w = |v: Option<&serde_json::Value>, w: f32| -> [f32; 4] {
+                    let mut out = [1.0, 1.0, 1.0, w];
+                    if let Some(a) = v.and_then(|a| a.as_array()) {
+                        for (i, x) in a.iter().take(3).enumerate() {
+                            out[i] = x.as_f64().unwrap_or(1.0) as f32;
+                        }
+                    }
+                    out
+                };
+                let mut tex_idx = [NO_ALBEDO; 4];
+                let mut ok = true;
+                for (i, l) in layers.iter().enumerate() {
+                    match l.get("albedo").and_then(|v| v.as_str()).filter(|p| !p.is_empty()) {
+                        Some(p) => {
+                            tex_idx[i] =
+                                *path_to_index.entry(p.to_string()).or_insert_with(|| {
+                                    let idx = albedo_paths.len() as u32;
+                                    albedo_paths.push(p.to_string());
+                                    idx
+                                });
+                        }
+                        None => ok = false,
+                    }
+                }
+                if ok {
+                    // Heights control mask: R/G/B = per-layer coverage, sampled at the RAW uv.
+                    // DATA, not color -> linear upload (same rule as the terrain control maps).
+                    tex_idx[3] = vpv
+                        .get("heights")
+                        .and_then(|v| v.as_str())
+                        .filter(|p| !p.is_empty())
+                        .map(|p| {
+                            let idx =
+                                *path_to_index.entry(p.to_string()).or_insert_with(|| {
+                                    let idx = albedo_paths.len() as u32;
+                                    albedo_paths.push(p.to_string());
+                                    idx
+                                });
+                            ctrl_tex_linear.insert(idx);
+                            idx
+                        })
+                        .unwrap_or(NO_ALBEDO);
+                    let blend = vpv.get("blend").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                    flags |= MAT_FLAG_VP;
+                    vp_index = vp_table.len() as u32;
+                    vp_table.push(VpGpu {
+                        tex: tex_idx,
+                        uv0: f4(layers[0].get("uv"), [1.0, 1.0, 0.0, 0.0]),
+                        uv1: f4(layers[1].get("uv"), [1.0, 1.0, 0.0, 0.0]),
+                        uv2: f4(layers[2].get("uv"), [1.0, 1.0, 0.0, 0.0]),
+                        tint0: f3w(layers[0].get("tint"), blend.max(1.0)),
+                        tint1: f3w(layers[1].get("tint"), 0.0),
+                        tint2: f3w(layers[2].get("tint"), 0.0),
+                    });
+                }
+            }
         }
         if mat.role == "water" {
             flags |= MAT_FLAG_WATER;
@@ -1007,7 +1124,9 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
             normal_index,
             normal_flags,
             normal_scale: mat.normal_scale,
-            _pad2: 0,
+            // MAT_FLAG_VP: index into vp_table. MAT_FLAG_TERRAIN: slice index (tagged after this
+            // loop, overwrites). The two classes are disjoint so the lane can't collide.
+            _pad2: vp_index,
             // #6 Detail maps (zeros unless MAT_FLAG_DETAIL was set above).
             detail_albedo_index,
             detail_normal_index,
@@ -1031,9 +1150,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         layer_rep: [1.0; 12],
         ctrl_idx: [0; 48],
     };
-    // Control-map bindless indices: these are DATA (blend weights), not color — they must be
-    // uploaded LINEAR, not sRGB-decoded, or the weights warp toward the dominant layer.
-    let mut ctrl_tex_linear: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // (ctrl_tex_linear is declared above the material loop — vp heights masks share it.)
     'terrain: {
         let Some(tl_path) = pack.manifest.sidecars.terrain_layers.as_deref() else {
             warn!("gpu-driven terrain: no terrainLayers sidecar — terrain stays single-layer");
@@ -1503,6 +1620,7 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         normal_paths,
         sh_volume,
         terrain,
+        vp_table,
         ctrl_tex_linear,
         blend_meshes,
         sun_dir,
@@ -1838,6 +1956,21 @@ fn prepare_gpu_buffers(
         contents: bytemuck::bytes_of(&cpu.terrain),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
+    // Vert-Paint 3-layer splat table (group(2) binding(5)); a zeroed sentinel entry keeps the
+    // binding valid when the pack has no vp materials (the shader never reads it then).
+    let vp_entries: &[VpGpu] = if cpu.vp_table.is_empty() {
+        &[VpGpu {
+            tex: [NO_ALBEDO; 4],
+            ..VpGpu::default()
+        }]
+    } else {
+        &cpu.vp_table
+    };
+    let vp_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_vp_splat"),
+        contents: bytemuck::cast_slice(vp_entries),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
 
     // Decode + upload every UNIQUE albedo (image crate -> Rgba8UnormSrgb). One texture per
     // entry, IN THE SAME order as cpu.albedo_paths, so GpuMaterial.albedo_index stays aligned;
@@ -1920,6 +2053,7 @@ fn prepare_gpu_buffers(
                         .count(NonZeroU32::new(normal_count).unwrap()),
                 ),
                 (4, storage_buffer_read_only_sized(false, None)), // #1 terrain splat table
+                (5, storage_buffer_read_only_sized(false, None)), // vert-paint 3-layer splat table
             ),
         ),
     );
@@ -1936,6 +2070,7 @@ fn prepare_gpu_buffers(
             (2, &albedo_sampler),
             (3, &normal_view_refs[..]),
             (4, terrain_buf.as_entire_binding()),
+            (5, vp_buf.as_entire_binding()),
         )),
     );
 
