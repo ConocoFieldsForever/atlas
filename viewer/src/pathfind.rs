@@ -55,10 +55,15 @@ pub struct Nav(pub Option<Arc<NavGrid>>);
 struct PathfindTask(Option<Task<Result<(Vec<Vec3>, f32), String>>>);
 
 /// The player's placed "you are here" start. `None` -> routes fall back to the camera (which, in
-/// walk mode, IS the player). Set by SHIFT-clicking the floor (pick.rs) or the `B` hotkey / UI
-/// button (drop at the current position). Drawn as a gold pin.
+/// walk mode, IS the player). Set by clicking the map while [`PlaceMode`] is armed (the Navigation
+/// tab's PLACE ON MAP button; pick.rs does the raycast). Drawn as a gold pin.
 #[derive(Resource, Default)]
 pub struct StartPoint(pub Option<Vec3>);
+
+/// Armed = the next left-click on the map places [`StartPoint`] (single-shot; Esc cancels). Set by
+/// the Navigation tab's PLACE ON MAP button, consumed by pick.rs.
+#[derive(Resource, Default)]
+pub struct PlaceMode(pub bool);
 
 /// Kept for UI compatibility. `Running` = nav grid loaded (routing available); `Stopped` = none.
 /// (`Starting` is unused now — there is no external process to warm up.)
@@ -97,18 +102,11 @@ impl Plugin for PathfindPlugin {
             .init_resource::<PathfindServer>()
             .init_resource::<Nav>()
             .init_resource::<StartPoint>()
+            .init_resource::<PlaceMode>()
             .add_systems(
                 Update,
-                // chained: nav-load -> place-start -> scripted-route -> dispatch -> poll -> draw.
-                (
-                    manage_nav,
-                    set_start_input,
-                    debug_route,
-                    dispatch_route,
-                    poll_route,
-                    draw_route,
-                    draw_start,
-                )
+                // chained: nav-load -> scripted-route -> dispatch -> poll -> draw (dataflow order).
+                (manage_nav, debug_route, dispatch_route, poll_route, draw_route, draw_start)
                     .chain(),
             );
     }
@@ -270,27 +268,6 @@ fn poll_route(mut task: ResMut<PathfindTask>, mut result: ResMut<RouteResult>) {
                 result.dist = 0.0;
                 result.status = RouteStatus::Error(e);
             }
-        }
-    }
-}
-
-/// `B` drops the "you are here" start at the current position (walk player / camera). Behind the
-/// typing guard so pressing B in a text field doesn't move it. SHIFT-clicking the floor (pick.rs)
-/// is the precise alternative.
-fn set_start_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    ui_kb: Res<crate::inspect::UiWantsKeyboard>,
-    cam: Query<&GlobalTransform, With<CullCamera>>,
-    mut start_pt: ResMut<StartPoint>,
-) {
-    if ui_kb.0 {
-        return;
-    }
-    if keys.just_pressed(KeyCode::KeyB) {
-        if let Ok(t) = cam.single() {
-            let p = t.translation();
-            start_pt.0 = Some(p);
-            info!("pathfind: start placed at ({:.1}, {:.1}, {:.1})", p.x, p.y, p.z);
         }
     }
 }

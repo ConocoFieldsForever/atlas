@@ -176,6 +176,8 @@ pub enum RightPanelTab {
     Camera,
     /// Task / quest tracker (revamped module).
     Tasks,
+    /// Navigation: place your position + route to extracts (navigate_panel module).
+    Navigate,
 }
 
 pub struct UiPlugin;
@@ -187,10 +189,11 @@ impl Plugin for UiPlugin {
             .init_resource::<PlanList>()
             .init_resource::<Bookmarks>()
             .init_resource::<PosHud>()
-            // EFT_TAB=camera|tasks|vis seeds the initial right-panel tab (screenshots / power users).
+            // EFT_TAB=camera|tasks|nav|vis seeds the initial right-panel tab (screenshots / power users).
             .insert_resource(match std::env::var("EFT_TAB").as_deref() {
                 Ok("camera") => RightPanelTab::Camera,
                 Ok("tasks") => RightPanelTab::Tasks,
+                Ok("nav") | Ok("route") => RightPanelTab::Navigate,
                 _ => RightPanelTab::Visibility,
             })
             .add_systems(Update, (apply_loot_visibility, load_bookmarks));
@@ -206,7 +209,15 @@ impl Plugin for UiPlugin {
             // fit_camera_viewport LAST: once all right-side panels are laid out, shrink the 3D
             // camera viewport to the free central area so the scene re-centers instead of hiding
             // behind the panel.
-            (toolbar_panel, layers_panel, camera_panel, tasks_tab, pos_hud, fit_camera_viewport)
+            (
+                toolbar_panel,
+                layers_panel,
+                camera_panel,
+                tasks_tab,
+                crate::navigate_panel::navigate_tab,
+                pos_hud,
+                fit_camera_viewport,
+            )
                 .chain(),
         );
     }
@@ -417,18 +428,8 @@ fn layers_panel(
     // transform is identity; it would route the tour through the world origin).
     poi_q: Query<&crate::poi::PoiLayer, Without<crate::poi::ZoneWall>>,
     loot_q: Query<&crate::loot::LootClass>,
-    extracts: Query<
-        (
-            &crate::poi::PoiLayer,
-            &GlobalTransform,
-            Option<&crate::poi::ExtractFaction>,
-        ),
-        Without<crate::poi::ZoneWall>,
-    >,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
-    mut start_pt: ResMut<crate::pathfind::StartPoint>,
-    route_result: Res<crate::pathfind::RouteResult>,
     server: Res<crate::pathfind::PathfindServer>,
 ) {
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
@@ -987,78 +988,8 @@ fn layers_panel(
                         );
                     });
 
-                    // ===== PATHFINDING (in-process CPU routing over the baked nav grid) =====
-                    CollapsingHeader::new(section_hdr("Pathfinding", 0))
-                        .id_salt("sec_pathfind")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            // `Running` now means the pack's nav grid is loaded (routing is available);
-                            // there is no external server anymore — it runs on the CPU, in-process.
-                            let ready = server.status == ServerStatus::Running;
-                            let (dot, txt, col) = if ready {
-                                ("\u{25CF}", "routing ready (CPU, in-process)", theme::OK)
-                            } else {
-                                ("\u{25CF}", "no route data for this map", theme::FAINT)
-                            };
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(dot).color(col).size(11.0));
-                                ui.label(RichText::new(txt).color(col).size(12.0));
-                            });
-                            // ---- START placement: shift-click the floor or press B; else routes
-                            // begin at the camera (the player, in walk mode). ----
-                            ui.horizontal(|ui| {
-                                match start_pt.0 {
-                                    Some(p) => {
-                                        ui.label(
-                                            RichText::new(format!("start: ({:.0}, {:.0})", p.x, p.z))
-                                                .size(11.0)
-                                                .color(Color32::from_rgb(255, 209, 51)),
-                                        );
-                                        if ui.small_button("clear").on_hover_text("route from the camera again").clicked() {
-                                            start_pt.0 = None;
-                                        }
-                                    }
-                                    None => {
-                                        ui.label(RichText::new("start: your location").size(11.0).color(MUTED));
-                                    }
-                                }
-                            });
-                            ui.label(
-                                RichText::new("Shift-click the floor (or press B) to place your start")
-                                    .size(9.0)
-                                    .italics()
-                                    .color(MUTED),
-                            );
-                            // One-click route from your location through every extract — the chain
-                            // re-orders the stops, so the nearest extract comes first.
-                            if ui
-                                .add_enabled(ready, egui::Button::new("Route: nearest extract"))
-                                .clicked()
-                            {
-                                let dests: Vec<Vec3> = extracts
-                                    .iter()
-                                    .filter(|(l, _, _)| **l == PoiLayer::Extract)
-                                    .map(|(_, gt, _)| gt.translation())
-                                    .collect();
-                                if !dests.is_empty() {
-                                    route_writer.write(RouteRequest {
-                                        start: None,
-                                        dests,
-                                        optimize_order: true,
-                                    });
-                                }
-                            }
-                            ui.label(
-                                RichText::new(if ready {
-                                    "runs on the CPU in-process (no GPU/server) \u{2014} routes from your location (walk position or camera)"
-                                } else {
-                                    "this map has no baked nav grid \u{2014} rebuild it from the start menu to enable routing"
-                                })
-                                .size(10.0)
-                                .italics()
-                                .color(MUTED),
-                            );
-                        });
+                    // (Pathfinding moved to its own Navigation tab — navigate_panel.rs. Position
+                    // placement + the extract table + route status all live there now.)
 
                     // ---- Graphics (experimental): live toggles for the render features. ----
                     // Edits go through a local copy so change-detection only fires on a real
@@ -1280,6 +1211,9 @@ fn toolbar_panel(
             }
             if theme::rail_button(ui, cur == RightPanelTab::Tasks, 2, "Tasks") {
                 *tab = RightPanelTab::Tasks;
+            }
+            if theme::rail_button(ui, cur == RightPanelTab::Navigate, 3, "Navigation \u{00B7} routes") {
+                *tab = RightPanelTab::Navigate;
             }
         });
 }
