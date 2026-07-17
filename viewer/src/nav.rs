@@ -33,6 +33,12 @@ const NB: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), 
 /// Vertical-movement cost multiplier: strongly prefers the flat floor (no roof/ceiling detours).
 const VERT: f32 = 6.0;
 
+/// Per-CELL soft-avoidance cost (extra metres-equivalent added when the path enters the cell).
+/// XZ-only (a danger zone spans all floors above it). Built by [`NavGrid::build_avoid`] from
+/// danger points (boss/PMC/scav spawns); the A* takes it as an optional penalty layer, so paths
+/// "avoid if possible" — they still cross a zone when no reasonable detour exists.
+pub type AvoidMap = std::collections::HashMap<u32, f32>;
+
 /// A loaded, immutable nav grid for one map. Shared read-only across async query tasks.
 pub struct NavGrid {
     pub min_x: f32,
@@ -109,6 +115,39 @@ impl NavGrid {
     /// Node count (nx*nz*K) — the size a `Scratch` must match.
     pub fn nodes(&self) -> usize {
         self.nx * self.nz * self.k
+    }
+
+    /// Build a soft-avoidance cost field from danger points `(pos, radius_m)`. Cost per entered
+    /// cell falls off linearly from `strength * res` at the centre to 0 at the radius edge —
+    /// `strength` is roughly "extra metres of detour a path accepts per metre walked at the
+    /// centre". Overlapping zones keep the max (not sum), so stacked spawns don't explode.
+    pub fn build_avoid(&self, pts: &[(Vec3, f32)], strength: f32) -> AvoidMap {
+        let mut m = AvoidMap::new();
+        for (p, r) in pts {
+            let r = r.max(self.res);
+            let cr = (r / self.res).ceil() as i64;
+            let cx = ((p.x - self.min_x) / self.res).round() as i64;
+            let cz = ((p.z - self.min_z) / self.res).round() as i64;
+            for dz in -cr..=cr {
+                for dx in -cr..=cr {
+                    let (jx, jz) = (cx + dx, cz + dz);
+                    if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                        continue;
+                    }
+                    let d = (((dx * dx + dz * dz) as f32).sqrt()) * self.res;
+                    if d > r {
+                        continue;
+                    }
+                    let w = strength * (1.0 - d / r) * self.res;
+                    let cell = (jz * self.nx as i64 + jx) as u32;
+                    let e = m.entry(cell).or_insert(0.0);
+                    if w > *e {
+                        *e = w;
+                    }
+                }
+            }
+        }
+        m
     }
 
     #[inline]
@@ -209,8 +248,18 @@ impl NavGrid {
     }
 
     /// A* from (start cell,layer) to (dest cell,layer). Returns the node polyline, or None if
-    /// unreachable. Uses generation-stamped scratch (no O(grid) clears).
-    fn astar(&self, sc: usize, sl: usize, dc: usize, dl: usize, s: &mut Scratch) -> Option<Vec<Vec3>> {
+    /// unreachable. Uses generation-stamped scratch (no O(grid) clears). `avoid` adds a per-cell
+    /// soft penalty (danger zones) — heuristic stays the plain distance, which remains admissible
+    /// (penalties only ADD cost), so the path is still optimal under the penalised metric.
+    fn astar(
+        &self,
+        sc: usize,
+        sl: usize,
+        dc: usize,
+        dl: usize,
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+    ) -> Option<Vec<Vec3>> {
         let k = self.k;
         let nx = self.nx as i64;
         let nz = self.nz as i64;
@@ -290,7 +339,12 @@ impl NavGrid {
                 }
                 let nn = nc * k + nl;
                 let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
-                let step = (horiz * horiz + (up * VERT) * (up * VERT)).sqrt();
+                let mut step = (horiz * horiz + (up * VERT) * (up * VERT)).sqrt();
+                if let Some(av) = avoid {
+                    if let Some(&p) = av.get(&(nc as u32)) {
+                        step += p; // danger-zone soft penalty (extra metres-equivalent)
+                    }
+                }
                 let ng = s.g[cur] + step;
                 let known = s.open_gen[nn] == gen;
                 if !known || ng < s.g[nn] {
@@ -320,7 +374,14 @@ impl NavGrid {
     }
 
     /// Route a->b: snap the start, try dest layers nearest b.y. Returns (polyline, walkable length).
-    pub fn path(&self, a: Vec3, b: Vec3, s: &mut Scratch) -> Option<(Vec<Vec3>, f32)> {
+    /// The reported length is the REAL walked metres (avoid penalties shape the path, not the number).
+    pub fn path(
+        &self,
+        a: Vec3,
+        b: Vec3,
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+    ) -> Option<(Vec<Vec3>, f32)> {
         let (sc, sl) = self.snap_start(a.x, a.y, a.z, 16)?;
         let mut dc = self.cell_of(b.x, b.z);
         if dc < 0 {
@@ -331,7 +392,7 @@ impl NavGrid {
         }
         let dc = dc as usize;
         for dl in self.layers_by_height(dc, b.y) {
-            if let Some(path) = self.astar(sc, sl, dc, dl, s) {
+            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid) {
                 let dist = polyline_len(&path);
                 return Some((path, dist));
             }
@@ -342,12 +403,18 @@ impl NavGrid {
     /// Chain: visit every dest from `start` in the cheapest order (exact TSP <= 7 stops, else
     /// nearest-neighbour). Returns one flattened polyline + total length + the visiting order (into
     /// `dests`). Legs from unreachable dests are skipped.
-    pub fn chain(&self, start: Vec3, dests: &[Vec3], s: &mut Scratch) -> Option<(Vec<Vec3>, f32)> {
+    pub fn chain(
+        &self,
+        start: Vec3,
+        dests: &[Vec3],
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+    ) -> Option<(Vec<Vec3>, f32)> {
         if dests.is_empty() {
             return None;
         }
         if dests.len() == 1 {
-            return self.path(start, dests[0], s);
+            return self.path(start, dests[0], s, avoid);
         }
         let n = dests.len() + 1;
         // nodes[0] = start, nodes[1..] = dests
@@ -357,7 +424,7 @@ impl NavGrid {
         for i in 0..n {
             for j in 1..n {
                 if i != j {
-                    if let Some(r) = self.path(node(i), node(j), s) {
+                    if let Some(r) = self.path(node(i), node(j), s, avoid) {
                         legs.insert((i, j), r);
                     }
                 }
@@ -429,7 +496,12 @@ impl NavGrid {
 
     /// Tour: route an ORDERED sequence of waypoints as one continuous polyline (each leg continues
     /// from the previous SNAPPED endpoint so shared elevated waypoints don't jump floors).
-    pub fn tour(&self, points: &[Vec3], s: &mut Scratch) -> Option<(Vec<Vec3>, f32)> {
+    pub fn tour(
+        &self,
+        points: &[Vec3],
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+    ) -> Option<(Vec<Vec3>, f32)> {
         if points.len() < 2 {
             return None;
         }
@@ -438,7 +510,7 @@ impl NavGrid {
         let mut prev: Option<Vec3> = None;
         for i in 1..points.len() {
             let a = prev.unwrap_or(points[i - 1]);
-            if let Some((pts, d)) = self.path(a, points[i], s) {
+            if let Some((pts, d)) = self.path(a, points[i], s, avoid) {
                 if pts.len() > 1 {
                     if full.is_empty() {
                         full.extend_from_slice(&pts);

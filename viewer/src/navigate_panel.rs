@@ -20,7 +20,9 @@
 use bevy::prelude::*;
 use bevy_egui::egui::{self, Color32, RichText};
 
-use crate::pathfind::{PlaceMode, RouteRequest, RouteResult, RouteStatus, ServerStatus, StartPoint};
+use crate::pathfind::{
+    PlaceMode, RouteOpts, RouteRequest, RouteResult, RouteStatus, ServerStatus, StartPoint,
+};
 use crate::poi::{PoiLayer, SceneInactive, ZoneWall};
 use crate::render::CullCamera;
 use crate::ui::RightPanelTab;
@@ -57,7 +59,8 @@ pub fn navigate_tab(
     mut start_pt: ResMut<StartPoint>,
     mut place: ResMut<PlaceMode>,
     mut route: MessageWriter<RouteRequest>,
-    route_result: Res<RouteResult>,
+    mut route_result: ResMut<RouteResult>,
+    mut route_opts: ResMut<RouteOpts>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     extracts: Query<
         (
@@ -204,6 +207,18 @@ pub fn navigate_tab(
                 {
                     place.0 = true;
                 }
+            });
+
+            // ---- avoid options: soft-avoid danger zones; when any is on, every route computes
+            // Direct / Cautious / Wide-berth variants (listed with distances under ROUTE). ----
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("avoid").size(theme::SIZE_SMALL).color(theme::MUTED));
+                ui.checkbox(&mut route_opts.avoid_boss, RichText::new("bosses").size(theme::SIZE_SMALL))
+                    .on_hover_text("detour around boss spawn areas when a reasonable path exists");
+                ui.checkbox(&mut route_opts.avoid_pmc, RichText::new("PMCs").size(theme::SIZE_SMALL))
+                    .on_hover_text("detour around PMC spawn areas");
+                ui.checkbox(&mut route_opts.avoid_scav, RichText::new("scavs").size(theme::SIZE_SMALL))
+                    .on_hover_text("detour around scav spawn areas");
             });
 
             // ---- flagship action: true nearest-by-foot (one A* per ACTIVE extract, keep the
@@ -392,7 +407,8 @@ pub fn navigate_tab(
                 });
 
             // ===== 3 · ROUTE =====
-            match &route_result.status {
+            let status = route_result.status.clone();
+            match &status {
                 RouteStatus::Idle => {}
                 RouteStatus::Pending => {
                     ui.add_space(theme::SP_SM);
@@ -406,6 +422,10 @@ pub fn navigate_tab(
                 RouteStatus::Ok => {
                     ui.add_space(theme::SP_SM);
                     ui.label(theme::section_header("ROUTE", 0));
+                    let dest = route_result.dest_label.clone();
+                    let opts_list: Vec<(&'static str, f32)> =
+                        route_result.options.iter().map(|o| (o.name, o.dist)).collect();
+                    let selected = route_result.selected;
                     theme::card(ui, theme::OK, |ui| {
                         ui.horizontal(|ui| {
                             // WHERE the route goes (the whole point of the card), then the metres.
@@ -419,15 +439,10 @@ pub fn navigate_tab(
                                     |ui| {
                                         ui.add(
                                             egui::Label::new(
-                                                RichText::new(
-                                                    route_result
-                                                        .dest_label
-                                                        .as_deref()
-                                                        .unwrap_or("Route"),
-                                                )
-                                                .size(theme::SIZE_BODY)
-                                                .strong()
-                                                .color(theme::TEXT_BRIGHT),
+                                                RichText::new(dest.as_deref().unwrap_or("Route"))
+                                                    .size(theme::SIZE_BODY)
+                                                    .strong()
+                                                    .color(theme::TEXT_BRIGHT),
                                             )
                                             .truncate(),
                                         );
@@ -435,14 +450,58 @@ pub fn navigate_tab(
                                 );
                             });
                         });
-                        ui.label(
-                            RichText::new(format!(
-                                "{:.0} m walkable \u{00B7} drawn on the map",
-                                route_result.dist
-                            ))
-                            .size(theme::SIZE_CAPTION)
-                            .color(theme::OK),
-                        );
+                        if opts_list.len() <= 1 {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.0} m walkable \u{00B7} drawn on the map",
+                                    route_result.dist
+                                ))
+                                .size(theme::SIZE_CAPTION)
+                                .color(theme::OK),
+                            );
+                        } else {
+                            // Variant list: click one to draw it (the others stay as dim
+                            // alternates on the map). Longer = safer.
+                            for (i, (name, dist)) in opts_list.iter().enumerate() {
+                                let sel = i == selected;
+                                let resp = ui
+                                    .horizontal(|ui| {
+                                        dot(
+                                            ui,
+                                            if sel { theme::color32(bevy::prelude::Color::srgb(0.25, 1.0, 0.45)) } else { theme::FAINT },
+                                            3.2,
+                                        );
+                                        ui.label(
+                                            RichText::new(*name)
+                                                .size(theme::SIZE_SMALL)
+                                                .strong()
+                                                .color(if sel { theme::TEXT_BRIGHT } else { theme::MUTED }),
+                                        );
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{dist:.0} m"))
+                                                        .size(theme::SIZE_SMALL)
+                                                        .color(if sel { theme::OK } else { theme::MUTED }),
+                                                );
+                                            },
+                                        );
+                                    })
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                    .on_hover_text("draw this variant");
+                                if resp.clicked() {
+                                    route_result.select(i);
+                                }
+                            }
+                            ui.label(
+                                RichText::new("variants differ by how hard they avoid danger zones")
+                                    .size(theme::SIZE_TINY)
+                                    .color(theme::MUTED),
+                            );
+                        }
                     });
                 }
                 RouteStatus::Error(e) => {
