@@ -54,6 +54,12 @@ pub struct Nav(pub Option<Arc<NavGrid>>);
 #[derive(Resource, Default)]
 struct PathfindTask(Option<Task<Result<(Vec<Vec3>, f32), String>>>);
 
+/// The player's placed "you are here" start. `None` -> routes fall back to the camera (which, in
+/// walk mode, IS the player). Set by SHIFT-clicking the floor (pick.rs) or the `B` hotkey / UI
+/// button (drop at the current position). Drawn as a gold pin.
+#[derive(Resource, Default)]
+pub struct StartPoint(pub Option<Vec3>);
+
 /// Kept for UI compatibility. `Running` = nav grid loaded (routing available); `Stopped` = none.
 /// (`Starting` is unused now — there is no external process to warm up.)
 #[derive(Clone, PartialEq, Default)]
@@ -90,10 +96,20 @@ impl Plugin for PathfindPlugin {
             .init_resource::<PathfindTask>()
             .init_resource::<PathfindServer>()
             .init_resource::<Nav>()
+            .init_resource::<StartPoint>()
             .add_systems(
                 Update,
-                // chained: nav-load -> scripted-route -> dispatch -> poll -> draw (dataflow order).
-                (manage_nav, debug_route, dispatch_route, poll_route, draw_route).chain(),
+                // chained: nav-load -> place-start -> scripted-route -> dispatch -> poll -> draw.
+                (
+                    manage_nav,
+                    set_start_input,
+                    debug_route,
+                    dispatch_route,
+                    poll_route,
+                    draw_route,
+                    draw_start,
+                )
+                    .chain(),
             );
     }
 }
@@ -181,6 +197,7 @@ fn debug_route(
 fn dispatch_route(
     mut ev: MessageReader<RouteRequest>,
     nav: Res<Nav>,
+    start_pt: Res<StartPoint>,
     cam: Query<&GlobalTransform, With<CullCamera>>,
     mut task: ResMut<PathfindTask>,
     mut result: ResMut<RouteResult>,
@@ -202,8 +219,11 @@ fn dispatch_route(
             RouteStatus::Error("no route data for this map (nav is baked during the map build)".to_string());
         return;
     };
+    // Start = the explicit request start, else the placed "you are here" pin, else the camera
+    // (which IS the player in walk mode). snap_start then drops it onto the nearest walkable floor.
     let start = req
         .start
+        .or(start_pt.0)
         .or_else(|| cam.single().ok().map(|t| t.translation()))
         .unwrap_or(Vec3::ZERO);
     let dests = req.dests.clone();
@@ -252,6 +272,40 @@ fn poll_route(mut task: ResMut<PathfindTask>, mut result: ResMut<RouteResult>) {
             }
         }
     }
+}
+
+/// `B` drops the "you are here" start at the current position (walk player / camera). Behind the
+/// typing guard so pressing B in a text field doesn't move it. SHIFT-clicking the floor (pick.rs)
+/// is the precise alternative.
+fn set_start_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    ui_kb: Res<crate::inspect::UiWantsKeyboard>,
+    cam: Query<&GlobalTransform, With<CullCamera>>,
+    mut start_pt: ResMut<StartPoint>,
+) {
+    if ui_kb.0 {
+        return;
+    }
+    if keys.just_pressed(KeyCode::KeyB) {
+        if let Ok(t) = cam.single() {
+            let p = t.translation();
+            start_pt.0 = Some(p);
+            info!("pathfind: start placed at ({:.1}, {:.1}, {:.1})", p.x, p.y, p.z);
+        }
+    }
+}
+
+/// Draw the placed start as a gold "you are here" pin (stem + head + base), distinct from the cyan
+/// route. No-op when unplaced (routes then start at the camera).
+fn draw_start(mut gizmos: Gizmos, start_pt: Res<StartPoint>) {
+    let Some(p) = start_pt.0 else {
+        return;
+    };
+    let gold = Color::srgb(1.0, 0.82, 0.2);
+    let top = p + Vec3::Y * 2.4;
+    gizmos.line(p, top, gold);
+    gizmos.sphere(Isometry3d::from_translation(top), 0.45, gold);
+    gizmos.sphere(Isometry3d::from_translation(p), 0.2, gold);
 }
 
 /// Draw the current route each frame (immediate-mode; the polyline is static once computed):

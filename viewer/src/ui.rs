@@ -358,6 +358,7 @@ fn layers_panel(
     >,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
+    mut start_pt: ResMut<crate::pathfind::StartPoint>,
     route_result: Res<crate::pathfind::RouteResult>,
     server: Res<crate::pathfind::PathfindServer>,
 ) {
@@ -934,6 +935,31 @@ fn layers_panel(
                                 ui.label(RichText::new(dot).color(col).size(11.0));
                                 ui.label(RichText::new(txt).color(col).size(12.0));
                             });
+                            // ---- START placement: shift-click the floor or press B; else routes
+                            // begin at the camera (the player, in walk mode). ----
+                            ui.horizontal(|ui| {
+                                match start_pt.0 {
+                                    Some(p) => {
+                                        ui.label(
+                                            RichText::new(format!("start: ({:.0}, {:.0})", p.x, p.z))
+                                                .size(11.0)
+                                                .color(Color32::from_rgb(255, 209, 51)),
+                                        );
+                                        if ui.small_button("clear").on_hover_text("route from the camera again").clicked() {
+                                            start_pt.0 = None;
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(RichText::new("start: your location").size(11.0).color(MUTED));
+                                    }
+                                }
+                            });
+                            ui.label(
+                                RichText::new("Shift-click the floor (or press B) to place your start")
+                                    .size(9.0)
+                                    .italics()
+                                    .color(MUTED),
+                            );
                             // One-click route from your location through every extract — the chain
                             // re-orders the stops, so the nearest extract comes first.
                             if ui
