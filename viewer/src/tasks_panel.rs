@@ -463,7 +463,10 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
     const ACCENT: Color32 = theme::ACCENT;
     const BONE: Color32 = theme::BONE;
     const MUTED: Color32 = theme::MUTED;
-    const CARD_BORDER: Color32 = theme::BORDER;
+    // Slightly stronger than the default card border: an untracked task card's body is near-panel
+    // charcoal, so a faint 1px line let cards melt together in a long list (review finding). The
+    // brighter steel + the dark title bar give each card a clear boundary.
+    const CARD_BORDER: Color32 = theme::BORDER_STRONG;
     const FIR: Color32 = theme::OK;
     const TRACKED: Color32 = theme::TRACKED; // quest purple accent when tracked
 
@@ -795,12 +798,15 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
 
                             ui.add_space(2.0);
 
-                            // ===== SUBTASK TABLE: fixed left icon gutter + click-to-toggle text =====
-                            // GUTTER holds ONE big item icon (or a type-coloured dot when the item has
-                            // no cached art / the objective carries no item) so every row's icon column
-                            // lines up at the same x. Extra item names spill into the text column.
+                            // ===== SUBTASK TABLE: fixed left icon/glyph gutter + click-to-toggle rows =====
+                            // Every row shares a fixed-width left gutter so the art lines up in ONE
+                            // column: a 32px item ICON when the item has cached art, else a painter-drawn
+                            // TYPE GLYPH (crosshair / door / flag / pin / ...). A DONE row is dimmed whole
+                            // and its gutter shows a green check. Clicking the gutter, the tag, OR the
+                            // text toggles done — the whole line is the hit target.
                             const GUTTER: f32 = 40.0;
                             const ICON: f32 = 32.0;
+                            const CHIP_CAP: usize = 3;
                             for (i, o) in t.objectives.iter().enumerate() {
                                 let key = obj_key(&t.id, i);
                                 let is_done = ui_state.done.contains(&key);
@@ -811,77 +817,101 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                 if let Some(qi) = &o.quest_item { names.push(qi.as_str()); }
                                 if let Some(mi) = &o.marker_item { names.push(mi.as_str()); }
 
-                                ui.horizontal_top(|ui| {
-                                    // -- LEFT: fixed-width icon gutter, left-aligned --
-                                    let mut first_has_icon = false;
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(GUTTER, ICON),
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.set_min_width(GUTTER);
-                                            if let Some(name) = names.first() {
-                                                let slug = crate::inspect::icon_slug(name);
-                                                if let Some(tex) = icons.get(
-                                                    ui.ctx(),
-                                                    icon_root.as_deref(),
-                                                    icon_shared.as_deref(),
-                                                    &slug,
-                                                ) {
-                                                    let sz = tex.size_vec2();
-                                                    let s = ICON / sz.y.max(1.0);
-                                                    ui.image((tex.id(), sz * s)).on_hover_text(*name);
-                                                    first_has_icon = true;
-                                                }
-                                            }
-                                            if !first_has_icon {
-                                                // type-coloured dot keeps the gutter column aligned
-                                                ui.label(RichText::new("\u{25CF}").size(14.0).color(dot))
-                                                    .on_hover_text(o.kind.as_str());
-                                            }
-                                        },
-                                    );
+                                // done state dims the whole row (text + tag + counts), gutter shows a check.
+                                let body_col = if is_done { MUTED } else { BONE };
+                                let tag_col = if is_done { MUTED } else { dot };
+                                let mut toggle = false;
 
-                                    // -- RIGHT: text column (click the line to toggle done) --
+                                ui.horizontal_top(|ui| {
+                                    // -- LEFT: fixed gutter (item icon / type glyph / done check) --
+                                    let mut first_has_icon = false;
+                                    let (grect, gresp) =
+                                        ui.allocate_exact_size(egui::vec2(GUTTER, ICON), egui::Sense::click());
+                                    let ibox = egui::Rect::from_min_size(grect.min, egui::vec2(ICON, ICON));
+                                    if is_done {
+                                        theme::paint_check(ui.painter(), ibox, FIR);
+                                    } else {
+                                        if let Some(name) = names.first() {
+                                            let slug = crate::inspect::icon_slug(name);
+                                            if let Some(tex) = icons.get(
+                                                ui.ctx(), icon_root.as_deref(), icon_shared.as_deref(), &slug,
+                                            ) {
+                                                let sz = tex.size_vec2();
+                                                let s = (ICON / sz.x.max(1.0)).min(ICON / sz.y.max(1.0));
+                                                let irect = egui::Rect::from_center_size(ibox.center(), sz * s);
+                                                ui.painter().image(
+                                                    tex.id(),
+                                                    irect,
+                                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                    Color32::WHITE,
+                                                );
+                                                first_has_icon = true;
+                                            }
+                                        }
+                                        if !first_has_icon {
+                                            theme::paint_obj_glyph(ui.painter(), ibox, o.kind.as_str(), dot);
+                                        }
+                                    }
+                                    if gresp
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text(if first_has_icon { names[0] } else { o.kind.as_str() })
+                                        .clicked()
+                                    {
+                                        toggle = true;
+                                    }
+
+                                    // -- RIGHT: text column (tag + clickable text + meta) --
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(5.0, 2.0);
                                         ui.horizontal_wrapped(|ui| {
-                                            ui.label(RichText::new(tag).size(9.0).strong().color(dot))
-                                                .on_hover_text(o.kind.as_str());
-                                            let body = if o.desc.is_empty() {
-                                                "(objective)".to_string()
-                                            } else {
-                                                o.desc.clone()
-                                            };
-                                            let rt = if is_done {
-                                                RichText::new(body).size(11.5).strikethrough().color(MUTED)
-                                            } else {
-                                                RichText::new(body).size(11.5).color(BONE)
-                                            };
-                                            let resp = ui
+                                            if ui
+                                                .add(egui::Label::new(RichText::new(tag).size(9.0).strong().color(tag_col))
+                                                    .sense(egui::Sense::click()))
+                                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                                .on_hover_text(o.kind.as_str())
+                                                .clicked()
+                                            { toggle = true; }
+                                            let body = if o.desc.is_empty() { "(objective)".to_string() } else { o.desc.clone() };
+                                            let mut rt = RichText::new(body).size(11.5).color(body_col);
+                                            if is_done { rt = rt.strikethrough(); }
+                                            if ui
                                                 .add(egui::Label::new(rt).sense(egui::Sense::click()))
                                                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                                .on_hover_text("click to mark done / not done");
-                                            if resp.clicked() {
-                                                if is_done { ui_state.done.remove(&key); }
-                                                else { ui_state.done.insert(key.clone()); }
-                                            }
+                                                .on_hover_text("click to mark done / not done")
+                                                .clicked()
+                                            { toggle = true; }
                                             if o.count > 1 {
-                                                ui.label(RichText::new(format!("\u{00D7}{}", o.count)).size(10.0).strong().color(BONE));
+                                                ui.label(RichText::new(format!("\u{00D7}{}", o.count)).size(10.0).strong()
+                                                    .color(if is_done { MUTED } else { BONE }));
                                             }
                                             if o.fir {
-                                                ui.label(RichText::new("FIR").size(9.0).strong().color(FIR))
+                                                ui.label(RichText::new("FIR").size(9.0).strong().color(if is_done { MUTED } else { FIR }))
                                                     .on_hover_text("Found In Raid");
                                             }
                                             if o.optional {
                                                 ui.label(RichText::new("opt").size(9.0).italics().color(MUTED))
                                                     .on_hover_text("optional objective");
                                             }
-                                            // Extra item names (beyond the one shown as the gutter icon),
-                                            // or the single item's name when it had no icon — as chips so
-                                            // nothing is lost.
+                                            // extra item names (beyond the one shown as the gutter icon) —
+                                            // capped so a big "any of these" enumeration (some objectives
+                                            // list thousands of acceptable items) can't blow up the row OR
+                                            // allocate per-name every frame: only CHIP_CAP chips render and
+                                            // the "+N more" hover samples a BOUNDED slice, never the full list.
                                             let skip = if first_has_icon { 1 } else { 0 };
-                                            for name in names.iter().skip(skip) {
-                                                theme::chip(ui, &short_item(name), MUTED).on_hover_text(*name);
+                                            let extra_total = names.len().saturating_sub(skip);
+                                            for name in names.iter().copied().skip(skip).take(CHIP_CAP) {
+                                                theme::chip(ui, &short_item(name), MUTED).on_hover_text(name);
+                                            }
+                                            if extra_total > CHIP_CAP {
+                                                let sample: Vec<&str> =
+                                                    names.iter().copied().skip(skip + CHIP_CAP).take(12).collect();
+                                                let mut hover = sample.join(", ");
+                                                let covered = CHIP_CAP + sample.len();
+                                                if extra_total > covered {
+                                                    hover.push_str(&format!(" \u{2026} (+{} more)", extra_total - covered));
+                                                }
+                                                ui.label(RichText::new(format!("+{} more", extra_total - CHIP_CAP)).size(9.0).color(MUTED))
+                                                    .on_hover_text(hover);
                                             }
                                         });
                                         // secondary: kill targets / extract / go / route
@@ -912,6 +942,9 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                         }
                                     });
                                 });
+                                if toggle {
+                                    if is_done { ui_state.done.remove(&key); } else { ui_state.done.insert(key.clone()); }
+                                }
                                 ui.add_space(3.0);
                             }
                         });
