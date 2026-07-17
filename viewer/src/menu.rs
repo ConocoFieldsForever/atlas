@@ -665,6 +665,16 @@ pub fn menu_ui(
 
             // ---- Build progress (Tarkov task-log style): stage header + streaming tail ----
             let mut clear_build = false;
+            // Auto-refresh the map rows the moment the pipeline finishes (the panel itself
+            // stays up until CLOSE so the log remains readable). result doubles as the
+            // "already rescanned" latch.
+            if let Some(job) = &mut state.build {
+                let (_, _, finished, ok) = job.snapshot(0);
+                if finished && job.result.is_none() {
+                    job.result = Some(ok);
+                    rescan = true;
+                }
+            }
             if let Some(job) = &state.build {
                 let (stage, tail, finished, ok) = job.snapshot(12);
                 ui.add_space(10.0);
