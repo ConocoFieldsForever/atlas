@@ -201,8 +201,9 @@ impl Plugin for UiPlugin {
         app.add_systems(
             bevy_egui::EguiPrimaryContextPass,
             // .chain(): egui panel STACKING follows .show() order, so the toolbar must run first
-            // (rightmost rail) and the content panel second (to its left).
-            (toolbar_panel, layers_panel, camera_panel, pos_hud).chain(),
+            // (rightmost rail) and the content panels second (to its left). layers/camera/tasks
+            // share the "map_layers" slot and each early-returns unless it's the active tab.
+            (toolbar_panel, layers_panel, camera_panel, tasks_tab, pos_hud).chain(),
         );
     }
 }
@@ -1498,6 +1499,31 @@ fn camera_panel(
     if expo != gfx.grade_exposure {
         gfx.grade_exposure = expo;
     }
+}
+
+/// Tasks tab: opens the shared content slot and delegates to the revamped `tasks_panel` module
+/// (trader-grouped task cards, required-item icons, objective go/route, map filter). Gated on the
+/// active tab like the other content panels.
+#[cfg(feature = "egui")]
+fn tasks_tab(
+    mut contexts: bevy_egui::EguiContexts,
+    tab: Res<RightPanelTab>,
+    menu: Option<Res<crate::menu::MenuState>>,
+    mut params: crate::tasks_panel::TasksPanelParams,
+) {
+    use bevy_egui::egui::{self, Color32};
+    if menu.is_some() || *tab != RightPanelTab::Tasks {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    egui::SidePanel::right("map_layers")
+        .default_width(320.0)
+        .frame(egui::Frame::new().fill(Color32::from_rgb(18, 18, 17)).inner_margin(10.0))
+        .show(ctx, |ui| {
+            crate::tasks_panel::tasks_panel_ui(ui, &mut params);
+        });
 }
 
 /// Section header text: name + a dim count of markers in that section.

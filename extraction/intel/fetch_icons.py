@@ -103,6 +103,25 @@ def main():
             if lo.get("n"):
                 names.add(lo["n"])
 
+    # TASK-REQUIRED ITEMS (tasks.json, build_tasks.py) — the Tasks tab shows hand-in / find / mark /
+    # quest items with icons via this same shared store. By default only tasks that TOUCH this map
+    # are fetched (keeps the per-map run small); --tasks-all pulls every task item across all maps.
+    tasks_all = any(a == "--tasks-all" for a in sys.argv[1:])
+    tj = jload(os.path.join(PACK, "tasks.json")) or jload(
+        os.path.join(os.path.dirname(PACK), "shared", "tasks.json"))
+    if tj:
+        n_task = 0
+        for t in tj.get("tasks") or []:
+            if not tasks_all and not (t.get("map") == MAP or MAP in (t.get("maps") or [])):
+                continue
+            for o in t.get("objectives") or []:
+                for it in o.get("items") or []:
+                    names.add(it); n_task += 1
+                for key in ("questItem", "markerItem"):
+                    if o.get(key):
+                        names.add(o[key]); n_task += 1
+        print(f"[icons] {MAP}: +{n_task} task item refs ({'all maps' if tasks_all else 'this map'})")
+
     if not names and not ids:
         print(f"[icons] {MAP}: no items referenced — nothing to do")
         return
@@ -111,12 +130,17 @@ def main():
     items = {}
     Q = "{ items(%s: [%s]) { id name iconLink gridImageLink } }"
     if names:
-        lst = ",".join(json.dumps(n) for n in sorted(names))
-        for it in gql(Q % ("names", lst)).get("items") or []:
-            # items(names:) can match loosely — keep ONLY exact referenced names so the pack
-            # never carries icons no card shows (our names round-trip from tarkov.dev data).
-            if it["name"] in names:
-                items[it["name"]] = it
+        # Chunk the names query — task-item runs (esp. --tasks-all) can reference thousands of
+        # names, which would blow the request size in one shot.
+        names_sorted = sorted(names)
+        for i in range(0, len(names_sorted), 400):
+            chunk = names_sorted[i:i + 400]
+            lst = ",".join(json.dumps(n) for n in chunk)
+            for it in gql(Q % ("names", lst)).get("items") or []:
+                # items(names:) can match loosely — keep ONLY exact referenced names so the pack
+                # never carries icons no card shows (our names round-trip from tarkov.dev data).
+                if it["name"] in names:
+                    items[it["name"]] = it
     if ids:
         lst = ",".join(json.dumps(i) for i in sorted(ids))
         for it in gql(Q % ("ids", lst)).get("items") or []:
