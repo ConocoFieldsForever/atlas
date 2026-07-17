@@ -14,7 +14,38 @@ members = ["viewer"]
 # bevy::render::render_resource; the standalone `wgpu` pin below MUST match the
 # version Bevy 0.17 vendors (26.x) — see README if a `cargo update` drifts it.
 [workspace.dependencies]
-bevy = { version = "0.17", default-features = true }
+# Feature-trimmed for the shippable build (redistribution PR4, Codex-audited keep-list):
+# drops audio/vorbis, gltf/scene/animation, picking (+3 backends), gilrs, state, smaa_luts,
+# png/hdr (bevy-side; the direct `image` dep still carries codecs), reflect_auto_register,
+# sysinfo, custom_cursor, x11/wayland/webgl2/android. Keeps pbr (StandardMaterial markers),
+# ui/text/sprite (pick readout), gizmos (zone outlines/routes), tonemapping_luts+zstd_rust
+# (TonyMcMapface fallback), multi_threaded.
+bevy = { version = "0.17", default-features = false, features = [
+    "bevy_asset",
+    "bevy_camera",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_gizmos",
+    "bevy_image",
+    "bevy_light",
+    "bevy_log",
+    "bevy_mesh",
+    "bevy_pbr",
+    "bevy_post_process",
+    "bevy_render",
+    "bevy_shader",
+    "bevy_sprite",
+    "bevy_sprite_render",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_render",
+    "bevy_window",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "tonemapping_luts",
+    "zstd_rust",
+] }
 wgpu = "26"
 bytemuck = { version = "1.20", features = ["derive"] }
 glam = { version = "0.30", features = ["bytemuck"] }
@@ -22,9 +53,14 @@ image = "0.25"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# egui overlay is OPTIONAL (behind the `egui` feature) so the default build
-# never blocks on a bevy_egui version that lags a fresh Bevy point release.
-bevy_egui = "0.37"
+# non-optional (the UI IS the app); trimmed features — dropping `picking` is what actually
+# severs bevy_picking from the graph.
+bevy_egui = { version = "0.37", default-features = false, features = [
+    "bevy_ui",
+    "default_fonts",
+    "manage_clipboard",
+    "render",
+] }
 
 [profile.dev]
 opt-level = 1          # the loader touches ~100 MB of vertex/instance bytes; keep debug builds usable
@@ -37,3 +73,8 @@ opt-level = 3          # always optimize deps (bevy/wgpu/glam) even in dev
 # parallel codegen; opt-level=3 (release default) still applies.
 lto = false
 codegen-units = 16
+# Shippable-binary trims (PR4): symbols stripped (audited: no backtrace consumer);
+# panic=abort — no catch_unwind in workspace code, winit/bevy unwind-recovery becomes a
+# fail-fast abort, which is right for a viewer.
+strip = "symbols"
+panic = "abort"

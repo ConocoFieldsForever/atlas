@@ -16,18 +16,17 @@ image = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-bevy_egui = { workspace = true, optional = true }
+bevy_egui = { workspace = true }
 # On-demand pathfinding: blocking HTTP POST to the local :8091 GPU pathfind server (GraphQL).
 # default-features=false drops rustls/TLS — we only ever hit http://127.0.0.1, no cert machinery.
 ureq = { version = "2", default-features = false }
 texpresso = "2.0.2"
 
 [features]
-# On by default? No — keep the default build robust against bevy_egui version
-# skew. Enable with `cargo run --features egui`.
-# egui is ON by default now — it drives the right-hand layer-toggle panel (ui.rs).
+# egui is structural (ui/menu/inspect are unconditional modules); the feature remains as a
+# no-op alias so `--features egui` invocations keep working.
 default = ["egui"]
-egui = ["dep:bevy_egui"]
+egui = []
 
 [[bin]]
 name = "eft_viewer"
