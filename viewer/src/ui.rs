@@ -285,6 +285,8 @@ fn min_value_label(v: i64) -> String {
 struct GfxUiParams<'w, 's> {
     gfx: ResMut<'w, crate::render::GfxSettings>,
     map_switch: ResMut<'w, crate::MapSwitch>,
+    /// Present only in start-menu mode (bare launch) — the panel stands down entirely.
+    menu: Option<Res<'w, crate::menu::MenuState>>,
     pack: Option<Res<'w, crate::render::LoadedPack>>,
     /// (display name, pack path) list, scanned once from the packs/ dir beside the current pack.
     pack_list: bevy::ecs::system::Local<'s, Option<Vec<(String, String)>>>,
@@ -351,6 +353,9 @@ fn layers_panel(
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
     use crate::pathfind::{RouteRequest, RouteStatus, ServerCmd, ServerStatus};
     use crate::poi::PoiLayer;
+    if gfx_ui.menu.is_some() {
+        return; // start-menu mode: menu.rs owns the whole screen
+    }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };

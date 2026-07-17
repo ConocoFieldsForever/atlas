@@ -12,6 +12,7 @@
 mod eftpack;
 mod inspect;
 mod loot;
+mod menu;
 mod pathfind;
 mod pick;
 mod poi;
@@ -184,15 +185,11 @@ fn main() {
     // Pack selection order: explicit argv[1] > EFT_PACK env > first existing default pack.
     // Default map is LIGHTHOUSE (falls back to interchange if its pack isn't built), so a
     // bare `eft_viewer` with no arguments opens a map instead of an empty window.
+    // Bare launch (no argv pack, no EFT_PACK) opens the START MENU (menu.rs) instead of a
+    // default map — the menu's PLAY relaunches with the chosen pack as argv[1].
     let pack_dir = std::env::args().nth(1)
         .filter(|a| !a.starts_with('-'))
-        .or_else(|| std::env::var("EFT_PACK").ok().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            ["packs/lighthouse.eftpack", "packs/interchange.eftpack"]
-                .into_iter()
-                .find(|p| std::path::Path::new(p).exists())
-                .map(str::to_string)
-        });
+        .or_else(|| std::env::var("EFT_PACK").ok().filter(|s| !s.is_empty()));
     // A/B selector: `EFT_RENDER=m0|gpu` env, or a 2nd argv token; default = GPU-driven.
     let render_path = RenderPath::from_env_or(std::env::args().nth(2).as_deref());
     eprintln!("render path: {render_path:?}  (override with EFT_RENDER=m0|gpu)");
@@ -224,10 +221,11 @@ fn main() {
             }
         },
         None => {
-            eprintln!("no .eftpack path given — opening empty viewer.  usage: eft_viewer <pack-dir>");
+            eprintln!("no pack given — opening the start menu.  direct: eft_viewer <pack-dir>");
             None
         }
     };
+    let menu_mode = pack.is_none();
 
     // Play-alongside-a-game friendliness: by DEFAULT cap to vsync (don't render faster than the
     // monitor) and idle when the window loses focus (see WinitSettings below) — so with the game in
@@ -353,6 +351,14 @@ fn main() {
         app.add_plugins(bevy_egui::EguiPlugin::default())
             // egui UI runs in EguiPrimaryContextPass, not Update (else ctx_mut() panics: no fonts).
             .add_systems(bevy_egui::EguiPrimaryContextPass, stats_ui);
+        if menu_mode {
+            app.add_systems(bevy_egui::EguiPrimaryContextPass, menu::menu_ui);
+        }
+    }
+    // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
+    // manager. The in-raid panels check for this resource and stand down while it exists.
+    if menu_mode {
+        app.insert_resource(menu::build_state());
     }
 
     app.run();
@@ -703,7 +709,14 @@ fn auto_screenshot(mut commands: Commands, mut frames: Local<u32>) {
 }
 
 #[cfg(feature = "egui")]
-fn stats_ui(mut contexts: bevy_egui::EguiContexts, pack: Option<Res<LoadedPack>>) {
+fn stats_ui(
+    mut contexts: bevy_egui::EguiContexts,
+    pack: Option<Res<LoadedPack>>,
+    menu: Option<Res<menu::MenuState>>,
+) {
+    if menu.is_some() {
+        return; // start menu owns the screen
+    }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
