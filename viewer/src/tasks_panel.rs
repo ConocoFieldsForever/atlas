@@ -614,11 +614,11 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                 }
             }
             if !dests.is_empty() {
-                route.write(RouteRequest { start: None, dests, optimize_order: true });
+                route.write(RouteRequest { start: None, dests, optimize_order: true, ..Default::default() });
             }
         }
         if ui.button("Clear route").clicked() {
-            route.write(RouteRequest { start: None, dests: Vec::new(), optimize_order: false });
+            route.write(RouteRequest { start: None, dests: Vec::new(), optimize_order: false, ..Default::default() });
         }
     });
     match &route_result.status {
@@ -926,7 +926,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                                         .add_enabled(pf_running, egui::Button::new(RichText::new("route").size(10.0)))
                                                         .on_hover_text("route here").clicked()
                                                     {
-                                                        route.write(RouteRequest { start: None, dests: vec![pos], optimize_order: false });
+                                                        route.write(RouteRequest { start: None, dests: vec![pos], optimize_order: false, ..Default::default() });
                                                     }
                                                 }
                                             });

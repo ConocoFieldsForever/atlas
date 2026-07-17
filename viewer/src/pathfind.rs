@@ -16,14 +16,20 @@ use bevy::prelude::*;
 use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::sync::Arc;
 
-/// Ask to route from `start` (or the camera if `None`) through `dests`. EMPTY `dests` clears the
-/// route. Sent by the UI via `MessageWriter<RouteRequest>` (Bevy 0.17 buffered events = "messages").
-#[derive(Message, Clone)]
+/// Ask to route from `start` (or the placed pin / camera if `None`) through `dests`. EMPTY `dests`
+/// clears the route. Sent by the UI via `MessageWriter<RouteRequest>` (Bevy 0.17 messages).
+#[derive(Message, Clone, Default)]
 pub struct RouteRequest {
     pub start: Option<Vec3>,
     pub dests: Vec<Vec3>,
     /// true -> cheapest visiting order (`chain`); false -> keep the given order (`tour`).
     pub optimize_order: bool,
+    /// true -> the dests are ALTERNATIVES: route to ONLY the one cheapest to reach by foot
+    /// (one A* per candidate, keep the shortest) instead of visiting all of them.
+    pub nearest_of: bool,
+    /// Display labels aligned with `dests` (may be empty = unlabeled). The label of the dest the
+    /// route actually ends at is echoed back in [`RouteResult::dest_label`] for the UI.
+    pub labels: Vec<String>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -40,10 +46,13 @@ pub struct RouteResult {
     pub points: Vec<Vec3>,
     pub dist: f32,
     pub status: RouteStatus,
+    /// Display label of the destination this route ends at (from `RouteRequest::labels`), so the
+    /// UI can say WHERE the route goes and highlight the matching row. None = unlabeled request.
+    pub dest_label: Option<String>,
 }
 impl Default for RouteResult {
     fn default() -> Self {
-        Self { points: Vec::new(), dist: 0.0, status: RouteStatus::Idle }
+        Self { points: Vec::new(), dist: 0.0, status: RouteStatus::Idle, dest_label: None }
     }
 }
 
@@ -52,7 +61,7 @@ impl Default for RouteResult {
 pub struct Nav(pub Option<Arc<NavGrid>>);
 
 #[derive(Resource, Default)]
-struct PathfindTask(Option<Task<Result<(Vec<Vec3>, f32), String>>>);
+struct PathfindTask(Option<Task<Result<(Vec<Vec3>, f32, Option<String>), String>>>);
 
 /// The player's placed "you are here" start. `None` -> routes fall back to the camera (which, in
 /// walk mode, IS the player). Set by clicking the map while [`PlaceMode`] is armed (the Navigation
@@ -105,8 +114,16 @@ impl Plugin for PathfindPlugin {
             .init_resource::<PlaceMode>()
             .add_systems(
                 Update,
-                // chained: nav-load -> scripted-route -> dispatch -> poll -> draw (dataflow order).
-                (manage_nav, debug_route, dispatch_route, poll_route, draw_route, draw_start)
+                // chained: nav-load -> stale-clear -> scripted-route -> dispatch -> poll -> draw.
+                (
+                    manage_nav,
+                    clear_route_on_start_move,
+                    debug_route,
+                    dispatch_route,
+                    poll_route,
+                    draw_route,
+                    draw_start,
+                )
                     .chain(),
             );
     }
@@ -187,6 +204,7 @@ fn debug_route(
         start: Some(pts[0]),
         dests: pts[1..].to_vec(),
         optimize_order: true,
+        ..Default::default()
     });
     info!("pathfind: EFT_ROUTE debug route requested ({} points)", pts.len());
 }
@@ -207,6 +225,7 @@ fn dispatch_route(
         task.0 = None;
         result.points.clear();
         result.dist = 0.0;
+        result.dest_label = None;
         result.status = RouteStatus::Idle;
         return;
     }
@@ -225,27 +244,63 @@ fn dispatch_route(
         .or_else(|| cam.single().ok().map(|t| t.translation()))
         .unwrap_or(Vec3::ZERO);
     let dests = req.dests.clone();
+    let labels = req.labels.clone();
     let optimize = req.optimize_order;
+    let nearest_of = req.nearest_of;
     result.status = RouteStatus::Pending;
     // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
     let t = AsyncComputeTaskPool::get().spawn(async move {
         let mut s = Scratch::new(grid.nodes());
-        let routed = if dests.len() == 1 {
-            grid.path(start, dests[0], &mut s)
+        let lbl = |i: usize| labels.get(i).cloned();
+        let routed: Option<((Vec<Vec3>, f32), Option<String>)> = if dests.len() == 1 {
+            grid.path(start, dests[0], &mut s).map(|r| (r, lbl(0)))
+        } else if nearest_of {
+            // The dests are ALTERNATIVES: one A* per candidate, keep the shortest walkable.
+            let mut best: Option<((Vec<Vec3>, f32), Option<String>)> = None;
+            for (i, d) in dests.iter().enumerate() {
+                if let Some(r) = grid.path(start, *d, &mut s) {
+                    if best.as_ref().is_none_or(|(b, _)| r.1 < b.1) {
+                        best = Some((r, lbl(i)));
+                    }
+                }
+            }
+            best
         } else if optimize {
-            grid.chain(start, &dests, &mut s)
+            grid.chain(start, &dests, &mut s).map(|r| (r, None))
         } else {
             let mut pts = Vec::with_capacity(dests.len() + 1);
             pts.push(start);
             pts.extend_from_slice(&dests);
-            grid.tour(&pts, &mut s)
+            grid.tour(&pts, &mut s).map(|r| (r, None))
         };
         match routed {
-            Some((pts, dist)) => Ok((crate::nav::simplify(&pts, grid.res * 0.4), dist)),
+            Some(((pts, dist), label)) => {
+                Ok((crate::nav::simplify(&pts, grid.res * 0.4), dist, label))
+            }
             None => Err("no walkable path found".to_string()),
         }
     });
     task.0 = Some(t);
+}
+
+/// Moving/placing/removing the "you are here" pin invalidates any drawn route (it started from the
+/// OLD position) — clear it instead of leaving a stale, now-wrong polyline + distance on screen.
+/// Runs before dispatch so a same-frame new request still goes through.
+fn clear_route_on_start_move(
+    start_pt: Res<StartPoint>,
+    mut task: ResMut<PathfindTask>,
+    mut result: ResMut<RouteResult>,
+) {
+    if !start_pt.is_changed() || start_pt.is_added() {
+        return;
+    }
+    if result.status != RouteStatus::Idle || task.0.is_some() {
+        task.0 = None;
+        result.points.clear();
+        result.dist = 0.0;
+        result.dest_label = None;
+        result.status = RouteStatus::Idle;
+    }
 }
 
 /// Poll the in-flight task; when it finishes, publish the polyline (or the error) to `RouteResult`.
@@ -256,16 +311,18 @@ fn poll_route(mut task: ResMut<PathfindTask>, mut result: ResMut<RouteResult>) {
     if let Some(res) = block_on(future::poll_once(t)) {
         task.0 = None;
         match res {
-            Ok((points, dist)) => {
+            Ok((points, dist, label)) => {
                 info!("pathfind: route ok — {} pts, {:.1} m", points.len(), dist);
                 result.points = points;
                 result.dist = dist;
+                result.dest_label = label;
                 result.status = RouteStatus::Ok;
             }
             Err(e) => {
                 warn!("pathfind: {e}");
                 result.points.clear();
                 result.dist = 0.0;
+                result.dest_label = None;
                 result.status = RouteStatus::Error(e);
             }
         }

@@ -113,13 +113,14 @@ fn pick_system(
     pack: Option<Res<LoadedPack>>,
     pointer_on_ui: Res<crate::inspect::PointerOnUi>,
     keys: Res<ButtonInput<KeyCode>>,
+    ui_kb: Res<crate::inspect::UiWantsKeyboard>,
     mut place: ResMut<crate::pathfind::PlaceMode>,
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut readout: Query<&mut Text, With<PickReadout>>,
 ) {
-    // Esc cancels an armed place-position mode (checked before the click gate so it works
-    // without any click).
-    if place.0 && keys.just_pressed(KeyCode::Escape) {
+    // Esc cancels an armed place-position mode (checked before the click gate so it works without
+    // any click) — unless a text field has focus, where Esc means "defocus the field".
+    if place.0 && keys.just_pressed(KeyCode::Escape) && !ui_kb.0 {
         place.0 = false;
     }
     // ---- click gate --------------------------------------------------------
@@ -136,7 +137,11 @@ fn pick_system(
     let now = time.elapsed_secs();
     let is_double = (now - state.last_left) <= DOUBLE_CLICK_SECS;
     state.last_left = now;
-    if !place_start && !is_double {
+    if place_start {
+        // A placement click must not PRIME the double-click detector: without this, a quick
+        // follow-up plain click would read as a double and fire the identify raycast.
+        state.last_left = f32::NEG_INFINITY;
+    } else if !is_double {
         return; // first (or lone) plain click — arm and wait for the second
     }
     if is_double {
