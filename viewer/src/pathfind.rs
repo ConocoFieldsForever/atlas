@@ -102,13 +102,31 @@ pub struct RouteOpts {
     pub avoid_boss: bool,
     pub avoid_pmc: bool,
     pub avoid_scav: bool,
+    /// Animate the A* search wavefront converging on the next single-destination route.
+    pub visualize: bool,
 }
 impl Default for RouteOpts {
     fn default() -> Self {
         let s = std::env::var("EFT_AVOID").unwrap_or_default();
         let has = |k: &str| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(k));
-        Self { avoid_boss: has("boss"), avoid_pmc: has("pmc"), avoid_scav: has("scav") }
+        Self {
+            avoid_boss: has("boss"),
+            avoid_pmc: has("pmc"),
+            avoid_scav: has("scav"),
+            visualize: std::env::var("EFT_VIZ").map(|v| v.trim() == "1").unwrap_or(false),
+        }
     }
+}
+
+/// The recorded A* wavefront for the live search visualization: each closed node's position + its
+/// g-distance (ascending). `draw_trace` reveals them over ~1.6 s coloured by distance so you watch
+/// the flood expand and converge on the destination.
+#[derive(Resource, Default)]
+pub struct NavTrace {
+    nodes: Vec<(Vec3, f32)>,
+    max_g: f32,
+    start_t: f32,
+    playing: bool,
 }
 
 /// The loaded nav grid for the CURRENT map. `None` = this pack has no baked nav -> routing off.
@@ -116,7 +134,7 @@ impl Default for RouteOpts {
 pub struct Nav(pub Option<Arc<NavGrid>>);
 
 #[derive(Resource, Default)]
-struct PathfindTask(Option<Task<Result<(Vec<RouteOption>, Option<String>), String>>>);
+struct PathfindTask(Option<Task<Result<(Vec<RouteOption>, Option<String>, Vec<(Vec3, f32)>), String>>>);
 
 /// The player's placed "you are here" start. `None` -> routes fall back to the camera (which, in
 /// walk mode, IS the player). Set by clicking the map while [`PlaceMode`] is armed (the Navigation
@@ -168,6 +186,7 @@ impl Plugin for PathfindPlugin {
             .init_resource::<StartPoint>()
             .init_resource::<PlaceMode>()
             .init_resource::<RouteOpts>()
+            .init_resource::<NavTrace>()
             .add_systems(
                 Update,
                 // chained: nav-load -> stale-clear -> scripted-route -> dispatch -> poll -> draw.
@@ -177,6 +196,7 @@ impl Plugin for PathfindPlugin {
                     debug_route,
                     dispatch_route,
                     poll_route,
+                    draw_trace,
                     draw_route,
                     draw_start,
                 )
@@ -259,7 +279,9 @@ fn debug_route(
     w.write(RouteRequest {
         start: Some(pts[0]),
         dests: pts[1..].to_vec(),
-        optimize_order: true,
+        // A single destination needs no ordering (and staying un-optimized lets EFT_VIZ exercise the
+        // live search wavefront); multi-stop still optimizes the visiting order.
+        optimize_order: pts.len() > 2,
         ..Default::default()
     });
     info!("pathfind: EFT_ROUTE debug route requested ({} points)", pts.len());
@@ -328,6 +350,9 @@ fn dispatch_route(
     let labels = req.labels.clone();
     let optimize = req.optimize_order;
     let nearest_of = req.nearest_of;
+    // Only the single-destination Direct leg records a wavefront — the flood is meaningless for a
+    // multi-stop tour and adds cost to every leg.
+    let visualize = opts.visualize && dests.len() == 1 && nearest_of == false && !optimize;
     result.status = RouteStatus::Pending;
     // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
     let t = AsyncComputeTaskPool::get().spawn(async move {
@@ -375,8 +400,17 @@ fn dispatch_route(
                 }
             }
         };
-        let direct = run(&mut s, None);
-        push(&mut options, "Direct", direct, &mut label);
+        let mut trace: Vec<(Vec3, f32)> = Vec::new();
+        if visualize {
+            // Instrumented A*: same result as run(), plus the recorded flood for the live viz.
+            if let Some((pts, dist, tr)) = grid.path_traced(start, dests[0], &mut s, None, 4000) {
+                push(&mut options, "Direct", Some(((pts, dist), lbl(0))), &mut label);
+                trace = tr;
+            }
+        } else {
+            let direct = run(&mut s, None);
+            push(&mut options, "Direct", direct, &mut label);
+        }
         if !avoid_pts.is_empty() {
             let cautious = grid.build_avoid(&avoid_pts, AVOID_W_CAUTIOUS);
             let r = run(&mut s, Some(&cautious));
@@ -388,7 +422,7 @@ fn dispatch_route(
         if options.is_empty() {
             Err("no walkable path found".to_string())
         } else {
-            Ok((options, label))
+            Ok((options, label, trace))
         }
     });
     task.0 = Some(t);
@@ -412,14 +446,19 @@ fn clear_route_on_start_move(
 }
 
 /// Poll the in-flight task; when it finishes, publish the polyline (or the error) to `RouteResult`.
-fn poll_route(mut task: ResMut<PathfindTask>, mut result: ResMut<RouteResult>) {
+fn poll_route(
+    mut task: ResMut<PathfindTask>,
+    mut result: ResMut<RouteResult>,
+    mut trace: ResMut<NavTrace>,
+    time: Res<Time>,
+) {
     let Some(t) = task.0.as_mut() else {
         return;
     };
     if let Some(res) = block_on(future::poll_once(t)) {
         task.0 = None;
         match res {
-            Ok((options, label)) => {
+            Ok((options, label, nodes)) => {
                 info!(
                     "pathfind: route ok — {} option(s): {}",
                     options.len(),
@@ -433,13 +472,58 @@ fn poll_route(mut task: ResMut<PathfindTask>, mut result: ResMut<RouteResult>) {
                 result.dest_label = label;
                 result.status = RouteStatus::Ok;
                 result.select(0);
+                // Kick off the wavefront animation (or clear a stale one when viz is off).
+                if nodes.len() >= 2 {
+                    trace.max_g = nodes.iter().map(|(_, g)| *g).fold(0.0_f32, f32::max);
+                    trace.nodes = nodes;
+                    trace.start_t = time.elapsed_secs();
+                    trace.playing = true;
+                } else {
+                    trace.playing = false;
+                    trace.nodes.clear();
+                }
             }
             Err(e) => {
                 warn!("pathfind: {e}");
                 result.clear();
                 result.status = RouteStatus::Error(e);
+                trace.playing = false;
+                trace.nodes.clear();
             }
         }
+    }
+}
+
+/// Animate the recorded A* wavefront: reveal nodes in g-distance order over ~1.6 s, each drawn as a
+/// short vertical tick coloured cyan (near the start) -> magenta (the frontier), with a brighter
+/// band right at the advancing edge. Purely cosmetic and immediate-mode; stops itself once the
+/// flood has fully revealed so the finished route line stands alone.
+fn draw_trace(mut gizmos: Gizmos, mut trace: ResMut<NavTrace>, time: Res<Time>) {
+    if !trace.playing || trace.nodes.len() < 2 || trace.max_g <= 0.0 {
+        return;
+    }
+    const REVEAL_SECS: f32 = 1.6;
+    let elapsed = time.elapsed_secs() - trace.start_t;
+    // g-distance revealed so far (whole flood in REVEAL_SECS, then held one extra beat before stop).
+    let reveal_g = (elapsed / REVEAL_SECS).clamp(0.0, 1.0) * trace.max_g;
+    let edge_band = trace.max_g * 0.06; // width of the bright advancing-front band
+    for (p, g) in &trace.nodes {
+        if *g > reveal_g {
+            continue;
+        }
+        let f = (*g / trace.max_g).clamp(0.0, 1.0); // 0 near start .. 1 at frontier
+        // cyan (0.2,0.9,1.0) -> magenta (1.0,0.25,0.95)
+        let mut col = Color::srgba(0.2 + f * 0.8, 0.9 - f * 0.65, 1.0 - f * 0.05, 0.42);
+        let mut h = 0.35;
+        if reveal_g - *g < edge_band {
+            // advancing front: brighter + taller
+            col = Color::srgba(0.85, 1.0, 1.0, 0.9);
+            h = 0.9;
+        }
+        gizmos.line(*p + Vec3::Y * 0.08, *p + Vec3::Y * (0.08 + h), col);
+    }
+    if elapsed > REVEAL_SECS + 0.4 {
+        trace.playing = false; // done — let the route line take over cleanly
     }
 }
 

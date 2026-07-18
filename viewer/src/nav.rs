@@ -330,6 +330,7 @@ impl NavGrid {
         dl: usize,
         s: &mut Scratch,
         avoid: Option<&AvoidMap>,
+        trace: &mut Option<Vec<(Vec3, f32)>>,
     ) -> Option<Vec<Vec3>> {
         let k = self.k;
         let nx = self.nx as i64;
@@ -369,6 +370,9 @@ impl NavGrid {
                 continue;
             }
             s.closed_gen[cur] = gen;
+            if let Some(tr) = trace.as_mut() {
+                tr.push((self.node_pos(cur), s.g[cur])); // record the wavefront for the live search viz
+            }
             expanded += 1;
             if expanded > 2_000_000 {
                 warn!("nav: A* expansion cap hit");
@@ -577,7 +581,7 @@ impl NavGrid {
         }
         let dc = dc as usize;
         for dl in self.layers_by_height(dc, b.y) {
-            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid) {
+            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, &mut None) {
                 // Report the length of the SIMPLIFIED polyline (what actually gets drawn + walked),
                 // not the raw 8-connected staircase: the staircase over-measures a diagonal-ish leg
                 // by the grid metrication error (~up to 8%). Simplifying first makes the displayed
@@ -585,6 +589,42 @@ impl NavGrid {
                 let simp = simplify(&path, self.res * 0.4);
                 let dist = polyline_len(&simp);
                 return Some((simp, dist));
+            }
+        }
+        None
+    }
+
+    /// Like `path`, but ALSO records the A* wavefront (every closed node's position + g-distance),
+    /// down-sampled to `max_trace` points, so the UI can animate the search converging. Only used
+    /// for single-destination routes with the "visualize search" toggle on.
+    pub fn path_traced(
+        &self,
+        a: Vec3,
+        b: Vec3,
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+        max_trace: usize,
+    ) -> Option<(Vec<Vec3>, f32, Vec<(Vec3, f32)>)> {
+        let (sc, sl) = self.snap_start(a.x, a.y, a.z, 16)?;
+        let mut dc = self.cell_of(b.x, b.z);
+        if dc < 0 {
+            let cix = (((b.x - self.min_x) / self.res).round() as i64).clamp(0, self.nx as i64 - 1);
+            let ciz = (((b.z - self.min_z) / self.res).round() as i64).clamp(0, self.nz as i64 - 1);
+            dc = ciz * self.nx as i64 + cix;
+        }
+        let dc = dc as usize;
+        for dl in self.layers_by_height(dc, b.y) {
+            let mut trace: Option<Vec<(Vec3, f32)>> = Some(Vec::new());
+            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, &mut trace) {
+                let simp = simplify(&path, self.res * 0.4);
+                let dist = polyline_len(&simp);
+                let mut tr = trace.unwrap_or_default();
+                // Down-sample the wavefront (keeps g-order) so the animated draw stays cheap.
+                if max_trace > 0 && tr.len() > max_trace {
+                    let stride = tr.len() / max_trace + 1;
+                    tr = tr.into_iter().step_by(stride).collect();
+                }
+                return Some((simp, dist, tr));
             }
         }
         None

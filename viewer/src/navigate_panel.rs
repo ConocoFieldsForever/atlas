@@ -231,6 +231,14 @@ pub fn navigate_tab(
                     .on_hover_text("detour around scav spawn areas");
             });
 
+            // ---- live search visualization: replay the A* flood as it converges on a single
+            // destination (cosmetic; only affects single-extract routes, not tours/loot plans). ----
+            ui.checkbox(
+                &mut route_opts.visualize,
+                RichText::new("visualize search").size(theme::SIZE_SMALL).color(theme::MUTED),
+            )
+            .on_hover_text("watch the pathfinder's wavefront expand and converge on the next single-destination route");
+
             // ---- flagship action: true nearest-by-foot (one A* per ACTIVE extract, keep the
             // shortest — NOT a tour through all of them). ----
             let full = egui::vec2(ui.available_width(), 26.0);
