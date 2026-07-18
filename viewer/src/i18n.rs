@@ -49,27 +49,18 @@ pub fn detect_lang(saved: Option<&str>) -> Lang {
     Lang::En
 }
 
-/// Localized display name for a map, keyed by its dataset key (matches menu::KNOWN_MAPS). Falls
-/// back to the English title for unknown keys / the En language.
+/// Localized display name for a map, keyed by its dataset id. The Russian names come from the
+/// game-derived roster manifest (`crate::maps`), keyed by the SAME id as the English roster, so
+/// EN/RU can't drift apart (the old hardcoded table was keyed "factory" while the roster shipped
+/// "factory_rework", silently dropping Russian). Falls back to the English title for the En
+/// language or any id not in the roster (e.g. an on-disk extra pack).
 pub fn map_title(lang: Lang, key: &str, en_title: &str) -> String {
     if lang == Lang::En {
         return en_title.to_string();
     }
-    let ru = match key {
-        "lighthouse" => "Маяк",
-        "interchange" => "Развязка",
-        "factory" => "Завод",
-        "customs" => "Таможня",
-        "woods" => "Лес",
-        "shoreline" => "Берег",
-        "reserve" => "Резерв",
-        "labs" => "Лаборатория",
-        "ground_zero" => "Эпицентр",
-        "streets" => "Улицы Таркова",
-        "labyrinth" => "Лабиринт",
-        _ => return en_title.to_string(),
-    };
-    ru.to_string()
+    crate::maps::ru_title(key)
+        .map(str::to_string)
+        .unwrap_or_else(|| en_title.to_string())
 }
 
 /// UI-string keys. Add an arm to `pair()` for each; a missing arm won't compile.

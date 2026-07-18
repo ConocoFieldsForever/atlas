@@ -225,6 +225,7 @@ impl Plugin for UiPlugin {
                 tasks_tab,
                 crate::navigate_panel::navigate_tab,
                 pos_hud,
+                lang_toggle,
                 map_loading_indicator,
                 fit_camera_viewport,
             )
@@ -269,6 +270,35 @@ fn map_loading_indicator(
                     );
                 });
         });
+}
+
+/// EN|RU language switch, always reachable IN-RAID (the start menu draws its own). Floats on a
+/// foreground `Area` anchored bottom-LEFT so it clears the right-edge toolbar/layers panels. Shares
+/// the `lang_switch_area` helper + the one global `Lang` resource with the menu, so flipping it here
+/// takes effect everywhere next frame and persists identically.
+#[cfg(feature = "egui")]
+fn lang_toggle(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    mut lang: ResMut<crate::i18n::Lang>,
+) {
+    use bevy_egui::egui;
+    if menu.is_some() {
+        return; // start menu owns the screen + draws its own toggle
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    if let Some(l) = crate::menu::lang_switch_area(
+        ctx,
+        *lang,
+        "raid_lang_toggle",
+        egui::Align2::LEFT_BOTTOM,
+        egui::vec2(8.0, -8.0),
+    ) {
+        *lang = l;
+        crate::menu::save_config_lang(l.tag());
+    }
 }
 
 /// Re-center the 3D scene in the area egui leaves free (the window minus the right-side rail +
