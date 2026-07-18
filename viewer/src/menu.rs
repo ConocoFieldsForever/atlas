@@ -457,6 +457,14 @@ pub fn save_config_assets_dir(dir: &str) {
     save_config_str("assetsRoot", dir);
 }
 
+/// UI language override ("en"/"ru") persisted by the menu's language toggle (None = auto-detect).
+pub fn config_lang() -> Option<String> {
+    config_str("lang")
+}
+pub fn save_config_lang(tag: &str) {
+    save_config_str("lang", tag);
+}
+
 /// The writable tarkmap working dir (`EFT_TARKMAP_ROOT`; holds `out/` bake+intel outputs and,
 /// optionally, `maps/` configs — the kit falls back to the shipped `extraction/maps` when absent):
 /// env > saved config > a sibling `tarkmap` beside the assets dir (matches the pipeline's expected
@@ -711,12 +719,16 @@ pub fn menu_ui(
     // the CentralPanel transparent so the 3D world shows through, and suppresses the
     // vector-drawn camera (exactly one of the two decors ever renders).
     prop3d: Option<Res<crate::menu_fx::MenuCamProp>>,
+    // UI language (EN/RU); the footer toggle flips + persists it.
+    mut lang: ResMut<crate::i18n::Lang>,
 ) {
     use bevy_egui::egui::{self, Color32, RichText};
+    use crate::i18n::{map_title, t, K};
     use crate::jobs::Job;
     let Some(mut state) = state else { return };
     let real_prop = prop3d.is_some();
     let Ok(ctx) = contexts.ctx_mut() else { return };
+    let lg = *lang; // Copy for reads; the toggle writes *lang
 
     // First-frame EFT_MENU_BUILD auto-build (enqueue once onto the shared worker).
     if let Some(map) = state.autobuild.take() {
@@ -796,13 +808,13 @@ pub fn menu_ui(
             ui.horizontal(|ui| {
                 ui.label(RichText::new("ATLAS").color(BONE).size(theme::SIZE_DISPLAY).strong());
                 ui.add_space(14.0);
-                ui.label(RichText::new("|  MAP").color(BEIGE).size(13.0));
-                ui.label(RichText::new("SELECT LOCATION").color(DIM).size(13.0));
+                ui.label(RichText::new(format!("|  {}", t(lg, K::Map))).color(BEIGE).size(13.0));
+                ui.label(RichText::new(t(lg, K::SelectLocation)).color(DIM).size(13.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(fmt_size(state.total_bytes)).color(BEIGE).size(13.0),
                     );
-                    ui.label(RichText::new("PACKS ON DISK").color(DIM).size(11.0));
+                    ui.label(RichText::new(t(lg, K::PacksOnDisk)).color(DIM).size(11.0));
                 });
             });
 
@@ -810,12 +822,15 @@ pub fn menu_ui(
             // values, tasks, icons) are only as good as their last sync — surface it. ----
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("INTEL").color(BEIGE).size(11.0).strong());
+                ui.label(RichText::new(t(lg, K::Intel)).color(BEIGE).size(11.0).strong());
                 let (loot_d, tasks_d, icons) = state.intel;
+                let ru = lg == crate::i18n::Lang::Ru;
                 let age_txt = |d: Option<f64>| match d {
-                    Some(d) if d < 1.0 => format!("{:.0} h ago", (d * 24.0).max(1.0)),
-                    Some(d) => format!("{d:.0} d ago"),
-                    None => "never".to_string(),
+                    Some(d) if d < 1.0 => {
+                        format!("{:.0} {}", (d * 24.0).max(1.0), if ru { "ч назад" } else { "h ago" })
+                    }
+                    Some(d) => format!("{d:.0} {}", if ru { "д назад" } else { "d ago" }),
+                    None => t(lg, K::Never).to_string(),
                 };
                 // Stale warning: prices move per wipe/week — amber past 7 days, red past 21.
                 let worst = loot_d.unwrap_or(f64::MAX).max(tasks_d.unwrap_or(f64::MAX));
@@ -828,10 +843,13 @@ pub fn menu_ui(
                 };
                 ui.label(
                     RichText::new(format!(
-                        "tarkov.dev synced {}  \u{00B7}  tasks {}  \u{00B7}  {} icons",
+                        "{} {}  \u{00B7}  {} {}  \u{00B7}  {} {}",
+                        t(lg, K::Synced),
                         age_txt(loot_d),
+                        t(lg, K::TasksLabel),
                         age_txt(tasks_d),
-                        icons
+                        icons,
+                        t(lg, K::Icons),
                     ))
                     .color(age_col)
                     .size(11.0),
@@ -846,7 +864,7 @@ pub fn menu_ui(
                     }
                 } else {
                     if ui
-                        .add(egui::Button::new(RichText::new("SYNC NOW").size(11.0).color(BEIGE)))
+                        .add(egui::Button::new(RichText::new(t(lg, K::SyncNow)).size(11.0).color(BEIGE)))
                         .on_hover_text("re-pull loot values, tasks and item icons from tarkov.dev (network)")
                         .clicked()
                     {
@@ -917,19 +935,20 @@ pub fn menu_ui(
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.set_min_height(34.0);
-                                let title = RichText::new(e.title).size(theme::SIZE_ROW_TITLE).strong().color(
-                                    if installed { BEIGE } else { DIM },
-                                );
+                                let title = RichText::new(map_title(lg, e.key, e.title))
+                                    .size(theme::SIZE_ROW_TITLE)
+                                    .strong()
+                                    .color(if installed { BEIGE } else { DIM });
                                 ui.add_sized([220.0, 30.0], egui::Label::new(title));
                                 // Status badge.
                                 let (txt, col) = if !installed {
-                                    ("NOT INSTALLED", DIM)
+                                    (t(lg, K::NotInstalled), DIM)
                                 } else {
                                     match e.fp_match {
-                                        Some(true) => ("READY", OK),
+                                        Some(true) => (t(lg, K::Ready), OK),
                                         // Game-file hashes changed since this pack was built.
-                                        Some(false) => ("GAME FILES UPDATED", WARN),
-                                        None => ("READY (unstamped)", WARN),
+                                        Some(false) => (t(lg, K::GameFilesUpdated), WARN),
+                                        None => (t(lg, K::ReadyUnstamped), WARN),
                                     }
                                 };
                                 ui.label(RichText::new(txt).color(col).size(12.0).strong());
@@ -947,10 +966,10 @@ pub fn menu_ui(
                                             .size(11.0),
                                     );
                                     let tick = |on: bool, s: &str| theme::tick(on, s);
-                                    ui.label(tick(e.has_volume, "light"));
-                                    ui.label(tick(e.has_grass, "grass"));
-                                    ui.label(tick(e.has_gamedata, "zones"));
-                                    ui.label(tick(e.has_icons, "icons"));
+                                    ui.label(tick(e.has_volume, t(lg, K::TickLight)));
+                                    ui.label(tick(e.has_grass, t(lg, K::TickGrass)));
+                                    ui.label(tick(e.has_gamedata, t(lg, K::TickZones)));
+                                    ui.label(tick(e.has_icons, t(lg, K::TickIcons)));
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -959,7 +978,7 @@ pub fn menu_ui(
                                             building_key.as_deref() == Some(e.key);
                                         let any_building = building_key.is_some();
                                         if installed {
-                                            let play = theme::primary_button("PLAY");
+                                            let play = theme::primary_button(t(lg, K::Play));
                                             if ui.add_sized([84.0, 30.0], play).clicked() {
                                                 switch.0 = e.pack_dir.clone();
                                             }
@@ -968,9 +987,9 @@ pub fn menu_ui(
                                             // re-runs the pipeline so the data catches up.
                                             if e.fp_match == Some(false) {
                                                 let upd = theme::warn_button(if this_building {
-                                                    "UPDATING..."
+                                                    "..."
                                                 } else {
-                                                    "UPDATE"
+                                                    t(lg, K::Update)
                                                 });
                                                 if ui
                                                     .add_enabled_ui(!any_building, |ui| {
@@ -986,17 +1005,17 @@ pub fn menu_ui(
                                                 }
                                             }
                                             // Tarkov-style destructive button: red fill, black text.
-                                            let del_btn = |t: &str| theme::danger_button(t);
+                                            let del_btn = |s: &str| theme::danger_button(s);
                                             if confirm_idx == Some(i) {
                                                 if ui
-                                                    .add_sized([120.0, 30.0], del_btn("CONFIRM"))
+                                                    .add_sized([120.0, 30.0], del_btn(t(lg, K::Confirm)))
                                                     .clicked()
                                                 {
                                                     delete_now = Some(i);
                                                 }
                                             } else if ui
                                                 .add_enabled_ui(!this_building, |ui| {
-                                                    ui.add_sized([84.0, 30.0], del_btn("DELETE"))
+                                                    ui.add_sized([84.0, 30.0], del_btn(t(lg, K::Delete)))
                                                 })
                                                 .inner
                                                 .clicked()
@@ -1004,9 +1023,12 @@ pub fn menu_ui(
                                                 set_confirm = Some(i);
                                             }
                                         } else {
-                                            let b = egui::Button::new(RichText::new(
-                                                if this_building { "BUILDING..." } else { "BUILD" },
-                                            ));
+                                            let build_label = if this_building {
+                                                format!("{}...", t(lg, K::Building))
+                                            } else {
+                                                t(lg, K::Build).to_string()
+                                            };
+                                            let b = egui::Button::new(RichText::new(build_label));
                                             if ui.add_enabled(!any_building, b).clicked() {
                                                 start_build = Some(e.key.to_string());
                                             }
@@ -1177,7 +1199,7 @@ pub fn menu_ui(
             // Game install path: autodetected (env > saved > registry > probe), editable here;
             // SET validates, persists to atlas.config.json and re-fingerprints the packs.
             ui.horizontal(|ui| {
-                ui.label(RichText::new("GAME INSTALL").color(DIM).size(11.0));
+                ui.label(RichText::new(t(lg, K::GameInstall)).color(DIM).size(11.0));
                 let mut edit = state.game_dir_edit.clone();
                 ui.add(
                     egui::TextEdit::singleline(&mut edit)
@@ -1187,7 +1209,7 @@ pub fn menu_ui(
                 state.game_dir_edit = edit;
                 let dirty = state.game_dir_edit != state.game_dir;
                 if ui
-                    .add_enabled(dirty, egui::Button::new(RichText::new("SET").color(BONE)))
+                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
                     .clicked()
                 {
                     if valid_game_dir(&state.game_dir_edit) {
@@ -1206,9 +1228,7 @@ pub fn menu_ui(
                         RichText::new(format!("[{}]", &fp[..8])).color(OK).size(11.0),
                     ),
                     None => ui.label(
-                        RichText::new("NOT FOUND - set the EscapeFromTarkov_Data path")
-                            .color(WARN)
-                            .size(11.0),
+                        RichText::new(t(lg, K::GameNotFound)).color(WARN).size(11.0),
                     ),
                 };
             });
@@ -1217,19 +1237,11 @@ pub fn menu_ui(
             // datasets that BUILD reads. On first run explain it; CHOOSE opens a native folder picker.
             if !state.assets_ok {
                 ui.add_space(2.0);
-                ui.label(
-                    RichText::new(
-                        "First run: choose a folder for EXTRACTED ASSETS. The first BUILD of a map \
-                         runs a one-time extraction from your game files into it (close the game \
-                         first; ~1-6 GB per map, can take a while); later builds are quick.",
-                    )
-                    .color(WARN)
-                    .size(11.0),
-                );
+                ui.label(RichText::new(t(lg, K::FirstRunBanner)).color(WARN).size(11.0));
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new("EXTRACTED ASSETS").color(DIM).size(11.0));
-                if ui.button(RichText::new("CHOOSE\u{2026}").color(BONE)).clicked() {
+                ui.label(RichText::new(t(lg, K::ExtractedAssets)).color(DIM).size(11.0));
+                if ui.button(RichText::new(t(lg, K::Choose)).color(BONE)).clicked() {
                     let mut dlg = rfd::FileDialog::new()
                         .set_title("Choose a folder for extracted map assets");
                     if std::path::Path::new(&state.assets_dir).is_dir() {
@@ -1252,7 +1264,7 @@ pub fn menu_ui(
                 state.assets_dir_edit = edit;
                 let dirty = state.assets_dir_edit != state.assets_dir;
                 if ui
-                    .add_enabled(dirty, egui::Button::new(RichText::new("SET").color(BONE)))
+                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
                     .clicked()
                 {
                     state.assets_dir = state.assets_dir_edit.clone();
@@ -1260,10 +1272,31 @@ pub fn menu_ui(
                     state.assets_ok = true;
                 }
                 if state.assets_ok {
-                    ui.label(RichText::new("[set]").color(OK).size(11.0));
+                    ui.label(RichText::new(t(lg, K::IsSet)).color(OK).size(11.0));
                 } else {
-                    ui.label(RichText::new("using default - CHOOSE to set").color(WARN).size(11.0));
+                    ui.label(RichText::new(t(lg, K::UsingDefault)).color(WARN).size(11.0));
                 }
+            });
+
+            // Language switch (bottom-right) — overrides the auto-detected default, persisted to
+            // atlas.config.json. egui re-renders the whole menu next frame in the chosen language.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for l in [crate::i18n::Lang::Ru, crate::i18n::Lang::En] {
+                    let active = *lang == l;
+                    let btn = egui::Button::new(
+                        RichText::new(l.code())
+                            .size(12.0)
+                            .strong()
+                            .color(if active { BONE } else { DIM }),
+                    )
+                    .fill(if active { theme::RAIL } else { Color32::TRANSPARENT })
+                    .stroke(egui::Stroke::new(1.0, if active { BEIGE } else { BORDER }));
+                    if ui.add(btn).on_hover_text(t(lg, K::LanguageTip)).clicked() && !active {
+                        *lang = l;
+                        save_config_lang(l.tag());
+                    }
+                }
+                ui.label(RichText::new("LANG").size(10.0).color(DIM));
             });
         });
 

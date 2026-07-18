@@ -10,6 +10,7 @@
 //! designed in `render::gpu_driven` (M1).
 
 mod eftpack;
+mod i18n;
 mod inspect;
 mod jobs;
 mod loot;
@@ -597,6 +598,9 @@ fn main() {
     // The active render path: load_map only swaps IN-PLACE under GPU-driven (the only path with an
     // epoch-aware rebuild); m0/std spawn geometry once at Startup, so they must relaunch on a switch.
     app.insert_resource(render_path);
+    // UI language (EN/RU): saved override in atlas.config.json > system locale > English. The menu
+    // language toggle flips + persists it; egui re-renders the whole UI next frame.
+    app.insert_resource(i18n::detect_lang(menu::config_lang().as_deref()));
 
     // Foreground-gated redraw: full-rate when the window is focused, near-idle (only user/window
     // events, ~2 Hz) when it's not — so alt-tabbing to your game frees the GPU. Skipped under

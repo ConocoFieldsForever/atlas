@@ -341,6 +341,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sys-locale",
  "texpresso",
  "ureq",
 ]

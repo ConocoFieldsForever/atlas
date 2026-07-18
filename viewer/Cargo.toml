@@ -24,6 +24,8 @@ texpresso = "2.0.2"
 # Native folder picker for the first-run onboarding (choose where extracted datasets live).
 # default-features off = just the OS-native dialog, no Linux async/portal runtimes.
 rfd = { version = "0.15", default-features = false }
+# System UI language detection for the EN/RU default (overridable in the menu).
+sys-locale = "0.3"
 
 [features]
 # egui is structural (ui/menu/inspect are unconditional modules); the feature remains as a
