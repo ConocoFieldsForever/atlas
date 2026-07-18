@@ -2,38 +2,49 @@
 //! (the start menu OR while a map is open in-raid) through ONE queue + one worker.
 //!
 //! Clean-worker architecture (the maintainable core):
-//!   * `Job`        — what to run (build a map / sync intel). Knows how to spawn its child process.
-//!   * `JobWorker`  — the resource: a FIFO queue + the single in-flight job + the last outcome. It
-//!                    runs at most one child at a time (these are heavy GPU/Unity pipelines).
+//!   * `Job`        — what to run (build a map / sync intel). Snapshots the paths it needs at
+//!                    enqueue time (a later game-dir edit can't mutate queued work) and knows how
+//!                    to spawn its child process.
+//!   * `JobWorker`  — the resource: a FIFO queue + the single in-flight job + the last FINISHED job
+//!                    (kept with its full log so a frontend can show the lingering outcome panel).
+//!                    Runs at most one child at a time (these are heavy GPU/Unity pipelines).
 //!   * `pump_jobs`  — the one system: reap a finished child, then start the next queued one.
 //!   * `job_panel`  — a compact floating egui window (in-raid only) to enqueue builds / sync and
 //!                    watch progress, so maps process in the background WITHOUT leaving the map.
 //!
-//! The child-process streaming (stdout tail + `[STAGE i/N]` parsing + reap) is REUSED verbatim from
+//! BOTH frontends feed this one worker: the start menu (`menu::menu_ui`) and the in-raid panel
+//! below. The child-process streaming (stdout tail + `[STAGE i/N]` parsing + reap) lives in
 //! `menu::BuildJob` — this module is the queue/worker around it, not a second copy.
 
 use crate::menu::BuildJob;
 use bevy::prelude::*;
 use std::collections::VecDeque;
 
-/// A unit of background work. `BuildMap` runs `tools/build_map.py <map>`; `SyncIntel` runs
-/// `tools/sync_intel.py` (both via `menu::BuildJob`).
-#[derive(Clone, PartialEq)]
+/// A unit of background work. `BuildMap` runs `tools/build_map.py <map>` against the game install
+/// captured when it was enqueued; `SyncIntel` runs `tools/sync_intel.py` (no map/game args).
+#[derive(Clone)]
 pub enum Job {
-    BuildMap(String),
+    BuildMap { map: String, game_dir: String },
     SyncIntel,
 }
 
 impl Job {
     pub fn label(&self) -> String {
         match self {
-            Job::BuildMap(m) => format!("build {m}"),
+            Job::BuildMap { map, .. } => format!("build {map}"),
             Job::SyncIntel => "sync intel".to_string(),
         }
     }
-    fn spawn(&self, game_dir: &str) -> std::io::Result<BuildJob> {
+    /// The map key when this is a build (drives the menu's per-row BUILDING state), else None.
+    pub fn build_key(&self) -> Option<&str> {
         match self {
-            Job::BuildMap(m) => BuildJob::spawn(m, game_dir),
+            Job::BuildMap { map, .. } => Some(map.as_str()),
+            Job::SyncIntel => None,
+        }
+    }
+    fn spawn(&self) -> std::io::Result<BuildJob> {
+        match self {
+            Job::BuildMap { map, game_dir } => BuildJob::spawn(map, game_dir),
             Job::SyncIntel => BuildJob::spawn_intel(),
         }
     }
@@ -44,17 +55,26 @@ impl Job {
 #[derive(Resource, Default)]
 pub struct JobWorker {
     queue: VecDeque<Job>,
-    /// (label, running child) of the in-flight job.
-    current: Option<(String, BuildJob)>,
-    /// (label, ok) of the most recently finished job — shown until the next one starts.
-    pub last: Option<(String, bool)>,
+    /// The in-flight job (its kind + running child).
+    current: Option<(Job, BuildJob)>,
+    /// The most recently FINISHED job, kept with its full log for the lingering outcome panel
+    /// until a frontend dismisses it (menu CLOSE). A new completion clears the dismissed flag.
+    last: Option<(Job, BuildJob)>,
+    last_dismissed: bool,
+    /// Monotonic count of finished jobs — a frontend detects "a job just completed" (→ rescan)
+    /// by watching this change, without consuming a shared event.
+    pub completed: u64,
+    /// Transient "failed to start" message (rare: python kit missing / spawn error).
+    pub spawn_error: Option<String>,
 }
 
 impl JobWorker {
-    /// Queue a job (deduped: won't double-queue the exact same job).
+    /// Queue a job (deduped by label: won't double-queue the same map build / a second sync while
+    /// one is already running or pending).
     pub fn enqueue(&mut self, job: Job) {
-        let running = self.current.as_ref().map(|(l, _)| l == &job.label()).unwrap_or(false);
-        if !running && !self.queue.contains(&job) {
+        let l = job.label();
+        let running = self.current.as_ref().map(|(j, _)| j.label() == l).unwrap_or(false);
+        if !running && !self.queue.iter().any(|j| j.label() == l) {
             self.queue.push_back(job);
         }
     }
@@ -64,17 +84,50 @@ impl JobWorker {
     pub fn queued(&self) -> usize {
         self.queue.len()
     }
-    /// (label, latest `[STAGE …]` marker) of the running job, for a panel readout.
+
+    // ---- in-flight job ----
+    pub fn current_job(&self) -> Option<&BuildJob> {
+        self.current.as_ref().map(|(_, b)| b)
+    }
+    /// The map key if a BuildMap is in flight (else None — e.g. a sync is running).
+    pub fn current_build_key(&self) -> Option<&str> {
+        self.current.as_ref().and_then(|(j, _)| j.build_key())
+    }
+    pub fn current_is_sync(&self) -> bool {
+        matches!(self.current.as_ref().map(|(j, _)| j), Some(Job::SyncIntel))
+    }
+    /// (label, latest `[STAGE …]` marker) of the running job, for a compact readout.
     pub fn status(&self) -> Option<(String, String)> {
-        self.current.as_ref().map(|(l, j)| {
-            let (stage, _, _, _) = j.snapshot(1);
-            (l.clone(), stage)
-        })
+        self.current.as_ref().map(|(j, b)| (j.label(), b.snapshot(1).0))
     }
     pub fn cancel_current(&mut self) {
         if let Some((_, j)) = &self.current {
             j.cancel();
         }
+    }
+
+    // ---- last finished job (lingers until dismissed) ----
+    pub fn last_job(&self) -> Option<&BuildJob> {
+        if self.last_dismissed {
+            return None;
+        }
+        self.last.as_ref().map(|(_, b)| b)
+    }
+    pub fn last_is_build(&self) -> bool {
+        !self.last_dismissed && matches!(self.last.as_ref().map(|(j, _)| j), Some(Job::BuildMap { .. }))
+    }
+    pub fn last_is_sync(&self) -> bool {
+        !self.last_dismissed && matches!(self.last.as_ref().map(|(j, _)| j), Some(Job::SyncIntel))
+    }
+    /// (label, ok) of the most recent finished (undismissed) job.
+    pub fn last_outcome(&self) -> Option<(String, bool)> {
+        if self.last_dismissed {
+            return None;
+        }
+        self.last.as_ref().map(|(j, b)| (j.label(), b.snapshot(0).3))
+    }
+    pub fn dismiss_last(&mut self) {
+        self.last_dismissed = true;
     }
 }
 
@@ -90,24 +143,23 @@ impl Plugin for JobsPlugin {
 /// The one worker tick: reap a finished child, then start the next queued job.
 fn pump_jobs(mut w: ResMut<JobWorker>) {
     // Reap the running job if its child has exited.
-    let finished = w
-        .current
-        .as_ref()
-        .map(|(_, j)| j.snapshot(1).2)
-        .unwrap_or(false);
+    let finished = w.current.as_ref().map(|(_, j)| j.snapshot(1).2).unwrap_or(false);
     if finished {
-        if let Some((label, job)) = w.current.take() {
-            let ok = job.snapshot(1).3;
-            w.last = Some((label, ok));
+        if let Some(done) = w.current.take() {
+            w.last = Some(done);
+            w.last_dismissed = false;
+            w.completed = w.completed.wrapping_add(1);
         }
     }
     // Start the next queued job when idle.
     if w.current.is_none() {
         if let Some(job) = w.queue.pop_front() {
-            let game_dir = crate::menu::detect_game_dir();
-            match job.spawn(&game_dir) {
-                Ok(child) => w.current = Some((job.label(), child)),
-                Err(e) => w.last = Some((format!("{}: {e}", job.label()), false)),
+            match job.spawn() {
+                Ok(child) => {
+                    w.spawn_error = None;
+                    w.current = Some((job, child));
+                }
+                Err(e) => w.spawn_error = Some(format!("{}: {e}", job.label())),
             }
         }
     }
@@ -163,12 +215,14 @@ fn job_panel(
                 if q > 0 {
                     ui.label(RichText::new(format!("{q} queued")).size(theme::SIZE_TINY).color(theme::FAINT));
                 }
-            } else if let Some((label, ok)) = &worker.last {
+            } else if let Some((label, ok)) = worker.last_outcome() {
                 ui.label(
-                    RichText::new(format!("{} {}", if *ok { "\u{2713}" } else { "\u{00D7}" }, label))
+                    RichText::new(format!("{} {}", if ok { "\u{2713}" } else { "\u{00D7}" }, label))
                         .size(theme::SIZE_SMALL)
-                        .color(if *ok { theme::OK } else { theme::DANGER_TEXT }),
+                        .color(if ok { theme::OK } else { theme::DANGER_TEXT }),
                 );
+            } else if let Some(err) = &worker.spawn_error {
+                ui.label(RichText::new(err.as_str()).size(theme::SIZE_SMALL).color(theme::DANGER_TEXT));
             } else {
                 ui.label(RichText::new("idle").size(theme::SIZE_SMALL).color(theme::MUTED));
             }
@@ -194,7 +248,7 @@ fn job_panel(
                     .clicked()
                 {
                     let m = if ui_state.pick.is_empty() { "interchange".to_string() } else { ui_state.pick.clone() };
-                    worker.enqueue(Job::BuildMap(m));
+                    worker.enqueue(Job::BuildMap { map: m, game_dir: crate::menu::detect_game_dir() });
                 }
             });
             if ui.small_button(RichText::new("sync tarkov.dev intel").size(10.0))
