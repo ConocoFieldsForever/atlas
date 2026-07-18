@@ -1,12 +1,24 @@
-# Release workflow — MIRRORS scripts/release.ps1, which must be proven locally FIRST.
-# workflow_dispatch ONLY (no on: push): this never runs until manually triggered, so no
-# CI credits are spent by accident (user directive). GitHub runners have no usable GPU, so
-# the only smoke here is --version; the render smoke stays a local-only step.
-# CI builds the EXE + code kit zips ONLY — packs/game-derived data never touch CI
-# (see LICENSE-NOTES.md).
+# Release workflow — MIRRORS scripts/release.ps1 (proven locally first; no wasted CI credits).
+# Manual trigger ONLY (workflow_dispatch): pick "Run workflow" in the Actions tab to build.
+# It builds the Windows EXE, assembles the shippable zip (exe + shaders + python kit; NO packs or
+# game-derived data — see LICENSE-NOTES.md), uploads it as a run artifact, AND publishes a GitHub
+# Release so the exe is hosted on the Releases page. GitHub runners have no usable GPU, so the only
+# smoke here is --version (the render smoke stays a local step).
 name: release
 on:
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (blank = auto: v<version>-<short-sha>)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark the GitHub Release as a pre-release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write # create the Release + tag
 
 jobs:
   build-windows:
@@ -19,12 +31,34 @@ jobs:
         run: cargo build --release --locked
       - name: Version smoke (runners have no GPU)
         run: .\target\release\atlas.exe --version
-      - name: Assemble dist (skip build + render smoke; both done above / locally)
+      - name: Assemble dist (skip build + render smoke; done above / GPU-only)
         shell: powershell
         run: .\scripts\release.ps1 -Full -SkipBuild -SkipRenderSmoke
-      - uses: actions/upload-artifact@v4
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            ver=$(grep -m1 -E '^version' viewer/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+            tag="v${ver}-${GITHUB_SHA::7}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Upload run artifact
+        uses: actions/upload-artifact@v4
         with:
           name: atlas-win64
           path: |
+            dist/*.zip
+            dist/*.sha256
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Atlas ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ github.event.inputs.prerelease }}
+          fail_on_unmatched_files: true
+          files: |
             dist/*.zip
             dist/*.sha256
