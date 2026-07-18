@@ -1,4 +1,4 @@
-# EFT Native Viewer — TODO / deferred
+# Atlas — TODO / deferred
 
 Tracking issues deferred during M0–M2. Updated 2026-07-14.
 

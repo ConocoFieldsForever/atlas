@@ -1,7 +1,7 @@
 //! eft::paths — exe-anchored filesystem roots (redistribution PR1).
 //!
 //! Everything used to be cwd-relative (`packs/…`), which only works when the exe is launched
-//! from the workspace root. A shipped bundle is `dist/eft_viewer.exe` + `assets/` + `packs/`
+//! from the workspace root. A shipped bundle is `dist/atlas.exe` + `assets/` + `packs/`
 //! side by side, launched from anywhere (Explorer double-click cwd = who knows). All path
 //! lookups route through here:
 //!   - `exe_dir()`      — directory containing the running exe.
@@ -10,7 +10,7 @@
 //!                        `<exe>/packs` (created on demand by writers).
 //!   - `shared_dir()`   — `<packs>/shared` (cross-map tier: tarkov.dev catalogs, icons,
 //!                        texcache).
-//!   - `config_path()`  — `<exe>/eft_viewer.config.json`, falling back to the cwd copy when
+//!   - `config_path()`  — `<exe>/atlas.config.json`, falling back to the cwd copy when
 //!                        only it exists (pre-portability configs keep working).
 //!   - `repo_root()`    — first dir among [cwd, exe_dir] containing `tools/build_map.py`
 //!                        (where the python kit lives; the menu build spawns from here).
@@ -48,11 +48,11 @@ pub fn shared_dir() -> PathBuf {
 }
 
 pub fn config_path() -> PathBuf {
-    let exe = exe_dir().join("eft_viewer.config.json");
+    let exe = exe_dir().join("atlas.config.json");
     if exe.exists() {
         return exe;
     }
-    let cwd = PathBuf::from("eft_viewer.config.json");
+    let cwd = PathBuf::from("atlas.config.json");
     if cwd.exists() {
         return cwd;
     }

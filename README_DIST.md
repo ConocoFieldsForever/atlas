@@ -1,14 +1,14 @@
-# EFT Native Viewer — distribution readme
+# Atlas — distribution readme
 
 A native raid-planning map viewer for Escape from Tarkov. Renders maps extracted from YOUR
 OWN game install; overlays loot, extracts, hazards, quests and more.
 
 ## Quick start (viewer-only bundle)
 
-1. Unzip anywhere. Keep `eft_viewer.exe`, `assets/`, and `packs/` side by side.
+1. Unzip anywhere. Keep `atlas.exe`, `assets/`, and `packs/` side by side.
 2. Drop `.eftpack` map folders into `packs/` (build your own — see below; packs are never
    distributed, they contain data derived from the game).
-3. Run `eft_viewer.exe` → the stash screen lists maps; PLAY opens one.
+3. Run `atlas.exe` → the stash screen lists maps; PLAY opens one.
 
 Controls: WASD + RMB mouse-look, Q/E up/down, Shift fast. Double-click identifies geometry.
 Right panel: layers, search, quests, routes, graphics settings.
@@ -20,7 +20,7 @@ Optional for baked lighting: NVIDIA GPU (CUDA) — without it maps render with f
 
 ```powershell
 .\bootstrap.ps1                        # one-time: venv + python deps + env check
-.\eft_viewer.exe                       # menu: set GAME INSTALL if not autodetected,
+.\atlas.exe                       # menu: set GAME INSTALL if not autodetected,
                                        # then BUILD on any map row
 # GPU lighting bake (optional):  .\venv\Scripts\pip install -r extraction\requirements-bake.txt
 ```

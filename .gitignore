@@ -14,7 +14,7 @@ tarkmap/out/
 *.old/
 
 # local config & secrets
-eft_viewer.config.json
+atlas.config.json
 .env
 .env.*
 !.env.example

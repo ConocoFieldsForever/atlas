@@ -1,4 +1,4 @@
-# EFT native viewer â€” WGSL shader port map
+# Atlas â€” WGSL shader port map
 
 Ports the pure MATH from the web three.js/WebGL viewer modules (under
 `beamng_blender_pipeline/tarkmap/out/`) into Bevy 0.17 / wgpu 26 WGSL. The GLSL/WebGL

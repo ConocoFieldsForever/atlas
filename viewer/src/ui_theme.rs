@@ -104,7 +104,7 @@ pub const CYAN: Color32 = Color32::from_rgb(120, 200, 210);
 // ============================================================================================
 // TYPE SCALE — every font size the UI uses (pt). No panel should hardcode a raw size.
 // ============================================================================================
-/// Menu wordmark ("TARKOV STASH").
+/// Menu wordmark ("ATLAS").
 pub const SIZE_DISPLAY: f32 = 22.0;
 /// Menu map-row title (per-map name).
 pub const SIZE_ROW_TITLE: f32 = 18.0;

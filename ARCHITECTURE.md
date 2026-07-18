@@ -1,4 +1,4 @@
-# eft_native_viewer — Architecture
+# Atlas — Architecture
 
 A native desktop EFT map viewer (**Rust + Bevy**, GPU-driven) replacing the web three.js
 `tarkmap` viewer. This repo is **code only**; it references the extracted assets *in place*

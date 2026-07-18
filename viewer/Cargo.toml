@@ -1,5 +1,5 @@
 [package]
-name = "eft_viewer"
+name = "atlas"
 version = "0.1.0"
 edition = "2021"
 description = "Native GPU-driven EFT map viewer consuming .eftpack v1 packs"
@@ -29,5 +29,5 @@ default = ["egui"]
 egui = []
 
 [[bin]]
-name = "eft_viewer"
+name = "atlas"
 path = "src/main.rs"

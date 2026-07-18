@@ -1,4 +1,4 @@
-# EFT Native Viewer — Rendering Fidelity: SOURCE OF TRUTH
+# Atlas — Rendering Fidelity: SOURCE OF TRUTH
 
 Working doc for getting the native viewer to EFT-quality rendering. Every issue below
 has a known root cause + a solution recipe distilled from the **web-viewer battles**

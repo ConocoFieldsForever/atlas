@@ -329,6 +329,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "atlas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bevy",
+ "bevy_egui",
+ "bytemuck",
+ "glam",
+ "image",
+ "serde",
+ "serde_json",
+ "texpresso",
+ "ureq",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2029,22 +2045,6 @@ checksum = "94bdf37f8d5bd9aa7f753573fdda9cf7343afa73dd28d7bfe9593bd9798fc07e"
 dependencies = [
  "bytemuck",
  "emath",
-]
-
-[[package]]
-name = "eft_viewer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bevy",
- "bevy_egui",
- "bytemuck",
- "glam",
- "image",
- "serde",
- "serde_json",
- "texpresso",
- "ureq",
 ]
 
 [[package]]

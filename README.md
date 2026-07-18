@@ -1,4 +1,4 @@
-# eft_native_viewer
+# Atlas
 
 Native desktop **Escape from Tarkov map viewer** — Rust + Bevy (GPU-driven),
 replacing the web three.js `tarkmap`. This repo is **code-only**: it *consumes*
@@ -13,7 +13,7 @@ The extraction pipeline (UnityPy extractor → `assemble_bevy.py`) is the scene
 ## Layout
 
 ```
-eft_native_viewer/
+atlas/
   Cargo.toml               workspace root (pinned deps, profiles)
   eft_pipeline/            the .eftpack emitter (Python)
     __init__.py
@@ -23,7 +23,7 @@ eft_native_viewer/
       instmath.py  culls.py  objio.py  matsig.py   (verbatim)
       config.py    (verbatim EXCEPT ROOT/MAPS_DIR repointed at the in-place tree)
   viewer/
-    Cargo.toml             the eft_viewer binary crate
+    Cargo.toml             the atlas binary crate
     src/
       main.rs              Bevy app: window, fly camera, load .eftpack, install render plugin
       eftpack.rs           .eftpack v1 loader — reads strides/offsets FROM manifest.json

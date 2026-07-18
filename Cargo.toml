@@ -1,4 +1,4 @@
-# eft_native_viewer — Cargo workspace root
+# Atlas — Cargo workspace root
 #
 # Native desktop EFT map viewer (Rust + Bevy, GPU-driven instancing) that
 # CONSUMES the .eftpack v1 packs emitted by assemble_bevy.py. Code-only repo:
