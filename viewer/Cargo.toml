@@ -21,6 +21,9 @@ bevy_egui = { workspace = true }
 # default-features=false drops rustls/TLS — we only ever hit http://127.0.0.1, no cert machinery.
 ureq = { version = "2", default-features = false }
 texpresso = "2.0.2"
+# Native folder picker for the first-run onboarding (choose where extracted datasets live).
+# default-features off = just the OS-native dialog, no Linux async/portal runtimes.
+rfd = { version = "0.15", default-features = false }
 
 [features]
 # egui is structural (ui/menu/inspect are unconditional modules); the feature remains as a
