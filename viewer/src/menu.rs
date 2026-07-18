@@ -220,7 +220,7 @@ pub fn intel_status() -> (Option<f64>, Option<f64>, usize) {
 
 /// The standard map roster (dataset key -> display name). Packs on disk that aren't in this
 /// list still show up (title falls back to the key).
-const KNOWN_MAPS: &[(&str, &str)] = &[
+pub const KNOWN_MAPS: &[(&str, &str)] = &[
     ("lighthouse", "Lighthouse"),
     ("interchange", "Interchange"),
     ("factory", "Factory"),
