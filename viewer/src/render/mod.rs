@@ -113,6 +113,15 @@ impl Default for GfxSettings {
     }
 }
 
+/// Bumped by the in-place map loader (`main::load_map`) on every `.eftpack` swap. Extracted to the
+/// render world so the epoch-aware GPU reset (`gpu_driven::reset_gpu_map_if_epoch_changed`) can tear
+/// down the old map's buffers/bind-groups/pipelines and rebuild for the new pack. Also gates the
+/// main-world per-map rebuild systems (`build_cpu_data`, `spawn_pois`, `spawn_loot`, camera reset,
+/// teardown) via `run_if(resource_changed::<MapEpoch>)`. Starts at 0 (fires once on the first frame
+/// so the initial map builds); each swap does `.0 += 1`.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, bevy::render::extract_resource::ExtractResource)]
+pub struct MapEpoch(pub u64);
+
 /// A/B render-path selector. `EFT_RENDER=m0` picks the working M0 custom instanced
 /// path (`instancing.rs`, zero culling); anything else (default) picks the M2
 /// GPU-driven compute-cull + indirect-draw path (`gpu_driven.rs`).
