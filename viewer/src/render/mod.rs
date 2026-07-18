@@ -137,8 +137,12 @@ pub enum RenderPath {
 }
 
 impl RenderPath {
-    /// Resolve from the `EFT_RENDER` env var (`m0` | `gpu`) or an optional CLI token
-    /// (e.g. the 2nd argv). Defaults to GPU-driven.
+    /// Resolve from the `EFT_RENDER` env var (`m0` | `gpu` | `std`) or an optional CLI token
+    /// (e.g. the 2nd argv). With NO override the path is chosen by GPU capability: the
+    /// GPU-driven path if the adapter supports it (any modern AMD/NVIDIA discrete card via
+    /// DX12/Vulkan), else the M0 instanced path — so an under-featured GPU renders honest
+    /// geometry instead of the empty view the render-world feature guards would otherwise
+    /// leave. An explicit `EFT_RENDER=gpu` still forces GPU-driven (skips the probe).
     pub fn from_env_or(cli: Option<&str>) -> Self {
         let pick = std::env::var("EFT_RENDER")
             .ok()
@@ -146,7 +150,50 @@ impl RenderPath {
         match pick.as_deref().map(str::trim).map(str::to_ascii_lowercase) {
             Some(ref s) if s == "m0" || s == "instanced" => RenderPath::M0Instanced,
             Some(ref s) if s == "std" || s == "standard" || s == "pbr" => RenderPath::Standard,
-            _ => RenderPath::GpuDriven,
+            Some(ref s) if s == "gpu" || s == "gpu-driven" => RenderPath::GpuDriven,
+            _ => {
+                if gpu_driven_supported() {
+                    RenderPath::GpuDriven
+                } else {
+                    eprintln!(
+                        "render path: GPU lacks MULTI_DRAW_INDIRECT / bindless features - \
+                         auto-selecting the M0 instanced path (override with EFT_RENDER=gpu)"
+                    );
+                    RenderPath::M0Instanced
+                }
+            }
         }
+    }
+}
+
+/// Probe a throwaway wgpu adapter for the features the GPU-driven path hard-requires
+/// (`init_gpu_pipelines` disables that path — empty view — without them). Uses the same
+/// `HighPerformance` preference Bevy defaults to, so on a single-GPU AMD/NVIDIA box we inspect
+/// the very adapter Bevy will pick. The instance/adapter are dropped immediately. Any probe
+/// failure returns `true` (assume capable) so we never regress a working machine into M0 on a
+/// transient enumeration hiccup — the render-world guard is the real backstop either way.
+fn gpu_driven_supported() -> bool {
+    use bevy::render::settings::WgpuFeatures;
+    let need = WgpuFeatures::MULTI_DRAW_INDIRECT
+        | WgpuFeatures::INDIRECT_FIRST_INSTANCE
+        | WgpuFeatures::TEXTURE_BINDING_ARRAY
+        | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }));
+    match adapter {
+        Ok(a) => {
+            let ok = a.features().contains(need);
+            let info = a.get_info();
+            eprintln!(
+                "gpu probe: {} ({:?}/{:?}) gpu-driven={}",
+                info.name, info.device_type, info.backend, ok
+            );
+            ok
+        }
+        Err(_) => true,
     }
 }

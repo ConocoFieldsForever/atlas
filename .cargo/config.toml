@@ -1,0 +1,8 @@
+# Statically link the MSVC C runtime into atlas.exe so the shipped binary launches on a
+# CLEAN Windows install (any machine, AMD or NVIDIA) WITHOUT requiring the Microsoft Visual
+# C++ Redistributable. A default dynamically-CRT-linked Rust/MSVC build fails to start with
+# "VCRUNTIME140.dll not found" on a box that has never had the redist installed. +crt-static
+# folds the CRT into the exe, removing that external dependency. Applies to every cargo build
+# in this tree, including the GitHub Actions release build.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

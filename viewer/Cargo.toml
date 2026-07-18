@@ -7,9 +7,14 @@ publish = false
 
 [dependencies]
 bevy = { workspace = true }
-# NOTE: no direct `wgpu` dep — all GPU types come via `bevy::render` (its
-# re-exports), which guarantees we use the exact wgpu version Bevy vendors and
-# never accidentally link two wgpu versions.
+# Direct wgpu dep, pinned EXACTLY to the version Bevy 0.17.3 vendors (26.0.1) with
+# default-features off: Cargo feature-unifies it into Bevy's single wgpu build, so there is
+# still only ONE wgpu in the graph (no two-versions hazard). It exists solely for the
+# startup GPU-capability probe in `render::gpu_driven_supported` (auto-selecting the M0
+# fallback on adapters without MULTI_DRAW_INDIRECT/bindless) — Bevy re-exports the wgpu
+# enums but not `Instance`/`RequestAdapterOptions`, which the probe needs. All GPU types used
+# in render code still come via `bevy::render` re-exports; keep the version in lockstep with Bevy.
+wgpu = { version = "=26.0.1", default-features = false }
 bytemuck = { workspace = true }
 glam = { workspace = true }
 image = { workspace = true }
