@@ -409,6 +409,24 @@ pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: C
             painter.circle_stroke(ctr, 4.2, s);
             painter.circle_filled(egui::pos2(body.right() - 2.5, body.top() + 2.5), 1.0, c);
         }
+        4 => {
+            // home / back-to-menu: a simple house (roof + body + door)
+            let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);
+            painter.line_segment([p(-9.0, -0.5), p(0.0, -8.5)], s);
+            painter.line_segment([p(0.0, -8.5), p(9.0, -0.5)], s);
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(-7.0, -0.5), p(7.0, 9.0)),
+                0.0,
+                s,
+                StrokeKind::Middle,
+            );
+            painter.rect_stroke(
+                egui::Rect::from_min_max(p(-2.5, 3.5), p(2.5, 9.0)),
+                0.0,
+                Stroke::new(1.3, c),
+                StrokeKind::Middle,
+            );
+        }
         _ => {
             // tasks: three checklist rows, first with a check
             for r in 0..3 {

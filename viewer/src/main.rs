@@ -148,6 +148,39 @@ fn apply_camera_fov(
 #[derive(Resource, Default)]
 pub struct MapSwitch(pub Option<String>);
 
+/// Set by the toolbar's "back to menu" button: relaunch the process with NO pack so the start menu
+/// (map manager) opens. The menu<->raid transition still relaunches (the in-place path is raid->raid
+/// only for now); a background build DOES die on this relaunch — full in-place menu is a follow-up.
+#[derive(Resource, Default)]
+pub struct ReturnToMenu(pub bool);
+
+/// Relaunch into the start menu when `ReturnToMenu` is set (a fresh process with no pack argv AND
+/// EFT_PACK stripped, so `main()` opens the menu instead of re-opening the current pack).
+fn return_to_menu(
+    mut req: ResMut<ReturnToMenu>,
+    mut server: ResMut<pathfind::PathfindServer>,
+    mut exit: MessageWriter<bevy::app::AppExit>,
+) {
+    if !req.0 {
+        return;
+    }
+    req.0 = false;
+    match std::env::current_exe() {
+        Ok(exe) => {
+            // No pack arg + EFT_PACK removed -> menu mode (main() pack-selection order).
+            match std::process::Command::new(exe).env_remove("EFT_PACK").spawn() {
+                Ok(_) => {
+                    info!("returning to the start menu (relaunch, no pack)");
+                    server.stop_owned_child();
+                    exit.write(bevy::app::AppExit::Success);
+                }
+                Err(e) => error!("return to menu: spawn failed: {e}"),
+            }
+        }
+        Err(e) => error!("return to menu: current_exe failed: {e}"),
+    }
+}
+
 /// Load the selected pack in-place: swap `LoadedPack`, reload pack-local grade/gfx flags, drop the
 /// per-map ground grid, and bump `MapEpoch` (which drives every per-map rebuild + the render-world
 /// GPU reset). On `EFT_RELAUNCH_ON_SWITCH=1`, falls back to spawning a fresh process + exiting.
@@ -557,12 +590,13 @@ fn main() {
         .add_plugins(jobs::JobsPlugin) // background job worker: build/sync maps while a map is open
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
-        .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack
+        .init_resource::<MapSwitch>() // UI map dropdown -> switch to the selected pack (in place)
+        .init_resource::<ReturnToMenu>() // toolbar "back to menu" button -> relaunch into the menu
         .add_systems(Startup, setup)
         // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
         // exclusive by walk_mode) so they can't race the shared Transform.
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move, walk_move).chain())
-        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch))
+        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu))
         .add_systems(
             Update,
             (apply_gfx_camera, load_map, flycam_scroll, apply_camera_fov, build_walk_ground),
