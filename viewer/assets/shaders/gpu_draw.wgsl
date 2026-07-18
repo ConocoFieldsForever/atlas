@@ -967,12 +967,16 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let wet = m.tint.rgb * gi;                          // dark wet asphalt (grey _Color), GI-lit
         let col = mix(wet, refl, refl_mix) + spec_rgb;
         let a = coverage * m.tint.a;                        // _Color.a = overall puddle strength
-        return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality), a);
+        // PREMULTIPLIED output: rgb = col*a preserves the puddle's intended lerp(road, col, a) —
+        // the reflection is DELIBERATELY weighted by coverage here (it wets the road), unlike glass.
+        return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality) * a, a);
     }
-    // Glass / plain decal: env reflection (glass is glossy -> strong) + the GGX glint make it read as
-    // reflective, not a flat tinted pane. Emissive rides here too (lit windows / signage panes).
+    // Glass / plain decal: PREMULTIPLIED. Transmission alpha scales only the DIFFUSE (lit) — the env
+    // reflection, GGX glint and emissive are ADDED at full strength so a clear pane mirrors the
+    // bright overcast sky instead of reading as a dark tinted slab. Emissive rides here too
+    // (lit windows / signage panes).
     return vec4<f32>(
-        apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality),
+        apply_fog(lit, o.world_pos, dom.directionality) * albedo.a + spec_rgb + refl_rgb + em_rgb,
         albedo.a
     );
 #else

@@ -3272,7 +3272,12 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
         ) = match key.pass {
             DrawPass::Opaque => (None, true, DepthBiasState::default(), vec![]),
             DrawPass::Blend => (
-                Some(BlendState::ALPHA_BLENDING),
+                // PREMULTIPLIED (src=One, dst=OneMinusSrcAlpha): the fragment premultiplies its
+                // DIFFUSE by the transmission alpha but ADDS specular/reflection/emissive at full
+                // strength — the Unity Standard transparent convention. Under the old straight
+                // ALPHA_BLENDING every term was scaled by alpha, so clear glass showed only ~10-30%
+                // of its sky reflection and read as a dark tinted slab (render-audit finding #18).
+                Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 false,
                 toward_cam_bias,
                 vec!["BLEND_PASS".into()],
