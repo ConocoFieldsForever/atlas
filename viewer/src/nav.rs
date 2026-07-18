@@ -32,6 +32,10 @@ use std::path::Path;
 const NB: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 /// Vertical-movement cost multiplier: strongly prefers the flat floor (no roof/ceiling detours).
 const VERT: f32 = 6.0;
+/// Extra cost (× res) for entering a wall-adjacent cell — an agent-clearance nudge that biases
+/// routes off walls and away from the sub-cell gaps a thin edge-ray can thread. Soft + uniform,
+/// so it steers toward a clearer route when one exists but never blocks a genuinely narrow passage.
+const WALL_CLEARANCE: f32 = 0.35;
 
 /// Per-CELL soft-avoidance cost (extra metres-equivalent added when the path enters the cell).
 /// XZ-only (a danger zone spans all floors above it). Built by [`NavGrid::build_avoid`] from
@@ -48,16 +52,26 @@ pub struct NavGrid {
     pub nz: usize,
     pub k: usize,
     miss: f32,
-    /// A layer above the previous by <= this many metres is walkable up (players vault ~1.2 m).
+    /// Ceiling for an up-move: rises above this are never scaled (players vault ~1.2 m at most).
     climb: f32,
     /// A drop larger than this is routed around (fall damage), not stepped off.
     drop_max: f32,
+    /// Free step-up height (stairs / curbs auto-stepped without a slope check) — Unity stepHeight.
+    step_up: f32,
+    /// tan(max walkable incline). An up-move's rise/run above this is too STEEP to scale — the
+    /// player would slide (Unity NavMesh maxSlope). Separates "walk a hill" from "scale a wall": a
+    /// 1.2 m rise over a 1 m cell is 50° and now rejected, while a curb (<= step_up) still passes.
+    slope_tan: f32,
     /// nx*nz*K ascending floor heights (`miss` = empty).
     h: Vec<f32>,
     /// nx*nz door bits.
     door: Vec<u8>,
     /// nx*nz*K 8-dir edge-block masks.
     blk: Vec<u8>,
+    /// nx*nz: true when the cell is within ~1 cell of a blocked edge. A small enter-penalty on
+    /// these keeps the route centred in corridors instead of hugging walls / threading the
+    /// sub-cell gaps the thin edge-ray can miss — an agent-radius clearance nudge (Unity erode).
+    near_wall: Vec<bool>,
 }
 
 /// Reusable per-query A* scratch (generation-stamped so no full clears). One `Scratch` is reused
@@ -97,19 +111,76 @@ impl NavGrid {
         let miss = f("miss").unwrap_or(-1.0e9) as f32;
         let climb = f("climb").unwrap_or(1.2) as f32;
         let drop_max = f("drop_max").unwrap_or(2.0) as f32;
+        // Walkability tuning (runtime — no re-bake). step_up = freely-walked curb/stair height;
+        // walk_slope_deg = max incline you can scale (Unity maxSlope), distinct from the bake's
+        // surface-recording slope (nav.json slope_max_deg, ~60). Env-overridable for A/B tuning.
+        let step_up = env_f32("EFT_NAV_STEP").or_else(|| f("step_up").map(|v| v as f32)).unwrap_or(0.45);
+        let slope_deg = env_f32("EFT_NAV_SLOPE").or_else(|| f("walk_slope_deg").map(|v| v as f32)).unwrap_or(45.0);
+        let slope_tan = slope_deg.clamp(20.0, 70.0).to_radians().tan();
         let m = nx * nz * k;
 
         let h = read_f32(&dir.join("nav.bin"), m)?;
         // Door / block masks are optional; absent -> no doors / no blocked edges (graceful).
         let door = read_u8(&dir.join("nav_door.bin"), nx * nz).unwrap_or_else(|| vec![0; nx * nz]);
         let blk = read_u8(&dir.join("nav_blk.bin"), m).unwrap_or_else(|| vec![0; m]);
+
+        // Agent-clearance field: a cell is "near a wall" if it (or a neighbour) has any blocked
+        // edge. Dilated by one cell so the penalty biases routes ~1 cell (res) off walls — the
+        // grid's coarse stand-in for eroding the walkable area by the agent radius.
+        let mut near_wall = vec![false; nx * nz];
+        for cell in 0..nx * nz {
+            if (0..k).any(|l| blk[cell * k + l] != 0) {
+                near_wall[cell] = true;
+            }
+        }
+        let seed = near_wall.clone();
+        for cz in 0..nz as i64 {
+            for cx in 0..nx as i64 {
+                let c = (cz * nx as i64 + cx) as usize;
+                if near_wall[c] {
+                    continue;
+                }
+                'ring: for dz in -1..=1i64 {
+                    for dx in -1..=1i64 {
+                        let (jx, jz) = (cx + dx, cz + dz);
+                        if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
+                            continue;
+                        }
+                        if seed[(jz * nx as i64 + jx) as usize] {
+                            near_wall[c] = true;
+                            break 'ring;
+                        }
+                    }
+                }
+            }
+        }
         info!(
-            "nav: loaded grid {}x{}x{} @ {}m ({:.0} MB) from {}",
+            "nav: loaded grid {}x{}x{} @ {}m ({:.0} MB); step_up {:.2}m slope {:.0}deg; from {}",
             nx, nz, k, res,
             (h.len() * 4 + door.len() + blk.len()) as f32 / 1e6,
+            step_up, slope_deg,
             dir.display()
         );
-        Some(NavGrid { min_x, min_z, res, nx, nz, k, miss, climb, drop_max, h, door, blk })
+        Some(NavGrid {
+            min_x, min_z, res, nx, nz, k, miss, climb, drop_max, step_up, slope_tan, h, door, blk,
+            near_wall,
+        })
+    }
+
+    /// Can you move onto a neighbour whose floor is `up` metres above (negative = below) yours,
+    /// `run` metres away horizontally? Doors always pass. UP: a free step (<= step_up), else a
+    /// walkable incline capped by both the vault ceiling AND the max slope. DOWN: any survivable
+    /// drop. This is what keeps routes on terrain the player can actually scale.
+    #[inline]
+    fn walkable_step(&self, up: f32, run: f32, forced: bool) -> bool {
+        if forced {
+            return true;
+        }
+        if up > 0.0 {
+            up <= self.step_up || (up <= self.climb && up <= run * self.slope_tan)
+        } else {
+            -up <= self.drop_max
+        }
     }
 
     /// Node count (nx*nz*K) — the size a `Scratch` must match.
@@ -326,8 +397,9 @@ impl NavGrid {
                 let h_n = self.h_lay(nc, nl);
                 let up = h_n - h_cur;
                 let forced = self.door[nc] == 1;
-                if !forced && (up > self.climb || -up > self.drop_max) {
-                    continue; // wall / cliff (doors bypass)
+                let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                if !self.walkable_step(up, horiz, forced) {
+                    continue; // too steep/tall to scale, or too deep a drop (doors bypass)
                 }
                 if dx != 0 && dz != 0 {
                     // no corner-cut through a wall: at least one of the two ortho cells must be floor
@@ -338,8 +410,10 @@ impl NavGrid {
                     }
                 }
                 let nn = nc * k + nl;
-                let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
                 let mut step = (horiz * horiz + (up * VERT) * (up * VERT)).sqrt();
+                if self.near_wall[nc] {
+                    step += self.res * WALL_CLEARANCE; // clearance nudge (soft; never blocks a corridor)
+                }
                 if let Some(av) = avoid {
                     if let Some(&p) = av.get(&(nc as u32)) {
                         step += p; // danger-zone soft penalty (extra metres-equivalent)
@@ -424,8 +498,9 @@ impl NavGrid {
                 let h_n = self.h_lay(nc, nl);
                 let up = h_n - h_cur;
                 let forced = self.door[nc] == 1;
-                if !forced && (up > self.climb || -up > self.drop_max) {
-                    continue;
+                let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                if !self.walkable_step(up, horiz, forced) {
+                    continue; // same connectivity as astar (reachability must agree)
                 }
                 if dx != 0 && dz != 0 {
                     let a = (iz * nx + jx) as usize;
@@ -435,7 +510,8 @@ impl NavGrid {
                     }
                 }
                 let nn = nc * k + nl;
-                let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                // Pure geometric step (NO clearance/avoid penalty) — the field is a distance
+                // estimate for the planner, so its g must stay real metres.
                 let step = (horiz * horiz + (up * VERT) * (up * VERT)).sqrt();
                 let ng = s.g[cur] + step;
                 let known = s.open_gen[nn] == gen;
@@ -502,8 +578,13 @@ impl NavGrid {
         let dc = dc as usize;
         for dl in self.layers_by_height(dc, b.y) {
             if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid) {
-                let dist = polyline_len(&path);
-                return Some((path, dist));
+                // Report the length of the SIMPLIFIED polyline (what actually gets drawn + walked),
+                // not the raw 8-connected staircase: the staircase over-measures a diagonal-ish leg
+                // by the grid metrication error (~up to 8%). Simplifying first makes the displayed
+                // metres match the drawn line and the true walked distance.
+                let simp = simplify(&path, self.res * 0.4);
+                let dist = polyline_len(&simp);
+                return Some((simp, dist));
             }
         }
         None
@@ -782,6 +863,11 @@ fn read_f32(path: &Path, n: usize) -> Option<Vec<f32>> {
         *o = f32::from_le_bytes(b);
     }
     Some(out)
+}
+
+/// Parse an f32 from an env var (trimmed); None if unset or unparseable.
+fn env_f32(key: &str) -> Option<f32> {
+    std::env::var(key).ok().and_then(|s| s.trim().parse().ok())
 }
 
 fn read_u8(path: &Path, n: usize) -> Option<Vec<u8>> {
