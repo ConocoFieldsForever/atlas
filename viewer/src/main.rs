@@ -572,6 +572,11 @@ fn main() {
     // look; availability flags gate the toggles that need pack data.
     let mut gfx = render::GfxSettings::default();
     gfx.grade_available = grade_lut.is_some();
+    // Menu backdrop: crank Bloom so the neon globe reads as a hazy VOLUMETRIC glow (in-raid keeps
+    // the subtle 0.06). apply_gfx_camera pushes this to the camera.
+    if menu_mode {
+        gfx.bloom_intensity = 0.32;
+    }
     app.insert_resource(gfx);
     if let Some(g) = grade_lut {
         app.insert_resource(g);
