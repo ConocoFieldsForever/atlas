@@ -80,16 +80,23 @@ Then:
 
 1. Right-click `bootstrap.ps1` → **Run with PowerShell** (one-time setup — it
    installs what the builder needs and checks your setup).
-2. Launch `atlas.exe`. At the bottom of the menu, make sure **GAME INSTALL** points
-   at your Tarkov folder (it usually auto-fills; if not, paste the path and press
-   **SET**).
-3. Press **BUILD** on any map row. Progress shows live. When it finishes the row
-   turns **READY** and you can **PLAY**.
+2. Launch `atlas.exe`. At the bottom of the menu:
+   - **GAME INSTALL** — point it at your Tarkov folder (usually auto-fills; if not,
+     paste the path and press **SET**).
+   - **EXTRACTED ASSETS** — press **CHOOSE…** and pick a folder with plenty of free
+     space (the extracted map data lands here — budget **~1–6 GB per map**).
+3. **Close the game and its launcher** (the extractor needs the files unlocked),
+   then press **BUILD** on a map row. The **first** build of a map runs a one-time
+   extraction from your game files and can take a while (tens of minutes for a big
+   map); it then assembles the pack. Progress streams live. When it finishes the
+   row turns **READY** and you can **PLAY**. Re-building or building other maps
+   afterward is much quicker.
 4. If a row later says **GAME FILES UPDATED**, the game got patched — press
    **UPDATE** to rebuild it.
 
-> A map takes a few GB and some minutes to build. An NVIDIA graphics card makes the
-> lighting look better but isn't required.
+> The extraction is resumable — if it's interrupted, pressing BUILD again picks up
+> where it left off. An NVIDIA graphics card makes the lighting look better but
+> isn't required.
 
 ---
 
@@ -129,6 +136,16 @@ If it still won't start, install Microsoft's free **Visual C++ Redistributable
 Building maps needs the full kit (Option B): the `tools`/`eft_pipeline` folders
 beside the exe, Python installed, and your Tarkov install. The viewer-only download
 can open and view packs but can't build them.
+
+**BUILD says "no dataset" / the extraction fails.**
+Make sure you set **EXTRACTED ASSETS** (a folder with free space) and **GAME
+INSTALL** at the bottom of the menu, and that you ran `bootstrap.ps1` (it installs
+UnityPy, which the extractor needs). The **game and its launcher must be closed** —
+they lock the files the extractor reads.
+
+**The first BUILD looks stuck on the first step for a long time.**
+That's the one-time extraction working — it can take tens of minutes on a big map.
+Watch the streaming log lines; it's making progress. Later builds skip this step.
 
 **It feels like it's holding back / low frame rate.**
 By design, Atlas caps to your monitor's refresh rate and goes nearly idle when its

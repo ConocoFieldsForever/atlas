@@ -4,7 +4,13 @@
 param([string]$Python = "")
 
 $ErrorActionPreference = "Stop"
-$here = Split-Path -Parent $PSScriptRoot
+# Locate the kit root (the dir holding extraction\). In the shipped bundle this script sits AT that
+# root beside extraction\; in the dev tree it lives in scripts\ and the kit is its parent.
+if (Test-Path (Join-Path $PSScriptRoot "extraction")) {
+    $here = $PSScriptRoot
+} else {
+    $here = Split-Path -Parent $PSScriptRoot
+}
 if ($here -notmatch "\S") { $here = "." }
 Set-Location $here
 
