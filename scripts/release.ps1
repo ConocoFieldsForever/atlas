@@ -72,6 +72,10 @@ if ($Full) {
     }
     # prune caches + anything game-derived that may sit in the workspace copies
     Get-ChildItem -Recurse "$dist" -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+    # The grade LUT source (lut_amidgen_bluegreen.png) is extracted from the game's
+    # resources.assets and eft_grade_lut.bin is its derivative — non-redistributable
+    # (LICENSE-NOTES.md). Pack builders regenerate them locally via make_grade_lut_game.py.
+    Remove-Item "$dist\extraction\grade\lut_amidgen_bluegreen.png","$dist\extraction\grade\eft_grade_lut.bin" -Force -ErrorAction SilentlyContinue
     Copy-Item "extraction\requirements.txt" $dist
     Copy-Item "scripts\bootstrap.ps1" $dist
 }
@@ -98,6 +102,24 @@ if (-not $SkipRenderSmoke) {
         Write-Host "[release] render smoke OK ($([math]::Round((Get-Item $shot).Length/1kb)) KB)"
     }
 }
+
+# 5b. The render smoke runs the dist exe, which writes game-derived BC texcache into
+#     <dist>\packs\shared\texcache (paths.rs anchors the cache beside the exe). Purge everything
+#     the exe generated under packs\ so only an empty shared\ ships.
+if (Test-Path "$dist\packs") {
+    Get-ChildItem "$dist\packs" -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
+New-Item -ItemType Directory -Force "$dist\packs\shared" | Out-Null
+New-Item -ItemType File -Force "$dist\packs\shared\.keep" | Out-Null
+
+# 5c. Final belt-and-braces: NOTHING game-derived may ship — packs, texcache, BC blobs, extracted
+#     grade LUTs, or the tarkov.dev intel caches. Fail closed on any match anywhere in the tree.
+$bad = Get-ChildItem -Recurse "$dist" -File -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -match '\.eftpack$|\.bc[0-9]|lut_amidgen|eft_grade_lut\.bin$' -or
+    $_.FullName -match '\\texcache\\' -or
+    $_.Name -in @('loot.json','tasks.json')
+}
+if ($bad) { throw "game-derived data leaked into dist: $($bad.FullName -join ', ')" }
 
 # 6. Zip + checksum.
 $zip = "dist\$name$(if ($Full) { '-full' }).zip"
