@@ -295,10 +295,13 @@ impl ViewNode for GradeNode {
         let Some(gp) = world.get_resource::<GradePipeline>() else {
             return Ok(()); // grade disabled
         };
-        // Runtime UI toggle: when the grade is switched off the main world swaps the camera back
-        // to TonyMcMapface (apply_gfx_camera in main.rs); this node just steps aside.
+        // Step aside when the grade is off OR the current pack has no grade LUT (grade_available):
+        // in both cases the main world runs TonyMcMapface on the camera (apply_gfx_camera). Checking
+        // grade_available too keeps the "grade OWNS the chain XOR TonyMcMapface" invariant across an
+        // in-place swap to a LUT-less pack — otherwise this node keeps applying the OLD pack's LUT
+        // on top of TonyMcMapface (double tonemapping).
         if let Some(s) = world.get_resource::<crate::render::GfxSettings>() {
-            if !s.grade {
+            if !s.grade || !s.grade_available {
                 return Ok(());
             }
         }

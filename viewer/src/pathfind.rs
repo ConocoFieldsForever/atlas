@@ -84,7 +84,7 @@ impl RouteResult {
             self.dist = o.dist;
         }
     }
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.points.clear();
         self.dist = 0.0;
         self.dest_label = None;
@@ -203,9 +203,13 @@ impl Plugin for PathfindPlugin {
                     .chain(),
             )
             // In-place map swap: drop the old pack's routing state (manage_nav reloads the new nav).
+            // BEFORE poll_route so an in-flight A* completing on the swap frame can't publish an
+            // old-map polyline (it sees PathfindTask=None).
             .add_systems(
                 Update,
-                teardown_nav.run_if(resource_changed::<crate::render::MapEpoch>),
+                teardown_nav
+                    .run_if(resource_changed::<crate::render::MapEpoch>)
+                    .before(poll_route),
             );
     }
 }

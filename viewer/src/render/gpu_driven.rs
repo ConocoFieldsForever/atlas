@@ -726,8 +726,11 @@ pub struct CpuData {
     mesh_count: u32,
 }
 
+/// The repacked CPU geometry blob + the `MapEpoch` it was built for. `prepare_gpu_buffers` builds
+/// GPU buffers ONLY when `.1 == MapEpoch`, so a fast double-swap can't rebuild from the previous
+/// map's still-resident blob (the epoch reaches the render world one frame before the matching blob).
 #[derive(Resource, Clone)]
-pub struct ExtractedCpuData(Arc<CpuData>);
+pub struct ExtractedCpuData(Arc<CpuData>, u64);
 
 impl ExtractResource for ExtractedCpuData {
     type Source = ExtractedCpuData;
@@ -881,6 +884,7 @@ fn softcutout_params(vp: &Option<crate::eftpack::VertPaint>) -> Option<[f32; 4]>
 fn build_cpu_data(
     mut commands: Commands,
     pack: Option<Res<LoadedPack>>,
+    epoch: Res<super::MapEpoch>,
     tags: Query<(), With<GpuDrivenTag>>,
 ) {
     let Some(pack) = pack else {
@@ -1691,7 +1695,7 @@ fn build_cpu_data(
         sun_dir,
         instance_total,
         mesh_count,
-    })));
+    }), epoch.0));
     // one entity to hang the draw phase item on (ignored by the draw command). Idempotent: on an
     // in-place map swap build_cpu_data re-runs, and a SECOND GpuDrivenTag would make queue_gpu_driven
     // emit every phase item twice (the whole scene drawn 2×). The tag carries no per-map data, so
@@ -1974,6 +1978,7 @@ fn prepare_gpu_buffers(
     already: Option<Res<EftGpuBuffers>>,
     compute: Option<Res<EftComputePipelines>>,
     draw: Option<Res<EftDrawPipeline>>,
+    map_epoch: Option<Res<super::MapEpoch>>,
 ) {
     if already.is_some() {
         // Buffers are built. Drop any render-world copy of the ~650 MiB CPU staging
@@ -1995,6 +2000,15 @@ fn prepare_gpu_buffers(
         }
         return;
     };
+    // Epoch gate: build ONLY from the blob that matches the CURRENT map epoch. The MapEpoch reaches
+    // the render world a frame before build_cpu_data emits the matching blob, so on a fast swap the
+    // previous map's still-resident blob would otherwise be rebuilt here and then locked in by the
+    // `already.is_some()` guard above — rendering the wrong map forever.
+    if let Some(ep) = &map_epoch {
+        if cpu.1 != ep.0 {
+            return;
+        }
+    }
     let cpu = &cpu.0;
 
     let vertex = render_device.create_buffer_with_data(&BufferInitDescriptor {
