@@ -163,9 +163,9 @@ pub fn wireframe_globe(ui: &egui::Ui, panel: Rect) {
     let dt = ctx.input(|i| i.stable_dt).min(0.1);
     let _ = t_now;
 
-    // Backdrop placement: large, a touch right of centre, sitting behind the menu content.
-    let center = pos2(panel.center().x + panel.width() * 0.14, panel.center().y);
-    let radius = panel.height().min(panel.width() * 0.7) * 0.44;
+    // Backdrop placement: centred in the window, sitting behind the menu content.
+    let center = panel.center();
+    let radius = panel.height().min(panel.width()) * 0.40;
 
     // ---- spin + tilt state (persist across frames): angle phi, angular velocity omega, tilt ----
     let id = egui::Id::new("menu_fx_globe");
@@ -196,19 +196,34 @@ pub fn wireframe_globe(ui: &egui::Ui, panel: Rect) {
     };
 
     let painter = ui.painter();
-    // Glowing, defocused polyline: a wide low-alpha halo + a softer core, both alpha-scaled by
-    // depth (back arcs fade). Holographic teal-cyan.
+
+    // Soft neon ATMOSPHERE behind the globe (the "blur"): concentric translucent discs building a
+    // radial haze, brightest near the surface and fading out — a cheap bloom/defocus glow.
+    for i in 0..9 {
+        let f = i as f32 / 8.0;
+        let r = radius * (1.18 - f * 0.5); // large -> small
+        let a = 0.045 * f; // fainter outside, denser toward the core
+        painter.circle_filled(
+            center,
+            r,
+            Color32::from_rgba_unmultiplied(30, 140, 170, (a * 255.0) as u8),
+        );
+    }
+
+    // Glowing neon polyline: wide soft HALO + mid glow + bright CORE, alpha-scaled by depth so the
+    // back of the sphere fades. Holographic teal-cyan.
     let glow = |pts: &[(egui::Pos2, f32)]| {
         for w in pts.windows(2) {
             let (a, za) = w[0];
             let (b, zb) = w[1];
             let depth = (((za + zb) * 0.5) + 1.0) * 0.5; // 0 back .. 1 front
-            let k = 0.18 + 0.82 * depth;
+            let k = 0.22 + 0.78 * depth;
             let col = |al: f32| {
-                Color32::from_rgba_unmultiplied(96, 214, 232, (al * 255.0).clamp(0.0, 255.0) as u8)
+                Color32::from_rgba_unmultiplied(130, 240, 252, (al * 255.0).clamp(0.0, 255.0) as u8)
             };
-            painter.line_segment([a, b], Stroke::new(5.0, col(k * 0.14))); // soft out-of-focus halo
-            painter.line_segment([a, b], Stroke::new(2.2, col(k * 0.42))); // soft core (still no 1px edge)
+            painter.line_segment([a, b], Stroke::new(7.0, col(k * 0.09))); // wide out-of-focus halo
+            painter.line_segment([a, b], Stroke::new(3.2, col(k * 0.26))); // mid glow
+            painter.line_segment([a, b], Stroke::new(1.4, col(k * 0.85))); // bright neon core
         }
     };
 
@@ -216,32 +231,34 @@ pub fn wireframe_globe(ui: &egui::Ui, panel: Rect) {
     for band in 1..6 {
         let lat = -PI / 2.0 + PI * (band as f32 / 6.0);
         let (sl, cl) = lat.sin_cos();
-        let pts: Vec<(egui::Pos2, f32)> = (0..=56)
+        let pts: Vec<(egui::Pos2, f32)> = (0..=64)
             .map(|i| {
-                let th = i as f32 / 56.0 * TAU + phi;
+                let th = i as f32 / 64.0 * TAU + phi;
                 proj(cl * th.cos(), sl, cl * th.sin())
             })
             .collect();
         glow(&pts);
     }
-    // Longitude meridians.
-    for mrd in 0..8 {
-        let lon = mrd as f32 / 8.0 * PI + phi; // 8 half-meridians = 16 apparent lines w/ wrap
+    // Meridians as FULL great circles (each pole-to-pole circle = 2 apparent vertical lines): 6
+    // great circles -> 12 evenly-spaced verticals with NO gap (the old half-arcs only covered ~150
+    // deg of longitude, so half the vertical lines were missing).
+    for mrd in 0..6 {
+        let lon = mrd as f32 / 6.0 * PI + phi;
         let (sn, cs) = lon.sin_cos();
-        let pts: Vec<(egui::Pos2, f32)> = (0..=56)
+        let pts: Vec<(egui::Pos2, f32)> = (0..=64)
             .map(|i| {
-                let la = -PI / 2.0 + PI * (i as f32 / 56.0);
-                let (sla, cla) = la.sin_cos();
-                proj(cla * cs, sla, cla * sn)
+                let ang = i as f32 / 64.0 * TAU; // sweep the whole great circle (front + back halves)
+                let (sa, ca) = ang.sin_cos();
+                proj(ca * cs, sa, ca * sn)
             })
             .collect();
         glow(&pts);
     }
-    // Poles: a tiny bright node so the axis reads.
+    // Poles: a bright node so the spin axis reads.
     for pole in [-1.0f32, 1.0] {
         let (p, z) = proj(0.0, pole, 0.0);
         let d = ((z + 1.0) * 0.5).clamp(0.0, 1.0);
-        painter.circle_filled(p, 2.2, Color32::from_rgba_unmultiplied(150, 235, 245, (d * 150.0) as u8));
+        painter.circle_filled(p, 2.6, Color32::from_rgba_unmultiplied(190, 248, 255, (d * 200.0) as u8));
     }
 }
 
