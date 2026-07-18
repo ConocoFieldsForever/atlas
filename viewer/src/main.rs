@@ -718,6 +718,21 @@ fn setup(
         ));
     }
 
+    // SKY: attach the procedural overcast cubemap (horizon->zenith gradient + soft HDR sun disk,
+    // matching sky_reflect() so reflections agree with the visible sky). REGRESSION FIX — the
+    // menu-CCTV change (commit 51c5cea) dropped this insert entirely, leaving `sky` a dead binding
+    // and every outdoor map rendering the flat ClearColor as "sky" (no gradient, no sun for Bloom,
+    // fog/horizon mismatch). Skipped in menu mode (sky is None there). brightness 900 nits maps a
+    // cubemap value of 1.0 to ~0.9 render radiance under the default camera Exposure — the grade LUT
+    // then remaps sky + scene identically, so relative brightness is preserved.
+    if let Some(image) = sky {
+        cam.insert(Skybox {
+            image,
+            brightness: 900.0,
+            rotation: Quat::IDENTITY,
+        });
+    }
+
     // Analytic-sky key light (real sun_dir comes from the SH volume sidecar later).
     // M0 lighting is a fixed key baked into the shader; this light is for when the
     // material path (M3) uses Bevy's lighting for non-instanced helpers.
