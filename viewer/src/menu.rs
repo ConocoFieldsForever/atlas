@@ -47,13 +47,16 @@ pub struct BuildJob {
 
 impl BuildJob {
     pub fn spawn(key: &str, game_dir: &str) -> std::io::Result<Self> {
-        Self::spawn_script(key, game_dir, "tools/build_map.py", true)
+        // GUI builds are ALWAYS --self-contained: the pack copies its textures/sidecars in and
+        // references them pack-relative, so it stays valid when shipped to a friend (without it,
+        // assemble_bevy bakes absolute machine paths and the pack loads untextured elsewhere).
+        Self::spawn_script(key, game_dir, "tools/build_map.py", true, &["--self-contained"])
     }
 
     /// The menu's tarkov.dev INTEL refresh (tools/sync_intel.py) — same streaming-job shape as a
     /// map build, no map args.
     pub fn spawn_intel() -> std::io::Result<Self> {
-        Self::spawn_script("__intel__", "", "tools/sync_intel.py", false)
+        Self::spawn_script("__intel__", "", "tools/sync_intel.py", false, &[])
     }
 
     fn spawn_script(
@@ -61,6 +64,7 @@ impl BuildJob {
         game_dir: &str,
         script: &str,
         key_as_args: bool,
+        extra_args: &[&str],
     ) -> std::io::Result<Self> {
         use std::io::BufRead;
         use std::os::windows::process::CommandExt;
@@ -71,13 +75,22 @@ impl BuildJob {
                 "python kit not found (tools/ beside the exe or in the cwd)",
             )
         })?;
+        // The datasets dir + writable working dir the pipeline reads from env (previously unset ->
+        // the kit fell back to the original dev machine's hardcoded path -> "no dataset"). Ensure
+        // out/ exists so bake/intel/sync can write there.
+        let assets_root = detect_assets_dir();
+        let tarkmap_root = detect_tarkmap_dir();
+        let _ = std::fs::create_dir_all(std::path::Path::new(&tarkmap_root).join("out"));
         let mut cmd = std::process::Command::new(crate::paths::python_exe(root));
         cmd.current_dir(root) // kit-relative paths inside the script resolve from its root
             .env("EFT_GAME_DATA", game_dir) // menu-selected install drives the pipeline
+            .env("EFT_ASSETS_ROOT", &assets_root)
+            .env("EFT_TARKMAP_ROOT", &tarkmap_root)
             .arg(script);
         if key_as_args {
             cmd.args(key.split([',', ' ']).filter(|s| !s.is_empty()));
         }
+        cmd.args(extra_args);
         let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -198,6 +211,11 @@ pub struct MenuState {
     pub show_log: bool,
     /// Footer editor buffer for the game-install path.
     pub game_dir_edit: String,
+    /// Where extracted datasets live (EFT_ASSETS_ROOT) + its footer editor buffer, and whether the
+    /// user has explicitly configured it (false => show the first-run onboarding banner).
+    pub assets_dir: String,
+    pub assets_dir_edit: String,
+    pub assets_ok: bool,
     /// INTEL strip stats: (loot.json age days, tasks.json age days, cached icon count).
     pub intel: (Option<f64>, Option<f64>, usize),
     /// Outcome note of the last finished sync ("refreshed" / failure), shown until the next one.
@@ -394,12 +412,71 @@ fn config_game_dir() -> Option<String> {
 }
 
 pub fn save_config_game_dir(dir: &str) {
+    save_config_str("gameData", dir);
+}
+
+/// Generic single-key read from atlas.config.json (the game-dir helpers are the canonical example).
+fn config_str(key: &str) -> Option<String> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+    v.get(key).and_then(|s| s.as_str()).map(str::to_string)
+}
+
+/// Generic single-key read-modify-write into atlas.config.json (preserves other keys).
+fn save_config_str(key: &str, val: &str) {
     let mut v: serde_json::Value = std::fs::read_to_string(config_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
-    v["gameData"] = serde_json::Value::String(dir.to_string());
+    v[key] = serde_json::Value::String(val.to_string());
     let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&v).unwrap_or_default());
+}
+
+/// True once the user (or an env var) has chosen where extracted datasets live — drives the
+/// first-run onboarding gate. The default location existing on disk does NOT count as "configured".
+pub fn assets_configured() -> bool {
+    std::env::var("EFT_ASSETS_ROOT").map(|d| !d.is_empty()).unwrap_or(false)
+        || config_str("assetsRoot").map(|d| !d.is_empty()).unwrap_or(false)
+}
+
+/// The extracted-datasets dir (`EFT_ASSETS_ROOT` the Python kit reads): env > saved config >
+/// `<exe>/eft_assets` default. The full game extraction WRITES here and every build READS here.
+pub fn detect_assets_dir() -> String {
+    if let Ok(d) = std::env::var("EFT_ASSETS_ROOT") {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    if let Some(d) = config_str("assetsRoot").filter(|d| !d.is_empty()) {
+        return d;
+    }
+    crate::paths::exe_dir().join("eft_assets").to_string_lossy().into_owned()
+}
+
+pub fn save_config_assets_dir(dir: &str) {
+    save_config_str("assetsRoot", dir);
+}
+
+/// The writable tarkmap working dir (`EFT_TARKMAP_ROOT`; holds `out/` bake+intel outputs and,
+/// optionally, `maps/` configs — the kit falls back to the shipped `extraction/maps` when absent):
+/// env > saved config > a sibling `tarkmap` beside the assets dir (matches the pipeline's expected
+/// layout so `assemble_bevy` resolves the SH-volume dir correctly).
+pub fn detect_tarkmap_dir() -> String {
+    if let Ok(d) = std::env::var("EFT_TARKMAP_ROOT") {
+        if !d.is_empty() {
+            return d;
+        }
+    }
+    if let Some(d) = config_str("tarkmapRoot").filter(|d| !d.is_empty()) {
+        return d;
+    }
+    let assets = detect_assets_dir();
+    std::path::Path::new(&assets)
+        .parent()
+        .map(|p| p.join("tarkmap"))
+        .unwrap_or_else(|| crate::paths::exe_dir().join("tarkmap"))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Looks like an EscapeFromTarkov_Data dir? (has level files / globalgamemanagers)
@@ -546,11 +623,15 @@ pub fn build_state() -> MenuState {
     // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook);
     // enqueued on the shared worker on the first frame (build_state has no worker access here).
     let autobuild = std::env::var("EFT_MENU_BUILD").ok().filter(|s| !s.is_empty());
+    let assets_dir = detect_assets_dir();
     MenuState {
         entries,
         game_fp,
         game_dir_edit: game_dir.clone(),
         game_dir,
+        assets_dir_edit: assets_dir.clone(),
+        assets_dir,
+        assets_ok: assets_configured(),
         total_bytes,
         confirm_delete: None,
         show_rebuild: None,
@@ -1128,6 +1209,59 @@ pub fn menu_ui(
                             .size(11.0),
                     ),
                 };
+            });
+
+            // Extracted-assets dir (EFT_ASSETS_ROOT): where the one-time full extraction writes the
+            // datasets that BUILD reads. On first run explain it; CHOOSE opens a native folder picker.
+            if !state.assets_ok {
+                ui.add_space(2.0);
+                ui.label(
+                    RichText::new(
+                        "First run: choose a folder for EXTRACTED ASSETS. The first BUILD of a map \
+                         runs a one-time extraction from your game files into it (close the game \
+                         first; ~1-6 GB per map, can take a while); later builds are quick.",
+                    )
+                    .color(WARN)
+                    .size(11.0),
+                );
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("EXTRACTED ASSETS").color(DIM).size(11.0));
+                if ui.button(RichText::new("CHOOSE\u{2026}").color(BONE)).clicked() {
+                    let mut dlg = rfd::FileDialog::new()
+                        .set_title("Choose a folder for extracted map assets");
+                    if std::path::Path::new(&state.assets_dir).is_dir() {
+                        dlg = dlg.set_directory(&state.assets_dir);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        let dir = p.to_string_lossy().into_owned();
+                        state.assets_dir = dir.clone();
+                        state.assets_dir_edit = dir.clone();
+                        save_config_assets_dir(&dir);
+                        state.assets_ok = true;
+                    }
+                }
+                let mut edit = state.assets_dir_edit.clone();
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit)
+                        .desired_width(420.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                state.assets_dir_edit = edit;
+                let dirty = state.assets_dir_edit != state.assets_dir;
+                if ui
+                    .add_enabled(dirty, egui::Button::new(RichText::new("SET").color(BONE)))
+                    .clicked()
+                {
+                    state.assets_dir = state.assets_dir_edit.clone();
+                    save_config_assets_dir(&state.assets_dir);
+                    state.assets_ok = true;
+                }
+                if state.assets_ok {
+                    ui.label(RichText::new("[set]").color(OK).size(11.0));
+                } else {
+                    ui.label(RichText::new("using default - CHOOSE to set").color(WARN).size(11.0));
+                }
             });
         });
 

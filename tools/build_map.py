@@ -1,7 +1,8 @@
 """One-command map pack builder for the viewer's start menu.
 
-Runs the full pipeline for a map whose DATASET already exists (<EFT_ASSETS_ROOT>/<dataset>/scene.json —
-full game extraction is a separate, much longer step; the menu surfaces that case).
+Runs the full pipeline for a map. If the DATASET is missing (<EFT_ASSETS_ROOT>/<dataset>/scene.json)
+it first runs the ONE-TIME full game extraction inline (the long step - game must be CLOSED), then
+assembles the pack. Levels for that extraction come from the map config's source.levels.
 Stages print `[STAGE i/N] name` markers and stream child output unbuffered so the menu's
 progress panel can display them live. Exit 0 = pack ready (stamped). ASCII output only.
 
@@ -102,6 +103,21 @@ def dataset_name(m):
     return m
 
 
+def dataset_levels(m):
+    """Comma-separated Unity level indices for the map (map config's source.levels) — the input to
+    the one-time full extraction. Empty string when unreadable (caller errors clearly)."""
+    for p in (os.path.join(TK, "maps", m, "config.json"),
+              os.path.join(VIEWER, "extraction", "maps", m, "config.json")):
+        if os.path.isfile(p):
+            try:
+                lv = json.load(open(p, encoding="utf-8"))["source"]["levels"]
+                return ",".join(str(int(x)) for x in lv)
+            except Exception as e:
+                print(f"[BUILD] WARNING: cannot read source.levels from {p} ({e})", flush=True)
+                return ""
+    return ""
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry = "--dry-run" in sys.argv
@@ -135,12 +151,31 @@ def main():
         print("[BUILD OK] dry run", flush=True)
         return
 
-    # 1: dataset present?
+    # 1: dataset present? If not, run the ONE-TIME full game extraction inline (the long step:
+    #    game/launcher must be CLOSED, tens of minutes to hours, 1-6 GB on disk). Folded into BUILD
+    #    so one click goes from "no data" to a playable pack. Resumable - a re-run skips already
+    #    exported meshes/textures.
     print(f"[STAGE 1/{total}] check dataset", flush=True)
     if not os.path.isfile(os.path.join(dataset, "scene.json")):
-        print(f"[BUILD FAILED] no dataset at {dataset} - run the full game extraction first "
-              f"(extraction/README.md, eft_extract_v2)", flush=True)
-        sys.exit(3)
+        levels = dataset_levels(m)
+        if not levels:
+            print(f"[BUILD FAILED] no dataset at {dataset} and no source.levels in the map config "
+                  f"- cannot auto-extract (see extraction/README.md)", flush=True)
+            sys.exit(3)
+        print(f"[STAGE 1/{total}] no dataset yet - running the ONE-TIME full extraction. CLOSE the "
+              f"game and launcher first (file locks). This can take a long time.", flush=True)
+        run(1, total, "extract dataset (geometry + textures)",
+            [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_v2.py"),
+             "--levels", levels, "--name", dsname], VIEWER)
+        if m not in INDOOR_NO_GRASS:
+            run(1, total, "extract grass density",
+                [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
+                 "--levels", levels, "--name", dsname], VIEWER, optional=True)
+        if not os.path.isfile(os.path.join(dataset, "scene.json")):
+            print(f"[BUILD FAILED] extraction finished but no scene.json at {dataset} - check the "
+                  f"log above (is UnityPy installed for EFT_PY_UNITY? is EFT_GAME_DATA correct and "
+                  f"the game closed?)", flush=True)
+            sys.exit(3)
     print(f"[STAGE 1/{total}] check dataset: done", flush=True)
 
     # 2: lights (optional; some maps have none / are fleet-handled)
@@ -188,9 +223,14 @@ def main():
     if m in INDOOR_NO_GRASS:
         print(f"[STAGE 5/{total}] grass: skipped (indoor map)", flush=True)
     else:
-        ok = run(5, total, "grass: extract density grids",
-                 [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
-                  "--name", dsname], VIEWER, optional=True)
+        gl = dataset_levels(m)
+        grass_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
+                     "--name", dsname]
+        if gl:
+            # pass the level list so the extractor finds the terrain bundle (without it, it
+            # auto-detects over an empty list and silently skips -> no grass on fresh datasets).
+            grass_cmd += ["--levels", gl]
+        ok = run(5, total, "grass: extract density grids", grass_cmd, VIEWER, optional=True)
         if ok:
             run(5, total, "grass: build grass.bin",
                 [PY, "-m", "eft_pipeline.build_grass", "--pack", pack] + sc_flag,
