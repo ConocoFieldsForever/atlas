@@ -689,6 +689,14 @@ pub fn menu_ui(
     // theme and paints a fullscreen pale layer, the historical bug).
     theme::apply_global_style(ctx);
 
+    // Backdrop: the 2D reactive triangle field (default). Skipped when an env flag selects one of the
+    // 3D backdrops instead (EFT_MENU_EXFIL / EFT_MENU_TERRAIN), so they don't double up.
+    let use_3d_bg = std::env::var("EFT_MENU_EXFIL").map(|v| v.trim() == "1").unwrap_or(false)
+        || std::env::var("EFT_MENU_TERRAIN").map(|v| v.trim() == "1").unwrap_or(false);
+    if !use_3d_bg {
+        crate::menu_fx::triangle_field(ctx);
+    }
+
     // Worker intents: collected inside the egui closures (which only READ the worker) and applied
     // once after, so the ResMut is never aliased mid-closure. `enqueue_build` is the map key to
     // build; `cancel_current` cancels whatever job is in flight (build or sync).
