@@ -1,4 +1,4 @@
-# release.ps1 — build the shippable EFT viewer bundles LOCALLY (redistribution PR5).
+# release.ps1 — build the shippable Atlas bundles LOCALLY (redistribution PR5).
 # PowerShell 5.1-safe (no &&). The GitHub workflow mirrors this; nothing runs in CI until
 # this script has been proven locally (user directive: no wasted credits).
 #
@@ -20,43 +20,43 @@ $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
 # 0. A running viewer holds a lock on the exe -> stale-binary trap (project build-loop rule).
-$running = Get-Process eft_viewer -ErrorAction SilentlyContinue
+$running = Get-Process atlas -ErrorAction SilentlyContinue
 if ($running -and -not $SkipBuild) {
-    throw "eft_viewer.exe is running (PID $($running.Id -join ',')) - close it first (locked exe = stale binary)"
+    throw "atlas.exe is running (PID $($running.Id -join ',')) - close it first (locked exe = stale binary)"
 }
 
 # 1. Version = Cargo.toml package version + short git hash.
 $verLine = Select-String -Path "viewer\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 $ver = $verLine.Matches[0].Groups[1].Value
 $sha = (git rev-parse --short HEAD).Trim()
-$name = "eft_viewer-$ver-$sha-win64"
+$name = "atlas-$ver-$sha-win64"
 Write-Host "[release] $name"
 
 # 2. Build (locked deps for reproducibility).
 if (-not $SkipBuild) {
-    $before = (Get-Item "target\release\eft_viewer.exe" -ErrorAction SilentlyContinue).LastWriteTime
+    $before = (Get-Item "target\release\atlas.exe" -ErrorAction SilentlyContinue).LastWriteTime
     # cmd does the stderr merge: PS 5.1's own 2>&1 on native exes wraps stderr lines in
     # ErrorRecords and $ErrorActionPreference=Stop turns cargo WARNINGS into a fatal throw.
     $buildOut = cmd /c "cargo build --release --locked 2>&1" | Out-String
     if ($LASTEXITCODE -ne 0) { Write-Host $buildOut; throw "cargo build failed ($LASTEXITCODE)" }
     # Only demand a fresh mtime when cargo actually recompiled the bin (an up-to-date build
     # legitimately leaves it untouched; the locked-exe trap is caught by the step-0 check).
-    if ($buildOut -match "Compiling eft_viewer") {
-        $after = (Get-Item "target\release\eft_viewer.exe").LastWriteTime
+    if ($buildOut -match "Compiling atlas") {
+        $after = (Get-Item "target\release\atlas.exe").LastWriteTime
         if ($before -and $after -le $before) { throw "binary mtime did not advance - stale build?" }
     }
 }
 
 # 3. Version smoke (works on GPU-less machines; the only CI-safe check).
-$verOut = & "target\release\eft_viewer.exe" --version
-if ($LASTEXITCODE -ne 0 -or -not ($verOut -match "eft_viewer")) { throw "--version smoke failed: $verOut" }
+$verOut = & "target\release\atlas.exe" --version
+if ($LASTEXITCODE -ne 0 -or -not ($verOut -match "atlas")) { throw "--version smoke failed: $verOut" }
 Write-Host "[release] smoke: $verOut"
 
 # 4. Assemble dist tree.
 $dist = "dist\$name"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force "$dist\packs\shared" | Out-Null
-Copy-Item "target\release\eft_viewer.exe" $dist
+Copy-Item "target\release\atlas.exe" $dist
 # wired shaders only (instanced/sh_gi/splat are dead - provenance audit)
 New-Item -ItemType Directory -Force "$dist\assets\shaders" | Out-Null
 foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","grade.wgsl","instancing_m0.wgsl") {
@@ -92,7 +92,7 @@ if (-not $SkipRenderSmoke) {
         $shot = Join-Path (Resolve-Path "dist") "smoke.png"
         if (Test-Path $shot) { Remove-Item $shot }
         $env:EFT_HIDDEN = "1"; $env:EFT_UNCAPPED = "1"; $env:EFT_SHOT = $shot
-        $p = Start-Process -FilePath "$dist\eft_viewer.exe" -ArgumentList (Resolve-Path $SmokePack) -PassThru -WindowStyle Hidden
+        $p = Start-Process -FilePath "$dist\atlas.exe" -ArgumentList (Resolve-Path $SmokePack) -PassThru -WindowStyle Hidden
         $deadline = (Get-Date).AddSeconds(120)
         while ((Get-Date) -lt $deadline -and -not (Test-Path $shot)) { Start-Sleep -Seconds 2 }
         try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {}

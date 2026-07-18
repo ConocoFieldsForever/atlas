@@ -1,6 +1,6 @@
 //! eft::menu — Tarkov-style start menu / map manager ("stash screen").
 //!
-//! Shown when the viewer is launched with NO pack (bare `eft_viewer`). Scans `packs/` and
+//! Shown when the viewer is launched with NO pack (bare `atlas`). Scans `packs/` and
 //! presents one card per known map: install state, pack size on disk, built age, tarkov.dev
 //! intel sync age, data-completeness ticks, and a game-update check — each pack's manifest
 //! carries the `sourceFingerprint` of the game install it was extracted from (stamped by
@@ -704,7 +704,7 @@ pub fn menu_ui(
         .frame(egui::Frame::new().fill(HEADER).inner_margin(egui::Margin::symmetric(24, 10)))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("TARKOV STASH").color(BONE).size(theme::SIZE_DISPLAY).strong());
+                ui.label(RichText::new("ATLAS").color(BONE).size(theme::SIZE_DISPLAY).strong());
                 ui.add_space(14.0);
                 ui.label(RichText::new("|  MAP").color(BEIGE).size(13.0));
                 ui.label(RichText::new("SELECT LOCATION").color(DIM).size(13.0));
@@ -1077,7 +1077,7 @@ pub fn menu_ui(
             ui.add_space(8.0);
             ui.separator();
             // Game install path: autodetected (env > saved > registry > probe), editable here;
-            // SET validates, persists to eft_viewer.config.json and re-fingerprints the packs.
+            // SET validates, persists to atlas.config.json and re-fingerprints the packs.
             ui.horizontal(|ui| {
                 ui.label(RichText::new("GAME INSTALL").color(DIM).size(11.0));
                 let mut edit = state.game_dir_edit.clone();

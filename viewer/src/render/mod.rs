@@ -1,4 +1,4 @@
-//! Render subsystem for the native EFT viewer.
+//! Render subsystem for Atlas (native GPU-driven EFT map viewer).
 //!
 //! Two layers:
 //!   * `instancing` â€” the WORKING M0 custom instanced draw (first-pixel). One

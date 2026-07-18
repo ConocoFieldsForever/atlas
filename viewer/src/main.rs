@@ -1,6 +1,6 @@
-//! eft_viewer — native GPU-driven EFT map viewer (Bevy 0.17).
+//! atlas — native GPU-driven EFT map viewer (Bevy 0.17).
 //!
-//! Usage:  eft_viewer <path-to-.eftpack-dir>
+//! Usage:  atlas <path-to-.eftpack-dir>
 //!
 //! M0 target dataset is the "interchange" pack. This binary opens a window, sets
 //! up a fly camera, loads the pack (reading its layout FROM manifest.json), and
@@ -362,12 +362,12 @@ fn main() {
     // this is the only smoke test a workflow can run (redistribution PR5).
     if let Some(flag) = std::env::args().nth(1) {
         if matches!(flag.as_str(), "--version" | "-V") {
-            println!("eft_viewer {} ({})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_NAME"));
+            println!("atlas {} ({})", env!("CARGO_PKG_VERSION"), env!("CARGO_PKG_NAME"));
             return;
         }
         if matches!(flag.as_str(), "--help" | "-h") {
             println!(
-                "eft_viewer [<pack-dir>] [m0|gpu]\n\
+                "atlas [<pack-dir>] [m0|gpu]\n\
                  no args: start menu (scans <exe>/packs).  env: EFT_PACK, EFT_RENDER, EFT_SHADOWS,\n\
                  EFT_GRADE/EFT_GRADE_EXPOSURE, EFT_FOG, EFT_UNCAPPED, EFT_HIDDEN, EFT_SHOT,\n\
                  EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0. Docs: README_DIST.md"
@@ -378,7 +378,7 @@ fn main() {
     // ---- parse argv: pack dir + optional render-path token ----
     // Pack selection order: explicit argv[1] > EFT_PACK env > first existing default pack.
     // Default map is LIGHTHOUSE (falls back to interchange if its pack isn't built), so a
-    // bare `eft_viewer` with no arguments opens a map instead of an empty window.
+    // bare `atlas` with no arguments opens a map instead of an empty window.
     // Bare launch (no argv pack, no EFT_PACK) opens the START MENU (menu.rs) instead of a
     // default map — the menu's PLAY relaunches with the chosen pack as argv[1].
     let pack_dir = std::env::args().nth(1)
@@ -415,7 +415,7 @@ fn main() {
             }
         },
         None => {
-            eprintln!("no pack given — opening the start menu.  direct: eft_viewer <pack-dir>");
+            eprintln!("no pack given — opening the start menu.  direct: atlas <pack-dir>");
             None
         }
     };
@@ -437,7 +437,7 @@ fn main() {
         DefaultPlugins
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "EFT Native Viewer".into(),
+                    title: "Atlas".into(),
                     resolution: (1600u32, 900u32).into(),
                     present_mode,
                     // EFT_HIDDEN=1: render without showing a window (headless EFT_SHOT

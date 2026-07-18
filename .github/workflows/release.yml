@@ -18,13 +18,13 @@ jobs:
       - name: Build (locked)
         run: cargo build --release --locked
       - name: Version smoke (runners have no GPU)
-        run: .\target\release\eft_viewer.exe --version
+        run: .\target\release\atlas.exe --version
       - name: Assemble dist (skip build + render smoke; both done above / locally)
         shell: powershell
         run: .\scripts\release.ps1 -Full -SkipBuild -SkipRenderSmoke
       - uses: actions/upload-artifact@v4
         with:
-          name: eft_viewer-win64
+          name: atlas-win64
           path: |
             dist/*.zip
             dist/*.sha256
