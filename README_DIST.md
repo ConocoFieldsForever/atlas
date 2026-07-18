@@ -27,7 +27,16 @@ Optional for baked lighting: NVIDIA GPU (CUDA) — without it maps render with f
 
 The BUILD button runs the full pipeline with live progress (lights → lighting bake →
 assembly → grass → gameplay zones → icons → fingerprint). "GAME FILES UPDATED" on a row
-means the game patched since that pack was built — press UPDATE.
+means the game patched since that pack was built — press UPDATE. Loot values and the quest
+layer are fetched from tarkov.dev automatically after your first successful build (needs
+internet), so they populate without a separate step.
+
+> **Self-built packs vs. prebuilt:** geometry, lighting, grass, gameplay zones, loot, quests,
+> extracts and hazards all build fully here. Two extras are dev-pipeline-only and are NOT
+> produced by this kit: **in-viewer routing** (the Navigate tab needs a separate nav-grid
+> bake) and the **game color grade** (needs a LUT extracted from the game's `resources.assets`).
+> Maps still render and plan fully without them — colors are just un-graded and point-to-point
+> routing is unavailable on packs you built yourself.
 
 ## Environment toggles (common)
 

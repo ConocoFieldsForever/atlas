@@ -102,6 +102,7 @@ pub enum K {
     DepsReady,
     DepsMissing,
     InstallDeps,
+    BuildNeedsSetup,
     Installing,
     // Build / loading panel
     InstallingDeps,
@@ -230,6 +231,10 @@ fn pair(k: K) -> [&'static str; 2] {
             "Не хватает пакетов Python (UnityPy) — нужны для сборки карт",
         ],
         InstallDeps => ["INSTALL DEPS", "УСТАНОВИТЬ"],
+        BuildNeedsSetup => [
+            "Install the build deps and set GAME INSTALL (below) first",
+            "Сначала установите зависимости и укажите GAME INSTALL (ниже)",
+        ],
         Installing => ["installing\u{2026}", "установка\u{2026}"],
         InstallingDeps => ["INSTALLING DEPENDENCIES", "УСТАНОВКА ЗАВИСИМОСТЕЙ"],
         Done => ["DONE", "ГОТОВО"],
