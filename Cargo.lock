@@ -344,6 +344,7 @@ dependencies = [
  "sys-locale",
  "texpresso",
  "ureq",
+ "wgpu",
 ]
 
 [[package]]
