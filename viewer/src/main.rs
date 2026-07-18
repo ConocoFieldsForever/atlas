@@ -656,14 +656,21 @@ fn main() {
     }
     // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
     // manager. The in-raid panels check for this resource and stand down while it exists.
-    // Menu backdrop = the NEON LOW-POLY TERRAIN: a triangulated emissive grid in the 3D world that
-    // the camera's Bloom halos into a glowing neon wireframe, rippling toward the cursor
-    // (menu_fx::spawn_menu_terrain / update). The CentralPanel goes transparent (menu.rs) so it
-    // shows behind the UI.
+    // Menu backdrop = the INTERCHANGE-INSPIRED NEON WIREFRAME CITY: a stylized, derivative low-poly
+    // schematic (mall mass + shops + parking + outlying blocks) in the 3D world that the camera's
+    // Bloom halos into a glowing hologram, with idle drift + cursor parallax (menu_fx::spawn_menu_city
+    // / update). Fully synthetic (no game geometry) so it ships with the app. The CentralPanel goes
+    // transparent (menu.rs) so it shows behind the UI. EFT_MENU_TERRAIN=1 falls back to the old
+    // rippling triangle terrain.
     if menu_mode {
         app.insert_resource(menu::build_state());
-        app.add_systems(Startup, menu_fx::spawn_menu_terrain.after(setup));
-        app.add_systems(Update, menu_fx::menu_terrain_update);
+        if std::env::var("EFT_MENU_TERRAIN").map(|v| v.trim() == "1").unwrap_or(false) {
+            app.add_systems(Startup, menu_fx::spawn_menu_terrain.after(setup));
+            app.add_systems(Update, menu_fx::menu_terrain_update);
+        } else {
+            app.add_systems(Startup, menu_fx::spawn_menu_city.after(setup));
+            app.add_systems(Update, menu_fx::menu_city_update);
+        }
     }
 
     app.run();
@@ -770,14 +777,23 @@ fn frame_for_pack(pack: Option<&crate::eftpack::Pack>) -> (Vec3, Vec3, f32, f32,
                 let d = (ext * 0.10).clamp(30.0, 90.0);
                 (anchor, anchor + Vec3::new(0.0, d * 0.5, d), (ext * 6.0).max(2000.0))
             }
-            // Menu: look DOWN (~30°) at the neon terrain backdrop so its triangle grid reads,
-            // receding into the distance behind the UI (menu_fx::spawn_menu_terrain).
-            None => (Vec3::new(0.0, 0.0, -4.0), Vec3::new(0.0, 50.0, 82.0), 2000.0),
+            // Menu: pose is set explicitly just below (the target here only feeds `far`).
+            None => (Vec3::ZERO, Vec3::new(140.0, 56.0, 150.0), 4000.0),
         }
     };
     let dir = (target - cam_pos).normalize_or_zero();
     let mut yaw = dir.x.atan2(-dir.z);
     let mut pitch = dir.y.asin();
+    // Menu backdrop: a hand-picked elevated 3/4 vantage over the neon wireframe city
+    // (menu_fx::spawn_menu_city), ~-16deg pitch to echo the in-game Interchange pose it's derived from.
+    // yaw/pitch are set DIRECTLY because the target->yaw derivation above only aims correctly when
+    // dir.x==0 (every in-raid framing offsets in the YZ-plane); an off-axis menu camera needs explicit
+    // angles. EFT_POSE below still overrides, for live tuning.
+    if pack.is_none() {
+        cam_pos = Vec3::new(140.0, 56.0, 150.0);
+        yaw = 44.0_f32.to_radians();
+        pitch = (-16.0_f32).to_radians();
+    }
     // EFT_POSE="x,y,z,yaw_deg,pitch_deg" reproduces an EXACT camera pose (the POS HUD's copy button).
     if let Ok(s) = std::env::var("EFT_POSE") {
         let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
