@@ -772,6 +772,73 @@ pub fn menu_scene_update(
     }
 }
 
+// ============================================================================================
+// 2D REACTIVE TRIANGLE FIELD — the menu backdrop (default). A screen-space triangulated point grid
+// painted straight onto egui's Background layer: a faint neon triangulation everywhere with a slow
+// diagonal "scan" band keeping it alive, a glowing pool of filled triangles that follows the cursor,
+// and the grid bulging/warping radially around the pointer. Fully procedural 2D — no 3D world, no
+// camera — so it's cheap and ships with the app.
+// ============================================================================================
+pub fn triangle_field(ctx: &egui::Context) {
+    let rect = ctx.screen_rect();
+    let painter =
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("menu_tri_field")));
+    let t = ctx.input(|i| i.time) as f32;
+    let mouse = ctx.input(|i| i.pointer.hover_pos());
+
+    const COLS: usize = 26;
+    const ROWS: usize = 16;
+    let (nx, ny) = (COLS + 1, ROWS + 1);
+    // one cell of overscan each side so warped edge verts still cover the screen
+    let ox = rect.width() / (COLS as f32 - 2.0);
+    let oy = rect.height() / (ROWS as f32 - 2.0);
+    let (x0, y0) = (rect.left() - ox, rect.top() - oy);
+
+    // Displaced grid points: gentle idle wobble + a radial "bulge" that pushes verts away from the cursor.
+    let mut pts = Vec::with_capacity(nx * ny);
+    for j in 0..ny {
+        for i in 0..nx {
+            let mut px = x0 + ox * i as f32 + (t * 0.6 + i as f32 * 0.7 + j as f32 * 0.5).sin() * 5.0;
+            let mut py = y0 + oy * j as f32 + (t * 0.5 + i as f32 * 0.4 - j as f32 * 0.6).cos() * 5.0;
+            if let Some(m) = mouse {
+                let (dx, dy) = (px - m.x, py - m.y);
+                let d2 = dx * dx + dy * dy;
+                let push = 46.0 * (-d2 / (200.0 * 200.0)).exp();
+                let d = d2.sqrt().max(0.001);
+                px += dx / d * push;
+                py += dy / d * push;
+            }
+            pts.push(egui::pos2(px, py));
+        }
+    }
+
+    // Two triangles per cell; edge/fill brightness = idle scan band, spiking into a pool at the cursor.
+    let glow_r = 240.0f32;
+    for j in 0..ROWS {
+        for i in 0..COLS {
+            let (a, b) = (pts[j * nx + i], pts[j * nx + i + 1]);
+            let (c, d) = (pts[(j + 1) * nx + i], pts[(j + 1) * nx + i + 1]);
+            for tri in [[a, b, c], [b, d, c]] {
+                let cx = (tri[0].x + tri[1].x + tri[2].x) / 3.0;
+                let cy = (tri[0].y + tri[1].y + tri[2].y) / 3.0;
+                let g_cursor = match mouse {
+                    Some(m) => (-((cx - m.x).powi(2) + (cy - m.y).powi(2)) / (glow_r * glow_r)).exp(),
+                    None => 0.0,
+                };
+                let band = 0.5 + 0.5 * (t * 0.7 - (cx + cy) * 0.006).sin();
+                let glow = g_cursor.max(0.30 * band);
+                let edge_a = (20.0 + 205.0 * glow).clamp(0.0, 255.0) as u8;
+                let fill_a = (4.0 + 120.0 * g_cursor).clamp(0.0, 255.0) as u8;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![tri[0], tri[1], tri[2]],
+                    Color32::from_rgba_unmultiplied(40, 185, 214, fill_a),
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(96, 224, 246, edge_a)),
+                ));
+            }
+        }
+    }
+}
+
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
     use std::f32::consts::{PI, TAU};
     const BODY: Color32 = Color32::from_rgb(42, 42, 40); // #2a2a28

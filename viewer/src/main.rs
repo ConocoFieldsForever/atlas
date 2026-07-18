@@ -671,10 +671,13 @@ fn main() {
     // behind the UI. EFT_MENU_TERRAIN=1 falls back to the old rippling triangle terrain.
     if menu_mode {
         app.insert_resource(menu::build_state());
+        // Default backdrop is the 2D reactive triangle field, painted in egui (menu::menu_ui ->
+        // menu_fx::triangle_field) — no 3D world needed. The 3D backdrops are opt-in fallbacks:
+        // EFT_MENU_EXFIL=1 = neon wireframe exfil, EFT_MENU_TERRAIN=1 = rippling triangle terrain.
         if std::env::var("EFT_MENU_TERRAIN").map(|v| v.trim() == "1").unwrap_or(false) {
             app.add_systems(Startup, menu_fx::spawn_menu_terrain.after(setup));
             app.add_systems(Update, menu_fx::menu_terrain_update);
-        } else {
+        } else if std::env::var("EFT_MENU_EXFIL").map(|v| v.trim() == "1").unwrap_or(false) {
             app.add_systems(Startup, menu_fx::spawn_menu_scene.after(setup));
             app.add_systems(Update, menu_fx::menu_scene_update);
         }
