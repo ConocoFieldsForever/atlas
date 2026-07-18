@@ -62,6 +62,9 @@ New-Item -ItemType Directory -Force "$dist\assets\shaders" | Out-Null
 foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","grade.wgsl","instancing_m0.wgsl") {
     Copy-Item "viewer\assets\shaders\$sh" "$dist\assets\shaders\"
 }
+# README.md is the friendly non-dev guide (first-run + SmartScreen "Run anyway" steps);
+# README_DIST.md is the technical/env-toggle reference. Ship both.
+Copy-Item "README.md" $dist -ErrorAction SilentlyContinue
 Copy-Item "README_DIST.md" $dist -ErrorAction SilentlyContinue
 Copy-Item "LICENSE-NOTES.md" $dist -ErrorAction SilentlyContinue
 
