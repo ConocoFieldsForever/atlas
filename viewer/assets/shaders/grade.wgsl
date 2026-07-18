@@ -1,11 +1,12 @@
 // eft::grade — EFT display-chain post pass (grade LUT + tonemap-OFF display encode).
 // Ported MATH from tarkmap/out/_gradegl.js (the WebGL ShaderPass; cleaner reference than the
-// TSL variant). The pass OUTPUT IS ALREADY DISPLAY-ENCODED — the sRGB/Hejl encode is BAKED
-// INTO THE LUT. Therefore, in the Bevy render graph:
+// TSL variant). CONTRACT (see render/grade.rs): the LUT bytes ship display-encoded, but grade.rs
+// INVERTS that encode per texel at load, so the 3D LUT sampled here is LINEAR. Therefore:
 //   * the scene is rendered with NO tonemapping (Tonemapping::None), linear HDR;
-//   * this pass runs last;
-//   * its target MUST be a NON-sRGB (Unorm) surface/texture — writing to an sRGB target would
-//     gamma-encode the already-encoded output twice.
+//   * this pass runs last and OUTPUTS LINEAR into the Rgba16Float HDR ping-pong target;
+//   * the swapchain view applies the single sRGB display encode.
+// Anything that operates in DISPLAY space (the reference's vignette/sharpen) must be converted to
+// this linear domain — see the vignette below.
 //
 // LUT: the web ships a 512x512 RGBA8 raw-bytes file (eft_grade_lut.bin) that is a 64^3 LUT
 // tiled 8x8 with a manual blue-slice trilinear in-shader. We convert it to a REAL 64x64x64
@@ -52,9 +53,13 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> FsIn {
 
 // LUT sample via a REAL 3D texture. c = pre-exposed LINEAR color.
 // shaper p = sqrt(clamp(c/4,0,1)) in [0,1]; HW trilinear covers the blue-slice lerp.
+// The LUT stores value-for-p at integer index p*(N-1); a normalized coord must therefore map
+// p -> texel CENTER (p*(N-1)+0.5)/N = p*(63/64)+0.5/64. Feeding raw p (as if p*N-0.5) skewed the
+// whole transfer curve by up to half a texel (shadows too dark, highlights clamped ~1 texel early).
 fn lut_sample(c: vec3<f32>) -> vec3<f32> {
     let p = sqrt(clamp(c / 4.0, vec3<f32>(0.0), vec3<f32>(1.0)));
-    return textureSampleLevel(lut3d, lut_samp, p, 0.0).rgb;
+    let uvw = p * (63.0 / 64.0) + (0.5 / 64.0);
+    return textureSampleLevel(lut3d, lut_samp, uvw, 0.0).rgb;
 }
 
 // --- 2D-tiled fallback (kept for reference; only if the LUT stays a 512x512 8x8 atlas) ---
@@ -84,6 +89,9 @@ fn fs_grade(in: FsIn) -> @location(0) vec4<f32> {
     let e = (in.uv - 0.5) * 2.0 / grade.vig.xy;
     let vig = 1.0 - smoothstep(grade.vig.z, grade.vig.w, length(e)) * grade.vig_strength.x;
 
-    // Already DISPLAY-ENCODED (LUT baked the sRGB encode). No further tonemap / sRGB.
-    return vec4<f32>(g * vig, 1.0);
+    // The reference multiplied the vignette onto DISPLAY-encoded pixels; here `g` is LINEAR (the
+    // swapchain encodes after us). Raise vig to the sRGB exponent so that after the encode the
+    // corner attenuation equals encode(g)*vig — i.e. pow(x,1/2.4) of (g*vig^2.4) = encode(g)*vig.
+    // Without this the vignette was applied in linear and corners darkened only ~half as much.
+    return vec4<f32>(g * pow(vec3<f32>(vig), vec3<f32>(2.4)), 1.0);
 }
