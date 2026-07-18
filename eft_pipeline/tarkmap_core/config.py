@@ -24,6 +24,10 @@ SCHEMA_VERSION = 1
 _DEFAULT_UPSTREAM = r"C:\Users\user\beamng_blender_pipeline\tarkmap"
 ROOT = os.environ.get("EFT_TARKMAP_ROOT", _DEFAULT_UPSTREAM)                 # <beamng>/tarkmap
 MAPS_DIR = os.path.join(ROOT, 'maps')
+# The map configs SHIP with the kit at <repo>/extraction/maps; a fresh install has no TARKMAP_ROOT/
+# maps, so MapConfig.load falls back here (mirrors tools/build_map.py's dataset_name resolution).
+_HERE = os.path.dirname(os.path.abspath(__file__))                           # .../eft_pipeline/tarkmap_core
+KIT_MAPS_DIR = os.path.join(os.path.dirname(os.path.dirname(_HERE)), 'extraction', 'maps')
 
 DEFAULTS = {
     "schema_version": SCHEMA_VERSION,
@@ -65,10 +69,14 @@ class MapConfig:
 
     @classmethod
     def load(cls, map_id, maps_dir=MAPS_DIR):
-        p = os.path.join(maps_dir, map_id, 'config.json')
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"no config for map '{map_id}' at {p}")
-        return cls(json.load(open(p, encoding='utf-8')), p)
+        # Workspace maps/ wins over the shipped kit copy (lets a user override), matching
+        # tools/build_map.py's dataset_name resolution order.
+        for base in (maps_dir, KIT_MAPS_DIR):
+            p = os.path.join(base, map_id, 'config.json')
+            if os.path.exists(p):
+                return cls(json.load(open(p, encoding='utf-8')), p)
+        raise FileNotFoundError(
+            f"no config for map '{map_id}' in {maps_dir} or {KIT_MAPS_DIR}")
 
     def _validate(self):
         d = self.d
@@ -118,8 +126,12 @@ class MapConfig:
 
 
 def list_maps(maps_dir=MAPS_DIR):
-    if not os.path.isdir(maps_dir): return []
-    return sorted(d for d in os.listdir(maps_dir) if os.path.exists(os.path.join(maps_dir, d, 'config.json')))
+    found = set()
+    for base in (maps_dir, KIT_MAPS_DIR):
+        if os.path.isdir(base):
+            found.update(d for d in os.listdir(base)
+                         if os.path.exists(os.path.join(base, d, 'config.json')))
+    return sorted(found)
 
 
 if __name__ == '__main__':
