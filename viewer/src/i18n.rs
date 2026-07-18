@@ -112,6 +112,78 @@ pub enum K {
     DepsMissing,
     InstallDeps,
     Installing,
+    // Build / loading panel
+    InstallingDeps,
+    Done,
+    Failed,
+    Close,
+    Cancel,
+    ShowLog,
+    HideLog,
+    CopyLog,
+    BuildFailed,
+    BuildComplete,
+    Starting,
+    EstimatedTime,
+    // INTEL strip
+    IntelRefreshed,
+    SyncFailed,
+    Syncing,
+    CancelLower,
+    SyncTip,
+    // card labels + tooltips
+    BuiltLabel,
+    IntelLabel,
+    Today,
+    DAgo,
+    UpdateTip,
+    // footer
+    InstallDepsTip,
+    FolderTitle,
+    LangLabel,
+}
+
+/// Localized display for a build STAGE name (the Python log text, already uppercased + ASCII). We
+/// map the English stage to Russian rather than pass Cyrillic through the ASCII whitelist. Prefix
+/// match so truncated / suffixed variants ("GRASS: BUILD ...", "INSTALL PACKAGES (...)") still hit.
+/// None => keep the (English) text as-is.
+pub fn stage_ru(lang: Lang, en_upper: &str) -> Option<&'static str> {
+    if lang == Lang::En {
+        return None;
+    }
+    let s = en_upper.trim();
+    let ru = if s.starts_with("CHECK DATASET") {
+        "ПРОВЕРКА ДАННЫХ"
+    } else if s.starts_with("EXTRACT DATASET") {
+        "РАСПАКОВКА (ГЕО + ТЕКСТУРЫ)"
+    } else if s.starts_with("EXTRACT GRASS") {
+        "РАСПАКОВКА ТРАВЫ"
+    } else if s.starts_with("EXTRACT LIGHTS") {
+        "РАСПАКОВКА СВЕТА"
+    } else if s.starts_with("BAKE LIGHTING") {
+        "ЗАПЕКАНИЕ СВЕТА (GPU)"
+    } else if s.starts_with("ASSEMBLE PACK") {
+        "СБОРКА ПАКЕТА"
+    } else if s.starts_with("GRASS") {
+        "ТРАВА"
+    } else if s.starts_with("GAMEPLAY ZONES") {
+        "ИГРОВЫЕ ЗОНЫ"
+    } else if s.starts_with("ITEM ICONS") {
+        "ИКОНКИ ПРЕДМЕТОВ"
+    } else if s.starts_with("NAV") {
+        "НАВИГАЦИЯ"
+    } else if s.starts_with("STAMP") {
+        "ОТПЕЧАТОК ИГРЫ"
+    } else if s.starts_with("CREATE VIRTUAL") {
+        "СОЗДАНИЕ ОКРУЖЕНИЯ"
+    } else if s.starts_with("INSTALL PACKAGES") {
+        "УСТАНОВКА ПАКЕТОВ"
+    } else if s.starts_with("VERIFY") {
+        "ПРОВЕРКА"
+    } else {
+        return None;
+    };
+    Some(ru)
 }
 
 /// The catalog: `[english, russian]` per key.
@@ -168,6 +240,40 @@ fn pair(k: K) -> [&'static str; 2] {
         ],
         InstallDeps => ["INSTALL DEPS", "УСТАНОВИТЬ"],
         Installing => ["installing\u{2026}", "установка\u{2026}"],
+        InstallingDeps => ["INSTALLING DEPENDENCIES", "УСТАНОВКА ЗАВИСИМОСТЕЙ"],
+        Done => ["DONE", "ГОТОВО"],
+        Failed => ["FAILED", "ОШИБКА"],
+        Close => ["CLOSE", "ЗАКРЫТЬ"],
+        Cancel => ["CANCEL", "ОТМЕНА"],
+        ShowLog => ["SHOW LOG", "ПОКАЗАТЬ ЛОГ"],
+        HideLog => ["HIDE LOG", "СКРЫТЬ ЛОГ"],
+        CopyLog => ["COPY LOG", "КОПИРОВАТЬ ЛОГ"],
+        BuildFailed => ["BUILD FAILED", "СБОРКА НЕ УДАЛАСЬ"],
+        BuildComplete => ["BUILD COMPLETE", "СБОРКА ЗАВЕРШЕНА"],
+        Starting => ["STARTING", "ЗАПУСК"],
+        EstimatedTime => ["ESTIMATED TIME", "ОЦЕНКА ВРЕМЕНИ"],
+        IntelRefreshed => ["intel refreshed", "данные обновлены"],
+        SyncFailed => ["sync FAILED (see log)", "ошибка обновления (см. лог)"],
+        Syncing => ["syncing\u{2026}", "обновление\u{2026}"],
+        CancelLower => ["cancel", "отмена"],
+        SyncTip => [
+            "re-pull loot values, tasks and item icons from tarkov.dev (network)",
+            "заново загрузить цены, задачи и иконки с tarkov.dev (сеть)",
+        ],
+        BuiltLabel => ["built", "собран"],
+        IntelLabel => ["intel", "данные"],
+        Today => ["today", "сегодня"],
+        DAgo => ["d ago", "д назад"],
+        UpdateTip => [
+            "game files changed since this pack was built - run the pipeline again (data may be out of date)",
+            "файлы игры изменились после сборки этого пакета — запустите сборку заново (данные могли устареть)",
+        ],
+        InstallDepsTip => [
+            "creates a local venv and pip-installs UnityPy, numpy and Pillow",
+            "создаёт локальный venv и ставит UnityPy, numpy и Pillow",
+        ],
+        FolderTitle => ["Choose a folder for extracted map assets", "Выберите папку для распакованных данных карт"],
+        LangLabel => ["LANG", "ЯЗЫК"],
     }
 }
 
