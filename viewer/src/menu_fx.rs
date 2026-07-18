@@ -262,6 +262,113 @@ pub fn wireframe_globe(ui: &egui::Ui, panel: Rect) {
     }
 }
 
+// ============================================================================================
+// NEON 3D GLOBE — the real "shader" backdrop: a UV sphere whose only visible surface is a lat/long
+// grid, drawn as bright HDR emissive with ADDITIVE blend, so the menu camera's Bloom halos it into
+// a glowing neon wireframe (true glow/blur, unlike the egui painter). A real 3D object => it spins,
+// the cursor steers it, and it sits behind the (transparent) menu UI. Menu mode only.
+// ============================================================================================
+
+/// Procedural lat/long grid MASK: bright on grid lines (soft edges), black between. Multiplied by
+/// the material's HDR emissive so only the lines glow.
+fn globe_grid_texture() -> Image {
+    const W: usize = 1024;
+    const H: usize = 512;
+    const NLON: usize = 18; // meridians (vertical)
+    const NLAT: usize = 9; // parallels (horizontal)
+    // distance-to-nearest-line -> soft 0..1 line intensity (thinner lines = cleaner wireframe).
+    let line = |frac: f32, n: usize| -> f32 {
+        let c = frac * n as f32;
+        let d = (c - c.round()).abs();
+        (1.0 - d / 0.03).clamp(0.0, 1.0)
+    };
+    let mut data = vec![0u8; W * H * 4];
+    for y in 0..H {
+        let v = (y as f32 + 0.5) / H as f32;
+        let lat_i = line(v, NLAT);
+        for x in 0..W {
+            let u = (x as f32 + 0.5) / W as f32;
+            let b = (lat_i.max(line(u, NLON)) * 255.0) as u8;
+            let o = (y * W + x) * 4;
+            data[o] = b;
+            data[o + 1] = b;
+            data[o + 2] = b;
+            data[o + 3] = b;
+        }
+    }
+    Image::new(
+        Extent3d { width: W as u32, height: H as u32, depth_or_array_layers: 1 },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+/// Spin + tilt state carried on the globe entity.
+#[derive(Component)]
+pub struct MenuGlobe {
+    phi: f32,
+    omega: f32,
+    tilt: f32,
+}
+
+/// Spawn the neon globe at the menu camera's look target (origin) — big enough to fill the backdrop.
+pub fn spawn_menu_globe(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let grid = images.add(globe_grid_texture());
+    // ALPHA-BLEND (not additive): the grid texture drives BOTH the emissive glow AND the alpha, so
+    // between-line texels are transparent (see-through globe) and the lines DON'T additively stack
+    // where front+back overlap (that stacking blew the edge-on latitudes out to white). NOT `unlit`
+    // — Bevy's unlit path skips emissive; lit + black base + HDR emissive = glowing lines only.
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        base_color_texture: Some(grid.clone()), // alpha = line mask -> transparent between lines
+        emissive: LinearRgba::rgb(0.15, 2.4, 3.2), // HDR cyan -> Bloom neon glow
+        emissive_texture: Some(grid),
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        double_sided: true,
+        ..default()
+    });
+    let mesh = meshes.add(Sphere::new(18.0).mesh().uv(60, 30));
+    commands.spawn((
+        Mesh3d(mesh),
+        MeshMaterial3d(mat),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        MenuGlobe { phi: 0.0, omega: 0.30, tilt: 0.42 },
+        Name::new("menu_neon_globe"),
+    ));
+    info!("menu: spawned neon 3D globe");
+}
+
+/// Spin the globe; the cursor drags the spin (horizontal) and tips the axis (vertical), with inertia.
+pub fn menu_globe_update(
+    time: Res<Time>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut q: Query<(&mut Transform, &mut MenuGlobe)>,
+) {
+    let dt = time.delta_secs().min(0.1);
+    let cursor = windows.single().ok().and_then(|w| {
+        w.cursor_position()
+            .map(|c| ((c.x / w.width() - 0.5) * 2.0, (c.y / w.height() - 0.5) * 2.0))
+    });
+    for (mut tf, mut g) in &mut q {
+        let (t_om, t_tl) = match cursor {
+            Some((nx, ny)) => (0.30 + nx * 1.7, 0.42 - ny * 0.30),
+            None => (0.30, 0.42),
+        };
+        g.omega += (t_om - g.omega) * (1.0 - (-2.5 * dt).exp());
+        g.tilt += (t_tl - g.tilt) * (1.0 - (-3.0 * dt).exp());
+        g.phi += g.omega * dt;
+        tf.rotation = Quat::from_rotation_x(g.tilt) * Quat::from_rotation_y(g.phi);
+    }
+}
+
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
     use std::f32::consts::{PI, TAU};
     const BODY: Color32 = Color32::from_rgb(42, 42, 40); // #2a2a28

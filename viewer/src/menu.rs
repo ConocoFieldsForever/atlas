@@ -782,17 +782,14 @@ pub fn menu_ui(
     // list looks identical either way.
     egui::CentralPanel::default()
         .frame(
+            // TRANSPARENT so the 3D neon globe (menu_fx::spawn_menu_globe, glowing in the 3D world
+            // behind egui) shows through. The ClearColor (#090909) is the dark field it glows on.
             egui::Frame::new()
-                .fill(if real_prop { Color32::TRANSPARENT } else { BG })
+                .fill(Color32::TRANSPARENT)
                 .inner_margin(24.0),
         )
         .show(ctx, |ui| {
-            // Backdrop decor: a slowly spinning, glowing, out-of-focus wireframe globe (menu_fx)
-            // that the cursor drags/tilts. Painted FIRST so every widget layers over it; it's pure
-            // painter output (no widget/Sense) so it can never steal clicks. The map cards below are
-            // drawn translucent so the globe glows through the whole list.
-            let _ = real_prop; // the 3D CCTV prop is retired; the globe is always the backdrop
-            crate::menu_fx::wireframe_globe(ui, ui.max_rect());
+            let _ = real_prop; // the CCTV prop is retired; the 3D neon globe is the backdrop now
 
             let mut delete_now: Option<usize> = None;
             let mut rescan = false;
@@ -812,8 +809,9 @@ pub fn menu_ui(
                 (false, _) => 74.0,     // footer only
             };
             let rows_h = (ui.available_height() - reserve).max(180.0);
-            // Translucent card fill so the glowing globe backdrop reads through the whole list.
-            let card_bg = Color32::from_rgba_unmultiplied(CARD.r(), CARD.g(), CARD.b(), 222);
+            // Translucent card fill so the glowing neon globe reads through the whole list (a little
+            // less opaque per request — the globe glows through, buttons get borders for contrast).
+            let card_bg = Color32::from_rgba_unmultiplied(CARD.r(), CARD.g(), CARD.b(), 188);
             egui::ScrollArea::vertical().max_height(rows_h).show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));

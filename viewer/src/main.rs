@@ -651,10 +651,13 @@ fn main() {
     }
     // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
     // manager. The in-raid panels check for this resource and stand down while it exists.
-    // The 3D CCTV prop (menu_fx::spawn_menu_prop / menu_prop_update) is RETIRED — the menu backdrop
-    // is now the painter-drawn wireframe globe (menu_fx::wireframe_globe, drawn from menu_ui).
+    // Menu backdrop = the NEON 3D GLOBE: a grid-textured emissive sphere in the 3D world that the
+    // camera's Bloom halos into a glowing neon wireframe (menu_fx::spawn_menu_globe / update). The
+    // CentralPanel goes transparent (menu.rs) so it shows behind the UI.
     if menu_mode {
         app.insert_resource(menu::build_state());
+        app.add_systems(Startup, menu_fx::spawn_menu_globe.after(setup));
+        app.add_systems(Update, menu_fx::menu_globe_update);
     }
 
     app.run();
