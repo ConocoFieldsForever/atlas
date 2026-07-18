@@ -27,8 +27,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build (locked)
-        run: cargo build --release --locked
+      - name: Build (locked, build-paths remapped)
+        shell: powershell
+        # build-clean.ps1 remaps the runner's CARGO_HOME + workspace prefixes out of the binary
+        # (trim-paths is unstable on the pinned cargo) so the published exe carries no build-machine
+        # paths, and re-applies +crt-static (RUSTFLAGS overrides .cargo/config.toml).
+        run: .\scripts\build-clean.ps1 -Locked
       - name: Version smoke (runners have no GPU)
         run: .\target\release\atlas.exe --version
       - name: Assemble dist (skip build + render smoke; done above / GPU-only)

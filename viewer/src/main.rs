@@ -533,15 +533,28 @@ fn main() {
                 ..default()
             })
             .set(AssetPlugin {
-                // Shipped bundle: assets/ sits beside the exe (portability PR1). Dev
-                // `cargo run` (exe in target/release, no assets/ there) falls back to
-                // the compile-time crate dir so shader hot-editing keeps working.
+                // Shipped bundle: assets/ sits beside the exe (portability PR1). If it's not there,
+                // an ATLAS_ASSETS_DIR env var wins (escape hatch for running a release build out of
+                // the cargo target dir). Only a DEBUG build falls back to the compile-time crate dir
+                // for shader hot-editing — a RELEASE build must NOT: env!("CARGO_MANIFEST_DIR") bakes
+                // the build machine's home path (leaking the builder's username) into the exe and
+                // never exists on a user's PC. In release we point at the expected <exe>/assets so a
+                // missing-shader error makes the "keep assets next to atlas.exe" rule obvious.
                 file_path: {
                     let exe_assets = paths::exe_dir().join("assets");
                     if exe_assets.is_dir() {
                         exe_assets.to_string_lossy().into_owned()
+                    } else if let Ok(dir) = std::env::var("ATLAS_ASSETS_DIR") {
+                        dir
                     } else {
-                        concat!(env!("CARGO_MANIFEST_DIR"), "/assets").to_string()
+                        #[cfg(debug_assertions)]
+                        {
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/assets").to_string()
+                        }
+                        #[cfg(not(debug_assertions))]
+                        {
+                            exe_assets.to_string_lossy().into_owned()
+                        }
                     }
                 },
                 ..default()

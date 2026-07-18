@@ -78,3 +78,9 @@ codegen-units = 16
 # fail-fast abort, which is right for a viewer.
 strip = "symbols"
 panic = "abort"
+# NOTE on build-path leakage: Rust bakes the build machine's absolute paths (home\.cargo\registry\...
+# and the workspace dir) into panic Location strings in .rdata. `trim-paths` would remove them but is
+# not stabilized in this cargo, so release builds go through scripts/build-clean.ps1 (used by
+# .github/workflows/release.yml) which passes --remap-path-prefix via RUSTFLAGS to remap those
+# prefixes to neutral tokens. Those flags carry the machine-specific home path, so they are computed
+# from the environment at build time and live in the build env, NOT committed here.
