@@ -85,10 +85,14 @@ impl Plugin for PlannerPlugin {
             .init_resource::<PlanResult>()
             .init_resource::<PlanTask>()
             .add_systems(Update, (debug_plan, dispatch_plan, poll_plan, draw_stops).chain())
-            // In-place map swap: cancel the in-flight solve + clear the plan (old-map coords/route).
+            // In-place map swap: cancel the in-flight solve + clear the plan. BEFORE poll_plan so a
+            // solve completing on the swap frame can't republish an old-map route/PlanResult (it
+            // sees PlanTask=None). RouteResult is also cleared for order-independence.
             .add_systems(
                 Update,
-                teardown_plan.run_if(resource_changed::<crate::render::MapEpoch>),
+                teardown_plan
+                    .run_if(resource_changed::<crate::render::MapEpoch>)
+                    .before(poll_plan),
             );
     }
 }
@@ -96,9 +100,16 @@ impl Plugin for PlannerPlugin {
 /// In-place map swap: cancel the in-flight orienteering solve (it captured a clone of the OLD nav
 /// grid; if it completed, `poll_plan` would re-populate `PlanResult` AND overwrite `RouteResult`
 /// with an old-map "Loot run" route after teardown) and clear the stale plan list.
-fn teardown_plan(mut task: ResMut<PlanTask>, mut result: ResMut<PlanResult>) {
+fn teardown_plan(
+    mut task: ResMut<PlanTask>,
+    mut result: ResMut<PlanResult>,
+    mut route: ResMut<RouteResult>,
+) {
     task.0 = None;
     *result = PlanResult::default();
+    // Belt-and-braces: the plan tour shares RouteResult with pathfind; clear it here too so a stale
+    // "Loot run" polyline can't survive regardless of teardown_nav vs poll_plan ordering.
+    route.clear();
 }
 
 /// Headless-QA aid (mirrors `EFT_ROUTE`): `EFT_PLAN="min_value,max_stops,budget_m"` (or `1` for

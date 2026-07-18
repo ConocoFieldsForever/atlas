@@ -159,16 +159,22 @@ fn load_map(
     mut server: ResMut<pathfind::PathfindServer>,
     mut exit: MessageWriter<bevy::app::AppExit>,
     menu: Option<Res<menu::MenuState>>,
+    render_path: Option<Res<RenderPath>>,
 ) {
     if sw.0.is_none() {
         return; // fast path: don't dirty change detection via take() every frame
     }
     let Some(dir) = sw.0.take() else { return };
 
-    // Menu PLAY still RELAUNCHES: the menu->raid transition also needs MenuState torn down and the
-    // menu UI stood down, which the in-place path doesn't yet do — so scope in-place to raid->raid
-    // (the map dropdown) for now. EFT_RELAUNCH_ON_SWITCH=1 forces relaunch everywhere (fallback).
+    // RELAUNCH (not in-place) when:
+    //  - menu PLAY (the menu->raid transition also needs MenuState torn down + the menu UI stood
+    //    down, which the in-place path doesn't yet do), OR
+    //  - the render path is NOT GPU-driven (only EftGpuDrivenPlugin has an epoch-aware rebuild; the
+    //    m0/std paths spawn geometry once at Startup, so in-place would leave stale map geometry), OR
+    //  - EFT_RELAUNCH_ON_SWITCH=1 (explicit fallback).
+    let not_gpu_driven = render_path.map(|r| *r != RenderPath::GpuDriven).unwrap_or(false);
     let relaunch = menu.is_some()
+        || not_gpu_driven
         || std::env::var("EFT_RELAUNCH_ON_SWITCH").map(|v| v.trim() == "1").unwrap_or(false);
     if relaunch {
         match std::env::current_exe() {
@@ -516,6 +522,9 @@ fn main() {
     // world and used as the run_if gate for every per-map (re)build system. Inserted always (menu
     // mode too) so `build_cpu_data`'s `run_if(resource_changed::<MapEpoch>)` fires on the first frame.
     app.insert_resource(render::MapEpoch(0));
+    // The active render path: load_map only swaps IN-PLACE under GPU-driven (the only path with an
+    // epoch-aware rebuild); m0/std spawn geometry once at Startup, so they must relaunch on a switch.
+    app.insert_resource(render_path);
 
     // Foreground-gated redraw: full-rate when the window is focused, near-idle (only user/window
     // events, ~2 Hz) when it's not — so alt-tabbing to your game frees the GPU. Skipped under

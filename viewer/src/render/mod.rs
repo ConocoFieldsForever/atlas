@@ -125,7 +125,7 @@ pub struct MapEpoch(pub u64);
 /// A/B render-path selector. `EFT_RENDER=m0` picks the working M0 custom instanced
 /// path (`instancing.rs`, zero culling); anything else (default) picks the M2
 /// GPU-driven compute-cull + indirect-draw path (`gpu_driven.rs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Resource)]
 pub enum RenderPath {
     /// M0: one instanced draw per unique mesh, no culling (A/B baseline).
     M0Instanced,
