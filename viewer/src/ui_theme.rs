@@ -247,8 +247,16 @@ pub fn card<R>(
 /// A filled action button (square). `fill`/`text_color` pick the variant; see [`primary_button`] /
 /// [`danger_button`] / [`warn_button`]. Returns the builder so callers can `add` or `add_sized`.
 pub fn button_filled(text: &str, fill: Color32, text_color: Color32) -> egui::Button<'static> {
+    // A bright rim (the fill lightened) crisply defines each button against the now-translucent menu
+    // + the glowing globe behind it, so DELETE/PLAY/UPDATE stay clearly readable.
+    let rim = Color32::from_rgb(
+        (fill.r() as u16 + 78).min(255) as u8,
+        (fill.g() as u16 + 78).min(255) as u8,
+        (fill.b() as u16 + 78).min(255) as u8,
+    );
     egui::Button::new(RichText::new(text.to_owned()).color(text_color).strong())
         .fill(fill)
+        .stroke(Stroke::new(1.5, rim))
         .corner_radius(0.0)
 }
 
