@@ -23,7 +23,8 @@ You need:
 - **About 1 GB of free space** for the app, plus **1–10 GB per map** you install
 
 You do **not** need to install Python, a runtime, or anything else just to run
-Atlas and view maps.
+Atlas and view maps. The Visual C++ runtime is built into the app, so there's
+nothing extra to install.
 
 ---
 
@@ -61,18 +62,22 @@ That's it — no Python, no game files needed on your end.
 Atlas can build maps straight from your Escape from Tarkov install. This is the
 "full kit" and asks a bit more of you:
 
-- You need the **full Atlas download** (the one that includes `bootstrap.ps1`, and
-  the `tools` / `eft_pipeline` / `extraction` folders), not the viewer-only zip.
+- The Atlas download already includes everything the builder needs (`bootstrap.ps1`
+  and the `tools` / `eft_pipeline` / `extraction` folders).
 - You need **Python 3.10 or newer** installed.
 - You need **Escape from Tarkov installed** on the same PC.
+- You need an **internet connection while building** — Atlas fetches loot values,
+  quest data, and item icons from the free community API at
+  [tarkov.dev](https://tarkov.dev). (Viewing a finished map stays fully offline.)
 
 Then:
 
 1. Right-click `bootstrap.ps1` → **Run with PowerShell** (one-time setup — it
    installs what the builder needs and checks your setup).
 2. Launch `atlas.exe`. At the bottom of the menu:
-   - **GAME INSTALL** — point it at your Tarkov folder (usually auto-fills; if not,
-     paste the path and press **SET**).
+   - **GAME INSTALL** — point it at the **`EscapeFromTarkov_Data`** folder inside your
+     Tarkov install (e.g. `…\Escape from Tarkov\EscapeFromTarkov_Data`; usually
+     auto-fills — if not, paste that path and press **SET**).
    - **EXTRACTED ASSETS** — press **CHOOSE…** and pick a folder with plenty of free
      space (the extracted map data lands here — budget **~1–6 GB per map**).
 3. **Close the game and its launcher** (the extractor needs the files unlocked),
@@ -118,14 +123,14 @@ Atlas isn't code-signed, so Windows SmartScreen and some antivirus tools flag it
 `atlas.exe`, add an exception for the Atlas folder.
 
 **The window opens black, or the app closes immediately.**
-Update your graphics drivers (NVIDIA/AMD/Intel) — Atlas needs Vulkan or DirectX 12.
-If it still won't start, install Microsoft's free **Visual C++ Redistributable
-(x64)** and try again.
+Update your graphics drivers (NVIDIA/AMD/Intel) — Atlas needs a GPU that supports
+Vulkan or DirectX 12. (No Visual C++ redistributable or other runtime is needed —
+the C runtime is built into the app.)
 
 **The BUILD button does nothing or shows an error.**
-Building maps needs the full kit (Option B): the `tools`/`eft_pipeline` folders
-beside the exe, Python installed, and your Tarkov install. The viewer-only download
-can open and view packs but can't build them.
+Building maps (Option B) needs the `tools`/`eft_pipeline` folders beside the exe
+(they come in the download), Python 3.10+ installed, and your Tarkov install — and
+make sure you ran `bootstrap.ps1` first.
 
 **BUILD says "no dataset" / the extraction fails.**
 Make sure you set **EXTRACTED ASSETS** (a folder with free space) and **GAME
