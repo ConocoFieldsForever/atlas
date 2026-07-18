@@ -166,8 +166,10 @@ def main():
             sys.exit(3)
         print(f"[STAGE 1/{total}] no dataset yet - running the ONE-TIME full extraction. CLOSE the "
               f"game and launcher first (file locks). This can take a long time.", flush=True)
+        # extract_parallel splits the levels across cores (reusing the unchanged eft_extract_v2 per
+        # chunk) then merges — big maps go multi-core. EFT_JOBS=1 forces the plain serial extractor.
         run(1, total, "extract dataset (geometry + textures)",
-            [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_v2.py"),
+            [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "extract_parallel.py"),
              "--levels", levels, "--name", dsname], VIEWER)
         if m not in INDOOR_NO_GRASS:
             run(1, total, "extract grass density",
