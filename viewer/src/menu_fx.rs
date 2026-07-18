@@ -276,11 +276,12 @@ fn globe_grid_texture() -> Image {
     const H: usize = 512;
     const NLON: usize = 18; // meridians (vertical)
     const NLAT: usize = 9; // parallels (horizontal)
-    // distance-to-nearest-line -> soft 0..1 line intensity (thinner lines = cleaner wireframe).
+    // distance-to-nearest-line -> GAUSSIAN soft 0..1 intensity: fuzzy, wide-falloff lines so the
+    // globe reads soft/blurred (volumetric) rather than as crisp wireframe edges.
     let line = |frac: f32, n: usize| -> f32 {
         let c = frac * n as f32;
         let d = (c - c.round()).abs();
-        (1.0 - d / 0.03).clamp(0.0, 1.0)
+        (-(d * d) / (2.0 * 0.055 * 0.055)).exp()
     };
     let mut data = vec![0u8; W * H * 4];
     for y in 0..H {
@@ -305,13 +306,17 @@ fn globe_grid_texture() -> Image {
     )
 }
 
-/// Spin + tilt state carried on the globe entity.
+/// Spin state carried on the globe entity (angle + angular velocity). The spin AXIS is a fixed
+/// tilted pole (below) — the cursor only changes the speed, so the axis never wobbles.
 #[derive(Component)]
 pub struct MenuGlobe {
     phi: f32,
     omega: f32,
-    tilt: f32,
 }
+
+/// The globe's polar spin axis: mostly vertical, tilted slightly toward the camera + a touch to the
+/// side, so meridians sweep side-to-side like a real spinning globe (not a face-on wheel).
+const GLOBE_AXIS: Vec3 = Vec3::new(0.13, 1.0, 0.22);
 
 /// Spawn the neon globe at the menu camera's look target (origin) — big enough to fill the backdrop.
 pub fn spawn_menu_globe(
@@ -328,7 +333,7 @@ pub fn spawn_menu_globe(
     let mat = materials.add(StandardMaterial {
         base_color: Color::BLACK,
         base_color_texture: Some(grid.clone()), // alpha = line mask -> transparent between lines
-        emissive: LinearRgba::rgb(0.15, 2.4, 3.2), // HDR cyan -> Bloom neon glow
+        emissive: LinearRgba::rgb(0.1, 1.8, 2.5), // HDR cyan; softer since lines are wide + Bloom hot
         emissive_texture: Some(grid),
         alpha_mode: AlphaMode::Blend,
         cull_mode: None,
@@ -340,32 +345,47 @@ pub fn spawn_menu_globe(
         Mesh3d(mesh),
         MeshMaterial3d(mat),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        MenuGlobe { phi: 0.0, omega: 0.30, tilt: 0.42 },
+        MenuGlobe { phi: 0.0, omega: 0.30 },
         Name::new("menu_neon_globe"),
+    ));
+
+    // Faint inner glow ORB: a translucent emissive sphere filling the wireframe so the globe reads as
+    // a glowing VOLUME, not just lines. The menu camera's (boosted) Bloom hazes it into a soft
+    // volumetric core; grazing angles at the silhouette make it denser at the rim. Default cull_mode
+    // (Back) shows only the front hemisphere.
+    let core = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.03, 0.26, 0.34, 0.17),
+        emissive: LinearRgba::rgb(0.03, 0.75, 1.1),
+        alpha_mode: AlphaMode::Blend,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(Sphere::new(15.0).mesh().uv(32, 16))),
+        MeshMaterial3d(core),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        Name::new("menu_globe_core"),
     ));
     info!("menu: spawned neon 3D globe");
 }
 
-/// Spin the globe; the cursor drags the spin (horizontal) and tips the axis (vertical), with inertia.
+/// Spin the globe around its FIXED tilted pole; the cursor's horizontal offset only changes the
+/// spin SPEED (drag it faster / reverse it), with inertia — so the axis stays put.
 pub fn menu_globe_update(
     time: Res<Time>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut q: Query<(&mut Transform, &mut MenuGlobe)>,
 ) {
     let dt = time.delta_secs().min(0.1);
-    let cursor = windows.single().ok().and_then(|w| {
-        w.cursor_position()
-            .map(|c| ((c.x / w.width() - 0.5) * 2.0, (c.y / w.height() - 0.5) * 2.0))
-    });
+    let cursor_nx = windows
+        .single()
+        .ok()
+        .and_then(|w| w.cursor_position().map(|c| (c.x / w.width() - 0.5) * 2.0));
+    let axis = GLOBE_AXIS.normalize();
     for (mut tf, mut g) in &mut q {
-        let (t_om, t_tl) = match cursor {
-            Some((nx, ny)) => (0.30 + nx * 1.7, 0.42 - ny * 0.30),
-            None => (0.30, 0.42),
-        };
-        g.omega += (t_om - g.omega) * (1.0 - (-2.5 * dt).exp());
-        g.tilt += (t_tl - g.tilt) * (1.0 - (-3.0 * dt).exp());
+        let target = 0.30 + cursor_nx.unwrap_or(0.0) * 1.7;
+        g.omega += (target - g.omega) * (1.0 - (-2.5 * dt).exp());
         g.phi += g.omega * dt;
-        tf.rotation = Quat::from_rotation_x(g.tilt) * Quat::from_rotation_y(g.phi);
+        tf.rotation = Quat::from_axis_angle(axis, g.phi);
     }
 }
 
