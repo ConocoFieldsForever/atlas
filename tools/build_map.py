@@ -207,9 +207,13 @@ def main():
     if not os.path.isfile(v2):
         # portable kit baker: takes the MAP ID positionally, reads EFT_TARKMAP_ROOT itself
         # (run() passes it) and writes TK/out/<map id>/volume2.*; cwd-independent.
+        # OPTIONAL: the SH bake needs an NVIDIA CUDA GPU + warp-lang. Without them (or on any bake
+        # error) the build continues and the pack renders with flat ambient light (README: "No CUDA
+        # GPU? Skip this step - the viewer still runs"). A mandatory bake wrongly failed the whole
+        # build for anyone without the GPU bake deps.
         run(3, total, "bake lighting (GPU)",
             [PY_BAKE, os.path.join(VIEWER, "extraction", "bake", "bake_volume2.py"), m],
-            VIEWER)
+            VIEWER, optional=True)
     else:
         print(f"[STAGE 3/{total}] bake lighting: skipped (volume2 exists)", flush=True)
     # promote volume2.* -> volume.* (assemble reads volume.*). vis.bin is NOT promoted:
