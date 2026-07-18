@@ -241,7 +241,7 @@ fn job_panel(
 
             // ---- enqueue a build for any known map ----
             ui.horizontal(|ui| {
-                let cur = crate::menu::KNOWN_MAPS
+                let cur = crate::maps::known_pairs()
                     .iter()
                     .find(|(k, _)| *k == ui_state.pick)
                     .map(|(_, n)| *n)
@@ -249,7 +249,7 @@ fn job_panel(
                 egui::ComboBox::from_id_salt("jobs_map")
                     .selected_text(RichText::new(cur).size(theme::SIZE_SMALL))
                     .show_ui(ui, |ui| {
-                        for (k, name) in crate::menu::KNOWN_MAPS {
+                        for (k, name) in crate::maps::known_pairs() {
                             ui.selectable_value(&mut ui_state.pick, k.to_string(), *name);
                         }
                     });

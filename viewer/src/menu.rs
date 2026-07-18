@@ -257,21 +257,11 @@ pub fn intel_status() -> (Option<f64>, Option<f64>, usize) {
     )
 }
 
-/// The standard map roster (dataset key -> display name). Packs on disk that aren't in this
-/// list still show up (title falls back to the key).
-pub const KNOWN_MAPS: &[(&str, &str)] = &[
-    ("lighthouse", "Lighthouse"),
-    ("interchange", "Interchange"),
-    ("factory", "Factory"),
-    ("customs", "Customs"),
-    ("woods", "Woods"),
-    ("shoreline", "Shoreline"),
-    ("reserve", "Reserve"),
-    ("labs", "The Lab"),
-    ("ground_zero", "Ground Zero"),
-    ("streets", "Streets of Tarkov"),
-    ("labyrinth", "The Labyrinth"),
-];
+// The map roster (dataset key -> display name) is no longer hardcoded here: it is generated from
+// the game's BuildSettings scene list into extraction/maps/manifest.json and read via
+// `crate::maps::known_pairs()` / `crate::maps::roster()`. Packs on disk that aren't in the roster
+// still show up (title falls back to the key). Factory resolves to the 1.0 rework (id
+// `factory_rework`) in the manifest, the version the live game loads.
 
 /// FNV-1a 64 over "name|size|mtime_s;" of the game's top-level asset files, sorted by name.
 /// MUST stay byte-identical to tools/stamp_fingerprint.py (the python stamper).
@@ -352,12 +342,12 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
                     let n = e.file_name().to_string_lossy().into_owned();
                     n.strip_suffix(".eftpack").map(str::to_string)
                 })
-                .filter(|k| KNOWN_MAPS.iter().all(|(key, _)| key != k))
+                .filter(|k| crate::maps::known_pairs().iter().all(|(key, _)| key != k))
                 .collect()
         })
         .unwrap_or_default();
     extra.sort();
-    let roster = KNOWN_MAPS
+    let roster = crate::maps::known_pairs()
         .iter()
         .map(|(k, t)| (*k, *t))
         .chain(extra.iter().map(|k| (k.as_str(), k.as_str())));
@@ -482,6 +472,56 @@ pub fn config_lang() -> Option<String> {
 }
 pub fn save_config_lang(tag: &str) {
     save_config_str("lang", tag);
+}
+
+/// Shared EN|RU language switch, drawn as a self-contained FOREGROUND `Area` anchored to a window
+/// corner. Used by BOTH the start menu and the in-raid viewer so the control is identical and —
+/// crucially — can NEVER be clipped by a panel's vertical overflow: it floats independent of any
+/// panel content flow. Pure UI: takes the current `Lang` by value and RETURNS the newly-picked lang
+/// (so the caller mutates its `ResMut` only on a real change, avoiding per-frame change detection).
+/// Anchor RIGHT_BOTTOM in the menu, LEFT_BOTTOM in-raid (clears the right-edge toolbar/layers rail).
+pub fn lang_switch_area(
+    ctx: &bevy_egui::egui::Context,
+    current: crate::i18n::Lang,
+    id: &str,
+    anchor: bevy_egui::egui::Align2,
+    offset: bevy_egui::egui::Vec2,
+) -> Option<crate::i18n::Lang> {
+    use bevy_egui::egui::{self, Color32, RichText, Stroke};
+    use crate::i18n::{t, Lang, K};
+    use crate::ui_theme as theme;
+    let mut picked = None;
+    egui::Area::new(egui::Id::new(id))
+        .anchor(anchor, offset)
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD_TRANSLUCENT)
+                .stroke(Stroke::new(1.0, theme::BORDER))
+                .inner_margin(egui::Margin::symmetric(8, 5))
+                .corner_radius(0.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(t(current, K::LangLabel)).size(10.0).color(theme::MUTED));
+                        for l in [Lang::En, Lang::Ru] {
+                            let active = current == l;
+                            let btn = egui::Button::new(
+                                RichText::new(l.code())
+                                    .size(12.0)
+                                    .strong()
+                                    .color(if active { theme::BONE } else { theme::MUTED }),
+                            )
+                            .fill(if active { theme::RAIL } else { Color32::TRANSPARENT })
+                            .stroke(Stroke::new(1.0, if active { theme::BEIGE } else { theme::BORDER }))
+                            .corner_radius(0.0);
+                            if ui.add(btn).on_hover_text(t(current, K::LanguageTip)).clicked() && !active {
+                                picked = Some(l);
+                            }
+                        }
+                    });
+                });
+        });
+    picked
 }
 
 /// Whether the build python has the extraction packages (UnityPy/numpy/Pillow). Runs a quick import
@@ -1392,27 +1432,22 @@ pub fn menu_ui(
                 }
             });
 
-            // Language switch (bottom-right) — overrides the auto-detected default, persisted to
-            // atlas.config.json. egui re-renders the whole menu next frame in the chosen language.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for l in [crate::i18n::Lang::Ru, crate::i18n::Lang::En] {
-                    let active = *lang == l;
-                    let btn = egui::Button::new(
-                        RichText::new(l.code())
-                            .size(12.0)
-                            .strong()
-                            .color(if active { BONE } else { DIM }),
-                    )
-                    .fill(if active { theme::RAIL } else { Color32::TRANSPARENT })
-                    .stroke(egui::Stroke::new(1.0, if active { BEIGE } else { BORDER }));
-                    if ui.add(btn).on_hover_text(t(lg, K::LanguageTip)).clicked() && !active {
-                        *lang = l;
-                        save_config_lang(l.tag());
-                    }
-                }
-                ui.label(RichText::new(t(lg, K::LangLabel)).size(10.0).color(DIM));
-            });
         });
+
+    // Language switch — floated on its OWN foreground Area anchored to the window bottom-right so a
+    // short window's (non-scrolling) CentralPanel overflow can NEVER clip it. It used to be the last
+    // widget inside the panel flow and fell off the bottom on small windows. Shared with the in-raid
+    // viewer (`lang_switch_area`) so the control is identical in both places.
+    if let Some(l) = lang_switch_area(
+        ctx,
+        *lang,
+        "menu_lang_toggle",
+        egui::Align2::RIGHT_BOTTOM,
+        egui::vec2(-20.0, -14.0),
+    ) {
+        *lang = l;
+        save_config_lang(l.tag());
+    }
 
     // ---- apply the worker intents collected above (single point of mutation) ----
     if enqueue_install {

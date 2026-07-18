@@ -14,6 +14,7 @@ mod i18n;
 mod inspect;
 mod jobs;
 mod loot;
+mod maps;
 mod menu;
 mod menu_fx;
 mod nav;
