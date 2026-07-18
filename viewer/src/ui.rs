@@ -565,7 +565,7 @@ fn layers_panel(
                         for (name, path) in packs.iter() {
                             if ui
                                 .selectable_label(*name == cur_name, name)
-                                .on_hover_text("switch map (restarts the viewer)")
+                                .on_hover_text("switch to this map in place (no relaunch)")
                                 .clicked()
                                 && *name != cur_name
                             {
@@ -1211,6 +1211,7 @@ fn toolbar_panel(
     mut contexts: bevy_egui::EguiContexts,
     mut tab: ResMut<RightPanelTab>,
     menu: Option<Res<crate::menu::MenuState>>,
+    mut go_menu: ResMut<crate::ReturnToMenu>,
 ) {
     use bevy_egui::egui;
     use crate::ui_theme as theme;
@@ -1231,6 +1232,14 @@ fn toolbar_panel(
         .frame(egui::Frame::new().fill(theme::RAIL).inner_margin(egui::Margin::symmetric(4, 8)))
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 6.0;
+            // Back to the start menu (map manager). Sits above the tab icons, separated — it's an
+            // action, not a tab, so it never shows the active-tab highlight.
+            if theme::rail_button(ui, false, 4, "Back to menu (map manager)") {
+                go_menu.0 = true;
+            }
+            ui.add_space(3.0);
+            ui.separator();
+            ui.add_space(3.0);
             if theme::rail_button(ui, cur == RightPanelTab::Visibility, 0, "Visibility layers") {
                 *tab = RightPanelTab::Visibility;
             }
