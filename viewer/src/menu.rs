@@ -705,6 +705,40 @@ fn fmt_age(days: Option<f64>) -> String {
     }
 }
 
+/// Weighted build progress in [0,1]. The extraction dominates wall-clock (~55% of a build), so weight
+/// phases by their typical relative duration (codex perf ranking) instead of "stage i of N" — that
+/// equal-stage assumption is what pinned the ESTIMATED TIME at 99:59 (extraction counted as 1/9).
+/// `stage` is the latest `[STAGE i/N]` / `[BUILD OK]` marker; `sub` is an optional in-stage fraction
+/// (0..1) from a `[SUBPROGRESS]` marker, so the bar moves DURING the long extraction.
+fn build_frac(stage: &str, sub: Option<f32>) -> f32 {
+    if stage.starts_with("[BUILD OK]") {
+        return 1.0;
+    }
+    let parsed = stage
+        .strip_prefix("[STAGE ")
+        .and_then(|s| s.split(']').next())
+        .and_then(|s| {
+            let (i, n) = s.split_once('/')?;
+            Some((i.trim().parse::<f32>().ok()?, n.trim().parse::<f32>().ok()?))
+        });
+    let Some((i, n)) = parsed else {
+        return 0.0;
+    };
+    let done = stage.contains(": done") || stage.contains(": skipped");
+    let in_frac = if done { 1.0 } else { sub.unwrap_or(0.5).clamp(0.0, 1.0) };
+    // Cumulative fraction AT THE END of each 1-based stage, per pipeline length.
+    let cum: &[f32] = if (n - 9.0).abs() < 0.5 {
+        // full build: extract, lights, bake(GPU), assemble, grass, zones, icons, nav(GPU), stamp
+        &[0.0, 0.55, 0.58, 0.80, 0.88, 0.92, 0.95, 0.96, 0.99, 1.0]
+    } else if (n - 3.0).abs() < 0.5 {
+        &[0.0, 0.05, 0.98, 1.0] // deps install: venv, pip, verify
+    } else {
+        return ((i - 1.0 + in_frac) / n).clamp(0.0, 1.0); // unknown pipeline: linear
+    };
+    let idx = (i as usize).clamp(1, cum.len() - 1);
+    (cum[idx - 1] + (cum[idx] - cum[idx - 1]) * in_frac).clamp(0.0, 1.0)
+}
+
 /// Localized age ("today" / "3 d ago") for the map-row cards.
 fn fmt_age_lg(lg: crate::i18n::Lang, days: Option<f64>) -> String {
     use crate::i18n::{t, K};
@@ -1188,25 +1222,22 @@ pub fn menu_ui(
                                 },
                             );
                         });
-                        // Progress from the [STAGE i/N] markers: finished stages count full,
-                        // the running stage counts half; [BUILD OK] pins 100%.
-                        let frac = if stage.starts_with("[BUILD OK]") || (finished && ok) {
-                            1.0
+                        // Weighted progress (build_frac): phases weighted by real relative duration,
+                        // not equal stages, so the ETA stops overshooting on the long extraction. The
+                        // extraction stage ([STAGE 1/N]) also moves within itself via a [SUBPROGRESS]
+                        // <done>/<total-levels> marker the parallel extractor emits.
+                        let sub = if stage.starts_with("[STAGE 1/") {
+                            tail.iter().rev().find_map(|l| {
+                                let rest = l.split("[SUBPROGRESS]").nth(1)?;
+                                let tok = rest.split_whitespace().last()?; // "<d>/<t>"
+                                let (d, t) = tok.split_once('/')?;
+                                let (d, t) = (d.trim().parse::<f32>().ok()?, t.trim().parse::<f32>().ok()?);
+                                (t > 0.0).then(|| (d / t).clamp(0.0, 1.0))
+                            })
                         } else {
-                            stage
-                                .strip_prefix("[STAGE ")
-                                .and_then(|s| s.split(']').next())
-                                .and_then(|s| {
-                                    let (i, n) = s.split_once('/')?;
-                                    let i: f32 = i.trim().parse().ok()?;
-                                    let n: f32 = n.trim().parse().ok()?;
-                                    let done_stage = stage.contains(": done")
-                                        || stage.contains(": skipped");
-                                    Some(((i - 1.0 + if done_stage { 1.0 } else { 0.5 }) / n)
-                                        .clamp(0.0, 1.0))
-                                })
-                                .unwrap_or(0.0)
+                            None
                         };
+                        let frac = if finished && ok { 1.0 } else { build_frac(stage, sub) };
                         // "LOADING OBJECTS..." style stage line for the loader bar: the text
                         // between the [STAGE] marker and its status suffix, uppercased and
                         // ASCII-whitelisted (menu glyph set is plain ASCII only).
