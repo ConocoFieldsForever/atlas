@@ -225,14 +225,23 @@ def main():
     if m in INDOOR_NO_GRASS:
         print(f"[STAGE 5/{total}] grass: skipped (indoor map)", flush=True)
     else:
-        gl = dataset_levels(m)
-        grass_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
-                     "--name", dsname]
-        if gl:
-            # pass the level list so the extractor finds the terrain bundle (without it, it
-            # auto-detects over an empty list and silently skips -> no grass on fresh datasets).
-            grass_cmd += ["--levels", gl]
-        ok = run(5, total, "grass: extract density grids", grass_cmd, VIEWER, optional=True)
+        # The stage-1 inline extraction already extracts grass density on a FRESH build, so don't
+        # scan the (huge, Streets = 217-level) terrain bundle a second time here - just pack it.
+        tl = os.path.join(dataset, "terrain_layers")
+        have_grids = os.path.isdir(tl) and any(
+            f.startswith("grass_density_") and f.endswith(".bin") for f in os.listdir(tl))
+        if have_grids:
+            print(f"[STAGE 5/{total}] grass: density grids already present - skip re-extract", flush=True)
+            ok = True
+        else:
+            gl = dataset_levels(m)
+            grass_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
+                         "--name", dsname]
+            if gl:
+                # pass the level list so the extractor finds the terrain bundle (without it, it
+                # auto-detects over an empty list and silently skips -> no grass on fresh datasets).
+                grass_cmd += ["--levels", gl]
+            ok = run(5, total, "grass: extract density grids", grass_cmd, VIEWER, optional=True)
         if ok:
             run(5, total, "grass: build grass.bin",
                 [PY, "-m", "eft_pipeline.build_grass", "--pack", pack] + sc_flag,
