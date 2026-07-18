@@ -1,6 +1,33 @@
+# build output
 target/
-__pycache__/
-*.pyc
-packs/
-*.eftpack
 dist/
+
+# map packs (game-derived geometry/textures — never redistribute)
+packs/
+*.eftpack/
+*.eftpack
+eft_assets/
+tarkmap/out/
+
+# transient build/staging dirs
+*.building/
+*.old/
+
+# local config & secrets
+eft_viewer.config.json
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+
+# logs & editor
+*.log
+.vscode/
+.idea/
