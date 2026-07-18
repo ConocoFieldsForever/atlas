@@ -345,7 +345,7 @@ pub fn spawn_menu_globe(
         Mesh3d(mesh),
         MeshMaterial3d(mat),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        MenuGlobe { phi: 0.0, omega: 0.30 },
+        MenuGlobe { phi: 0.0, omega: 0.09 },
         Name::new("menu_neon_globe"),
     ));
 
@@ -382,7 +382,7 @@ pub fn menu_globe_update(
         .and_then(|w| w.cursor_position().map(|c| (c.x / w.width() - 0.5) * 2.0));
     let axis = GLOBE_AXIS.normalize();
     for (mut tf, mut g) in &mut q {
-        let target = 0.30 + cursor_nx.unwrap_or(0.0) * 1.7;
+        let target = 0.09 + cursor_nx.unwrap_or(0.0) * 0.5; // much slower idle; gentle cursor drag
         g.omega += (target - g.omega) * (1.0 - (-2.5 * dt).exp());
         g.phi += g.omega * dt;
         tf.rotation = Quat::from_axis_angle(axis, g.phi);
