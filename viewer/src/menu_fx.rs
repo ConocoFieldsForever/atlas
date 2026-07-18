@@ -149,6 +149,102 @@ pub fn eft_loading_bar(
 ///
 /// This vector body is what SHIPS; when a machine-local packs/shared/menu extraction exists,
 /// menu.rs skips this call and the real 3D prop ([`spawn_menu_prop`]) renders instead.
+/// Menu backdrop: a slowly spinning, glowing wireframe globe rendered "just out of focus" (each
+/// edge drawn as a wide soft halo + a softer core — no crisp 1px line — so it reads as a defocused
+/// hologram). Latitude circles + longitude meridians of a unit sphere, tilted, orthographically
+/// projected; back-facing arcs are dimmed so it reads as a sphere. The cursor influences the spin:
+/// its horizontal offset from the globe centre sets a target angular velocity (drag it faster /
+/// reverse it), with inertia; its vertical offset nudges the tilt. Idle = gentle constant spin.
+/// Painter-only (no assets), the same idiom as `security_camera` which it replaces.
+pub fn wireframe_globe(ui: &egui::Ui, panel: Rect) {
+    use std::f32::consts::{PI, TAU};
+    let ctx = ui.ctx();
+    let t_now = ctx.input(|i| i.time) as f32;
+    let dt = ctx.input(|i| i.stable_dt).min(0.1);
+    let _ = t_now;
+
+    // Backdrop placement: large, a touch right of centre, sitting behind the menu content.
+    let center = pos2(panel.center().x + panel.width() * 0.14, panel.center().y);
+    let radius = panel.height().min(panel.width() * 0.7) * 0.44;
+
+    // ---- spin + tilt state (persist across frames): angle phi, angular velocity omega, tilt ----
+    let id = egui::Id::new("menu_fx_globe");
+    let (mut phi, mut omega, mut tilt) = ctx
+        .data(|d| d.get_temp::<(f32, f32, f32)>(id))
+        .unwrap_or((0.0, 0.30, 0.42));
+    const BASE_SPIN: f32 = 0.30; // idle rad/s
+    let (target_omega, target_tilt) = match ctx.input(|i| i.pointer.hover_pos()) {
+        Some(m) => {
+            let nx = ((m.x - center.x) / (panel.width() * 0.5)).clamp(-1.4, 1.4);
+            let ny = ((m.y - center.y) / (panel.height() * 0.5)).clamp(-1.0, 1.0);
+            (BASE_SPIN + nx * 1.7, 0.42 + ny * 0.28) // cursor drags the spin + tips the axis
+        }
+        None => (BASE_SPIN, 0.42),
+    };
+    omega += (target_omega - omega) * (1.0 - (-2.5 * dt).exp());
+    tilt += (target_tilt - tilt) * (1.0 - (-3.0 * dt).exp());
+    phi += omega * dt;
+    ctx.data_mut(|d| d.insert_temp(id, (phi, omega, tilt)));
+    let (st, ct) = tilt.sin_cos();
+
+    // Project a unit-sphere point (Y-spin already folded into longitudes) to screen + depth.
+    // z after tilt: +toward viewer .. -away; drives the front/back brightness so it reads 3D.
+    let proj = |x: f32, y: f32, z: f32| -> (egui::Pos2, f32) {
+        let y2 = y * ct - z * st;
+        let z2 = y * st + z * ct;
+        (pos2(center.x + x * radius, center.y - y2 * radius), z2)
+    };
+
+    let painter = ui.painter();
+    // Glowing, defocused polyline: a wide low-alpha halo + a softer core, both alpha-scaled by
+    // depth (back arcs fade). Holographic teal-cyan.
+    let glow = |pts: &[(egui::Pos2, f32)]| {
+        for w in pts.windows(2) {
+            let (a, za) = w[0];
+            let (b, zb) = w[1];
+            let depth = (((za + zb) * 0.5) + 1.0) * 0.5; // 0 back .. 1 front
+            let k = 0.18 + 0.82 * depth;
+            let col = |al: f32| {
+                Color32::from_rgba_unmultiplied(96, 214, 232, (al * 255.0).clamp(0.0, 255.0) as u8)
+            };
+            painter.line_segment([a, b], Stroke::new(5.0, col(k * 0.14))); // soft out-of-focus halo
+            painter.line_segment([a, b], Stroke::new(2.2, col(k * 0.42))); // soft core (still no 1px edge)
+        }
+    };
+
+    // Latitude circles.
+    for band in 1..6 {
+        let lat = -PI / 2.0 + PI * (band as f32 / 6.0);
+        let (sl, cl) = lat.sin_cos();
+        let pts: Vec<(egui::Pos2, f32)> = (0..=56)
+            .map(|i| {
+                let th = i as f32 / 56.0 * TAU + phi;
+                proj(cl * th.cos(), sl, cl * th.sin())
+            })
+            .collect();
+        glow(&pts);
+    }
+    // Longitude meridians.
+    for mrd in 0..8 {
+        let lon = mrd as f32 / 8.0 * PI + phi; // 8 half-meridians = 16 apparent lines w/ wrap
+        let (sn, cs) = lon.sin_cos();
+        let pts: Vec<(egui::Pos2, f32)> = (0..=56)
+            .map(|i| {
+                let la = -PI / 2.0 + PI * (i as f32 / 56.0);
+                let (sla, cla) = la.sin_cos();
+                proj(cla * cs, sla, cla * sn)
+            })
+            .collect();
+        glow(&pts);
+    }
+    // Poles: a tiny bright node so the axis reads.
+    for pole in [-1.0f32, 1.0] {
+        let (p, z) = proj(0.0, pole, 0.0);
+        let d = ((z + 1.0) * 0.5).clamp(0.0, 1.0);
+        painter.circle_filled(p, 2.2, Color32::from_rgba_unmultiplied(150, 235, 245, (d * 150.0) as u8));
+    }
+}
+
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
     use std::f32::consts::{PI, TAU};
     const BODY: Color32 = Color32::from_rgb(42, 42, 40); // #2a2a28

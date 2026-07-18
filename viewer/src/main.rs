@@ -505,7 +505,7 @@ fn main() {
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "Atlas".into(),
-                    resolution: (1600u32, 900u32).into(),
+                    resolution: (1600u32, 1000u32).into(),
                     present_mode,
                     // EFT_HIDDEN=1: render without showing a window (headless EFT_SHOT
                     // verification runs — GPU screenshot capture works on an invisible
@@ -651,13 +651,10 @@ fn main() {
     }
     // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
     // manager. The in-raid panels check for this resource and stand down while it exists.
-    // build_state() also runs the ONE-TIME local extraction of the real CCTV menu prop
-    // (menu::ensure_menu_prop) before anything draws; spawn_menu_prop then loads it (or
-    // silently leaves the vector camera in charge when the files are absent/corrupt).
+    // The 3D CCTV prop (menu_fx::spawn_menu_prop / menu_prop_update) is RETIRED — the menu backdrop
+    // is now the painter-drawn wireframe globe (menu_fx::wireframe_globe, drawn from menu_ui).
     if menu_mode {
         app.insert_resource(menu::build_state());
-        app.add_systems(Startup, menu_fx::spawn_menu_prop.after(setup));
-        app.add_systems(Update, menu_fx::menu_prop_update);
     }
 
     app.run();
