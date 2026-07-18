@@ -194,18 +194,20 @@ pub struct MenuState {
     pub confirm_delete: Option<usize>,
     /// Index showing rebuild instructions.
     pub show_rebuild: Option<usize>,
-    /// The one in-flight pipeline build, if any.
-    pub build: Option<BuildJob>,
     /// Build panel: raw log tail visible? Collapsed by default; auto-expands on failure.
     pub show_log: bool,
     /// Footer editor buffer for the game-install path.
     pub game_dir_edit: String,
-    /// The one in-flight tarkov.dev INTEL sync (tools/sync_intel.py), if any.
-    pub sync: Option<BuildJob>,
     /// INTEL strip stats: (loot.json age days, tasks.json age days, cached icon count).
     pub intel: (Option<f64>, Option<f64>, usize),
     /// Outcome note of the last finished sync ("refreshed" / failure), shown until the next one.
     pub sync_note: Option<(String, bool)>,
+    /// `JobWorker.completed` value we last reacted to — a change means a job finished, so rescan
+    /// the pack list / intel and (for a sync) set the note. Builds/syncs now run on the shared
+    /// worker, not owned by MenuState.
+    pub seen_completed: u64,
+    /// EFT_MENU_BUILD auto-build map key, enqueued once on the first menu frame (CLI/testing hook).
+    pub autobuild: Option<String>,
 }
 
 /// Shared tarkov.dev data freshness: (loot.json age d, tasks.json age d, icon count).
@@ -541,11 +543,9 @@ pub fn build_state() -> MenuState {
     ensure_menu_prop(&game_dir);
     let game_fp = game_fingerprint(&game_dir);
     let (entries, total_bytes) = scan(&game_fp);
-    // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook).
-    let build = std::env::var("EFT_MENU_BUILD")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|k| BuildJob::spawn(&k, &game_dir).ok());
+    // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook);
+    // enqueued on the shared worker on the first frame (build_state has no worker access here).
+    let autobuild = std::env::var("EFT_MENU_BUILD").ok().filter(|s| !s.is_empty());
     MenuState {
         entries,
         game_fp,
@@ -554,11 +554,11 @@ pub fn build_state() -> MenuState {
         total_bytes,
         confirm_delete: None,
         show_rebuild: None,
-        build,
         show_log: false,
-        sync: None,
         intel: intel_status(),
         sync_note: None,
+        seen_completed: 0,
+        autobuild,
     }
 }
 
@@ -580,27 +580,91 @@ fn fmt_age(days: Option<f64>) -> String {
     }
 }
 
+/// A per-frame snapshot of the build to show in the menu's loader panel — either the in-flight
+/// build or the most recent finished one (which lingers until CLOSE). Owned plain data so the
+/// egui closures don't hold a borrow on the worker.
+#[cfg(feature = "egui")]
+struct BuildView {
+    key: String,
+    stage: String,
+    tail: Vec<String>,
+    started_secs: f32,
+    finished: bool,
+    ok: bool,
+    full_log: String,
+}
+
+#[cfg(feature = "egui")]
+fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
+    // The running build takes precedence; otherwise a just-finished build lingers until dismissed.
+    let job = if w.current_build_key().is_some() {
+        w.current_job()
+    } else if w.last_is_build() {
+        w.last_job()
+    } else {
+        None
+    }?;
+    let (stage, tail, finished, ok) = job.snapshot(12);
+    Some(BuildView {
+        key: job.key.clone(),
+        stage,
+        tail,
+        started_secs: job.started.elapsed().as_secs_f32(),
+        finished,
+        ok,
+        full_log: job.full_log(),
+    })
+}
+
 /// Fullscreen menu UI (EguiPrimaryContextPass). Only registered/active in menu mode.
 #[cfg(feature = "egui")]
 pub fn menu_ui(
     mut contexts: bevy_egui::EguiContexts,
     state: Option<ResMut<MenuState>>,
     mut switch: ResMut<crate::MapSwitch>,
+    // The shared background worker: menu build/sync buttons enqueue onto the SAME queue the
+    // in-raid MAP PROCESSING panel uses (one worker, one code path).
+    mut worker: ResMut<crate::jobs::JobWorker>,
     // Present only when the real-asset 3D CCTV spawned (menu_fx::spawn_menu_prop): flips
     // the CentralPanel transparent so the 3D world shows through, and suppresses the
     // vector-drawn camera (exactly one of the two decors ever renders).
     prop3d: Option<Res<crate::menu_fx::MenuCamProp>>,
 ) {
     use bevy_egui::egui::{self, Color32, RichText};
+    use crate::jobs::Job;
     let Some(mut state) = state else { return };
     let real_prop = prop3d.is_some();
     let Ok(ctx) = contexts.ctx_mut() else { return };
 
+    // First-frame EFT_MENU_BUILD auto-build (enqueue once onto the shared worker).
+    if let Some(map) = state.autobuild.take() {
+        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone() });
+    }
+
+    // A job finished on the worker since we last looked: rescan the pack list + intel (a build
+    // may have produced/updated a pack), and reflect a finished SYNC / failed BUILD in the UI.
+    if worker.completed != state.seen_completed {
+        state.seen_completed = worker.completed;
+        let (entries, total) = scan(&state.game_fp);
+        state.entries = entries;
+        state.total_bytes = total;
+        state.intel = intel_status();
+        let ok = worker.last_outcome().map(|(_, ok)| ok).unwrap_or(false);
+        if worker.last_is_sync() {
+            state.sync_note = Some(if ok {
+                ("intel refreshed".to_string(), true)
+            } else {
+                ("sync FAILED (see log)".to_string(), false)
+            });
+        } else if worker.last_is_build() && !ok {
+            state.show_log = true; // surface the failing stage without a click
+        }
+    }
+
     // The menu animates without input now (camera LED blink / servo slew / idle patrol and
     // the loading-bar pulse): keep frames coming even when no events arrive, at a faster
     // cadence while a pipeline build is streaming.
-    let build_running = state.build.as_ref().is_some_and(|b| b.result.is_none());
-    ctx.request_repaint_after(std::time::Duration::from_millis(if build_running {
+    ctx.request_repaint_after(std::time::Duration::from_millis(if worker.busy() {
         50
     } else {
         80
@@ -624,6 +688,17 @@ pub fn menu_ui(
     // Modifies the existing dark style in place — never replaces it (that flips egui to its light
     // theme and paints a fullscreen pale layer, the historical bug).
     theme::apply_global_style(ctx);
+
+    // Worker intents: collected inside the egui closures (which only READ the worker) and applied
+    // once after, so the ResMut is never aliased mid-closure. `enqueue_build` is the map key to
+    // build; `cancel_current` cancels whatever job is in flight (build or sync).
+    let mut enqueue_sync = false;
+    let mut enqueue_build: Option<String> = None;
+    let mut cancel_current = false;
+    let mut dismiss_build = false;
+    // Per-frame snapshots so the closures don't hold a borrow on the worker.
+    let wk_build_key = worker.current_build_key().map(|s| s.to_string());
+    let bv = build_view(&worker);
 
     egui::TopBottomPanel::top("menu_header")
         .frame(egui::Frame::new().fill(HEADER).inner_margin(egui::Margin::symmetric(24, 10)))
@@ -671,22 +746,13 @@ pub fn menu_ui(
                     .color(age_col)
                     .size(11.0),
                 );
-                // Sync job lifecycle: idle button -> streaming stage -> outcome note.
-                if let Some(job) = &state.sync {
-                    let (stage, _, finished, ok) = job.snapshot(1);
-                    if finished {
-                        state.sync_note = Some(if ok {
-                            ("intel refreshed".to_string(), true)
-                        } else {
-                            ("sync FAILED (see log)".to_string(), false)
-                        });
-                        state.intel = intel_status();
-                        state.sync = None;
-                    } else {
-                        ui.label(RichText::new(format!("syncing\u{2026}  {stage}")).color(theme::ACCENT).size(11.0));
-                        if ui.small_button(RichText::new("cancel").size(10.0)).clicked() {
-                            job.cancel();
-                        }
+                // Sync job lifecycle on the shared worker: idle button -> streaming stage ->
+                // outcome note (the note is set by the completion handler at the top of menu_ui).
+                if worker.current_is_sync() {
+                    let stage = worker.status().map(|(_, s)| s).unwrap_or_default();
+                    ui.label(RichText::new(format!("syncing\u{2026}  {stage}")).color(theme::ACCENT).size(11.0));
+                    if ui.small_button(RichText::new("cancel").size(10.0)).clicked() {
+                        cancel_current = true;
                     }
                 } else {
                     if ui
@@ -694,13 +760,8 @@ pub fn menu_ui(
                         .on_hover_text("re-pull loot values, tasks and item icons from tarkov.dev (network)")
                         .clicked()
                     {
-                        match BuildJob::spawn_intel() {
-                            Ok(j) => {
-                                state.sync_note = None;
-                                state.sync = Some(j);
-                            }
-                            Err(e) => state.sync_note = Some((format!("sync failed to start: {e}"), false)),
-                        }
+                        state.sync_note = None;
+                        enqueue_sync = true;
                     }
                     if let Some((note, ok)) = &state.sync_note {
                         ui.label(
@@ -708,6 +769,8 @@ pub fn menu_ui(
                                 .color(if *ok { theme::OK } else { theme::DANGER_TEXT })
                                 .size(11.0),
                         );
+                    } else if let Some(err) = &worker.spawn_error {
+                        ui.label(RichText::new(err.as_str()).color(theme::DANGER_TEXT).size(11.0));
                     }
                 }
             });
@@ -738,13 +801,9 @@ pub fn menu_ui(
             let mut set_rebuild: Option<usize> = None;
             let mut start_build: Option<String> = None;
             let confirm_idx = state.confirm_delete;
-            // A FINISHED job (result latched) no longer blocks buttons — the log panel lingers
-            // until CLOSE, but DELETE/BUILD on the rows must come back as soon as it's done.
-            let building_key = state
-                .build
-                .as_ref()
-                .filter(|b| b.result.is_none())
-                .map(|b| b.key.clone());
+            // Which map (if any) is being built RIGHT NOW — marks that row BUILDING and blocks the
+            // other BUILD buttons. A finished build no longer blocks (its panel lingers until CLOSE).
+            let building_key = wk_build_key.clone();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the camera decor zone top-right
                 // (the camera is painted behind, so without this it would never be seen).
@@ -893,43 +952,23 @@ pub fn menu_ui(
 
             let _ = set_rebuild; // (legacy instructions window removed — BUILD runs the pipeline)
 
-            // Kick a build (one at a time; tools/build_map.py streams staged output).
+            // Kick a build: enqueue on the shared worker after this closure (one at a time;
+            // tools/build_map.py streams staged output; the completion handler up top rescans).
             if let Some(key) = start_build {
-                match BuildJob::spawn(&key, &state.game_dir) {
-                    Ok(job) => {
-                        info!("menu: building '{key}' via tools/build_map.py");
-                        state.build = Some(job);
-                        state.show_log = false; // fresh panel starts with the log collapsed
-                    }
-                    Err(e) => error!("menu: failed to start build for {key}: {e}"),
-                }
+                info!("menu: queueing build '{key}' via tools/build_map.py");
+                enqueue_build = Some(key);
+                state.show_log = false; // fresh panel starts with the log collapsed
             }
 
             // ---- Build progress (EFT loader style): segmented bar + stage line; the raw
-            // streaming tail stays collapsed behind SHOW LOG and auto-expands on failure ----
-            let mut clear_build = false;
+            // streaming tail stays collapsed behind SHOW LOG. Rendered from the shared worker's
+            // per-frame build snapshot (`bv`): the running build, else the finished one lingering
+            // until CLOSE. Completion/rescan is handled at the top of menu_ui. ----
             let mut toggle_log = false;
-            let mut expand_log = false;
-            // Auto-refresh the map rows the moment the pipeline finishes (the panel itself
-            // stays up until CLOSE so the result remains readable). result doubles as the
-            // "already rescanned" latch; a failure force-expands the log tail so the error
-            // lines are visible without a click.
-            if let Some(job) = &mut state.build {
-                let (_, _, finished, ok) = job.snapshot(0);
-                if finished && job.result.is_none() {
-                    job.result = Some(ok);
-                    rescan = true;
-                    if !ok {
-                        expand_log = true;
-                    }
-                }
-            }
-            if expand_log {
-                state.show_log = true;
-            }
             let show_log = state.show_log;
-            if let Some(job) = &state.build {
-                let (stage, tail, finished, ok) = job.snapshot(12);
+            if let Some(bv) = &bv {
+                let (stage, tail, key) = (&bv.stage, &bv.tail, &bv.key);
+                let (finished, ok) = (bv.finished, bv.ok);
                 let failed = finished && !ok;
                 ui.add_space(10.0);
                 egui::Frame::new()
@@ -939,7 +978,7 @@ pub fn menu_ui(
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("BUILDING: {}", job.key.to_uppercase()))
+                                RichText::new(format!("BUILDING: {}", key.to_uppercase()))
                                     .color(BONE)
                                     .strong(),
                             );
@@ -951,13 +990,13 @@ pub fn menu_ui(
                                         let txt = if ok { "DONE" } else { "FAILED" };
                                         ui.label(RichText::new(txt).color(col).strong());
                                         if ui.button("CLOSE").clicked() {
-                                            clear_build = true;
+                                            dismiss_build = true;
                                         }
                                     } else if ui
                                         .button(RichText::new("CANCEL").color(BAD))
                                         .clicked()
                                     {
-                                        job.cancel();
+                                        cancel_current = true;
                                     }
                                     // The tail is hidden by default — the loader bar carries
                                     // the status; the raw log is one click away.
@@ -970,7 +1009,7 @@ pub fn menu_ui(
                                     // Full captured log (the panel shows only a tail) — for
                                     // diagnosing which stage failed / sharing the output.
                                     if ui.button("COPY LOG").clicked() {
-                                        ui.ctx().copy_text(job.full_log());
+                                        ui.ctx().copy_text(bv.full_log.clone());
                                     }
                                 },
                             );
@@ -1020,16 +1059,10 @@ pub fn menu_ui(
                             s
                         };
                         ui.add_space(8.0);
-                        crate::menu_fx::eft_loading_bar(
-                            ui,
-                            frac,
-                            &stage_txt,
-                            job.started.elapsed().as_secs_f32(),
-                            failed,
-                        );
+                        crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed);
                         if show_log {
                             ui.add_space(6.0);
-                            for line in &tail {
+                            for line in tail {
                                 ui.label(
                                     RichText::new(line).color(DIM).size(11.0).monospace(),
                                 );
@@ -1039,15 +1072,6 @@ pub fn menu_ui(
             }
             if toggle_log {
                 state.show_log = !state.show_log;
-            }
-            if clear_build {
-                state.build = None;
-                rescan = true;
-            }
-            if rescan {
-                let (entries, total) = scan(&state.game_fp);
-                state.entries = entries;
-                state.total_bytes = total;
             }
 
             ui.add_space(8.0);
@@ -1091,4 +1115,18 @@ pub fn menu_ui(
                 };
             });
         });
+
+    // ---- apply the worker intents collected above (single point of mutation) ----
+    if enqueue_sync {
+        worker.enqueue(Job::SyncIntel);
+    }
+    if let Some(map) = enqueue_build {
+        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone() });
+    }
+    if cancel_current {
+        worker.cancel_current();
+    }
+    if dismiss_build {
+        worker.dismiss_last();
+    }
 }
