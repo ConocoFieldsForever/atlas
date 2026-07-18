@@ -875,6 +875,16 @@ pub fn menu_ui(
             });
         } else if worker.last_is_build() && !ok {
             state.show_log = true; // surface the failing stage without a click
+        } else if worker.last_is_build() && ok {
+            // A pack's loot values + quest layer come from the tarkov.dev intel sync, which the
+            // build pipeline itself never runs. On a fresh machine the first successful build has
+            // no shared intel sidecar yet, so the map would load with empty loot/quest layers until
+            // the user happened to click "sync intel". Kick off a one-time sync automatically so
+            // those layers populate. Once loot.json exists this won't fire again; a completing sync
+            // re-enters this handler as last_is_sync (above), so there's no loop.
+            if !crate::paths::shared_dir().join("loot.json").exists() {
+                worker.enqueue(Job::SyncIntel);
+            }
         }
     }
 
@@ -1036,6 +1046,11 @@ pub fn menu_ui(
             // Which map (if any) is being built RIGHT NOW — marks that row BUILDING and blocks the
             // other BUILD buttons. A finished build no longer blocks (its panel lingers until CLOSE).
             let building_key = wk_build_key.clone();
+            // BUILD needs the extraction deps installed AND a valid game dir; gate the button on both
+            // (Copy locals so they reach the inner button closure without borrowing `state`). Without
+            // this a user can click BUILD before INSTALL DEPS / before setting GAME INSTALL and hit a
+            // confusing mid-pipeline failure. deps_ok is true when deps are present OR unprobed.
+            let can_build = state.deps_ok && state.game_fp.is_some();
             // Bound the map-row scroll so the build panel + LOG + footer below always stay on screen
             // (reserve grows when a build is showing / its log is expanded); the rows scroll in what
             // remains. Without this the expanded log runs off the bottom of the window.
@@ -1156,7 +1171,13 @@ pub fn menu_ui(
                                                 t(lg, K::Build).to_string()
                                             };
                                             let b = egui::Button::new(RichText::new(build_label));
-                                            if ui.add_enabled(!any_building, b).clicked() {
+                                            let resp = ui.add_enabled(!any_building && can_build, b);
+                                            let resp = if !can_build {
+                                                resp.on_disabled_hover_text(t(lg, K::BuildNeedsSetup))
+                                            } else {
+                                                resp
+                                            };
+                                            if resp.clicked() {
                                                 start_build = Some(e.key.to_string());
                                             }
                                         }
