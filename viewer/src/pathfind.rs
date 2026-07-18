@@ -201,21 +201,29 @@ impl Plugin for PathfindPlugin {
                     draw_start,
                 )
                     .chain(),
+            )
+            // In-place map swap: drop the old pack's routing state (manage_nav reloads the new nav).
+            .add_systems(
+                Update,
+                teardown_nav.run_if(resource_changed::<crate::render::MapEpoch>),
             );
     }
 }
 
-/// Load the pack's nav grid once it appears; `ServerCmd` re-loads / unloads it (UI Start/Stop).
+/// Load the pack's nav grid whenever the map epoch advances (initial load + every in-place swap);
+/// `ServerCmd` re-loads / unloads it (UI Start/Stop). Epoch-tracked instead of a one-shot latch so
+/// an in-place `.eftpack` swap reloads the NEW pack's nav grid.
 fn manage_nav(
     mut ev: MessageReader<ServerCmd>,
     pack: Option<Res<LoadedPack>>,
+    epoch: Res<crate::render::MapEpoch>,
     mut nav: ResMut<Nav>,
     mut server: ResMut<PathfindServer>,
-    mut tried: Local<bool>,
+    mut loaded_epoch: Local<Option<u64>>,
 ) {
-    if !*tried {
+    if *loaded_epoch != Some(epoch.0) {
         if let Some(p) = pack.as_ref() {
-            *tried = true;
+            *loaded_epoch = Some(epoch.0);
             load_nav(&p.0.root, &mut nav, &mut server);
         }
     }
@@ -232,6 +240,24 @@ fn manage_nav(
             }
         }
     }
+}
+
+/// In-place map swap: drop the previous pack's routing state so a stale route/pin/plan can't linger
+/// on the new map (or an in-flight A* publish an old-map polyline after the swap). `manage_nav`
+/// reloads the new pack's nav grid separately (epoch-tracked).
+fn teardown_nav(
+    mut task: ResMut<PathfindTask>,
+    mut result: ResMut<RouteResult>,
+    mut trace: ResMut<NavTrace>,
+    mut start: ResMut<StartPoint>,
+    mut place: ResMut<PlaceMode>,
+) {
+    task.0 = None; // cancel the in-flight async A* (captured the OLD grid)
+    result.clear();
+    trace.nodes.clear();
+    trace.playing = false;
+    start.0 = None;
+    place.0 = false;
 }
 
 fn load_nav(root: &std::path::Path, nav: &mut Nav, server: &mut PathfindServer) {

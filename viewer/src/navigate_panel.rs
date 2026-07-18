@@ -36,10 +36,19 @@ pub struct NavUiState {
     plan_min_value: i64,
     plan_stops: usize,
     plan_budget: f32,
+    /// Last MapEpoch we reacted to — on a swap, `pending` (an extract Entity from the OLD map) is
+    /// cleared so it can't highlight a wrong row / recycled id on the new map.
+    last_epoch: u64,
 }
 impl Default for NavUiState {
     fn default() -> Self {
-        Self { pending: None, plan_min_value: 100_000, plan_stops: 10, plan_budget: 1500.0 }
+        Self {
+            pending: None,
+            plan_min_value: 100_000,
+            plan_stops: 10,
+            plan_budget: 1500.0,
+            last_epoch: 0,
+        }
     }
 }
 
@@ -83,10 +92,16 @@ pub fn navigate_tab(
         Without<ZoneWall>,
     >,
     cams: Query<&Transform, With<CullCamera>>,
+    epoch: Res<crate::render::MapEpoch>,
     mut ui_state: Local<NavUiState>,
 ) {
     if menu.is_some() {
         return; // start-menu mode owns the screen
+    }
+    // In-place map swap: forget the pending extract row (its Entity is from the OLD map).
+    if epoch.0 != ui_state.last_epoch {
+        ui_state.pending = None;
+        ui_state.last_epoch = epoch.0;
     }
     // Leaving the tab keeps an armed place-mode live on purpose: you arm it, swing the camera,
     // click. The banner (with its cancel button) stays visible either way.

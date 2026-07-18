@@ -224,10 +224,19 @@ impl Plugin for PoiPlugin {
         app.init_resource::<QuestData>()
             .init_resource::<KeyCatalog>()
             .init_resource::<GameDataZones>()
-            .add_systems(Startup, spawn_pois)
+            // Build ALL per-map POI markers + zone walls (and the QuestData/KeyCatalog/GameDataZones
+            // resources) on each MapEpoch — the initial epoch-0 insert included — despawning the old
+            // map's first. (Command ordering: teardown's despawns are queued before spawn's inserts.)
+            .add_systems(
+                Update,
+                (teardown_pois, spawn_pois)
+                    .chain()
+                    .run_if(resource_changed::<crate::render::MapEpoch>),
+            )
             // Quest markers get their own visibility pass (toggle AND tracker selection); the other
-            // POI layers stay on the plain toggle-driven `apply_poi_visibility`.
-            .add_systems(Update, (apply_poi_visibility, apply_quest_visibility))
+            // POI layers stay on the plain toggle-driven `apply_poi_visibility`. Ordered AFTER
+            // spawn_pois so the auto-inserted sync point makes the fresh markers visible on a swap.
+            .add_systems(Update, (apply_poi_visibility, apply_quest_visibility).after(spawn_pois))
             .add_systems(Update, (draw_quest_outlines, draw_gamedata_outlines));
     }
 }
@@ -1923,14 +1932,25 @@ fn spawn_pois(
 // owns every OTHER POI layer, so exclude them here to avoid the two systems fighting over the same
 // `Visibility`.
 #[allow(clippy::type_complexity)]
+/// In-place map swap: despawn every POI marker + zone wall (all carry `PoiLayer`) so `spawn_pois`
+/// can rebuild for the new pack. Runs (chained) immediately before `spawn_pois` on a MapEpoch bump.
+fn teardown_pois(mut commands: Commands, q: Query<Entity, With<PoiLayer>>) {
+    for e in &q {
+        commands.entity(e).despawn();
+    }
+}
+
 fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
+    epoch: Res<crate::render::MapEpoch>,
     mut q: Query<
         (&PoiLayer, Option<&MarkerValue>, Option<&SceneInactive>, &mut Visibility),
         Without<QuestMarkerTask>,
     >,
 ) {
-    if !toggles.is_changed() {
+    // Re-apply on a toggle change OR a map swap (fresh markers spawn Hidden; the swap didn't touch
+    // the toggles, so without the epoch trigger they'd stay invisible).
+    if !toggles.is_changed() && !epoch.is_changed() {
         return;
     }
     for (l, val, inactive, mut vis) in &mut q {
@@ -1972,9 +1992,10 @@ fn apply_poi_visibility(
 fn apply_quest_visibility(
     toggles: Res<LayerToggles>,
     tracker: Res<QuestTracker>,
+    epoch: Res<crate::render::MapEpoch>,
     mut q: Query<(&QuestMarkerTask, Option<&ZoneWall>, &mut Visibility)>,
 ) {
-    if !toggles.is_changed() && !tracker.is_changed() {
+    if !toggles.is_changed() && !tracker.is_changed() && !epoch.is_changed() {
         return;
     }
     for (task, is_zone, mut vis) in &mut q {

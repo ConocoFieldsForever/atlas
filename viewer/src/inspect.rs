@@ -149,9 +149,21 @@ impl Plugin for InspectPlugin {
         app.init_resource::<OpenCards>()
             .init_resource::<PointerOnUi>()
             .init_resource::<UiWantsKeyboard>()
-            .add_systems(Update, pick_markers);
+            .add_systems(Update, pick_markers)
+            // In-place map swap: drop open cards (their Entity ids point at despawned old-map
+            // markers; a recycled id would bind a card to the wrong new marker).
+            .add_systems(
+                Update,
+                teardown_cards.run_if(resource_changed::<crate::render::MapEpoch>),
+            );
         #[cfg(feature = "egui")]
-        app.init_resource::<IconCache>();
+        app.init_resource::<IconCache>()
+            // Re-resolve the icon dir for the new pack and drop memoized None-misses so a pack-local
+            // icon absent in the old pack is found (item-keyed hits are cross-map, but cheap to redo).
+            .add_systems(
+                Update,
+                teardown_icons.run_if(resource_changed::<crate::render::MapEpoch>),
+            );
         // The card UI is egui; it MUST live in EguiPrimaryContextPass (see module
         // doc). With the `egui` feature off there's simply no card UI, but the
         // component/resources still exist so loot.rs/poi.rs compile.
@@ -162,6 +174,20 @@ impl Plugin for InspectPlugin {
         #[cfg(feature = "egui")]
         app.add_systems(Update, debug_autoselect);
     }
+}
+
+/// In-place map swap: forget the open-card entity ids (old-map markers are despawned).
+fn teardown_cards(mut cards: ResMut<OpenCards>) {
+    cards.0.clear();
+}
+
+/// In-place map swap: reset the icon cache's resolved dirs + drop memoized entries so the new pack's
+/// (and shared) icons resolve fresh.
+#[cfg(feature = "egui")]
+fn teardown_icons(mut icons: ResMut<IconCache>) {
+    icons.root = None;
+    icons.shared = None;
+    icons.tex.clear();
 }
 
 /// System A — cursor ray vs marker hit-spheres. On a left press (and only when the

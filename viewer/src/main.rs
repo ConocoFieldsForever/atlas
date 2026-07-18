@@ -141,41 +141,141 @@ fn apply_camera_fov(
     }
 }
 
-/// UI map dropdown target: when set, `apply_map_switch` restarts the viewer into that pack.
-/// (The GPU-driven path builds its buffers/bind-groups exactly once by design — a process swap
-/// is the honest, robust map switch; the new instance inherits the current env settings.)
+/// UI map dropdown / menu PLAY target: when set, `load_map` swaps to that pack IN-PLACE (replace
+/// `LoadedPack` + bump `MapEpoch`; the epoch-gated teardown/rebuild systems do the rest — no process
+/// relaunch, so a background build keeps running across the switch). `EFT_RELAUNCH_ON_SWITCH=1`
+/// restores the old process-swap behavior as a fallback until the in-place path is fully trusted.
 #[derive(Resource, Default)]
 pub struct MapSwitch(pub Option<String>);
 
-/// Spawn a fresh viewer on the selected pack, then exit this one. The viewer-OWNED pathfind
-/// server child is stopped first so the switch doesn't orphan it (Codex review); an externally
-/// started server is untouched.
-fn apply_map_switch(
+/// Load the selected pack in-place: swap `LoadedPack`, reload pack-local grade/gfx flags, drop the
+/// per-map ground grid, and bump `MapEpoch` (which drives every per-map rebuild + the render-world
+/// GPU reset). On `EFT_RELAUNCH_ON_SWITCH=1`, falls back to spawning a fresh process + exiting.
+fn load_map(
     mut sw: ResMut<MapSwitch>,
+    mut commands: Commands,
+    epoch: Res<render::MapEpoch>,
+    mut gfx: ResMut<render::GfxSettings>,
     mut server: ResMut<pathfind::PathfindServer>,
     mut exit: MessageWriter<bevy::app::AppExit>,
+    menu: Option<Res<menu::MenuState>>,
 ) {
     if sw.0.is_none() {
-        return; // immutable-ish fast path: don't dirty change detection via take() every frame
+        return; // fast path: don't dirty change detection via take() every frame
     }
-    let Some(pack) = sw.0.take() else { return };
-    match std::env::current_exe() {
-        Ok(exe) => {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg(&pack);
-            if let Some(rp) = std::env::args().nth(2) {
-                cmd.arg(rp); // forward an argv render-path token (EFT_RENDER env inherits anyway)
+    let Some(dir) = sw.0.take() else { return };
+
+    // Menu PLAY still RELAUNCHES: the menu->raid transition also needs MenuState torn down and the
+    // menu UI stood down, which the in-place path doesn't yet do — so scope in-place to raid->raid
+    // (the map dropdown) for now. EFT_RELAUNCH_ON_SWITCH=1 forces relaunch everywhere (fallback).
+    let relaunch = menu.is_some()
+        || std::env::var("EFT_RELAUNCH_ON_SWITCH").map(|v| v.trim() == "1").unwrap_or(false);
+    if relaunch {
+        match std::env::current_exe() {
+            Ok(exe) => {
+                let mut cmd = std::process::Command::new(exe);
+                cmd.arg(&dir);
+                if let Some(rp) = std::env::args().nth(2) {
+                    cmd.arg(rp);
+                }
+                match cmd.spawn() {
+                    Ok(_) => {
+                        info!("map switch: relaunching into {dir}");
+                        server.stop_owned_child();
+                        exit.write(bevy::app::AppExit::Success);
+                    }
+                    Err(e) => error!("map switch: failed to spawn viewer for {dir}: {e}"),
+                }
             }
-            match cmd.spawn() {
-            Ok(_) => {
-                info!("map switch: relaunching into {pack}");
-                server.stop_owned_child();
-                exit.write(bevy::app::AppExit::Success);
-            }
-                Err(e) => error!("map switch: failed to spawn viewer for {pack}: {e}"),
-            }
+            Err(e) => error!("map switch: current_exe failed: {e}"),
         }
-        Err(e) => error!("map switch: current_exe failed: {e}"),
+        return;
+    }
+
+    // In-place swap. Load the pack FIRST (fallible) — on error, abort without touching any state.
+    let p = match Pack::load(&dir) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("map switch: failed to load pack '{dir}': {e:#}");
+            return;
+        }
+    };
+    info!(
+        "map switch: loading '{}' in-place ({} meshes, {} instances)",
+        p.manifest.dataset,
+        p.manifest.meshes.len(),
+        p.instances.len()
+    );
+    // Reload the pack-local grade LUT + recompute availability flags (these read the new pack root
+    // directly). Mutating gfx re-runs apply_gfx_camera (Bloom + Tonemapping selection).
+    let grade_lut = render::load_grade_lut(Some(p.root.as_path()));
+    gfx.grade_available = grade_lut.is_some();
+    let (_, sun_ok) = pack_sun_dir(Some(&p));
+    gfx.shadows_available = sun_ok;
+    match grade_lut {
+        Some(g) => commands.insert_resource(g),
+        None => commands.remove_resource::<GradeLutCpu>(),
+    }
+    // The ground grid is 100% per-map (~250-400 MB); drop it so build_walk_ground rebuilds lazily
+    // for the new pack on the next walk-mode activation.
+    commands.remove_resource::<walk_ground::GroundGrid>();
+    // Swap the pack AND bump the epoch via commands, so BOTH land at the same sync point — every
+    // epoch-gated (re)build system then sees the new LoadedPack + the changed MapEpoch together on
+    // the next frame (rather than racing a deferred LoadedPack insert against an immediate bump).
+    commands.insert_resource(LoadedPack(p));
+    commands.insert_resource(render::MapEpoch(epoch.0.wrapping_add(1)));
+}
+
+/// On an in-place map swap (`MapEpoch` bump), re-frame the single reused camera on the new pack and
+/// rebuild its skybox. The FIRST observation (startup) is skipped — `setup` already framed the
+/// initial pack; menu mode (no pack) is skipped entirely (no skybox / framing there).
+fn reset_map_view(
+    pack: Option<Res<LoadedPack>>,
+    epoch: Res<render::MapEpoch>,
+    mut images: ResMut<Assets<Image>>,
+    mut cam: Query<
+        (
+            &mut Transform,
+            &mut Projection,
+            &mut FlyCam,
+            &mut walk_ground::WalkState,
+            Option<&mut Skybox>,
+        ),
+        With<CullCamera>,
+    >,
+    mut last: Local<Option<u64>>,
+) {
+    let Some(pack) = pack else { return };
+    let cur = epoch.0;
+    if *last == Some(cur) {
+        return;
+    }
+    let first = last.is_none();
+    *last = Some(cur);
+    if first {
+        return; // setup already framed the initial pack
+    }
+    let Ok((mut tf, mut proj, mut fly, mut walk, skybox)) = cam.single_mut() else {
+        return;
+    };
+    let (cam_pos, _target, far, yaw, pitch) = frame_for_pack(Some(&pack.0));
+    tf.translation = cam_pos;
+    tf.rotation = Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(Vec3::X, pitch);
+    fly.yaw = yaw;
+    fly.pitch = pitch;
+    if let Projection::Perspective(pp) = &mut *proj {
+        pp.far = far;
+    }
+    // Drop stale ground/velocity from the old map (else the fell-through-world backstop can teleport
+    // the player to a nonexistent old-map Y, and a mid-jump vy carries over).
+    *walk = walk_ground::WalkState::default();
+    // Rebuild the skybox for the new sun; free the old cubemap image so it doesn't leak each swap.
+    let (sun_dir, _) = pack_sun_dir(Some(&pack.0));
+    let new_sky = build_sky_cubemap(&mut images, sun_dir);
+    if let Some(mut sb) = skybox {
+        let old = sb.image.clone();
+        sb.image = new_sky;
+        images.remove(&old);
     }
 }
 
@@ -453,11 +553,13 @@ fn main() {
         // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
         // exclusive by walk_mode) so they can't race the shared Transform.
         .add_systems(Update, (cursor_grab, flycam_look, flycam_move, walk_move).chain())
-        .add_systems(Update, (apply_camera_command, auto_screenshot))
+        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch))
         .add_systems(
             Update,
-            (apply_gfx_camera, apply_map_switch, flycam_scroll, apply_camera_fov, build_walk_ground),
-        );
+            (apply_gfx_camera, load_map, flycam_scroll, apply_camera_fov, build_walk_ground),
+        )
+        // In-place map swap: re-frame the reused camera + rebuild the skybox on a MapEpoch bump.
+        .add_systems(Update, reset_map_view.run_if(resource_changed::<render::MapEpoch>));
 
     #[cfg(feature = "egui")]
     {
@@ -561,53 +663,36 @@ fn build_sky_cubemap(images: &mut Assets<Image>, sun: Vec3) -> Handle<Image> {
     images.add(image)
 }
 
-/// Spawn camera + a key light, framed on the pack bounds if one is loaded.
-fn setup(
-    mut commands: Commands,
-    pack: Option<Res<LoadedPack>>,
-    mut images: ResMut<Assets<Image>>,
-    grade: Option<Res<GradeLutCpu>>,
-    mut gfx: ResMut<render::GfxSettings>,
-) {
-    // Frame the world AABB: stand back along +Y/+Z by the half-diagonal.
-    // Debug: EFT_LOOK="x,y,z" frames the camera CLOSE on that world point (e.g. a coordinate from
-    // the double-click pick) instead of the whole-map overview — to confirm a specific mesh renders
-    // where the data says it is.
+/// Framing for a pack (or a sensible default when none): `(cam_pos, target, far, yaw, pitch)`.
+/// Honors the EFT_LOOK (frame close on a world point) and EFT_POSE (exact pose) debug overrides.
+/// Shared by the initial `setup` spawn and the in-place `reset_map_view` swap path.
+fn frame_for_pack(pack: Option<&crate::eftpack::Pack>) -> (Vec3, Vec3, f32, f32, f32) {
+    // EFT_LOOK="x,y,z" frames the camera CLOSE on that world point (a picked coordinate) instead of
+    // the whole-map overview — to confirm a specific mesh renders where the data says it is.
     let look_override = std::env::var("EFT_LOOK").ok().and_then(|s| {
         let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
         (p.len() == 3).then(|| Vec3::new(p[0], p[1], p[2]))
     });
-    let (target, cam_pos, far) = if let Some(t) = look_override {
+    let (target, mut cam_pos, far) = if let Some(t) = look_override {
         (t, t + Vec3::new(4.0, 6.0, 14.0), 4000.0)
     } else {
-        match pack.as_ref() {
+        match pack {
             Some(p) => {
-                // Open NEAR the map's content (median instance position), not a whole-map
-                // overview: a neighborhood-scale framing that's consistent across ALL maps —
-                // small maps (factory) open close, big maps (streets) pull back — but always
+                // Open NEAR the map's content (median instance position), not a whole-map overview:
+                // consistent across ALL maps — small maps open close, big maps pull back — always
                 // looking at populated geometry, never the empty AABB center out over the sea.
-                let anchor = p.0.content_anchor();
-                let ext = p.0.bounds_extent().max(1.0);
-                // Ground/plaza-level framing near the populated center, capped so a big dense map
-                // (ground_zero downtown, streets) doesn't open up at skyscraper-facade height. A
-                // short back-distance + low height = "standing in the neighborhood", not overview.
+                let anchor = p.content_anchor();
+                let ext = p.bounds_extent().max(1.0);
                 let d = (ext * 0.10).clamp(30.0, 90.0);
-                (
-                    anchor,
-                    anchor + Vec3::new(0.0, d * 0.5, d),
-                    (ext * 6.0).max(2000.0), // far plane still clears the whole map
-                )
+                (anchor, anchor + Vec3::new(0.0, d * 0.5, d), (ext * 6.0).max(2000.0))
             }
             None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0), 2000.0),
         }
     };
-
     let dir = (target - cam_pos).normalize_or_zero();
     let mut yaw = dir.x.atan2(-dir.z);
     let mut pitch = dir.y.asin();
-    let mut cam_pos = cam_pos;
-    // EFT_POSE="x,y,z,yaw_deg,pitch_deg" reproduces an EXACT camera pose (the POS HUD's copy
-    // button emits this) — for reproducing a user-reported view precisely in a screenshot.
+    // EFT_POSE="x,y,z,yaw_deg,pitch_deg" reproduces an EXACT camera pose (the POS HUD's copy button).
     if let Ok(s) = std::env::var("EFT_POSE") {
         let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
         if p.len() == 5 {
@@ -616,34 +701,45 @@ fn setup(
             pitch = p[4].to_radians();
         }
     }
+    (cam_pos, target, far, yaw, pitch)
+}
 
-    // Sky sun direction: same volume.json sidecar + X-flip the SH/shadow path uses
-    // (gpu_driven::extract_pack_to_render_world), so the skybox sun disk, the baked GI, and the
-    // shader's reflected sun all agree. Fallback = a plausible high overcast sun.
-    let sun_from_pack = pack
-        .as_ref()
-        .and_then(|p| {
-            p.0.manifest
-                .sidecars
-                .volume_meta
-                .as_deref()
-                .map(|m| p.0.resolve_path(m)) // self-contained packs: pack-relative sidecars
-        })
+/// The pack's baked sun direction (viewer-space; the bake already conjugates it) + whether it was
+/// found (gates real-time shadows). Falls back to a plausible high overcast sun.
+fn pack_sun_dir(pack: Option<&crate::eftpack::Pack>) -> (Vec3, bool) {
+    let from_pack = pack
+        .and_then(|p| p.manifest.sidecars.volume_meta.as_deref().map(|m| p.resolve_path(m)))
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
         .and_then(|v| {
             v.get("sun_dir").and_then(|s| s.as_array()).and_then(|a| {
                 let raw = Vec3::new(
-                    a.first()?.as_f64()? as f32, // volume.json sun_dir is ALREADY viewer-space (bake conjugates); flipping again mirrored sun/shadows vs the SH radiance (audit C1)
+                    a.first()?.as_f64()? as f32,
                     a.get(1)?.as_f64()? as f32,
                     a.get(2)?.as_f64()? as f32,
                 );
                 (raw.length_squared() > 1e-6).then(|| raw.normalize())
             })
         });
-    // The experimental shadow toggle needs a real sun (matches the render side's sun_ok gate).
-    gfx.shadows_available = sun_from_pack.is_some();
-    let sun_dir = sun_from_pack.unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize());
+    let ok = from_pack.is_some();
+    (from_pack.unwrap_or_else(|| Vec3::new(-0.45, 0.8, -0.4).normalize()), ok)
+}
+
+/// Spawn camera + a key light, framed on the pack bounds if one is loaded.
+fn setup(
+    mut commands: Commands,
+    pack: Option<Res<LoadedPack>>,
+    mut images: ResMut<Assets<Image>>,
+    grade: Option<Res<GradeLutCpu>>,
+    mut gfx: ResMut<render::GfxSettings>,
+) {
+    let (cam_pos, target, far, yaw, pitch) = frame_for_pack(pack.as_ref().map(|p| &p.0));
+
+    // Sky sun direction from the pack's volume sidecar (same one the SH/shadow path uses, so the
+    // skybox sun disk, baked GI and reflected sun agree). The experimental shadow toggle needs a
+    // real sun (matches the render side's sun_ok gate).
+    let (sun_dir, sun_ok) = pack_sun_dir(pack.as_ref().map(|p| &p.0));
+    gfx.shadows_available = sun_ok;
     // Menu mode (no pack — same test main() uses): NO skybox — the menu's ClearColor
     // (#090909, set in main) must be the backdrop behind the transparent egui panel /
     // the 3D CCTV decor (menu_fx).
@@ -963,7 +1059,10 @@ fn walk_move(
 /// grab a blank white frame.
 fn auto_screenshot(mut commands: Commands, mut frames: Local<u32>) {
     *frames += 1;
-    if *frames != 90 {
+    // EFT_SHOT_FRAME overrides the default frame-90 capture (later frames let a scripted in-place
+    // map swap settle before the shot — see debug_switch).
+    let target = std::env::var("EFT_SHOT_FRAME").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(90);
+    if *frames != target {
         return;
     }
     if let Ok(path) = std::env::var("EFT_SHOT") {
@@ -972,5 +1071,23 @@ fn auto_screenshot(mut commands: Commands, mut frames: Local<u32>) {
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path.clone()));
         info!("auto-screenshot -> {path}");
+    }
+}
+
+/// Headless soak-test hook for the in-place map swap: `EFT_SWITCH="dir@frame;dir@frame;..."` fires
+/// each `MapSwitch` at its frame (relative to Update start), so an A->B->A swap can be exercised +
+/// screenshot without clicking. e.g. `EFT_SWITCH="packs/factory.eftpack@150"`.
+fn debug_switch(mut sw: ResMut<MapSwitch>, mut frames: Local<u32>) {
+    let Ok(spec) = std::env::var("EFT_SWITCH") else {
+        return;
+    };
+    *frames += 1;
+    for step in spec.split(';') {
+        if let Some((dir, at)) = step.rsplit_once('@') {
+            if at.trim().parse::<u32>().ok() == Some(*frames) {
+                info!("debug_switch: frame {} -> {dir}", *frames);
+                sw.0 = Some(dir.trim().to_string());
+            }
+        }
     }
 }

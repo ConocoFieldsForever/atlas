@@ -84,8 +84,21 @@ impl Plugin for PlannerPlugin {
         app.add_message::<PlanRequest>()
             .init_resource::<PlanResult>()
             .init_resource::<PlanTask>()
-            .add_systems(Update, (debug_plan, dispatch_plan, poll_plan, draw_stops).chain());
+            .add_systems(Update, (debug_plan, dispatch_plan, poll_plan, draw_stops).chain())
+            // In-place map swap: cancel the in-flight solve + clear the plan (old-map coords/route).
+            .add_systems(
+                Update,
+                teardown_plan.run_if(resource_changed::<crate::render::MapEpoch>),
+            );
     }
+}
+
+/// In-place map swap: cancel the in-flight orienteering solve (it captured a clone of the OLD nav
+/// grid; if it completed, `poll_plan` would re-populate `PlanResult` AND overwrite `RouteResult`
+/// with an old-map "Loot run" route after teardown) and clear the stale plan list.
+fn teardown_plan(mut task: ResMut<PlanTask>, mut result: ResMut<PlanResult>) {
+    task.0 = None;
+    *result = PlanResult::default();
 }
 
 /// Headless-QA aid (mirrors `EFT_ROUTE`): `EFT_PLAN="min_value,max_stops,budget_m"` (or `1` for
