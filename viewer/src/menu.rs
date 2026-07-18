@@ -551,6 +551,7 @@ pub fn detect_game_dir() -> String {
 /// finish on its own (files then exist for the NEXT launch) and this launch just uses the
 /// vector camera. Any failure falls through silently to the vector camera — the menu
 /// always draws. Runs before Bevy's first frame, so a short block here is invisible.
+#[allow(dead_code)] // retired CCTV-prop extractor; kept for reference (backdrop is 2D now)
 fn ensure_menu_prop(game_dir: &str) {
     let menu_dir = crate::paths::shared_dir().join("menu");
     if menu_dir.join("camera.bin").is_file() && menu_dir.join("camera.png").is_file() {
@@ -616,8 +617,8 @@ fn ensure_menu_prop(game_dir: &str) {
 
 pub fn build_state() -> MenuState {
     let game_dir = detect_game_dir();
-    // Real-asset menu decor: one-time local extraction BEFORE the pack scan / first frame.
-    ensure_menu_prop(&game_dir);
+    // (The old real-CCTV menu prop is retired — the backdrop is the 2D triangle field / opt-in 3D
+    // scenes now — so we no longer block first-frame on a synchronous extract_menu_prop run.)
     let game_fp = game_fingerprint(&game_dir);
     let (entries, total_bytes) = scan(&game_fp);
     // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook);
