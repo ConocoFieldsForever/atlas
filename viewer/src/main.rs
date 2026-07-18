@@ -634,8 +634,15 @@ fn main() {
         .init_resource::<PendingMapLoad>() // async in-place pack load (no frame freeze on switch)
         .add_systems(Startup, setup)
         // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
-        // exclusive by walk_mode) so they can't race the shared Transform.
-        .add_systems(Update, (cursor_grab, flycam_look, flycam_move, walk_move).chain())
+        // exclusive by walk_mode) so they can't race the shared Transform. Disabled in the MENU
+        // (MenuState present): the backdrop camera stays locked to its composed pose — no WASD /
+        // RMB-look / cursor-grab — while the scene itself drifts under the cursor (menu_city_update).
+        .add_systems(
+            Update,
+            (cursor_grab, flycam_look, flycam_move, walk_move)
+                .chain()
+                .run_if(not(resource_exists::<menu::MenuState>)),
+        )
         .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu))
         .add_systems(
             Update,
@@ -656,20 +663,20 @@ fn main() {
     }
     // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
     // manager. The in-raid panels check for this resource and stand down while it exists.
-    // Menu backdrop = the INTERCHANGE-INSPIRED NEON WIREFRAME CITY: a stylized, derivative low-poly
-    // schematic (mall mass + shops + parking + outlying blocks) in the 3D world that the camera's
-    // Bloom halos into a glowing hologram, with idle drift + cursor parallax (menu_fx::spawn_menu_city
-    // / update). Fully synthetic (no game geometry) so it ships with the app. The CentralPanel goes
-    // transparent (menu.rs) so it shows behind the UI. EFT_MENU_TERRAIN=1 falls back to the old
-    // rippling triangle terrain.
+    // Menu backdrop = the INTERCHANGE-INSPIRED NEON WIREFRAME EXFIL: a stylized, derivative low-poly
+    // schematic (razor-wire overpass + pillars, rail line with boxcars, receding power pylons,
+    // containers, gantry crane) in the 3D world that the camera's Bloom halos into a glowing hologram,
+    // with idle drift + cursor parallax (menu_fx::spawn_menu_scene / update). Fully synthetic (no game
+    // geometry) so it ships with the app. The CentralPanel goes transparent (menu.rs) so it shows
+    // behind the UI. EFT_MENU_TERRAIN=1 falls back to the old rippling triangle terrain.
     if menu_mode {
         app.insert_resource(menu::build_state());
         if std::env::var("EFT_MENU_TERRAIN").map(|v| v.trim() == "1").unwrap_or(false) {
             app.add_systems(Startup, menu_fx::spawn_menu_terrain.after(setup));
             app.add_systems(Update, menu_fx::menu_terrain_update);
         } else {
-            app.add_systems(Startup, menu_fx::spawn_menu_city.after(setup));
-            app.add_systems(Update, menu_fx::menu_city_update);
+            app.add_systems(Startup, menu_fx::spawn_menu_scene.after(setup));
+            app.add_systems(Update, menu_fx::menu_scene_update);
         }
     }
 
@@ -784,15 +791,15 @@ fn frame_for_pack(pack: Option<&crate::eftpack::Pack>) -> (Vec3, Vec3, f32, f32,
     let dir = (target - cam_pos).normalize_or_zero();
     let mut yaw = dir.x.atan2(-dir.z);
     let mut pitch = dir.y.asin();
-    // Menu backdrop: a hand-picked elevated 3/4 vantage over the neon wireframe city
-    // (menu_fx::spawn_menu_city), ~-16deg pitch to echo the in-game Interchange pose it's derived from.
-    // yaw/pitch are set DIRECTLY because the target->yaw derivation above only aims correctly when
-    // dir.x==0 (every in-raid framing offsets in the YZ-plane); an off-axis menu camera needs explicit
-    // angles. EFT_POSE below still overrides, for live tuning.
+    // Menu backdrop: a hand-picked elevated 3/4 vantage over the neon wireframe exfil scene
+    // (menu_fx::spawn_menu_scene), ~-17deg pitch to echo the in-game Interchange railway/overpass pose
+    // it's derived from. yaw/pitch are set DIRECTLY because the target->yaw derivation above only aims
+    // correctly when dir.x==0 (every in-raid framing offsets in the YZ-plane); an off-axis menu camera
+    // needs explicit angles. EFT_POSE below still overrides, for live tuning.
     if pack.is_none() {
-        cam_pos = Vec3::new(140.0, 56.0, 150.0);
-        yaw = 44.0_f32.to_radians();
-        pitch = (-16.0_f32).to_radians();
+        cam_pos = Vec3::new(60.0, 64.0, 155.0);
+        yaw = 22.0_f32.to_radians();
+        pitch = (-17.0_f32).to_radians();
     }
     // EFT_POSE="x,y,z,yaw_deg,pitch_deg" reproduces an EXACT camera pose (the POS HUD's copy button).
     if let Ok(s) = std::env::var("EFT_POSE") {

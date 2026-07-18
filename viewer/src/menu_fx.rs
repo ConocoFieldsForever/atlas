@@ -504,17 +504,18 @@ pub fn menu_terrain_update(
 }
 
 // ============================================================================================
-// INTERCHANGE-INSPIRED NEON WIREFRAME CITY — the menu backdrop. A stylized, DERIVATIVE low-poly
-// schematic evoking the ULTRA shopping-mall complex (the big multi-floor mall mass with interior
-// shop units + a central atrium, a parking lot with cars, and outlying blocks) seen from an
-// elevated 3/4 vantage — inspired by an in-game Interchange camera pose, but hand-built from
+// INTERCHANGE-INSPIRED NEON WIREFRAME EXFIL — the menu backdrop. A stylized, DERIVATIVE low-poly
+// schematic of the railway / elevated-overpass corner of Interchange (the razor-wire highway
+// overpass on its pillars, the rail line with boxcars running out from under it, power-transmission
+// pylons receding into the distance, stacked shipping containers, a gantry crane, and a few
+// conifers) — the vantage an in-game camera pose is derived from, but hand-built entirely from
 // primitives so it carries NO game geometry and ships safely with the app. Rendered as HDR-emissive
 // lines so the camera Bloom halos it into a glowing hologram; a gentle idle drift + cursor parallax
 // keep it alive.
 // ============================================================================================
 
 #[derive(Component)]
-pub struct MenuCity {
+pub struct MenuScene {
     yaw: f32,
     tilt: f32,
 }
@@ -557,86 +558,163 @@ fn wire_grid(v: &mut Vec<[f32; 3]>, x0: f32, x1: f32, z0: f32, z1: f32, y: f32, 
     }
 }
 
-/// Build the scene as two line sets: (dim ground/parking, bright structures) for depth.
-fn build_city() -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+/// A run of razor-wire concertina: overlapping vertical circles (X-Y plane) marching along X.
+fn wire_coils(v: &mut Vec<[f32; 3]>, x0: f32, x1: f32, y_top: f32, z: f32, r: f32, count: usize) {
+    let seg = 10;
+    let n = count.max(2);
+    for c in 0..n {
+        let cx = x0 + (x1 - x0) * c as f32 / (n as f32 - 1.0);
+        let cy = y_top + r;
+        for k in 0..seg {
+            let a0 = k as f32 / seg as f32 * std::f32::consts::TAU;
+            let a1 = (k + 1) as f32 / seg as f32 * std::f32::consts::TAU;
+            wire_edge(
+                v,
+                Vec3::new(cx + r * a0.cos(), cy + r * a0.sin(), z),
+                Vec3::new(cx + r * a1.cos(), cy + r * a1.sin(), z),
+            );
+        }
+    }
+}
+
+/// A simplified lattice power-transmission pylon at (cx,cz): 4 tapering legs, horizontal belts, and
+/// two cross-arms near the top. Returns the arm height so wires can hang from it.
+fn wire_pylon(v: &mut Vec<[f32; 3]>, cx: f32, cz: f32, base_hw: f32, top_hw: f32, h: f32) -> f32 {
+    let corner = |hw: f32, i: usize| {
+        let s = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)][i];
+        (hw * s.0, hw * s.1)
+    };
+    for i in 0..4 {
+        let (bx, bz) = corner(base_hw, i);
+        let (tx, tz) = corner(top_hw, i);
+        wire_edge(v, Vec3::new(cx + bx, 0.0, cz + bz), Vec3::new(cx + tx, h, cz + tz));
+    }
+    for &f in &[0.3f32, 0.6, 0.85] {
+        let hw = base_hw + (top_hw - base_hw) * f;
+        let y = h * f;
+        for i in 0..4 {
+            let (ax, az) = corner(hw, i);
+            let (bx, bz) = corner(hw, (i + 1) % 4);
+            wire_edge(v, Vec3::new(cx + ax, y, cz + az), Vec3::new(cx + bx, y, cz + bz));
+        }
+    }
+    let arm_y = h * 0.82;
+    for &(ay, aw) in &[(arm_y, base_hw * 2.4), (h * 0.95, base_hw * 1.7)] {
+        wire_edge(v, Vec3::new(cx - aw, ay, cz), Vec3::new(cx + aw, ay, cz));
+        wire_edge(v, Vec3::new(cx - aw, ay, cz), Vec3::new(cx - aw, ay + 3.0, cz));
+        wire_edge(v, Vec3::new(cx + aw, ay, cz), Vec3::new(cx + aw, ay + 3.0, cz));
+    }
+    arm_y
+}
+
+/// Build the scene as two line sets: (dim ground/pylons/trees, bright structures) for depth.
+/// Layout extends into -Z (away from the menu camera at +Z); rails run toward the camera.
+fn build_exfil_scene() -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
     let mut g = Vec::new();
     let mut s = Vec::new();
 
-    // ground plane + ring-road rim + parking lot (camera side, +Z) with fine bays
-    wire_grid(&mut g, -150.0, 150.0, -72.0, 168.0, 0.0, 22, 18);
-    wire_box(&mut g, Vec3::new(-142.0, 0.0, -64.0), Vec3::new(142.0, 0.02, 160.0));
-    wire_grid(&mut g, -96.0, 96.0, 60.0, 150.0, 0.05, 40, 6);
+    // ground
+    wire_grid(&mut g, -220.0, 220.0, -240.0, 110.0, 0.0, 26, 22);
 
-    // main ULTRA mall mass + floor slabs + roof parapet + HVAC blocks
-    let (mlo, mhi) = (Vec3::new(-72.0, 0.0, -48.0), Vec3::new(72.0, 27.0, 48.0));
-    wire_box(&mut s, mlo, mhi);
-    for &fy in &[9.0f32, 18.0] {
-        wire_grid(&mut s, mlo.x, mhi.x, mlo.z, mhi.z, fy, 6, 4);
+    // --- elevated overpass deck crossing along X, with pillars + razor wire on the near rail ---
+    let (dz0, dz1, dy0, dy1) = (-58.0f32, -40.0f32, 22.0f32, 27.0f32);
+    wire_box(&mut s, Vec3::new(-200.0, dy0, dz0), Vec3::new(200.0, dy1, dz1));
+    wire_grid(&mut s, -200.0, 200.0, dz0 + 3.0, dz1 - 3.0, dy1, 40, 2);
+    let mut px = -180.0;
+    while px <= 180.0 {
+        wire_box(&mut s, Vec3::new(px - 4.0, 0.0, dz0 + 4.0), Vec3::new(px + 4.0, dy0, dz1 - 4.0));
+        px += 40.0;
     }
-    wire_box(&mut s, Vec3::new(-64.0, 27.0, -40.0), Vec3::new(64.0, 30.5, 40.0));
-    for k in 0..5 {
-        let x = -46.0 + k as f32 * 23.0;
-        wire_box(&mut s, Vec3::new(x - 6.0, 30.5, -8.0), Vec3::new(x + 6.0, 34.0, 8.0));
-    }
+    wire_coils(&mut s, -196.0, 196.0, dy1, dz0 + 1.0, 2.6, 62);
 
-    // interior shop units — ground floor (with a central atrium void) + a sparser 2nd-floor ring
-    let (cols, rows) = (5usize, 3usize);
-    let (fx0, fx1, fz0, fz1) = (-64.0f32, 64.0, -40.0, 40.0);
-    let cw = (fx1 - fx0) / cols as f32;
-    let cd = (fz1 - fz0) / rows as f32;
-    for cx in 0..cols {
-        for cz in 0..rows {
-            if cx == 2 && cz == 1 {
-                continue; // atrium
-            }
-            let (x0, x1) = (fx0 + cx as f32 * cw + 2.5, fx0 + (cx as f32 + 1.0) * cw - 2.5);
-            let (z0, z1) = (fz0 + cz as f32 * cd + 2.5, fz0 + (cz as f32 + 1.0) * cd - 2.5);
-            wire_box(&mut s, Vec3::new(x0, 0.0, z0), Vec3::new(x1, 7.5, z1));
-        }
+    // --- power pylons receding into the distance + drooping catenary wires ---
+    let pylons = [
+        (-150.0f32, -90.0f32),
+        (-80.0, -120.0),
+        (0.0, -150.0),
+        (85.0, -185.0),
+        (165.0, -220.0),
+    ];
+    for &(cx, cz) in &pylons {
+        wire_pylon(&mut g, cx, cz, 6.0, 1.6, 46.0);
     }
-    for cx in 0..cols {
-        for cz in 0..rows {
-            if (cx + cz) % 2 == 0 {
-                continue;
+    let arm_y = 46.0 * 0.82;
+    for w in pylons.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        for &off in &[-13.0f32, 0.0, 13.0] {
+            let steps = 10;
+            for k in 0..steps {
+                let t0 = k as f32 / steps as f32;
+                let t1 = (k + 1) as f32 / steps as f32;
+                let sag = |t: f32| -24.0 * (t * (1.0 - t));
+                let p0 = Vec3::new(a.0 + off + (b.0 - a.0) * t0, arm_y + sag(t0), a.1 + (b.1 - a.1) * t0);
+                let p1 = Vec3::new(a.0 + off + (b.0 - a.0) * t1, arm_y + sag(t1), a.1 + (b.1 - a.1) * t1);
+                wire_edge(&mut g, p0, p1);
             }
-            let (x0, x1) = (fx0 + cx as f32 * cw + 5.0, fx0 + (cx as f32 + 1.0) * cw - 5.0);
-            let (z0, z1) = (fz0 + cz as f32 * cd + 5.0, fz0 + (cz as f32 + 1.0) * cd - 5.0);
-            wire_box(&mut s, Vec3::new(x0, 9.0, z0), Vec3::new(x1, 15.0, z1));
-        }
-    }
-    wire_box(&mut s, Vec3::new(-9.0, 0.0, -7.0), Vec3::new(9.0, 24.0, 7.0)); // atrium core
-
-    // cars scattered in the lot (deterministic; some empty bays)
-    for cx in 0..9 {
-        for cz in 0..3 {
-            if (cx * 3 + cz * 5) % 7 == 0 {
-                continue;
-            }
-            let jitter = ((cx * 7 + cz * 13) % 5) as f32 * 0.6;
-            let x = -84.0 + cx as f32 * 21.0 + jitter;
-            let z = 70.0 + cz as f32 * 26.0;
-            wire_box(&mut s, Vec3::new(x - 4.6, 0.0, z - 2.3), Vec3::new(x + 4.6, 3.0, z + 2.3));
         }
     }
 
-    // outlying structures: gas-station canopy on legs (+X), power station (-X), storage (-X/+Z), tower
-    wire_box(&mut s, Vec3::new(96.0, 9.5, 8.0), Vec3::new(134.0, 11.5, 46.0));
-    for &(lx, lz) in &[(100.0f32, 12.0f32), (130.0, 12.0), (100.0, 42.0), (130.0, 42.0)] {
-        wire_box(&mut s, Vec3::new(lx - 0.8, 0.0, lz - 0.8), Vec3::new(lx + 0.8, 9.5, lz + 0.8));
+    // --- railway: two rails toward the camera, sleepers, boxcars ---
+    let (rail_x, gauge) = (-52.0f32, 7.0f32);
+    let (rz0, rz1) = (-40.0f32, 95.0f32);
+    wire_edge(&mut s, Vec3::new(rail_x, 0.4, rz0), Vec3::new(rail_x, 0.4, rz1));
+    wire_edge(&mut s, Vec3::new(rail_x + gauge, 0.4, rz0), Vec3::new(rail_x + gauge, 0.4, rz1));
+    let mut sz = rz0;
+    while sz <= rz1 {
+        wire_edge(&mut s, Vec3::new(rail_x - 1.5, 0.2, sz), Vec3::new(rail_x + gauge + 1.5, 0.2, sz));
+        sz += 4.0;
     }
-    wire_box(&mut s, Vec3::new(-138.0, 0.0, -28.0), Vec3::new(-98.0, 17.0, 12.0));
-    wire_box(&mut s, Vec3::new(-134.0, 0.0, 66.0), Vec3::new(-104.0, 10.0, 100.0));
-    wire_box(&mut s, Vec3::new(112.0, 0.0, -34.0), Vec3::new(118.0, 40.0, -28.0));
+    for &bz in &[-8.0f32, 18.0, 46.0] {
+        wire_box(&mut s, Vec3::new(rail_x - 1.0, 0.6, bz - 7.5), Vec3::new(rail_x + gauge + 1.0, 10.5, bz + 7.5));
+    }
+
+    // --- stacked shipping containers, foreground ---
+    for &(cx, cz, cy) in &[
+        (8.0f32, 52.0f32, 0.0f32),
+        (30.0, 52.0, 0.0),
+        (10.0, 54.0, 9.2),
+        (-16.0, 66.0, 0.0),
+        (52.0, 60.0, 0.0),
+    ] {
+        wire_box(&mut s, Vec3::new(cx, cy, cz), Vec3::new(cx + 20.0, cy + 9.0, cz + 13.0));
+    }
+
+    // --- gantry crane: mast + angled lattice jib ---
+    let (mx, mz) = (-92.0f32, 6.0f32);
+    wire_box(&mut s, Vec3::new(mx - 2.5, 0.0, mz - 2.5), Vec3::new(mx + 2.5, 34.0, mz + 2.5));
+    let (ja, jb) = (Vec3::new(mx, 31.0, mz), Vec3::new(mx + 46.0, 41.0, mz));
+    let (ja2, jb2) = (Vec3::new(mx, 27.0, mz), Vec3::new(mx + 44.0, 37.5, mz));
+    wire_edge(&mut s, ja, jb);
+    wire_edge(&mut s, ja2, jb2);
+    for k in 0..6 {
+        let t = k as f32 / 6.0;
+        wire_edge(&mut s, ja.lerp(jb, t), ja2.lerp(jb2, t));
+    }
+
+    // --- conifers on the left (dim) ---
+    for &(tx, tz, th) in &[
+        (-150.0f32, 30.0f32, 16.0f32),
+        (-172.0, 8.0, 20.0),
+        (-140.0, -10.0, 14.0),
+        (-186.0, -30.0, 22.0),
+    ] {
+        wire_edge(&mut g, Vec3::new(tx, 0.0, tz), Vec3::new(tx, th, tz));
+        for &(dx, dz) in &[(5.0f32, 0.0f32), (0.0, 5.0)] {
+            wire_edge(&mut g, Vec3::new(tx - dx, th * 0.35, tz - dz), Vec3::new(tx, th, tz));
+            wire_edge(&mut g, Vec3::new(tx + dx, th * 0.35, tz + dz), Vec3::new(tx, th, tz));
+            wire_edge(&mut g, Vec3::new(tx - dx, th * 0.35, tz - dz), Vec3::new(tx + dx, th * 0.35, tz + dz));
+        }
+    }
 
     (g, s)
 }
 
-pub fn spawn_menu_city(
+pub fn spawn_menu_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    let (ground, structures) = build_city();
+    let (ground, structures) = build_exfil_scene();
     let mut mk = |verts: Vec<[f32; 3]>| {
         let mut m = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
         m.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
@@ -646,7 +724,7 @@ pub fn spawn_menu_city(
     let struct_mesh = mk(structures);
     let ground_mat = materials.add(StandardMaterial {
         base_color: Color::BLACK,
-        emissive: LinearRgba::rgb(0.02, 0.30, 0.45), // dim teal floor
+        emissive: LinearRgba::rgb(0.02, 0.30, 0.45), // dim teal ground/pylons/trees
         alpha_mode: AlphaMode::Add,
         ..default()
     });
@@ -661,17 +739,17 @@ pub fn spawn_menu_city(
             Mesh3d(mesh),
             MeshMaterial3d(mat),
             Transform::default(),
-            MenuCity { yaw: 0.0, tilt: 0.0 },
-            Name::new("menu_city_wire"),
+            MenuScene { yaw: 0.0, tilt: 0.0 },
+            Name::new("menu_exfil_wire"),
         ));
     }
-    info!("menu: spawned Interchange-inspired neon wireframe backdrop");
+    info!("menu: spawned Interchange-inspired neon wireframe exfil backdrop");
 }
 
-pub fn menu_city_update(
+pub fn menu_scene_update(
     time: Res<Time>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    mut q: Query<(&mut Transform, &mut MenuCity)>,
+    mut q: Query<(&mut Transform, &mut MenuScene)>,
 ) {
     let dt = time.delta_secs();
     let t = time.elapsed_secs();
@@ -683,14 +761,14 @@ pub fn menu_city_update(
                 .map(|c| ((c.x / w.width().max(1.0) - 0.5) * 2.0, (c.y / w.height().max(1.0) - 0.5) * 2.0))
         })
         .unwrap_or((0.0, 0.0));
-    // idle sway + cursor parallax (holographic feel)
-    let target_yaw = (t * 0.13).sin() * 0.06 + cnx * 0.16;
-    let target_tilt = -cny * 0.05;
-    for (mut tf, mut city) in &mut q {
+    // idle sway + cursor parallax (holographic feel) — gentle, the scene is deep
+    let target_yaw = (t * 0.11).sin() * 0.04 + cnx * 0.10;
+    let target_tilt = -cny * 0.035;
+    for (mut tf, mut sc) in &mut q {
         let k = 1.0 - (-3.0 * dt).exp();
-        city.yaw += (target_yaw - city.yaw) * k;
-        city.tilt += (target_tilt - city.tilt) * k;
-        tf.rotation = Quat::from_rotation_y(city.yaw) * Quat::from_rotation_x(city.tilt);
+        sc.yaw += (target_yaw - sc.yaw) * k;
+        sc.tilt += (target_tilt - sc.tilt) * k;
+        tf.rotation = Quat::from_rotation_y(sc.yaw) * Quat::from_rotation_x(sc.tilt);
     }
 }
 
