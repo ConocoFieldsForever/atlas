@@ -787,13 +787,12 @@ pub fn menu_ui(
                 .inner_margin(24.0),
         )
         .show(ctx, |ui| {
-            // Backdrop decor: wall-mounted CCTV servo-tracking the cursor (menu_fx). Painted
-            // FIRST so every widget added later layers over it (same-layer paint order); it is
-            // pure painter output — no widget, no Sense — so it can never steal clicks.
-            // Skipped when the REAL 3D prop is rendering in its place (never both).
-            if !real_prop {
-                crate::menu_fx::security_camera(ui, ui.max_rect());
-            }
+            // Backdrop decor: a slowly spinning, glowing, out-of-focus wireframe globe (menu_fx)
+            // that the cursor drags/tilts. Painted FIRST so every widget layers over it; it's pure
+            // painter output (no widget/Sense) so it can never steal clicks. The map cards below are
+            // drawn translucent so the globe glows through the whole list.
+            let _ = real_prop; // the 3D CCTV prop is retired; the globe is always the backdrop
+            crate::menu_fx::wireframe_globe(ui, ui.max_rect());
 
             let mut delete_now: Option<usize> = None;
             let mut rescan = false;
@@ -804,15 +803,25 @@ pub fn menu_ui(
             // Which map (if any) is being built RIGHT NOW — marks that row BUILDING and blocks the
             // other BUILD buttons. A finished build no longer blocks (its panel lingers until CLOSE).
             let building_key = wk_build_key.clone();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                // Right gutter: keep the map rows clear of the camera decor zone top-right
-                // (the camera is painted behind, so without this it would never be seen).
+            // Bound the map-row scroll so the build panel + LOG + footer below always stay on screen
+            // (reserve grows when a build is showing / its log is expanded); the rows scroll in what
+            // remains. Without this the expanded log runs off the bottom of the window.
+            let reserve = match (bv.is_some(), state.show_log) {
+                (true, true) => 380.0,  // loader + 12 log lines + footer
+                (true, false) => 180.0, // loader + footer
+                (false, _) => 74.0,     // footer only
+            };
+            let rows_h = (ui.available_height() - reserve).max(180.0);
+            // Translucent card fill so the glowing globe backdrop reads through the whole list.
+            let card_bg = Color32::from_rgba_unmultiplied(CARD.r(), CARD.g(), CARD.b(), 222);
+            egui::ScrollArea::vertical().max_height(rows_h).show(ui, |ui| {
+                // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));
                 for i in 0..state.entries.len() {
                     let e = &state.entries[i];
                     let installed = e.pack_dir.is_some();
                     egui::Frame::new()
-                        .fill(CARD)
+                        .fill(card_bg)
                         .stroke(egui::Stroke::new(1.0, BORDER))
                         .corner_radius(0.0)
                         .inner_margin(10.0)
