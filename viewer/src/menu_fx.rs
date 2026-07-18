@@ -781,8 +781,12 @@ pub fn menu_scene_update(
 // ============================================================================================
 pub fn triangle_field(ctx: &egui::Context) {
     let rect = ctx.screen_rect();
-    let painter =
-        ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("menu_tri_field")));
+    // Paint into the BASE background layer (not a custom Background-order layer). egui renders the
+    // base `background` layer's shapes in call order, and panels (header/footer/cards) append to it
+    // during their `.show()` AFTER this fn runs — so the field + vignette land BEHIND all panel
+    // content. A custom Background-order layer would instead paint on TOP of the panels (egui orders
+    // custom areas above the base layer within an Order), which darkened the menu rows.
+    let painter = ctx.layer_painter(egui::LayerId::background());
     let t = ctx.input(|i| i.time) as f32;
     let mouse = ctx.input(|i| i.pointer.hover_pos());
 
