@@ -225,11 +225,50 @@ impl Plugin for UiPlugin {
                 tasks_tab,
                 crate::navigate_panel::navigate_tab,
                 pos_hud,
+                map_loading_indicator,
                 fit_camera_viewport,
             )
                 .chain(),
         );
     }
+}
+
+/// A small centered "Loading <map>…" toast shown while an in-place map swap is loading off-thread
+/// (the previous map keeps rendering behind it, so the switch never freezes the frame).
+#[cfg(feature = "egui")]
+fn map_loading_indicator(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    pending: Res<crate::PendingMapLoad>,
+) {
+    use bevy_egui::egui::{self, RichText};
+    use crate::ui_theme as theme;
+    if menu.is_some() {
+        return;
+    }
+    let Some(name) = pending.loading() else {
+        return;
+    };
+    let label = titlecase(name);
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    egui::Area::new(egui::Id::new("map_loading"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 46.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD_TRANSLUCENT)
+                .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                .inner_margin(egui::Margin::symmetric(16, 9))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("Loading  {label}\u{2026}"))
+                            .size(14.0)
+                            .strong()
+                            .color(theme::TEXT_BRIGHT),
+                    );
+                });
+        });
 }
 
 /// Re-center the 3D scene in the area egui leaves free (the window minus the right-side rail +

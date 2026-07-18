@@ -186,13 +186,11 @@ fn return_to_menu(
 /// GPU reset). On `EFT_RELAUNCH_ON_SWITCH=1`, falls back to spawning a fresh process + exiting.
 fn load_map(
     mut sw: ResMut<MapSwitch>,
-    mut commands: Commands,
-    epoch: Res<render::MapEpoch>,
-    mut gfx: ResMut<render::GfxSettings>,
     mut server: ResMut<pathfind::PathfindServer>,
     mut exit: MessageWriter<bevy::app::AppExit>,
     menu: Option<Res<menu::MenuState>>,
     render_path: Option<Res<RenderPath>>,
+    mut pending: ResMut<PendingMapLoad>,
 ) {
     if sw.0.is_none() {
         return; // fast path: don't dirty change detection via take() every frame
@@ -231,38 +229,74 @@ fn load_map(
         return;
     }
 
-    // In-place swap. Load the pack FIRST (fallible) — on error, abort without touching any state.
-    let p = match Pack::load(&dir) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("map switch: failed to load pack '{dir}': {e:#}");
-            return;
-        }
-    };
-    info!(
-        "map switch: loading '{}' in-place ({} meshes, {} instances)",
-        p.manifest.dataset,
-        p.manifest.meshes.len(),
-        p.instances.len()
-    );
-    // Reload the pack-local grade LUT + recompute availability flags (these read the new pack root
-    // directly). Mutating gfx re-runs apply_gfx_camera (Bloom + Tonemapping selection).
-    let grade_lut = render::load_grade_lut(Some(p.root.as_path()));
-    gfx.grade_available = grade_lut.is_some();
-    let (_, sun_ok) = pack_sun_dir(Some(&p));
-    gfx.shadows_available = sun_ok;
-    match grade_lut {
-        Some(g) => commands.insert_resource(g),
-        None => commands.remove_resource::<GradeLutCpu>(),
+    // In-place swap: load the pack OFF-THREAD (AsyncComputeTaskPool) so the current map keeps
+    // rendering — no ~1-2s freeze while ~650 MB is repacked. `poll_map_load` applies the result when
+    // it's ready. A second switch REPLACES the pending load (drops the old task) — latest wins.
+    let name = dir
+        .rsplit(['/', '\\'])
+        .next()
+        .and_then(|n| n.strip_suffix(".eftpack"))
+        .unwrap_or(&dir)
+        .to_string();
+    info!("map switch: loading '{name}' in place (async)\u{2026}");
+    let task = bevy::tasks::AsyncComputeTaskPool::get()
+        .spawn(async move { Pack::load(&dir).map_err(|e| format!("{e:#}")) });
+    pending.0 = Some((name, task));
+}
+
+/// A pack being loaded off-thread for an in-place swap: (display name, load task). The current map
+/// keeps rendering until `poll_map_load` applies the result — so a switch never freezes the frame.
+#[derive(Resource, Default)]
+pub struct PendingMapLoad(Option<(String, bevy::tasks::Task<Result<Pack, String>>)>);
+
+impl PendingMapLoad {
+    /// The name of the map currently loading (drives the loading indicator), or None.
+    pub fn loading(&self) -> Option<&str> {
+        self.0.as_ref().map(|(n, _)| n.as_str())
     }
-    // The ground grid is 100% per-map (~250-400 MB); drop it so build_walk_ground rebuilds lazily
-    // for the new pack on the next walk-mode activation.
-    commands.remove_resource::<walk_ground::GroundGrid>();
-    // Swap the pack AND bump the epoch via commands, so BOTH land at the same sync point — every
-    // epoch-gated (re)build system then sees the new LoadedPack + the changed MapEpoch together on
-    // the next frame (rather than racing a deferred LoadedPack insert against an immediate bump).
-    commands.insert_resource(LoadedPack(p));
-    commands.insert_resource(render::MapEpoch(epoch.0.wrapping_add(1)));
+}
+
+/// Apply a finished async pack load: reload the pack-local grade/gfx flags, drop the ground grid,
+/// then swap LoadedPack + bump MapEpoch (both via commands → one sync point). Same tail the old
+/// synchronous `load_map` ran, now off the background task's completion.
+fn poll_map_load(
+    mut pending: ResMut<PendingMapLoad>,
+    mut commands: Commands,
+    epoch: Res<render::MapEpoch>,
+    mut gfx: ResMut<render::GfxSettings>,
+) {
+    let Some((_, task)) = pending.0.as_mut() else {
+        return;
+    };
+    let Some(result) = bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task))
+    else {
+        return; // still loading — the current map keeps rendering
+    };
+    let name = pending.0.take().map(|(n, _)| n).unwrap_or_default();
+    match result {
+        Ok(p) => {
+            info!(
+                "map switch: '{}' loaded in place ({} meshes, {} instances)",
+                p.manifest.dataset,
+                p.manifest.meshes.len(),
+                p.instances.len()
+            );
+            // Reload the pack-local grade LUT + availability flags (gfx change re-runs
+            // apply_gfx_camera: Bloom + Tonemapping selection).
+            let grade_lut = render::load_grade_lut(Some(p.root.as_path()));
+            gfx.grade_available = grade_lut.is_some();
+            let (_, sun_ok) = pack_sun_dir(Some(&p));
+            gfx.shadows_available = sun_ok;
+            match grade_lut {
+                Some(g) => commands.insert_resource(g),
+                None => commands.remove_resource::<GradeLutCpu>(),
+            }
+            commands.remove_resource::<walk_ground::GroundGrid>();
+            commands.insert_resource(LoadedPack(p));
+            commands.insert_resource(render::MapEpoch(epoch.0.wrapping_add(1)));
+        }
+        Err(e) => error!("map switch: failed to load pack '{name}': {e}"),
+    }
 }
 
 /// On an in-place map swap (`MapEpoch` bump), re-frame the single reused camera on the new pack and
@@ -592,6 +626,7 @@ fn main() {
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> switch to the selected pack (in place)
         .init_resource::<ReturnToMenu>() // toolbar "back to menu" button -> relaunch into the menu
+        .init_resource::<PendingMapLoad>() // async in-place pack load (no frame freeze on switch)
         .add_systems(Startup, setup)
         // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
         // exclusive by walk_mode) so they can't race the shared Transform.
@@ -599,7 +634,7 @@ fn main() {
         .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu))
         .add_systems(
             Update,
-            (apply_gfx_camera, load_map, flycam_scroll, apply_camera_fov, build_walk_ground),
+            (apply_gfx_camera, load_map, poll_map_load, flycam_scroll, apply_camera_fov, build_walk_ground),
         )
         // In-place map swap: re-frame the reused camera + rebuild the skybox on a MapEpoch bump.
         .add_systems(Update, reset_map_view.run_if(resource_changed::<render::MapEpoch>));
