@@ -26,7 +26,23 @@ use std::path::PathBuf;
 pub struct LootPlugin;
 impl Plugin for LootPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn_loot);
+        // Rebuild the loot overlay on each MapEpoch (initial epoch-0 insert included), despawning
+        // the old map's markers first. Despawn is UNCONDITIONAL (chained before spawn_loot, which
+        // has early-returns): a new pack may have no loot.json, so its markers must clear regardless.
+        app.add_systems(
+            Update,
+            (teardown_loot, spawn_loot)
+                .chain()
+                .run_if(resource_changed::<crate::render::MapEpoch>),
+        );
+    }
+}
+
+/// In-place map swap: despawn every loot marker so `spawn_loot` rebuilds for the new pack (freeing
+/// the per-class materials + cube mesh once the last handle drops).
+fn teardown_loot(mut commands: Commands, q: Query<Entity, With<LootMarker>>) {
+    for e in &q {
+        commands.entity(e).despawn();
     }
 }
 
@@ -112,7 +128,7 @@ pub(crate) fn resolve_loot_json(pack_root: Option<&std::path::Path>) -> Option<P
     None
 }
 
-fn spawn_loot(
+pub(crate) fn spawn_loot(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,

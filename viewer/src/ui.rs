@@ -196,7 +196,16 @@ impl Plugin for UiPlugin {
                 Ok("nav") | Ok("route") => RightPanelTab::Navigate,
                 _ => RightPanelTab::Visibility,
             })
-            .add_systems(Update, (apply_loot_visibility, load_bookmarks));
+            // apply_loot_visibility ordered AFTER spawn_loot so a swap-respawn's fresh markers are
+            // made visible (auto-sync point). teardown_ui drops per-map UI state on a swap.
+            .add_systems(
+                Update,
+                (apply_loot_visibility.after(crate::loot::spawn_loot), load_bookmarks),
+            )
+            .add_systems(
+                Update,
+                teardown_ui.run_if(resource_changed::<crate::render::MapEpoch>),
+            );
         // egui UI MUST run in EguiPrimaryContextPass (between egui's begin/end frame); in
         // plain Update the context has no fonts yet and `ctx_mut()` panics (bevy_egui 0.37).
         // toolbar_panel FIRST (rightmost narrow rail) then the tab content (to its left).
@@ -288,23 +297,38 @@ fn fit_camera_viewport(
     }
 }
 
-/// One-shot: once the pack is loaded, read `<pack>/bookmarks.json` into `Bookmarks`. After the
-/// first success it's a single bool check per frame. A missing/corrupt file just means an empty
-/// list (the next save recreates it).
-fn load_bookmarks(mut bm: ResMut<Bookmarks>, pack: Option<Res<crate::render::LoadedPack>>) {
-    if bm.loaded {
+/// Load `<pack>/bookmarks.json` into `Bookmarks` whenever the map epoch advances (initial load +
+/// every in-place swap). Epoch-tracked (not a one-shot bool) so a swap reloads the NEW pack's views
+/// — and it reloads BEFORE the egui `layers_panel` write-back that frame, so the old map's views
+/// can't serialize into the new pack's file. A missing/corrupt file just means an empty list.
+fn load_bookmarks(
+    mut bm: ResMut<Bookmarks>,
+    pack: Option<Res<crate::render::LoadedPack>>,
+    epoch: Res<crate::render::MapEpoch>,
+    mut loaded_epoch: Local<Option<u64>>,
+) {
+    if *loaded_epoch == Some(epoch.0) {
         return;
     }
     let Some(pack) = pack else {
         return;
     };
+    *loaded_epoch = Some(epoch.0);
     let path = pack.0.root.join("bookmarks.json");
-    let views = std::fs::read_to_string(&path)
+    bm.views = std::fs::read_to_string(&path)
         .ok()
         .and_then(|txt| serde_json::from_str::<Vec<Bookmark>>(&txt).ok())
         .unwrap_or_default();
-    bm.views = views;
     bm.loaded = true;
+}
+
+/// In-place map swap: drop the per-map UI state whose `Entity` refs point into the OLD map's
+/// markers (recycled ids would silently resolve to wrong new markers) and the quest tracker set
+/// (the new map's task ids differ). Filter/view PREFERENCES are kept. `Bookmarks` reload is handled
+/// by `load_bookmarks` (epoch-tracked); loot/POI/quest marker visibility by their epoch guards.
+fn teardown_ui(mut plan: ResMut<PlanList>, mut tracker: ResMut<QuestTracker>) {
+    plan.pins.clear();
+    tracker.active.clear();
 }
 
 /// Show/hide loot markers by the master toggle AND the per-class filter AND the min-value
@@ -312,9 +336,12 @@ fn load_bookmarks(mut bm: ResMut<Bookmarks>, pack: Option<Res<crate::render::Loa
 /// initial state is applied once the markers exist), so it's ~free per frame.
 fn apply_loot_visibility(
     toggles: Res<LayerToggles>,
+    epoch: Res<crate::render::MapEpoch>,
     mut q: Query<(&LootClass, Option<&crate::poi::MarkerValue>, &mut Visibility)>,
 ) {
-    if !toggles.is_changed() {
+    // Re-apply on a toggle change OR a map swap (fresh markers spawn Hidden and the swap didn't
+    // touch the toggles).
+    if !toggles.is_changed() && !epoch.is_changed() {
         return;
     }
     for (cls, val, mut vis) in &mut q {

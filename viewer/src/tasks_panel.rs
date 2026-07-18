@@ -289,14 +289,19 @@ fn resolve_tasks_json(root: Option<&Path>) -> Option<PathBuf> {
 fn load_task_catalog(
     mut cat: ResMut<TaskCatalog>,
     pack: Option<Res<crate::render::LoadedPack>>,
+    epoch: Res<crate::render::MapEpoch>,
+    mut loaded_epoch: Local<Option<u64>>,
 ) {
-    if cat.loaded {
+    // Epoch-tracked (not a one-shot latch): an in-place swap re-resolves tasks.json against the new
+    // pack root (usually the same shared file → identical catalog; a pack-local one is picked up).
+    if *loaded_epoch == Some(epoch.0) {
         return;
     }
     let Some(pack) = pack else {
         return; // no pack yet (start-menu mode) — try again next frame
     };
-    cat.loaded = true; // latch: one real attempt once the pack exists
+    *loaded_epoch = Some(epoch.0);
+    cat.loaded = true;
     let root = pack.0.root.as_path();
     let Some(path) = resolve_tasks_json(Some(root)) else {
         warn!("tasks_panel: no tasks.json found (set EFT_TASKS_JSON or drop it in packs/shared) — Tasks tab empty");

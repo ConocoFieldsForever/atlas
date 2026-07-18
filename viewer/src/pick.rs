@@ -67,8 +67,20 @@ impl Plugin for PickPlugin {
         app.init_resource::<PickState>()
             .init_resource::<PickSpheres>()
             .add_systems(Startup, spawn_pick_ui)
-            .add_systems(Update, pick_system);
+            .add_systems(Update, pick_system)
+            // In-place map swap: clear the lazy per-mesh bounding-sphere cache — it's indexed by the
+            // OLD pack's mesh table (wrong centers/radii for the new pack). Re-armed by is_empty().
+            .add_systems(
+                Update,
+                teardown_pick.run_if(resource_changed::<crate::render::MapEpoch>),
+            );
     }
+}
+
+/// In-place map swap: drop the stale bounding-sphere cache so `pick_system` rebuilds it from the new
+/// pack's mesh table on the next click.
+fn teardown_pick(mut spheres: ResMut<PickSpheres>) {
+    spheres.0.clear();
 }
 
 /// Top-left, dark, semi-transparent readout. Spawned once; the pick system just
