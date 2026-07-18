@@ -168,6 +168,16 @@ impl BuildJob {
     }
 
     pub fn cancel(&self) {
+        // Kill the WHOLE process tree. build_map.py / setup_deps.py spawn heavy child processes
+        // (eft_extract_v2, the GPU bake, pip). On Windows, killing only the direct child orphans
+        // them — the extraction would keep churning after CANCEL. `taskkill /T` walks the tree;
+        // the direct .kill() is a fallback if the PID has already been reaped.
+        use std::os::windows::process::CommandExt;
+        let pid = self.child.lock().unwrap().id();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x0800_0000)
+            .output();
         let _ = self.child.lock().unwrap().kill();
     }
 
@@ -695,6 +705,16 @@ fn fmt_age(days: Option<f64>) -> String {
     }
 }
 
+/// Localized age ("today" / "3 d ago") for the map-row cards.
+fn fmt_age_lg(lg: crate::i18n::Lang, days: Option<f64>) -> String {
+    use crate::i18n::{t, K};
+    match days {
+        Some(d) if d < 1.0 => t(lg, K::Today).to_string(),
+        Some(d) => format!("{:.0} {}", d, t(lg, K::DAgo)),
+        None => "-".to_string(),
+    }
+}
+
 /// A per-frame snapshot of the build to show in the menu's loader panel — either the in-flight
 /// build or the most recent finished one (which lingers until CLOSE). Owned plain data so the
 /// egui closures don't hold a borrow on the worker.
@@ -775,9 +795,9 @@ pub fn menu_ui(
         let ok = worker.last_outcome().map(|(_, ok)| ok).unwrap_or(false);
         if worker.last_is_sync() {
             state.sync_note = Some(if ok {
-                ("intel refreshed".to_string(), true)
+                (t(lg, K::IntelRefreshed).to_string(), true)
             } else {
-                ("sync FAILED (see log)".to_string(), false)
+                (t(lg, K::SyncFailed).to_string(), false)
             });
         } else if worker.last_is_build() && !ok {
             state.show_log = true; // surface the failing stage without a click
@@ -888,14 +908,18 @@ pub fn menu_ui(
                 // outcome note (the note is set by the completion handler at the top of menu_ui).
                 if worker.current_is_sync() {
                     let stage = worker.status().map(|(_, s)| s).unwrap_or_default();
-                    ui.label(RichText::new(format!("syncing\u{2026}  {stage}")).color(theme::ACCENT).size(11.0));
-                    if ui.small_button(RichText::new("cancel").size(10.0)).clicked() {
+                    ui.label(
+                        RichText::new(format!("{}  {stage}", t(lg, K::Syncing)))
+                            .color(theme::ACCENT)
+                            .size(11.0),
+                    );
+                    if ui.small_button(RichText::new(t(lg, K::CancelLower)).size(10.0)).clicked() {
                         cancel_current = true;
                     }
                 } else {
                     if ui
                         .add(egui::Button::new(RichText::new(t(lg, K::SyncNow)).size(11.0).color(BEIGE)))
-                        .on_hover_text("re-pull loot values, tasks and item icons from tarkov.dev (network)")
+                        .on_hover_text(t(lg, K::SyncTip))
                         .clicked()
                     {
                         state.sync_note = None;
@@ -988,12 +1012,12 @@ pub fn menu_ui(
                                 if installed {
                                     ui.label(RichText::new(fmt_size(e.size_bytes)).color(BEIGE));
                                     ui.label(
-                                        RichText::new(format!("built {}", fmt_age(e.built_days)))
+                                        RichText::new(format!("{} {}", t(lg, K::BuiltLabel), fmt_age_lg(lg, e.built_days)))
                                             .color(DIM)
                                             .size(11.0),
                                     );
                                     ui.label(
-                                        RichText::new(format!("intel {}", fmt_age(e.intel_days)))
+                                        RichText::new(format!("{} {}", t(lg, K::IntelLabel), fmt_age_lg(lg, e.intel_days)))
                                             .color(DIM)
                                             .size(11.0),
                                     );
@@ -1025,10 +1049,7 @@ pub fn menu_ui(
                                                 });
                                                 if ui
                                                     .add_enabled_ui(!any_building, |ui| {
-                                                        ui.add_sized([84.0, 30.0], upd).on_hover_text(
-                                                            "game files changed since this pack was built - \
-                                                             run the pipeline again (data may be out of date)",
-                                                        )
+                                                        ui.add_sized([84.0, 30.0], upd).on_hover_text(t(lg, K::UpdateTip))
                                                     })
                                                     .inner
                                                     .clicked()
@@ -1130,9 +1151,9 @@ pub fn menu_ui(
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let title = if key == "__deps__" {
-                                "INSTALLING DEPENDENCIES".to_string()
+                                t(lg, K::InstallingDeps).to_string()
                             } else {
-                                format!("BUILDING: {}", key.to_uppercase())
+                                format!("{}: {}", t(lg, K::Building), map_title(lg, key, key).to_uppercase())
                             };
                             ui.label(RichText::new(title).color(BONE).strong());
                             ui.with_layout(
@@ -1140,13 +1161,13 @@ pub fn menu_ui(
                                 |ui| {
                                     if finished {
                                         let col = if ok { OK } else { BAD };
-                                        let txt = if ok { "DONE" } else { "FAILED" };
+                                        let txt = t(lg, if ok { K::Done } else { K::Failed });
                                         ui.label(RichText::new(txt).color(col).strong());
-                                        if ui.button("CLOSE").clicked() {
+                                        if ui.button(t(lg, K::Close)).clicked() {
                                             dismiss_build = true;
                                         }
                                     } else if ui
-                                        .button(RichText::new("CANCEL").color(BAD))
+                                        .button(RichText::new(t(lg, K::Cancel)).color(BAD))
                                         .clicked()
                                     {
                                         cancel_current = true;
@@ -1154,14 +1175,14 @@ pub fn menu_ui(
                                     // The tail is hidden by default — the loader bar carries
                                     // the status; the raw log is one click away.
                                     if ui
-                                        .button(if show_log { "HIDE LOG" } else { "SHOW LOG" })
+                                        .button(t(lg, if show_log { K::HideLog } else { K::ShowLog }))
                                         .clicked()
                                     {
                                         toggle_log = true;
                                     }
                                     // Full captured log (the panel shows only a tail) — for
                                     // diagnosing which stage failed / sharing the output.
-                                    if ui.button("COPY LOG").clicked() {
+                                    if ui.button(t(lg, K::CopyLog)).clicked() {
                                         ui.ctx().copy_text(bv.full_log.clone());
                                     }
                                 },
@@ -1190,11 +1211,11 @@ pub fn menu_ui(
                         // between the [STAGE] marker and its status suffix, uppercased and
                         // ASCII-whitelisted (menu glyph set is plain ASCII only).
                         let stage_txt = if failed {
-                            "BUILD FAILED".to_string()
+                            t(lg, K::BuildFailed).to_string()
                         } else if finished {
-                            "BUILD COMPLETE".to_string()
+                            t(lg, K::BuildComplete).to_string()
                         } else {
-                            let mut s = stage
+                            let mut en = stage
                                 .split(']')
                                 .nth(1)
                                 .unwrap_or("")
@@ -1203,16 +1224,19 @@ pub fn menu_ui(
                                 .unwrap_or("")
                                 .trim()
                                 .to_ascii_uppercase();
-                            s.retain(|c| c.is_ascii_graphic() || c == ' ');
-                            s.truncate(38);
+                            en.retain(|c| c.is_ascii_graphic() || c == ' ');
+                            // The raw log is ASCII-only; the Russian stage name comes from our map
+                            // (not the log), so it renders fine past the ASCII whitelist above.
+                            let mut s = crate::i18n::stage_ru(lg, &en).map(str::to_string).unwrap_or(en);
                             if s.is_empty() {
-                                s = "STARTING".into();
+                                s = t(lg, K::Starting).to_string();
                             }
-                            s.push_str("...");
-                            s
+                            // char-safe cap (Cyrillic is multi-byte; String::truncate would panic).
+                            let capped: String = s.chars().take(38).collect();
+                            format!("{capped}...")
                         };
                         ui.add_space(8.0);
-                        crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed);
+                        crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed, lg);
                         if show_log {
                             ui.add_space(6.0);
                             for line in tail {
@@ -1249,7 +1273,7 @@ pub fn menu_ui(
                             !worker.busy(),
                             egui::Button::new(RichText::new(t(lg, K::InstallDeps)).color(BONE)),
                         )
-                        .on_hover_text("creates a local venv and pip-installs UnityPy, numpy and Pillow")
+                        .on_hover_text(t(lg, K::InstallDepsTip))
                         .clicked()
                     {
                         enqueue_install = true;
@@ -1302,8 +1326,7 @@ pub fn menu_ui(
             ui.horizontal(|ui| {
                 ui.label(RichText::new(t(lg, K::ExtractedAssets)).color(DIM).size(11.0));
                 if ui.button(RichText::new(t(lg, K::Choose)).color(BONE)).clicked() {
-                    let mut dlg = rfd::FileDialog::new()
-                        .set_title("Choose a folder for extracted map assets");
+                    let mut dlg = rfd::FileDialog::new().set_title(t(lg, K::FolderTitle));
                     if std::path::Path::new(&state.assets_dir).is_dir() {
                         dlg = dlg.set_directory(&state.assets_dir);
                     }
@@ -1356,7 +1379,7 @@ pub fn menu_ui(
                         save_config_lang(l.tag());
                     }
                 }
-                ui.label(RichText::new("LANG").size(10.0).color(DIM));
+                ui.label(RichText::new(t(lg, K::LangLabel)).size(10.0).color(DIM));
             });
         });
 

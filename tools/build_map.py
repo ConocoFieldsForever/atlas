@@ -76,6 +76,8 @@ def run(stage, total, name, cmd, cwd, optional=False):
         print("  " + line.rstrip(), flush=True)
     rc = p.wait()
     dt = time.time() - t0
+    # Machine-readable per-phase timing (captured by the viewer to weight the ETA + spot slow stages).
+    print(f"[TIMING] {name}={dt:.1f}", flush=True)
     if rc != 0:
         if optional:
             print(f"[STAGE {stage}/{total}] {name}: FAILED rc={rc} ({dt:.0f}s) - optional, continuing", flush=True)

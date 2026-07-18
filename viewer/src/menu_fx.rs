@@ -55,6 +55,7 @@ pub fn eft_loading_bar(
     stage_text: &str,
     elapsed_secs: f32,
     failed: bool,
+    lang: crate::i18n::Lang,
 ) {
     use egui::RichText;
     const SEGS: usize = 12; // the game loader reads as ~10-14 wide segments
@@ -86,7 +87,9 @@ pub fn eft_loading_bar(
             ui.label(RichText::new(format!("{:.0}%", frac * 100.0)).color(DIM).size(11.0));
         });
         ui.with_layout(egui::Layout::top_down(egui::Align::Max), |ui| {
-            ui.label(RichText::new("ESTIMATED TIME").color(DIM).size(10.0));
+            ui.label(
+                RichText::new(crate::i18n::t(lang, crate::i18n::K::EstimatedTime)).color(DIM).size(10.0),
+            );
             ui.label(RichText::new(eta).color(TXT).size(12.0).strong());
         });
     });
