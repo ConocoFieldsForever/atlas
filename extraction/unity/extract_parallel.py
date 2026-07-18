@@ -28,8 +28,14 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+# Global level-completion counter -> a single [SUBPROGRESS] extract <done>/<total> stream the viewer
+# reads to move the loader bar DURING the (long) extraction, across all chunk processes.
+_prog_lock = threading.Lock()
+_prog = {"done": 0, "total": 0}
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXTRACT = os.path.join(HERE, "eft_extract_v2.py")
@@ -73,6 +79,14 @@ def _run_chunk(idx, chunk_levels, name, passthrough):
     )
     for line in p.stdout:
         print(f"  [p{idx}] {line.rstrip()}", flush=True)
+        # eft_extract_v2 prints "level<lv>: +N mesh ... (<t>s)" once per finished level -> global bar.
+        s = line.strip()
+        if s.startswith("level") and " mesh" in s and s.endswith("s)"):
+            with _prog_lock:
+                _prog["done"] += 1
+                d, t = _prog["done"], _prog["total"]
+            if t:
+                print(f"[SUBPROGRESS] extract {d}/{t}", flush=True)
     rc = p.wait()
     print(f"[CHUNK {idx}] done rc={rc}", flush=True)
     return idx, rc
@@ -202,6 +216,7 @@ def main():
     chunks = _chunk(sized, jobs)
     n = len(chunks)
     print(f"[PARALLEL] {len(levels)} levels across {n} chunks (jobs={jobs})", flush=True)
+    _prog["total"] = len(levels)  # denominator for the [SUBPROGRESS] extraction bar
     T0 = time.time()
 
     results = []
