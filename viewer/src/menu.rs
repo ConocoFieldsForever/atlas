@@ -899,9 +899,9 @@ pub fn menu_ui(
                 (false, _) => 74.0,     // footer only
             };
             let rows_h = (ui.available_height() - reserve).max(180.0);
-            // Card fill: mostly opaque so the map list stays crisply readable over the busy neon
-            // wireframe backdrop, with just a hint of the glow bleeding through at the edges.
-            let card_bg = Color32::from_rgba_unmultiplied(CARD.r(), CARD.g(), CARD.b(), 235);
+            // Card fill: near-solid so the map list stays crisply readable over the backdrop (only
+            // the faintest translucency so it doesn't look like a flat cutout).
+            let card_bg = Color32::from_rgba_unmultiplied(CARD.r(), CARD.g(), CARD.b(), 250);
             egui::ScrollArea::vertical().max_height(rows_h).show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));

@@ -826,9 +826,11 @@ pub fn triangle_field(ctx: &egui::Context) {
                     None => 0.0,
                 };
                 let band = 0.5 + 0.5 * (t * 0.7 - (cx + cy) * 0.006).sin();
-                let glow = g_cursor.max(0.30 * band);
-                let edge_a = (20.0 + 205.0 * glow).clamp(0.0, 255.0) as u8;
-                let fill_a = (4.0 + 120.0 * g_cursor).clamp(0.0, 255.0) as u8;
+                let glow = g_cursor.max(0.16 * band);
+                // dim by default so the field is ambient texture, not a grid that fights the text;
+                // the cursor pool still brightens locally.
+                let edge_a = (7.0 + 170.0 * glow).clamp(0.0, 255.0) as u8;
+                let fill_a = (2.0 + 95.0 * g_cursor).clamp(0.0, 255.0) as u8;
                 painter.add(egui::Shape::convex_polygon(
                     vec![tri[0], tri[1], tri[2]],
                     Color32::from_rgba_unmultiplied(40, 185, 214, fill_a),
@@ -837,6 +839,32 @@ pub fn triangle_field(ctx: &egui::Context) {
             }
         }
     }
+
+    // Vignette: darken toward the edges/corners so the field recedes at the periphery and the menu
+    // reads. A coarse screen grid whose black alpha ramps up with elliptical distance from center.
+    let mut vg = egui::Mesh::default();
+    const VX: usize = 22;
+    const VY: usize = 14;
+    let (hw, hh) = (rect.width() * 0.5, rect.height() * 0.5);
+    let center = rect.center();
+    for j in 0..=VY {
+        for i in 0..=VX {
+            let x = rect.left() + rect.width() * i as f32 / VX as f32;
+            let y = rect.top() + rect.height() * j as f32 / VY as f32;
+            let (nx, ny) = ((x - center.x) / hw.max(1.0), (y - center.y) / hh.max(1.0));
+            let d = (nx * nx + ny * ny).sqrt();
+            let a = (((d - 0.42) / 0.85).clamp(0.0, 1.0)).powf(1.5) * 244.0;
+            vg.colored_vertex(egui::pos2(x, y), Color32::from_rgba_unmultiplied(0, 0, 0, a as u8));
+        }
+    }
+    let vid = |i: usize, j: usize| (j * (VX + 1) + i) as u32;
+    for j in 0..VY {
+        for i in 0..VX {
+            vg.add_triangle(vid(i, j), vid(i + 1, j), vid(i, j + 1));
+            vg.add_triangle(vid(i + 1, j), vid(i + 1, j + 1), vid(i, j + 1));
+        }
+    }
+    painter.add(egui::Shape::mesh(vg));
 }
 
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
