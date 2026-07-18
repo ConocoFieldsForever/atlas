@@ -777,8 +777,14 @@ impl Plugin for EftGpuDrivenPlugin {
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
             ExtractComponentPlugin::<CullCamera>::default(),
             ExtractResourcePlugin::<ExtractedCpuData>::default(),
+            // The map epoch reaches the render world so `reset_gpu_map_if_epoch_changed` can tear
+            // down the old pack's GPU state on a swap.
+            ExtractResourcePlugin::<super::MapEpoch>::default(),
         ))
-        .add_systems(Startup, build_cpu_data)
+        // build_cpu_data re-runs on every map epoch (the initial insert included) so an in-place
+        // .eftpack swap rebuilds the CPU staging blob; the render-world reset then rebuilds the GPU
+        // side. (Was `Startup`, which only ever ran for the first pack.)
+        .add_systems(Update, build_cpu_data.run_if(resource_changed::<super::MapEpoch>))
         .add_systems(Update, free_cpu_staging);
 
         let render_app = app.sub_app_mut(RenderApp);
@@ -789,6 +795,12 @@ impl Plugin for EftGpuDrivenPlugin {
             .add_systems(
                 Render,
                 (
+                    // Before prepare: on a NEW MapEpoch, drop the previous pack's per-map GPU
+                    // resources + null the bindless layouts + invalidate the pipeline cache, so
+                    // prepare_gpu_buffers rebuilds everything for the new pack.
+                    reset_gpu_map_if_epoch_changed
+                        .in_set(RenderSystems::PrepareResources)
+                        .before(prepare_gpu_buffers),
                     prepare_gpu_buffers.in_set(RenderSystems::PrepareResources),
                     // Runtime UI shadow toggle: refresh the effective switch BEFORE the frustum
                     // extrusion + uniform upload + shadow node read it this frame.
@@ -836,6 +848,12 @@ fn free_cpu_staging(
     if cpu.is_none() {
         return;
     }
+    // A NEW blob (in-place map swap re-inserts it → "added" again) restarts the countdown, so the
+    // new map's staging survives its ~4-frame upload window instead of being dropped next frame by
+    // the counter left stuck at 4 from the previous map.
+    if cpu.as_ref().is_some_and(|c| c.is_added()) {
+        *frames = 0;
+    }
     *frames += 1;
     if *frames >= 4 {
         commands.remove_resource::<ExtractedCpuData>();
@@ -860,7 +878,11 @@ fn softcutout_params(vp: &Option<crate::eftpack::VertPaint>) -> Option<[f32; 4]>
     ])
 }
 
-fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
+fn build_cpu_data(
+    mut commands: Commands,
+    pack: Option<Res<LoadedPack>>,
+    tags: Query<(), With<GpuDrivenTag>>,
+) {
     let Some(pack) = pack else {
         return;
     };
@@ -1670,8 +1692,13 @@ fn build_cpu_data(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         instance_total,
         mesh_count,
     })));
-    // one entity to hang the draw phase item on (ignored by the draw command)
-    commands.spawn((GpuDrivenTag, Name::new("eft_gpu_driven_draw")));
+    // one entity to hang the draw phase item on (ignored by the draw command). Idempotent: on an
+    // in-place map swap build_cpu_data re-runs, and a SECOND GpuDrivenTag would make queue_gpu_driven
+    // emit every phase item twice (the whole scene drawn 2×). The tag carries no per-map data, so
+    // keep the single existing one.
+    if tags.is_empty() {
+        commands.spawn((GpuDrivenTag, Name::new("eft_gpu_driven_draw")));
+    }
 }
 
 // ===========================================================================
@@ -1881,6 +1908,63 @@ fn init_gpu_pipelines(
 
 // ---- PrepareResources: build all GPU buffers + bind groups ONCE -------------
 #[allow(clippy::too_many_arguments)]
+/// On a NEW `MapEpoch` (an in-place `.eftpack` swap), drop the previous pack's per-map GPU
+/// resources, null the two bindless layouts on `EftDrawPipeline`, and invalidate the specialized
+/// pipeline cache — so `prepare_gpu_buffers` rebuilds everything for the new pack and no draw ever
+/// binds a fresh material bind group against a pipeline compiled for the OLD pack's bindless array
+/// size (a wgpu layout-incompatibility error). Map-INVARIANT state (`EftComputePipelines`, the
+/// shaders, `ssbo_layout`, `mesh_pipeline`) is preserved; `ExtractedCpuData` is left alone (the
+/// fresh blob is exactly what prepare needs). Runs before `prepare_gpu_buffers`.
+fn reset_gpu_map_if_epoch_changed(
+    mut commands: Commands,
+    epoch: Option<Res<super::MapEpoch>>,
+    draw: Option<Res<EftDrawPipeline>>,
+    mut last: Local<Option<u64>>,
+) {
+    let Some(epoch) = epoch else {
+        return;
+    };
+    let cur = epoch.0;
+    if *last == Some(cur) {
+        return; // unchanged since we last looked
+    }
+    let first = last.is_none();
+    *last = Some(cur);
+    if first {
+        return; // first observation: let the initial map build normally — nothing to tear down yet
+    }
+    // Remove every per-map GPU resource (no-op if absent). Removing EftGpuBuffers clears the
+    // build-once guard at the top of prepare_gpu_buffers; removing the bind groups drops the
+    // instance/mesh_meta/visible buffers they solely own.
+    commands.remove_resource::<EftGpuBuffers>();
+    commands.remove_resource::<EftCullBindGroup>();
+    commands.remove_resource::<EftDrawBindGroup>();
+    commands.remove_resource::<EftMaterialResources>();
+    commands.remove_resource::<EftMaterialBindGroup>();
+    commands.remove_resource::<EftShResources>();
+    commands.remove_resource::<EftShBindGroup>();
+    commands.remove_resource::<EftShadowConfig>();
+    commands.remove_resource::<EftShadowPipeline>();
+    commands.remove_resource::<EftShadowResources>();
+    // Null the per-pack bindless layouts (keep the invariant fields) so `queue_gpu_driven`'s
+    // `material_layout/sh_layout.is_none()` gate blocks specialization until prepare rebuilds them.
+    if let Some(d) = draw {
+        commands.insert_resource(EftDrawPipeline {
+            shader: d.shader.clone(),
+            shadow_shader: d.shadow_shader.clone(),
+            mesh_pipeline: d.mesh_pipeline.clone(),
+            ssbo_layout: d.ssbo_layout.clone(),
+            material_layout: None,
+            sh_layout: None,
+        });
+    }
+    // Invalidate the specialized-pipeline cache: its entries reference the OLD pack's material
+    // layout; re-init drops them so the next queue_gpu_driven re-specializes against the new one.
+    // (PipelineCache itself has no removal API in Bevy 0.17 — a few leaked pipelines per swap is
+    // acceptable for a viewer.)
+    commands.insert_resource(SpecializedRenderPipelines::<EftDrawPipeline>::default());
+}
+
 fn prepare_gpu_buffers(
     mut commands: Commands,
     render_device: Res<RenderDevice>,

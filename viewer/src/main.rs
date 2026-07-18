@@ -412,6 +412,10 @@ fn main() {
     if let Some(p) = pack {
         app.insert_resource(LoadedPack(p));
     }
+    // In-place map-swap epoch: bumped by `load_map` on each .eftpack swap; extracted to the render
+    // world and used as the run_if gate for every per-map (re)build system. Inserted always (menu
+    // mode too) so `build_cpu_data`'s `run_if(resource_changed::<MapEpoch>)` fires on the first frame.
+    app.insert_resource(render::MapEpoch(0));
 
     // Foreground-gated redraw: full-rate when the window is focused, near-idle (only user/window
     // events, ~2 Hz) when it's not — so alt-tabbing to your game frees the GPU. Skipped under
