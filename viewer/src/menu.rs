@@ -59,6 +59,12 @@ impl BuildJob {
         Self::spawn_script("__intel__", "", "tools/sync_intel.py", false, &[])
     }
 
+    /// One-click Python dependency setup (tools/setup_deps.py) — creates a venv + installs the
+    /// extraction requirements, streamed into the build panel. Key "__deps__" tags the panel.
+    pub fn spawn_setup() -> std::io::Result<Self> {
+        Self::spawn_script("__deps__", "", "tools/setup_deps.py", false, &[])
+    }
+
     fn spawn_script(
         key: &str,
         game_dir: &str,
@@ -216,6 +222,9 @@ pub struct MenuState {
     pub assets_dir: String,
     pub assets_dir_edit: String,
     pub assets_ok: bool,
+    /// Whether the build python has UnityPy/numpy/Pillow (None probe failure => treat as ok so we
+    /// don't nag when there's no kit to build with anyway).
+    pub deps_ok: bool,
     /// INTEL strip stats: (loot.json age days, tasks.json age days, cached icon count).
     pub intel: (Option<f64>, Option<f64>, usize),
     /// Outcome note of the last finished sync ("refreshed" / failure), shown until the next one.
@@ -465,6 +474,21 @@ pub fn save_config_lang(tag: &str) {
     save_config_str("lang", tag);
 }
 
+/// Whether the build python has the extraction packages (UnityPy/numpy/Pillow). Runs a quick import
+/// probe under paths::python_exe. None when there's no kit/python to probe (shipped-lite / no build).
+pub fn deps_ready() -> Option<bool> {
+    let root = crate::paths::repo_root()?;
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new(crate::paths::python_exe(root))
+        .current_dir(root)
+        .arg("-c")
+        .arg("import UnityPy, numpy, PIL")
+        .creation_flags(0x0800_0000)
+        .output()
+        .ok()?;
+    Some(out.status.success())
+}
+
 /// The writable tarkmap working dir (`EFT_TARKMAP_ROOT`; holds `out/` bake+intel outputs and,
 /// optionally, `maps/` configs — the kit falls back to the shipped `extraction/maps` when absent):
 /// env > saved config > a sibling `tarkmap` beside the assets dir (matches the pipeline's expected
@@ -641,6 +665,7 @@ pub fn build_state() -> MenuState {
         assets_dir_edit: assets_dir.clone(),
         assets_dir,
         assets_ok: assets_configured(),
+        deps_ok: deps_ready().unwrap_or(true),
         total_bytes,
         confirm_delete: None,
         show_rebuild: None,
@@ -686,10 +711,11 @@ struct BuildView {
 
 #[cfg(feature = "egui")]
 fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
-    // The running build takes precedence; otherwise a just-finished build lingers until dismissed.
-    let job = if w.current_build_key().is_some() {
+    // The running build/deps-install takes precedence; otherwise a just-finished one lingers until
+    // dismissed. Deps installs stream the same [STAGE]/[BUILD OK] markers, so they reuse the panel.
+    let job = if w.current_build_key().is_some() || w.current_is_install() {
         w.current_job()
-    } else if w.last_is_build() {
+    } else if w.last_is_build() || w.last_is_install() {
         w.last_job()
     } else {
         None
@@ -743,6 +769,9 @@ pub fn menu_ui(
         state.entries = entries;
         state.total_bytes = total;
         state.intel = intel_status();
+        // A deps install may have just finished — re-probe so the status flips to ready without a
+        // restart (python_exe now resolves to the freshly-created venv).
+        state.deps_ok = deps_ready().unwrap_or(true);
         let ok = worker.last_outcome().map(|(_, ok)| ok).unwrap_or(false);
         if worker.last_is_sync() {
             state.sync_note = Some(if ok {
@@ -796,6 +825,7 @@ pub fn menu_ui(
     // build; `cancel_current` cancels whatever job is in flight (build or sync).
     let mut enqueue_sync = false;
     let mut enqueue_build: Option<String> = None;
+    let mut enqueue_install = false;
     let mut cancel_current = false;
     let mut dismiss_build = false;
     // Per-frame snapshots so the closures don't hold a borrow on the worker.
@@ -911,10 +941,12 @@ pub fn menu_ui(
             // Bound the map-row scroll so the build panel + LOG + footer below always stay on screen
             // (reserve grows when a build is showing / its log is expanded); the rows scroll in what
             // remains. Without this the expanded log runs off the bottom of the window.
+            // Footer now carries deps + game-install + assets + language rows (plus the first-run
+            // banner), so reserve enough that they + any build panel stay on screen below the list.
             let reserve = match (bv.is_some(), state.show_log) {
-                (true, true) => 380.0,  // loader + 12 log lines + footer
-                (true, false) => 180.0, // loader + footer
-                (false, _) => 74.0,     // footer only
+                (true, true) => 450.0,  // loader + 12 log lines + footer
+                (true, false) => 250.0, // loader + footer
+                (false, _) => 150.0,    // footer only
             };
             let rows_h = (ui.available_height() - reserve).max(180.0);
             // Card fill: FULLY opaque so no backdrop lines show through the menu rows and the
@@ -1097,11 +1129,12 @@ pub fn menu_ui(
                     .inner_margin(10.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("BUILDING: {}", key.to_uppercase()))
-                                    .color(BONE)
-                                    .strong(),
-                            );
+                            let title = if key == "__deps__" {
+                                "INSTALLING DEPENDENCIES".to_string()
+                            } else {
+                                format!("BUILDING: {}", key.to_uppercase())
+                            };
+                            ui.label(RichText::new(title).color(BONE).strong());
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1196,6 +1229,33 @@ pub fn menu_ui(
 
             ui.add_space(8.0);
             ui.separator();
+            // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
+            // (venv + pip) from here without closing the app; progress streams into the panel above.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t(lg, K::BuildDeps)).color(DIM).size(11.0));
+                if worker.current_is_install() {
+                    let stage = worker.status().map(|(_, s)| s).unwrap_or_default();
+                    ui.label(
+                        RichText::new(format!("{}  {stage}", t(lg, K::Installing)))
+                            .color(theme::ACCENT)
+                            .size(11.0),
+                    );
+                } else if state.deps_ok {
+                    ui.label(RichText::new(t(lg, K::DepsReady)).color(OK).size(11.0));
+                } else {
+                    ui.label(RichText::new(t(lg, K::DepsMissing)).color(WARN).size(11.0));
+                    if ui
+                        .add_enabled(
+                            !worker.busy(),
+                            egui::Button::new(RichText::new(t(lg, K::InstallDeps)).color(BONE)),
+                        )
+                        .on_hover_text("creates a local venv and pip-installs UnityPy, numpy and Pillow")
+                        .clicked()
+                    {
+                        enqueue_install = true;
+                    }
+                }
+            });
             // Game install path: autodetected (env > saved > registry > probe), editable here;
             // SET validates, persists to atlas.config.json and re-fingerprints the packs.
             ui.horizontal(|ui| {
@@ -1301,6 +1361,9 @@ pub fn menu_ui(
         });
 
     // ---- apply the worker intents collected above (single point of mutation) ----
+    if enqueue_install {
+        worker.enqueue(Job::InstallDeps);
+    }
     if enqueue_sync {
         worker.enqueue(Job::SyncIntel);
     }

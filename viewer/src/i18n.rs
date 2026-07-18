@@ -107,6 +107,11 @@ pub enum K {
     UsingDefault,
     FirstRunBanner,
     LanguageTip,
+    BuildDeps,
+    DepsReady,
+    DepsMissing,
+    InstallDeps,
+    Installing,
 }
 
 /// The catalog: `[english, russian]` per key.
@@ -155,6 +160,14 @@ fn pair(k: K) -> [&'static str; 2] {
              карту, может занять время); последующие сборки быстрые.",
         ],
         LanguageTip => ["Language / Язык (override auto-detect)", "Язык / Language (переопределить)"],
+        BuildDeps => ["BUILD DEPS", "ЗАВИСИМОСТИ"],
+        DepsReady => ["ready", "готово"],
+        DepsMissing => [
+            "Python packages missing (UnityPy) - required to build maps",
+            "Не хватает пакетов Python (UnityPy) — нужны для сборки карт",
+        ],
+        InstallDeps => ["INSTALL DEPS", "УСТАНОВИТЬ"],
+        Installing => ["installing\u{2026}", "установка\u{2026}"],
     }
 }
 
