@@ -503,6 +503,197 @@ pub fn menu_terrain_update(
     }
 }
 
+// ============================================================================================
+// INTERCHANGE-INSPIRED NEON WIREFRAME CITY — the menu backdrop. A stylized, DERIVATIVE low-poly
+// schematic evoking the ULTRA shopping-mall complex (the big multi-floor mall mass with interior
+// shop units + a central atrium, a parking lot with cars, and outlying blocks) seen from an
+// elevated 3/4 vantage — inspired by an in-game Interchange camera pose, but hand-built from
+// primitives so it carries NO game geometry and ships safely with the app. Rendered as HDR-emissive
+// lines so the camera Bloom halos it into a glowing hologram; a gentle idle drift + cursor parallax
+// keep it alive.
+// ============================================================================================
+
+#[derive(Component)]
+pub struct MenuCity {
+    yaw: f32,
+    tilt: f32,
+}
+
+fn wire_edge(v: &mut Vec<[f32; 3]>, a: Vec3, b: Vec3) {
+    v.push([a.x, a.y, a.z]);
+    v.push([b.x, b.y, b.z]);
+}
+
+/// 12 edges of an axis-aligned box, appended as LineList vertex pairs.
+fn wire_box(v: &mut Vec<[f32; 3]>, lo: Vec3, hi: Vec3) {
+    let c = [
+        Vec3::new(lo.x, lo.y, lo.z),
+        Vec3::new(hi.x, lo.y, lo.z),
+        Vec3::new(hi.x, lo.y, hi.z),
+        Vec3::new(lo.x, lo.y, hi.z),
+        Vec3::new(lo.x, hi.y, lo.z),
+        Vec3::new(hi.x, hi.y, lo.z),
+        Vec3::new(hi.x, hi.y, hi.z),
+        Vec3::new(lo.x, hi.y, hi.z),
+    ];
+    for &(a, b) in &[
+        (0, 1), (1, 2), (2, 3), (3, 0), // floor ring
+        (4, 5), (5, 6), (6, 7), (7, 4), // roof ring
+        (0, 4), (1, 5), (2, 6), (3, 7), // uprights
+    ] {
+        wire_edge(v, c[a], c[b]);
+    }
+}
+
+/// A flat XZ grid of lines at height `y`.
+fn wire_grid(v: &mut Vec<[f32; 3]>, x0: f32, x1: f32, z0: f32, z1: f32, y: f32, nx: usize, nz: usize) {
+    for i in 0..=nx {
+        let x = x0 + (x1 - x0) * i as f32 / nx as f32;
+        wire_edge(v, Vec3::new(x, y, z0), Vec3::new(x, y, z1));
+    }
+    for j in 0..=nz {
+        let z = z0 + (z1 - z0) * j as f32 / nz as f32;
+        wire_edge(v, Vec3::new(x0, y, z), Vec3::new(x1, y, z));
+    }
+}
+
+/// Build the scene as two line sets: (dim ground/parking, bright structures) for depth.
+fn build_city() -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
+    let mut g = Vec::new();
+    let mut s = Vec::new();
+
+    // ground plane + ring-road rim + parking lot (camera side, +Z) with fine bays
+    wire_grid(&mut g, -150.0, 150.0, -72.0, 168.0, 0.0, 22, 18);
+    wire_box(&mut g, Vec3::new(-142.0, 0.0, -64.0), Vec3::new(142.0, 0.02, 160.0));
+    wire_grid(&mut g, -96.0, 96.0, 60.0, 150.0, 0.05, 40, 6);
+
+    // main ULTRA mall mass + floor slabs + roof parapet + HVAC blocks
+    let (mlo, mhi) = (Vec3::new(-72.0, 0.0, -48.0), Vec3::new(72.0, 27.0, 48.0));
+    wire_box(&mut s, mlo, mhi);
+    for &fy in &[9.0f32, 18.0] {
+        wire_grid(&mut s, mlo.x, mhi.x, mlo.z, mhi.z, fy, 6, 4);
+    }
+    wire_box(&mut s, Vec3::new(-64.0, 27.0, -40.0), Vec3::new(64.0, 30.5, 40.0));
+    for k in 0..5 {
+        let x = -46.0 + k as f32 * 23.0;
+        wire_box(&mut s, Vec3::new(x - 6.0, 30.5, -8.0), Vec3::new(x + 6.0, 34.0, 8.0));
+    }
+
+    // interior shop units — ground floor (with a central atrium void) + a sparser 2nd-floor ring
+    let (cols, rows) = (5usize, 3usize);
+    let (fx0, fx1, fz0, fz1) = (-64.0f32, 64.0, -40.0, 40.0);
+    let cw = (fx1 - fx0) / cols as f32;
+    let cd = (fz1 - fz0) / rows as f32;
+    for cx in 0..cols {
+        for cz in 0..rows {
+            if cx == 2 && cz == 1 {
+                continue; // atrium
+            }
+            let (x0, x1) = (fx0 + cx as f32 * cw + 2.5, fx0 + (cx as f32 + 1.0) * cw - 2.5);
+            let (z0, z1) = (fz0 + cz as f32 * cd + 2.5, fz0 + (cz as f32 + 1.0) * cd - 2.5);
+            wire_box(&mut s, Vec3::new(x0, 0.0, z0), Vec3::new(x1, 7.5, z1));
+        }
+    }
+    for cx in 0..cols {
+        for cz in 0..rows {
+            if (cx + cz) % 2 == 0 {
+                continue;
+            }
+            let (x0, x1) = (fx0 + cx as f32 * cw + 5.0, fx0 + (cx as f32 + 1.0) * cw - 5.0);
+            let (z0, z1) = (fz0 + cz as f32 * cd + 5.0, fz0 + (cz as f32 + 1.0) * cd - 5.0);
+            wire_box(&mut s, Vec3::new(x0, 9.0, z0), Vec3::new(x1, 15.0, z1));
+        }
+    }
+    wire_box(&mut s, Vec3::new(-9.0, 0.0, -7.0), Vec3::new(9.0, 24.0, 7.0)); // atrium core
+
+    // cars scattered in the lot (deterministic; some empty bays)
+    for cx in 0..9 {
+        for cz in 0..3 {
+            if (cx * 3 + cz * 5) % 7 == 0 {
+                continue;
+            }
+            let jitter = ((cx * 7 + cz * 13) % 5) as f32 * 0.6;
+            let x = -84.0 + cx as f32 * 21.0 + jitter;
+            let z = 70.0 + cz as f32 * 26.0;
+            wire_box(&mut s, Vec3::new(x - 4.6, 0.0, z - 2.3), Vec3::new(x + 4.6, 3.0, z + 2.3));
+        }
+    }
+
+    // outlying structures: gas-station canopy on legs (+X), power station (-X), storage (-X/+Z), tower
+    wire_box(&mut s, Vec3::new(96.0, 9.5, 8.0), Vec3::new(134.0, 11.5, 46.0));
+    for &(lx, lz) in &[(100.0f32, 12.0f32), (130.0, 12.0), (100.0, 42.0), (130.0, 42.0)] {
+        wire_box(&mut s, Vec3::new(lx - 0.8, 0.0, lz - 0.8), Vec3::new(lx + 0.8, 9.5, lz + 0.8));
+    }
+    wire_box(&mut s, Vec3::new(-138.0, 0.0, -28.0), Vec3::new(-98.0, 17.0, 12.0));
+    wire_box(&mut s, Vec3::new(-134.0, 0.0, 66.0), Vec3::new(-104.0, 10.0, 100.0));
+    wire_box(&mut s, Vec3::new(112.0, 0.0, -34.0), Vec3::new(118.0, 40.0, -28.0));
+
+    (g, s)
+}
+
+pub fn spawn_menu_city(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let (ground, structures) = build_city();
+    let mut mk = |verts: Vec<[f32; 3]>| {
+        let mut m = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+        m.insert_attribute(Mesh::ATTRIBUTE_POSITION, verts);
+        meshes.add(m)
+    };
+    let ground_mesh = mk(ground);
+    let struct_mesh = mk(structures);
+    let ground_mat = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        emissive: LinearRgba::rgb(0.02, 0.30, 0.45), // dim teal floor
+        alpha_mode: AlphaMode::Add,
+        ..default()
+    });
+    let struct_mat = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        emissive: LinearRgba::rgb(0.06, 1.5, 2.1), // HDR cyan -> Bloom neon
+        alpha_mode: AlphaMode::Add,
+        ..default()
+    });
+    for (mesh, mat) in [(ground_mesh, ground_mat), (struct_mesh, struct_mat)] {
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(mat),
+            Transform::default(),
+            MenuCity { yaw: 0.0, tilt: 0.0 },
+            Name::new("menu_city_wire"),
+        ));
+    }
+    info!("menu: spawned Interchange-inspired neon wireframe backdrop");
+}
+
+pub fn menu_city_update(
+    time: Res<Time>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut q: Query<(&mut Transform, &mut MenuCity)>,
+) {
+    let dt = time.delta_secs();
+    let t = time.elapsed_secs();
+    let (cnx, cny) = windows
+        .single()
+        .ok()
+        .and_then(|w| {
+            w.cursor_position()
+                .map(|c| ((c.x / w.width().max(1.0) - 0.5) * 2.0, (c.y / w.height().max(1.0) - 0.5) * 2.0))
+        })
+        .unwrap_or((0.0, 0.0));
+    // idle sway + cursor parallax (holographic feel)
+    let target_yaw = (t * 0.13).sin() * 0.06 + cnx * 0.16;
+    let target_tilt = -cny * 0.05;
+    for (mut tf, mut city) in &mut q {
+        let k = 1.0 - (-3.0 * dt).exp();
+        city.yaw += (target_yaw - city.yaw) * k;
+        city.tilt += (target_tilt - city.tilt) * k;
+        tf.rotation = Quat::from_rotation_y(city.yaw) * Quat::from_rotation_x(city.tilt);
+    }
+}
+
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
     use std::f32::consts::{PI, TAU};
     const BODY: Color32 = Color32::from_rgb(42, 42, 40); // #2a2a28
