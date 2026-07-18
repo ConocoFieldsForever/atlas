@@ -11,6 +11,7 @@
 
 mod eftpack;
 mod inspect;
+mod jobs;
 mod loot;
 mod menu;
 mod menu_fx;
@@ -440,6 +441,7 @@ fn main() {
         .add_plugins(tasks_panel::TasksPanelPlugin) // revamped Tasks tab: catalog + icon cache (router calls tasks_panel_ui)
         .add_plugins(pathfind::PathfindPlugin) // in-process CPU routing over the baked nav grid (nav.rs)
         .add_plugins(planner::PlannerPlugin) // loot-run orienteering planner (Navigation tab)
+        .add_plugins(jobs::JobsPlugin) // background job worker: build/sync maps while a map is open
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> restart into the selected pack
