@@ -389,6 +389,120 @@ pub fn menu_globe_update(
     }
 }
 
+// ============================================================================================
+// NEON LOW-POLY TRIANGLE TERRAIN — the interactive menu backdrop. A triangulated grid (row/col +
+// diagonal edges = triangles) in the 3D world, HDR-emissive so the camera's Bloom halos it into a
+// glowing neon wireframe. Each frame the vertex heights are recomputed: gentle idle swells + a
+// radial RIPPLE emanating from the cursor's point on the ground (a real camera->plane raycast), so
+// moving the mouse pushes waves across the terrain. Evokes a Tarkov map surface.
+// ============================================================================================
+
+const TN: usize = 56; // grid is TN x TN vertices
+const TCELL: f32 = 2.5; // cell size (world units)
+
+#[derive(Component)]
+pub struct MenuTerrain {
+    mesh: Handle<Mesh>,
+}
+
+pub fn spawn_menu_terrain(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let half = (TN as f32 - 1.0) * TCELL * 0.5;
+    let mut pos = Vec::with_capacity(TN * TN);
+    for j in 0..TN {
+        for i in 0..TN {
+            pos.push([i as f32 * TCELL - half, 0.0, j as f32 * TCELL - half]);
+        }
+    }
+    // Indexed LineList: row + column + one diagonal per cell (the diagonal splits each quad into two
+    // triangles). Indices are fixed; only the vertex heights change per frame.
+    let vid = |i: usize, j: usize| (j * TN + i) as u32;
+    let mut indices: Vec<u32> = Vec::new();
+    for j in 0..TN {
+        for i in 0..TN {
+            if i + 1 < TN {
+                indices.extend([vid(i, j), vid(i + 1, j)]);
+            }
+            if j + 1 < TN {
+                indices.extend([vid(i, j), vid(i, j + 1)]);
+            }
+            if i + 1 < TN && j + 1 < TN {
+                indices.extend([vid(i, j), vid(i + 1, j + 1)]);
+            }
+        }
+    }
+    let mut mesh = Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default());
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+    mesh.insert_indices(Indices::U32(indices));
+    let handle = meshes.add(mesh);
+
+    let mat = materials.add(StandardMaterial {
+        base_color: Color::BLACK,
+        emissive: LinearRgba::rgb(0.08, 1.7, 2.4), // HDR cyan -> Bloom neon
+        alpha_mode: AlphaMode::Add, // additive glowing lines (single layer -> no blowout)
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(handle.clone()),
+        MeshMaterial3d(mat),
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        MenuTerrain { mesh: handle },
+        Name::new("menu_terrain"),
+    ));
+    info!("menu: spawned neon triangle terrain");
+}
+
+pub fn menu_terrain_update(
+    time: Res<Time>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    cam: Query<(&GlobalTransform, &Camera), With<crate::render::CullCamera>>,
+    q: Query<&MenuTerrain>,
+) {
+    let t = time.elapsed_secs();
+    // Cursor -> point on the ground plane (y=0), via a camera->cursor raycast. None when off-screen.
+    let cursor_pt = (|| {
+        let w = windows.single().ok()?;
+        let cpos = w.cursor_position()?;
+        let (gt, camera) = cam.single().ok()?;
+        let ray = camera.viewport_to_world(gt, cpos).ok()?;
+        let dy = ray.direction.y;
+        if dy.abs() < 1e-4 {
+            return None;
+        }
+        let dist = -ray.origin.y / dy;
+        (dist > 0.0).then(|| {
+            let p = ray.get_point(dist);
+            Vec2::new(p.x, p.z)
+        })
+    })();
+    let half = (TN as f32 - 1.0) * TCELL * 0.5;
+    for terrain in &q {
+        let Some(mesh) = meshes.get_mut(&terrain.mesh) else {
+            continue;
+        };
+        let mut pos = Vec::with_capacity(TN * TN);
+        for j in 0..TN {
+            for i in 0..TN {
+                let x = i as f32 * TCELL - half;
+                let z = j as f32 * TCELL - half;
+                // gentle idle swells
+                let mut y = 1.5 * ((x * 0.05 + t * 0.25).sin() + (z * 0.06 - t * 0.2).cos());
+                // radial ripple from the cursor's ground point (decays with distance)
+                if let Some(c) = cursor_pt {
+                    let d = ((x - c.x) * (x - c.x) + (z - c.y) * (z - c.y)).sqrt();
+                    y += 5.5 * (d * 0.17 - t * 3.2).sin() * (-d * 0.045).exp();
+                }
+                pos.push([x, y, z]);
+            }
+        }
+        mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, pos);
+    }
+}
+
 pub fn security_camera(ui: &egui::Ui, panel: Rect) {
     use std::f32::consts::{PI, TAU};
     const BODY: Color32 = Color32::from_rgb(42, 42, 40); // #2a2a28

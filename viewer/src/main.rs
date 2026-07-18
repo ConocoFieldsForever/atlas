@@ -656,13 +656,14 @@ fn main() {
     }
     // Start menu (bare launch): scan packs/, fingerprint the game install, present the map
     // manager. The in-raid panels check for this resource and stand down while it exists.
-    // Menu backdrop = the NEON 3D GLOBE: a grid-textured emissive sphere in the 3D world that the
-    // camera's Bloom halos into a glowing neon wireframe (menu_fx::spawn_menu_globe / update). The
-    // CentralPanel goes transparent (menu.rs) so it shows behind the UI.
+    // Menu backdrop = the NEON LOW-POLY TERRAIN: a triangulated emissive grid in the 3D world that
+    // the camera's Bloom halos into a glowing neon wireframe, rippling toward the cursor
+    // (menu_fx::spawn_menu_terrain / update). The CentralPanel goes transparent (menu.rs) so it
+    // shows behind the UI.
     if menu_mode {
         app.insert_resource(menu::build_state());
-        app.add_systems(Startup, menu_fx::spawn_menu_globe.after(setup));
-        app.add_systems(Update, menu_fx::menu_globe_update);
+        app.add_systems(Startup, menu_fx::spawn_menu_terrain.after(setup));
+        app.add_systems(Update, menu_fx::menu_terrain_update);
     }
 
     app.run();
@@ -769,7 +770,9 @@ fn frame_for_pack(pack: Option<&crate::eftpack::Pack>) -> (Vec3, Vec3, f32, f32,
                 let d = (ext * 0.10).clamp(30.0, 90.0);
                 (anchor, anchor + Vec3::new(0.0, d * 0.5, d), (ext * 6.0).max(2000.0))
             }
-            None => (Vec3::ZERO, Vec3::new(0.0, 20.0, 60.0), 2000.0),
+            // Menu: look DOWN (~30°) at the neon terrain backdrop so its triangle grid reads,
+            // receding into the distance behind the UI (menu_fx::spawn_menu_terrain).
+            None => (Vec3::new(0.0, 0.0, -4.0), Vec3::new(0.0, 50.0, 82.0), 2000.0),
         }
     };
     let dir = (target - cam_pos).normalize_or_zero();
