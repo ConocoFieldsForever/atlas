@@ -13,16 +13,6 @@ internet required to use it.
 
 ---
 
-## What you'll see
-
-When you launch it you get a **menu** (a glowing neon wireframe backdrop with your
-map list on top). From there you pick a map and press **PLAY** to fly around it.
-
-You need a **map** to view — Atlas ships *without* any maps (they're too big and
-they're made from game files). Getting a map is covered below.
-
----
-
 ## Will it run on my PC?
 
 You need:
