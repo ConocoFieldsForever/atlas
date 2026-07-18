@@ -144,7 +144,39 @@ pub const MARGIN_CARD: i8 = 8;
 // it never REPLACES the Style (replacing with a fresh default flips egui to its light theme and
 // paints a fullscreen pale layer, the historical bug).
 // ============================================================================================
+/// Install an INTENTIONAL tactical UI font (once) — not egui's rounded default. Prefers Bahnschrift
+/// (techy condensed DIN), falling through common Windows faces, then egui's built-in if none load.
+/// Only the Proportional family is replaced; Monospace stays default (the install-path / build log).
+static FONTS_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn install_fonts_once(ctx: &egui::Context) {
+    use std::sync::atomic::Ordering;
+    if FONTS_INSTALLED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    use egui::{FontData, FontDefinitions, FontFamily};
+    for path in [
+        "C:/Windows/Fonts/bahnschrift.ttf",
+        "C:/Windows/Fonts/consola.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            let mut fonts = FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("atlas_ui".to_owned(), std::sync::Arc::new(FontData::from_owned(bytes)));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "atlas_ui".to_owned());
+            ctx.set_fonts(fonts);
+            return;
+        }
+    }
+}
+
 pub fn apply_global_style(ctx: &egui::Context) {
+    install_fonts_once(ctx);
     ctx.style_mut(|s| {
         // ---- hard corners everywhere (EFT UI has no rounded widgets) ----
         let z = CornerRadius::ZERO;
@@ -254,10 +286,12 @@ pub fn button_filled(text: &str, fill: Color32, text_color: Color32) -> egui::Bu
         (fill.g() as u16 + 78).min(255) as u8,
         (fill.b() as u16 + 78).min(255) as u8,
     );
-    egui::Button::new(RichText::new(text.to_owned()).color(text_color).strong())
-        .fill(fill)
-        .stroke(Stroke::new(1.5, rim))
-        .corner_radius(0.0)
+    egui::Button::new(
+        RichText::new(text.to_owned()).color(text_color).strong().size(15.5).extra_letter_spacing(0.6),
+    )
+    .fill(fill)
+    .stroke(Stroke::new(1.5, rim))
+    .corner_radius(0.0)
 }
 
 /// The primary affirmative button — beige fill, black text (the menu PLAY button).
