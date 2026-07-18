@@ -26,6 +26,8 @@ use std::collections::VecDeque;
 pub enum Job {
     BuildMap { map: String, game_dir: String },
     SyncIntel,
+    /// Install the Python build dependencies (venv + UnityPy/numpy/Pillow) from the menu.
+    InstallDeps,
 }
 
 impl Job {
@@ -33,19 +35,21 @@ impl Job {
         match self {
             Job::BuildMap { map, .. } => format!("build {map}"),
             Job::SyncIntel => "sync intel".to_string(),
+            Job::InstallDeps => "install deps".to_string(),
         }
     }
     /// The map key when this is a build (drives the menu's per-row BUILDING state), else None.
     pub fn build_key(&self) -> Option<&str> {
         match self {
             Job::BuildMap { map, .. } => Some(map.as_str()),
-            Job::SyncIntel => None,
+            Job::SyncIntel | Job::InstallDeps => None,
         }
     }
     fn spawn(&self) -> std::io::Result<BuildJob> {
         match self {
             Job::BuildMap { map, game_dir } => BuildJob::spawn(map, game_dir),
             Job::SyncIntel => BuildJob::spawn_intel(),
+            Job::InstallDeps => BuildJob::spawn_setup(),
         }
     }
 }
@@ -96,6 +100,9 @@ impl JobWorker {
     pub fn current_is_sync(&self) -> bool {
         matches!(self.current.as_ref().map(|(j, _)| j), Some(Job::SyncIntel))
     }
+    pub fn current_is_install(&self) -> bool {
+        matches!(self.current.as_ref().map(|(j, _)| j), Some(Job::InstallDeps))
+    }
     /// (label, latest `[STAGE …]` marker) of the running job, for a compact readout.
     pub fn status(&self) -> Option<(String, String)> {
         self.current.as_ref().map(|(j, b)| (j.label(), b.snapshot(1).0))
@@ -118,6 +125,9 @@ impl JobWorker {
     }
     pub fn last_is_sync(&self) -> bool {
         !self.last_dismissed && matches!(self.last.as_ref().map(|(j, _)| j), Some(Job::SyncIntel))
+    }
+    pub fn last_is_install(&self) -> bool {
+        !self.last_dismissed && matches!(self.last.as_ref().map(|(j, _)| j), Some(Job::InstallDeps))
     }
     /// (label, ok) of the most recent finished (undismissed) job.
     pub fn last_outcome(&self) -> Option<(String, bool)> {

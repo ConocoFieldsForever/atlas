@@ -807,7 +807,8 @@ pub fn triangle_field(ctx: &egui::Context) {
             if let Some(m) = mouse {
                 let (dx, dy) = (px - m.x, py - m.y);
                 let d2 = dx * dx + dy * dy;
-                let push = 46.0 * (-d2 / (200.0 * 200.0)).exp();
+                // Gentle nudge, not a bulge — a strong warp near the cursor reads as distracting.
+                let push = 12.0 * (-d2 / (230.0 * 230.0)).exp();
                 let d = d2.sqrt().max(0.001);
                 px += dx / d * push;
                 py += dy / d * push;
@@ -832,9 +833,9 @@ pub fn triangle_field(ctx: &egui::Context) {
                 let band = 0.5 + 0.5 * (t * 0.7 - (cx + cy) * 0.006).sin();
                 let glow = g_cursor.max(0.16 * band);
                 // dim by default so the field is ambient texture, not a grid that fights the text;
-                // the cursor pool still brightens locally.
-                let edge_a = (7.0 + 170.0 * glow).clamp(0.0, 255.0) as u8;
-                let fill_a = (2.0 + 95.0 * g_cursor).clamp(0.0, 255.0) as u8;
+                // the cursor pool brightens locally but gently (a strong pool is distracting).
+                let edge_a = (7.0 + 105.0 * glow).clamp(0.0, 255.0) as u8;
+                let fill_a = (2.0 + 48.0 * g_cursor).clamp(0.0, 255.0) as u8;
                 painter.add(egui::Shape::convex_polygon(
                     vec![tri[0], tri[1], tri[2]],
                     Color32::from_rgba_unmultiplied(40, 185, 214, fill_a),
