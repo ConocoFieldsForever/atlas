@@ -32,9 +32,13 @@ $pth = Join-Path $Dest "$tag._pth"
 Set-Content -Encoding ascii -Path $pth -Value @(
     "$tag.zip"
     "."
+    ".."
     "Lib\site-packages"
     ""
-    "# enable site so pip-installed packages import"
+    "# '..' = the kit root (one level above python\), so `python -m eft_pipeline.assemble_bevy` and the"
+    "# other pipeline modules import — the embeddable dist otherwise ignores the working dir, so a"
+    "# build fails at assemble with ModuleNotFoundError: No module named 'eft_pipeline'."
+    "# 'import site' enables site-packages so pip-installed deps (UnityPy/numpy/Pillow) import."
     "import site"
 )
 
