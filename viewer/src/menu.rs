@@ -15,9 +15,9 @@ use bevy::prelude::*;
 /// One known/installed map row.
 pub struct MapEntry {
     /// Display title ("Streets of Tarkov").
-    pub title: &'static str,
+    pub title: String,
     /// Dataset/dir stem ("streets").
-    pub key: &'static str,
+    pub key: String,
     /// packs/<key>.eftpack when present on disk.
     pub pack_dir: Option<String>,
     pub size_bytes: u64,
@@ -404,8 +404,8 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
         let manifest = p.join("manifest.json");
         if !manifest.is_file() {
             entries.push(MapEntry {
-                title: Box::leak(title.to_string().into_boxed_str()),
-                key: Box::leak(key.to_string().into_boxed_str()),
+                title: title.to_string(),
+                key: key.to_string(),
                 pack_dir: None,
                 size_bytes: 0,
                 built_days: None,
@@ -444,8 +444,8 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
             .unwrap_or(false)
             || p.join("volume.bin").exists();
         entries.push(MapEntry {
-            title: Box::leak(title.to_string().into_boxed_str()),
-            key: Box::leak(key.to_string().into_boxed_str()),
+            title: title.to_string(),
+            key: key.to_string(),
             pack_dir: Some(dir.clone()),
             size_bytes: size,
             built_days: age_days(&manifest),
@@ -1216,6 +1216,12 @@ pub fn menu_ui(
             if !state.assets_ok {
                 ui.add_space(2.0);
                 ui.label(RichText::new(t(lg, K::FirstRunBanner)).color(WARN).size(11.0));
+            } else {
+                // Even after the folder is chosen (the verbose banner above is gone), keep a short
+                // reminder that a map's FIRST build is a large one-time extraction — the user was
+                // surprised by the extraction cost / thought a finished deps install had built a map.
+                ui.add_space(2.0);
+                ui.label(RichText::new(t(lg, K::FirstBuildHint)).color(DIM).size(10.0));
             }
             ui.horizontal(|ui| {
                 ui.label(RichText::new(t(lg, K::ExtractedAssets)).color(DIM).size(11.0));
@@ -1416,6 +1422,22 @@ pub fn menu_ui(
             // vignette (Background layer, behind every opaque panel) only ever darkens the blue
             // background between/around them, never the UI text.
             let card_bg = CARD;
+            if !can_build {
+                // Persistent INLINE reason (not just the disabled-button hover tooltip) so a
+                // non-technical user actually sees WHY every BUILD is greyed out and what to do.
+                egui::Frame::new()
+                    .fill(theme::INSET)
+                    .stroke(egui::Stroke::new(1.0, WARN))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("\u{26A0} {}", t(lg, K::BuildNeedsSetup)))
+                                .color(WARN)
+                                .size(12.0),
+                        );
+                    });
+                ui.add_space(8.0);
+            }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));
@@ -1430,7 +1452,7 @@ pub fn menu_ui(
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.set_min_height(34.0);
-                                let title = RichText::new(map_title(lg, e.key, e.title))
+                                let title = RichText::new(map_title(lg, &e.key, &e.title))
                                     .size(theme::SIZE_ROW_TITLE)
                                     .strong()
                                     .color(if installed { BEIGE } else { DIM });
@@ -1474,7 +1496,7 @@ pub fn menu_ui(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
                                         let this_building =
-                                            building_key.as_deref() == Some(e.key);
+                                            building_key.as_deref() == Some(e.key.as_str());
                                         let any_building = building_key.is_some();
                                         if installed {
                                             // Only a VALID pack is playable (finding 4). A damaged
@@ -1645,6 +1667,23 @@ pub fn menu_ui(
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("\u{26A0} {msg}")).color(theme::DANGER_TEXT).size(11.0));
+            });
+    }
+
+    // A build/deps job that failed to even START (a rare spawn error — missing python kit, bad path)
+    // used to be shown ONLY inside the intel row, so a BUILD / INSTALL DEPS that never launched read
+    // as a dead click. Surface it globally, centred just above the footer, whatever the job type.
+    if let Some(err) = worker.spawn_error.clone() {
+        egui::Area::new(egui::Id::new("menu_spawn_err"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -42.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(format!("\u{26A0} {err}"))
+                        .color(theme::DANGER_TEXT)
+                        .size(12.0)
+                        .strong(),
+                );
             });
     }
 

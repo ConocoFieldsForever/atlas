@@ -77,13 +77,36 @@ pub struct JobWorker {
 
 impl JobWorker {
     /// Queue a job (deduped by label: won't double-queue the same map build / a second sync while
-    /// one is already running or pending).
+    /// one is already running or pending). FORCE-AWARE for map builds: an UPDATE (`force=true`,
+    /// re-extract against patched game files) must NEVER be swallowed by a queued/running plain BUILD
+    /// (`force=false`) for the same map — that silently skips the user's requested re-extraction and
+    /// can flip the row to READY over stale geometry. So a forced build UPGRADES a queued non-force
+    /// build in place, and appends after a running non-force build rather than being dropped.
     pub fn enqueue(&mut self, job: Job) {
         let l = job.label();
-        let running = self.current.as_ref().map(|(j, _)| j.label() == l).unwrap_or(false);
-        if !running && !self.queue.iter().any(|j| j.label() == l) {
-            self.queue.push_back(job);
+        let incoming_force = matches!(&job, Job::BuildMap { force: true, .. });
+        // Same-label job already QUEUED?
+        if let Some(pos) = self.queue.iter().position(|j| j.label() == l) {
+            let queued_force = matches!(&self.queue[pos], Job::BuildMap { force: true, .. });
+            if incoming_force && !queued_force {
+                self.queue[pos] = job; // upgrade the pending plain build to a forced re-extract
+            }
+            // else: an equal-or-stronger job is already queued → dedup (drop the incoming one).
+            return;
         }
+        // Same-label job currently RUNNING?
+        if let Some((cur, _)) = self.current.as_ref().filter(|(j, _)| j.label() == l) {
+            let running_force = matches!(cur, Job::BuildMap { force: true, .. });
+            if incoming_force && !running_force {
+                // A plain build is in flight but the user asked for a forced re-extract: queue it so
+                // it runs AFTER (don't drop it; don't cancel the in-flight extraction mid-way).
+                self.queue.push_back(job);
+            }
+            // else: an equal-or-stronger job is already running → dedup.
+            return;
+        }
+        // No conflict — queue it.
+        self.queue.push_back(job);
     }
     pub fn busy(&self) -> bool {
         self.current.is_some()

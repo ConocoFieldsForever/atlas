@@ -98,6 +98,7 @@ pub enum K {
     IsSet,
     UsingDefault,
     FirstRunBanner,
+    FirstBuildHint,
     LanguageTip,
     BuildDeps,
     DepsReady,
@@ -231,6 +232,10 @@ fn pair(k: K) -> [&'static str; 2] {
             "Первый запуск: выберите папку для РАСПАКОВАННЫХ ДАННЫХ. Первая СБОРКА карты запускает \
              однократную распаковку из файлов игры в эту папку (сначала закройте игру; ~1-6 ГБ на \
              карту, может занять время); последующие сборки быстрые.",
+        ],
+        FirstBuildHint => [
+            "First BUILD of a map runs a one-time ~1-6 GB extraction - close the game first.",
+            "Первая СБОРКА карты запускает однократную распаковку ~1-6 ГБ - сначала закройте игру.",
         ],
         LanguageTip => ["Language / Язык (override auto-detect)", "Язык / Language (переопределить)"],
         BuildDeps => ["BUILD DEPS", "ЗАВИСИМОСТИ"],
