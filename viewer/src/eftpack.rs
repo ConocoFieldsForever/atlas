@@ -591,6 +591,41 @@ impl Pack {
         out
     }
 
+    /// Like `instances_by_mesh` but keeps only ONE LOD level per LODGroup, for the viewer's forced-
+    /// LOD selector on `--alllod` packs. `forced_lod` = 0 (finest / default) .. N (coarser); each
+    /// group renders `min(forced_lod, that group's max available lod)`, so forcing a level a group
+    /// doesn't have falls back to its coarsest instead of vanishing. Ungrouped instances
+    /// (`lod_group < 0` — terrain, non-LOD meshes) are always kept. A LOD0-only pack has every
+    /// instance at `lod_index == 0`, so any `forced_lod` yields the identical (full) set — the
+    /// selector is a no-op there.
+    pub fn instances_by_mesh_for_lod(&self, forced_lod: i32) -> Vec<Vec<u32>> {
+        let mut group_max: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        for inst in &self.instances {
+            if inst.lod_group >= 0 {
+                let e = group_max.entry(inst.lod_group).or_insert(0);
+                if inst.lod_index > *e {
+                    *e = inst.lod_index;
+                }
+            }
+        }
+        let want = forced_lod.max(0);
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); self.manifest.meshes.len()];
+        for (i, inst) in self.instances.iter().enumerate() {
+            let keep = if inst.lod_group < 0 {
+                true
+            } else {
+                inst.lod_index == want.min(*group_max.get(&inst.lod_group).unwrap_or(&0))
+            };
+            if keep {
+                let mid = inst.mesh_id as usize;
+                if mid < out.len() {
+                    out[mid].push(i as u32);
+                }
+            }
+        }
+        out
+    }
+
     /// Per-mesh LOCAL bounding spheres, indexed to match `manifest.meshes`.
     /// Feeds the cull compute pass. center = mean of positions, radius = max
     /// distance from center (cheap, tight enough for frustum rejection).
