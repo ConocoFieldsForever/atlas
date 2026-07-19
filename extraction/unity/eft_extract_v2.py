@@ -123,8 +123,18 @@ def _save_npy(path, arr):
         np.save(f, arr)
 
 
+# EFT_PNG_FAST (OPT-IN speed knob, NOT default): zlib level 1 instead of PIL's default level 6 -> ~2x faster PNG
+# encode, ~15-40% larger files, still fully LOSSLESS (PNG is lossless at every compress_level). UNSET (the default)
+# keeps level 6 so default packs are BYTE-IDENTICAL to today. Read once at import; parallel child processes inherit
+# the env, so it applies to both the direct and the parallel extractor.
+_PNG_FAST = bool(os.environ.get("EFT_PNG_FAST"))
+
+
 def _save_png(path, img):
-    img.save(path, format="PNG")                   # format explicit: the temp name has no .png extension to infer from
+    if _PNG_FAST:
+        img.save(path, format="PNG", compress_level=1)   # opt-in: faster, larger, lossless
+    else:
+        img.save(path, format="PNG")               # format explicit: the temp name has no .png extension to infer from
 
 
 def _link_or_copy(src, dst):
