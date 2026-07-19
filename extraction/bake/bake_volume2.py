@@ -240,12 +240,23 @@ def load_lights(G3, DS):
     """FILTERED live lights (the extractor already applies m_Enabled + ancestor m_IsActive).
     Unity world -> glb world = G3 @ p; spot forward = G3 @ (R_quat @ (0,0,1)); spotAngle is the FULL cone."""
     cand = sorted(glob.glob(os.path.join(DS, 'lights_*.json')))
-    cand = [c for c in cand if not c.endswith('.bak')]
+    # Skip .bak and the *_all.json superset (that variant includes off/disabled lights tagged
+    # on:false, which are not for baking).
+    cand = [c for c in cand if not c.endswith('.bak') and not c.endswith('_all.json')]
     if not cand:
         print("[lights] no lights_*.json for this dataset -> SKY-ONLY bake"); L = []
     else:
-        L = json.load(open(cand[0]))
-        print(f"[lights] {cand[0]} -> {len(L)} lights")
+        # MERGE every per-scene light sidecar. Single-light maps have exactly one file (behaviour
+        # unchanged); maps that split their lighting across many district scenes (streets/ground_zero)
+        # need ALL of them for full lighting -- the previous code baked only the first file, leaving
+        # most districts dark.
+        L = []
+        for c in cand:
+            part = json.load(open(c))
+            L.extend(part)
+            print(f"[lights] {os.path.basename(c)} -> {len(part)} lights")
+        if len(cand) > 1:
+            print(f"[lights] merged {len(cand)} sidecars -> {len(L)} lights total")
     pos, ci, rng_, sf, cono, coni = [], [], [], [], [], []
     n_spot = n_dir_skipped = 0
     for l in L:
