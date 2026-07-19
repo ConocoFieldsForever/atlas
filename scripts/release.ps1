@@ -12,6 +12,7 @@ param(
     [switch]$Full,
     [switch]$SkipBuild,
     [switch]$SkipRenderSmoke,
+    [switch]$SkipPython,   # -Full only: skip bundling the embeddable Python (fast local reruns)
     [string]$SmokePack = "packs\factory.eftpack"
 )
 
@@ -81,6 +82,15 @@ if ($Full) {
     Remove-Item "$dist\extraction\grade\lut_amidgen_bluegreen.png","$dist\extraction\grade\eft_grade_lut.bin" -Force -ErrorAction SilentlyContinue
     Copy-Item "extraction\requirements.txt" $dist
     Copy-Item "scripts\bootstrap.ps1" $dist
+    # Bundle a self-contained embeddable Python (+ pip, ~30 MB) so a non-dev needs NO system Python.
+    # The heavy extraction deps (UnityPy/numpy/Pillow) install on first INSTALL DEPS into this same
+    # Python (tools/setup_deps.py detects the embeddable interpreter). paths::python_exe prefers it.
+    if (-not $SkipPython) {
+        & "$PSScriptRoot\bundle-python.ps1" -Dest "$dist\python"
+        if ($LASTEXITCODE -ne 0) { throw "bundle-python.ps1 failed (rc=$LASTEXITCODE)" }
+    } else {
+        Write-Host "[release] -SkipPython: no bundled Python in this dist"
+    }
 }
 
 # Belt-and-braces: no pack/game data may ship.

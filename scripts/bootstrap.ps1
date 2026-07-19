@@ -14,6 +14,19 @@ if (Test-Path (Join-Path $PSScriptRoot "extraction")) {
 if ($here -notmatch "\S") { $here = "." }
 Set-Location $here
 
+# If the release shipped a bundled embeddable Python, use it directly (no system Python needed and
+# no venv — the embeddable interpreter is already isolated per-kit). This is the non-dev path.
+$bundled = Join-Path $here "python\python.exe"
+if (Test-Path $bundled) {
+    Write-Host "[bootstrap] using the bundled Python ($bundled) - no system Python or venv needed"
+    & $bundled -m pip install --upgrade pip
+    & $bundled -m pip install -r "extraction\requirements.txt"
+    if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+    & $bundled "extraction\check_env.py"
+    Write-Host "[bootstrap] done. The viewer menu uses this bundled Python automatically."
+    return
+}
+
 if (-not $Python) {
     $cand = Get-Command py -ErrorAction SilentlyContinue
     if ($cand) { $Python = "py -3.10" } else { $Python = "python" }

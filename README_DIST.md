@@ -15,14 +15,15 @@ Right panel: layers, search, quests, routes, graphics settings.
 
 ## Building your own packs (full bundle)
 
-Requirements: Windows 10+, Python 3.10+, your own EFT install, ~2–10 GB disk per map.
-Optional for baked lighting: NVIDIA GPU (CUDA) — without it maps render with flat ambient.
+Requirements: Windows 10+, your own EFT install, ~2–10 GB disk per map. **Python is bundled**
+(`python\` beside the exe) — nothing to install. Optional for baked lighting: NVIDIA GPU (CUDA)
+— without it maps render with flat ambient.
 
 ```powershell
-.\bootstrap.ps1                        # one-time: venv + python deps + env check
-.\atlas.exe                       # menu: set GAME INSTALL if not autodetected,
-                                       # then BUILD on any map row
-# GPU lighting bake (optional):  .\venv\Scripts\pip install -r extraction\requirements-bake.txt
+.\atlas.exe            # in the menu: click INSTALL DEPS once (uses the bundled Python to fetch
+                       # UnityPy/numpy/Pillow), set GAME INSTALL if not autodetected, then BUILD.
+# Advanced/offline: .\bootstrap.ps1 does the same deps install from a shell.
+# GPU lighting bake (optional):  .\python\python.exe -m pip install -r extraction\requirements-bake.txt
 ```
 
 The BUILD button runs the full pipeline with live progress (lights → lighting bake →

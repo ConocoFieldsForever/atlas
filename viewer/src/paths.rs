@@ -77,12 +77,19 @@ pub fn repo_root() -> Option<&'static Path> {
     .as_deref()
 }
 
-/// Python for the menu build: EFT_PY env > bundled venv beside the kit > PATH "python".
+/// Python for the menu build: EFT_PY env > bundled embeddable Python (shipped in the -Full release
+/// so a non-dev needs NO system Python) > venv beside the kit (dev / system-python path) > PATH
+/// "python". The bundled Python ships with pip but WITHOUT the heavy deps; INSTALL DEPS
+/// (tools/setup_deps.py) installs UnityPy/numpy/Pillow into it on first use.
 pub fn python_exe(root: &Path) -> PathBuf {
     if let Ok(p) = std::env::var("EFT_PY") {
         if !p.is_empty() {
             return PathBuf::from(p);
         }
+    }
+    let bundled = root.join("python").join("python.exe");
+    if bundled.is_file() {
+        return bundled;
     }
     let venv = root.join("venv").join("Scripts").join("python.exe");
     if venv.is_file() {
