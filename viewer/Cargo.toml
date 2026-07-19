@@ -28,11 +28,14 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bevy_egui = { workspace = true }
-# Tiny HTTP client. `native-tls` = schannel on Windows (uses the OS cert store, so no bundled
-# webpki-roots blob and no OpenSSL to fight +crt-static) — needed for the one HTTPS GET to the
-# public GitHub releases API in `update.rs` (menu update check). default-features=false still drops
-# gzip/cookies/json; the body is parsed with the workspace serde_json.
-ureq = { version = "2", default-features = false, features = ["native-tls"] }
+# Tiny HTTP client for the one HTTPS GET to the public GitHub releases API in `update.rs` (menu
+# update check). Uses ureq's `tls` feature = rustls + bundled webpki-roots: pure Rust (no OpenSSL,
+# no schannel wiring), so it links cleanly under +crt-static AND supplies a DEFAULT TLS connector
+# that the top-level `ureq::get()` uses automatically — the `native-tls` feature does NOT (it must
+# be wired onto an Agent by hand, so https shortcut calls silently fail without rustls). The bundled
+# root store also makes the check machine-independent. default-features=false still drops
+# gzip/cookies/json; the response body is parsed with the workspace serde_json.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 texpresso = "2.0.2"
 # Native folder picker for the first-run onboarding (choose where extracted datasets live).
 # default-features off = just the OS-native dialog, no Linux async/portal runtimes.
