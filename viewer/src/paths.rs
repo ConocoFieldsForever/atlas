@@ -47,16 +47,34 @@ pub fn shared_dir() -> PathBuf {
     packs_root().join("shared")
 }
 
+/// `%APPDATA%\atlas\atlas.config.json` — the WRITABLE per-user config location (survives a
+/// read-only / Program Files install dir, where a config beside the exe would silently fail to
+/// save; finding 12). None when APPDATA is unset (non-Windows dev / stripped env).
+pub fn appdata_config() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("atlas").join("atlas.config.json"))
+}
+
+/// Resolved config path. READ order prefers an EXISTING file so pre-portability installs (config
+/// beside the exe / in the cwd) keep working; when none exists yet we point WRITES at the
+/// user-profile location (`%APPDATA%\atlas`), which is writable even when the install dir is not —
+/// so language / game-dir / assets settings actually persist across restarts (finding 12).
 pub fn config_path() -> PathBuf {
-    let exe = exe_dir().join("atlas.config.json");
-    if exe.exists() {
-        return exe;
+    let appdata = appdata_config();
+    for cand in [
+        appdata.clone(),
+        Some(exe_dir().join("atlas.config.json")),
+        Some(PathBuf::from("atlas.config.json")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if cand.exists() {
+            return cand;
+        }
     }
-    let cwd = PathBuf::from("atlas.config.json");
-    if cwd.exists() {
-        return cwd;
-    }
-    exe
+    // Nothing on disk yet: write to the user profile (falling back to beside-the-exe only when
+    // APPDATA is unavailable).
+    appdata.unwrap_or_else(|| exe_dir().join("atlas.config.json"))
 }
 
 /// Where the python kit lives (tools/, extraction/, eft_pipeline/): dev = the workspace cwd;
