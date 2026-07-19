@@ -3073,6 +3073,15 @@ fn fnv64(bytes: &[u8]) -> u64 {
 }
 
 /// Cache read: (w, h, mips, payload) when present.
+/// Exact byte length `bc3_compress_chain` produces for a (w,h,mips) BC3 payload (same per-mip
+/// `compressed_size` accumulation) — lets `texcache_read` reject a truncated/corrupt entry.
+fn bc3_payload_len(width: u32, height: u32, mips: u32) -> usize {
+    let fmt = texpresso::Format::Bc3;
+    (0..mips)
+        .map(|l| fmt.compressed_size((width >> l).max(1) as usize, (height >> l).max(1) as usize))
+        .sum()
+}
+
 fn texcache_read(hash: u64) -> Option<(u32, u32, u32, Vec<u8>)> {
     let bytes = std::fs::read(texcache_path(hash)).ok()?;
     if bytes.len() <= 12 {
@@ -3081,7 +3090,16 @@ fn texcache_read(hash: u64) -> Option<(u32, u32, u32, Vec<u8>)> {
     let w = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let h = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
     let m = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-    Some((w, h, m, bytes[12..].to_vec()))
+    let payload = &bytes[12..];
+    // Reject an implausible header or a wrong-length payload (e.g. a cache write interrupted by a
+    // crash): treat as a MISS so the caller re-decodes from the source PNG rather than feeding a
+    // short buffer into `create_texture_with_data`, which would panic/abort the process.
+    if w == 0 || h == 0 || m == 0 || w > 16384 || h > 16384 || m > 16
+        || payload.len() != bc3_payload_len(w, h, m)
+    {
+        return None;
+    }
+    Some((w, h, m, payload.to_vec()))
 }
 
 fn texcache_write(hash: u64, width: u32, height: u32, mips: u32, payload: &[u8]) {
@@ -3094,7 +3112,15 @@ fn texcache_write(hash: u64, width: u32, height: u32, mips: u32, payload: &[u8])
     file.extend_from_slice(&height.to_le_bytes());
     file.extend_from_slice(&mips.to_le_bytes());
     file.extend_from_slice(payload);
-    let _ = std::fs::write(&p, &file); // best-effort (read-only fs just re-encodes next launch)
+    // Atomic write: unique temp beside the target then rename, so a crash mid-write can never leave a
+    // truncated entry. The unique suffix avoids a collision when two workers encode the same content
+    // hash concurrently. Best-effort (a read-only fs just re-encodes next launch).
+    static TMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let uniq = TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = p.with_extension(format!("tmp{uniq:x}"));
+    if std::fs::write(&tmp, &file).is_ok() && std::fs::rename(&tmp, &p).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Feature+env gate alone (no dims) — used to probe the shared cache BEFORE decoding.
@@ -3356,7 +3382,7 @@ fn upload_budget_ms() -> f64 {
         std::env::var("EFT_LOAD_BUDGET_MS")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
-            .filter(|v| *v > 0.0)
+            .filter(|v| v.is_finite() && *v > 0.0) // reject inf/NaN: Duration::from_secs_f64 panics on them
             .unwrap_or(6.0)
     })
 }
