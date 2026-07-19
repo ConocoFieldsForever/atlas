@@ -28,6 +28,7 @@
 
 use core::num::NonZeroU32;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bevy::core_pipeline::core_3d::{
@@ -739,6 +740,39 @@ impl ExtractResource for ExtractedCpuData {
     }
 }
 
+/// Cross-world "GPU map build in progress" flag. Set TRUE the moment a new map's GPU build begins
+/// (main world: `build_cpu_data` / `poll_map_load`), cleared FALSE when `prepare_gpu_buffers`
+/// finishes uploading every texture and inserts `EftGpuBuffers` (render world). The SAME `Arc` is
+/// inserted into BOTH the main app and the render sub-app, so the render world can signal the main
+/// world's `map_loading_indicator` to keep showing the "Loading…" toast until the map is actually
+/// on-screen — not just until the .eftpack FILE finished loading (which is all `PendingMapLoad`
+/// tracks). Without this the toast vanishes the instant the file loads, then the window would sit
+/// blank/frozen through the multi-second GPU build.
+#[derive(Resource, Clone)]
+pub struct GpuLoadSignal(pub Arc<AtomicBool>);
+
+impl Default for GpuLoadSignal {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+impl GpuLoadSignal {
+    /// True while a map's GPU build is still running (textures uploading / buffers not yet built).
+    pub fn in_progress(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    /// Latch the flag TRUE — a new map's GPU build is starting. Called by `poll_map_load` the moment
+    /// it applies a finished file load (closing the 1-frame gap before `build_cpu_data` runs) and by
+    /// `build_cpu_data` itself.
+    pub fn begin(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+    fn set(&self, v: bool) {
+        self.0.store(v, Ordering::Relaxed);
+    }
+}
+
 /// Marker for the camera whose frustum drives the GPU cull. Extracted so the render
 /// world can pick THE player view out of Bevy's multiple ExtractedViews â€” otherwise
 /// `views.iter().next()` grabs a prepass/default view nondeterministically and the cull
@@ -776,6 +810,11 @@ pub struct EftGpuDrivenPlugin;
 
 impl Plugin for EftGpuDrivenPlugin {
     fn build(&self, app: &mut App) {
+        // Shared load-progress flag: the SAME Arc lives in the main app (read by the loading
+        // indicator + written when a build starts) and the render sub-app (cleared when the GPU
+        // build finishes). Insert into the MAIN app here; the render sub-app clone is inserted below.
+        let load_signal = GpuLoadSignal::default();
+        app.insert_resource(load_signal.clone());
         app.add_plugins((
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
             ExtractComponentPlugin::<CullCamera>::default(),
@@ -792,6 +831,7 @@ impl Plugin for EftGpuDrivenPlugin {
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
+            .insert_resource(load_signal)
             .add_render_command::<Transparent3d, DrawGpuDriven>()
             .init_resource::<SpecializedRenderPipelines<EftDrawPipeline>>()
             .add_systems(RenderStartup, init_gpu_pipelines)
@@ -847,8 +887,17 @@ fn free_cpu_staging(
     mut commands: Commands,
     mut frames: Local<u32>,
     cpu: Option<Res<ExtractedCpuData>>,
+    load_signal: Option<Res<GpuLoadSignal>>,
 ) {
     if cpu.is_none() {
+        return;
+    }
+    // The GPU build now streams textures across MANY frames (async), reading the extracted staging
+    // blob every frame. Do NOT drop it while a build is in progress — hold the countdown until the
+    // render world signals the map is on-screen, else prepare_gpu_buffers loses `cpu` mid-build and
+    // the load stalls forever. (Originally the whole build fit in one frame, so 4 frames sufficed.)
+    if load_signal.as_ref().map(|s| s.in_progress()).unwrap_or(false) {
+        *frames = 0;
         return;
     }
     // A NEW blob (in-place map swap re-inserts it → "added" again) restarts the countdown, so the
@@ -887,11 +936,21 @@ fn build_cpu_data(
     epoch: Res<super::MapEpoch>,
     tags: Query<(), With<GpuDrivenTag>>,
     lod: Res<crate::ForcedLod>,
+    load_signal: Option<Res<GpuLoadSignal>>,
 ) {
     let Some(pack) = pack else {
         return;
     };
+    // A new map's GPU build starts NOW: latch the loading flag so the indicator stays up through
+    // the whole (multi-frame, off-thread) texture build, not just the file load. Cleared by
+    // `prepare_gpu_buffers` once the map is actually on-screen. Covers epoch bumps with no
+    // `PendingMapLoad` (the LOD selector), and closes the 1-frame gap after `poll_map_load` clears
+    // `PendingMapLoad` but before the render world starts building.
+    if let Some(s) = &load_signal {
+        s.set(true);
+    }
     let pack = &pack.0;
+    let build_t0 = std::time::Instant::now(); // STALL INSTRUMENTATION (main-thread)
     // LOD selector (graphics panel): keep one LOD per group. No-op on lean LOD0-only packs.
     let by_mesh = pack.instances_by_mesh_for_lod(lod.0);
     let local_spheres = match pack.bounding_spheres() {
@@ -1681,6 +1740,14 @@ fn build_cpu_data(
             }
         }
     }
+    eprintln!(
+        "[stall] build_cpu_data (main thread): {:.1} ms  ({} meshes, {} instances, {} albedo, {} normal)",
+        build_t0.elapsed().as_secs_f64() * 1000.0,
+        mesh_count,
+        instance_total,
+        albedo_paths.len(),
+        normal_paths.len(),
+    );
     commands.insert_resource(ExtractedCpuData(Arc::new(CpuData {
         vertex_data,
         index_data,
@@ -1945,6 +2012,9 @@ fn reset_gpu_map_if_epoch_changed(
     commands.remove_resource::<EftGpuBuffers>();
     commands.remove_resource::<EftCullBindGroup>();
     commands.remove_resource::<EftDrawBindGroup>();
+    // Abandon any in-flight async texture build for the OLD map (its tasks + partial uploads are
+    // for stale geometry); prepare_gpu_buffers re-kicks a fresh build for the new epoch.
+    commands.remove_resource::<GpuBuildState>();
     commands.remove_resource::<EftMaterialResources>();
     commands.remove_resource::<EftMaterialBindGroup>();
     commands.remove_resource::<EftShResources>();
@@ -1971,6 +2041,7 @@ fn reset_gpu_map_if_epoch_changed(
     commands.insert_resource(SpecializedRenderPipelines::<EftDrawPipeline>::default());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_gpu_buffers(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
@@ -1981,11 +2052,18 @@ fn prepare_gpu_buffers(
     compute: Option<Res<EftComputePipelines>>,
     draw: Option<Res<EftDrawPipeline>>,
     map_epoch: Option<Res<super::MapEpoch>>,
+    // Async streaming build state (present only DURING a build) + the cross-world loading flag.
+    mut build: Option<ResMut<GpuBuildState>>,
+    load_signal: Option<Res<GpuLoadSignal>>,
 ) {
     if already.is_some() {
-        // Buffers are built. Drop any render-world copy of the ~650 MiB CPU staging
-        // blob that got re-extracted before free_cpu_staging drops the main-world
-        // source, so the whole Arc is released (Codex P1).
+        // Buffers are built. The map is on-screen: the load is fully done, so drop the loading flag
+        // (belt-and-suspenders — finalize already cleared it) and drop any render-world copy of the
+        // ~650 MiB CPU staging blob that got re-extracted before free_cpu_staging drops the
+        // main-world source, so the whole Arc is released (Codex P1).
+        if let Some(s) = &load_signal {
+            s.set(false);
+        }
         if cpu.is_some() {
             commands.remove_resource::<ExtractedCpuData>();
         }
@@ -1998,6 +2076,11 @@ fn prepare_gpu_buffers(
     let pipelines_missing = compute.is_none() || draw.is_none();
     let (Some(cpu), Some(compute), Some(draw)) = (cpu, compute, draw) else {
         if pipelines_missing {
+            // The GPU-driven path is permanently disabled (feature guard); the map will never build,
+            // so clear the loading flag or the indicator would spin forever.
+            if let Some(s) = &load_signal {
+                s.set(false);
+            }
             commands.remove_resource::<ExtractedCpuData>();
         }
         return;
@@ -2011,7 +2094,160 @@ fn prepare_gpu_buffers(
             return;
         }
     }
+    let epoch = cpu.1;
     let cpu = &cpu.0;
+
+    // ===== ASYNC STREAMING TEXTURE BUILD (fixes the "Not Responding" load freeze) ==============
+    // Instead of decoding+BC-encoding+uploading all ~700 albedo + ~540 normal textures in ONE
+    // render-thread pass (the multi-second stall that froze the winit pump), stream them in:
+    //   * KICKOFF  — spawn the CPU-heavy prep (fs::read/decode/mip/BC, or a warm cache read) for
+    //                every texture on the AsyncComputeTaskPool (parallel across cores), then RETURN.
+    //   * PROGRESS — each frame, poll finished payloads + upload a TIME-BUDGETED batch, then RETURN.
+    //                The map stays gated off (EftGpuBuffers not yet inserted) and the loading
+    //                indicator keeps animating because every frame is short.
+    //   * FINALIZE — once ALL textures are uploaded, fall through to the geometry/material/SH build
+    //                below (one ~30 ms frame) which inserts EftGpuBuffers and the map appears.
+    // `EFT_SYNC_LOAD=1` bypasses this and builds synchronously in one frame (escape hatch): the two
+    // texture loops below then load inline exactly as before.
+    let sync_load = std::env::var("EFT_SYNC_LOAD")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let (async_albedo, async_normal): (
+        Option<Vec<(Texture, TextureView)>>,
+        Option<Vec<(Texture, TextureView)>>,
+    ) = if sync_load {
+        (None, None) // escape hatch: the synchronous loops below produce the textures
+    } else {
+        // -- KICKOFF: spawn off-thread prep for every texture (once per map epoch) --
+        let need_kickoff = build.as_ref().map(|b| b.epoch != epoch).unwrap_or(true);
+        if need_kickoff {
+            let pool = bevy::tasks::AsyncComputeTaskPool::get();
+            let bc = bc_enabled(&render_device);
+            let albedo_tasks: Vec<Option<bevy::tasks::Task<TexCpu>>> = cpu
+                .albedo_paths
+                .iter()
+                .enumerate()
+                .map(|(i, path)| {
+                    let path = path.clone();
+                    // Terrain CONTROL maps are blend weights: load LINEAR + never BC (data_linear).
+                    let data_linear = cpu.ctrl_tex_linear.contains(&(i as u32));
+                    Some(pool.spawn(async move {
+                        prepare_tex_cpu(path, bc, data_linear, [255, 0, 255, 255]) // magenta placeholder
+                    }))
+                })
+                .collect();
+            let normal_tasks: Vec<Option<bevy::tasks::Task<TexCpu>>> = cpu
+                .normal_paths
+                .iter()
+                .map(|path| {
+                    let path = path.clone();
+                    Some(pool.spawn(async move {
+                        prepare_tex_cpu(path, bc, false, [128, 128, 255, 255]) // flat-normal placeholder
+                    }))
+                })
+                .collect();
+            let n_a = albedo_tasks.len();
+            let n_n = normal_tasks.len();
+            commands.insert_resource(GpuBuildState {
+                epoch,
+                albedo_tasks,
+                normal_tasks,
+                albedo_tex: (0..n_a).map(|_| None).collect(),
+                normal_tex: (0..n_n).map(|_| None).collect(),
+                started: std::time::Instant::now(),
+                frames: 0,
+                peak_ms: 0.0,
+            });
+            if let Some(s) = &load_signal {
+                s.set(true);
+            }
+            eprintln!(
+                "[stall] prepare_gpu_buffers: spawned {n_a} albedo + {n_n} normal off-thread prep \
+                 tasks (async streaming build; EFT_SYNC_LOAD=1 to force synchronous)"
+            );
+            return;
+        }
+
+        // -- PROGRESS: poll finished tasks + upload a time-budgeted batch this frame --
+        let bs = build.as_mut().unwrap();
+        let frame_t0 = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs_f64(upload_budget_ms() / 1000.0);
+        for i in 0..bs.albedo_tasks.len() {
+            if bs.albedo_tex[i].is_some() {
+                continue;
+            }
+            if frame_t0.elapsed() > budget {
+                break;
+            }
+            // Poll into a temporary FIRST (ends the &mut borrow of the task slot), then upload +
+            // clear — avoids a borrow conflict between `task` and the two slot writes.
+            let ready = match bs.albedo_tasks[i].as_mut() {
+                Some(task) => bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task)),
+                None => None,
+            };
+            if let Some(tc) = ready {
+                // sRGB unless this is a terrain control map (data_linear was used to prep it).
+                let srgb = !cpu.ctrl_tex_linear.contains(&(i as u32));
+                bs.albedo_tex[i] =
+                    Some(upload_prepared(&render_device, &render_queue, &tc, srgb, "eft_albedo"));
+                bs.albedo_tasks[i] = None;
+            }
+        }
+        for i in 0..bs.normal_tasks.len() {
+            if bs.normal_tex[i].is_some() {
+                continue;
+            }
+            if frame_t0.elapsed() > budget {
+                break;
+            }
+            let ready = match bs.normal_tasks[i].as_mut() {
+                Some(task) => bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(task)),
+                None => None,
+            };
+            if let Some(tc) = ready {
+                bs.normal_tex[i] = Some(upload_prepared(
+                    &render_device,
+                    &render_queue,
+                    &tc,
+                    false, // normals are LINEAR
+                    "eft_normal",
+                ));
+                bs.normal_tasks[i] = None;
+            }
+        }
+        let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
+        bs.peak_ms = bs.peak_ms.max(frame_ms);
+        bs.frames += 1;
+        let a_done = bs.albedo_tex.iter().all(|o| o.is_some());
+        let n_done = bs.normal_tex.iter().all(|o| o.is_some());
+        if !(a_done && n_done) {
+            return; // more frames needed — map stays gated off, indicator keeps animating
+        }
+
+        // -- DONE: drain the uploaded textures (order preserved) for the finalize block --
+        let mut a: Vec<(Texture, TextureView)> = Vec::with_capacity(bs.albedo_tex.len());
+        for slot in std::mem::take(&mut bs.albedo_tex) {
+            a.push(slot.expect("albedo slot filled once a_done"));
+        }
+        let mut n: Vec<(Texture, TextureView)> = Vec::with_capacity(bs.normal_tex.len());
+        for slot in std::mem::take(&mut bs.normal_tex) {
+            n.push(slot.expect("normal slot filled once n_done"));
+        }
+        eprintln!(
+            "[stall] prepare_gpu_buffers ASYNC build DONE: {} albedo + {} normal textures over {} \
+             frames, {:.0} ms wall — LONGEST single render-thread stall {:.1} ms (budget {:.0} ms)",
+            a.len(),
+            n.len(),
+            bs.frames,
+            bs.started.elapsed().as_secs_f64() * 1000.0,
+            bs.peak_ms,
+            upload_budget_ms(),
+        );
+        commands.remove_resource::<GpuBuildState>();
+        (Some(a), Some(n))
+    };
+
+    let prep_t0 = std::time::Instant::now(); // STALL: the finalize frame (geometry + SH + shadows)
 
     let vertex = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_gpu_vertex"),
@@ -2118,18 +2354,32 @@ fn prepare_gpu_buffers(
     // Decode + upload every UNIQUE albedo (image crate -> Rgba8UnormSrgb). One texture per
     // entry, IN THE SAME order as cpu.albedo_paths, so GpuMaterial.albedo_index stays aligned;
     // a failed decode still pushes a placeholder at its slot to preserve that alignment.
+    let geo_ms = prep_t0.elapsed().as_secs_f64() * 1000.0; // STALL: geometry+SSBO buffers phase
+    let tex_t0 = std::time::Instant::now();
     let mut textures: Vec<Texture> = Vec::with_capacity(cpu.albedo_paths.len());
     let mut views: Vec<TextureView> = Vec::with_capacity(cpu.albedo_paths.len());
-    for (i, path) in cpu.albedo_paths.iter().enumerate() {
-        // Terrain CONTROL maps are blend weights (data, not color): load them LINEAR — the sRGB
-        // decode would gamma-warp the weights toward the dominant layer (visible splat banding).
-        let (tex, view) = if cpu.ctrl_tex_linear.contains(&(i as u32)) {
-            load_data_texture(&render_device, &render_queue, path) // linear, never BC (weights)
-        } else {
-            load_albedo_texture(&render_device, &render_queue, path)
-        };
-        textures.push(tex);
-        views.push(view);
+    if let Some(prepared) = async_albedo {
+        // ASYNC path: textures were decoded off-thread + uploaded across frames already — just
+        // collect them here (same order as cpu.albedo_paths, so albedo_index stays aligned).
+        for (tex, view) in prepared {
+            textures.push(tex);
+            views.push(view);
+        }
+    } else {
+        // EFT_SYNC_LOAD escape hatch: decode + upload every UNIQUE albedo inline (image crate ->
+        // Rgba8UnormSrgb). IN THE SAME order as cpu.albedo_paths, so GpuMaterial.albedo_index stays
+        // aligned; a failed decode still pushes a placeholder at its slot to preserve that alignment.
+        for (i, path) in cpu.albedo_paths.iter().enumerate() {
+            // Terrain CONTROL maps are blend weights (data, not color): load them LINEAR — the sRGB
+            // decode would gamma-warp the weights toward the dominant layer (visible splat banding).
+            let (tex, view) = if cpu.ctrl_tex_linear.contains(&(i as u32)) {
+                load_data_texture(&render_device, &render_queue, path) // linear, never BC (weights)
+            } else {
+                load_albedo_texture(&render_device, &render_queue, path)
+            };
+            textures.push(tex);
+            views.push(view);
+        }
     }
     // A binding_array needs >= 1 element; if this pack referenced no albedo at all, synth a
     // 1x1 white so the layout/bind group stay valid (all materials then hit the sentinel).
@@ -2139,6 +2389,8 @@ fn prepare_gpu_buffers(
         views.push(view);
     }
     let tex_count = views.len() as u32;
+    let albedo_ms = tex_t0.elapsed().as_secs_f64() * 1000.0; // STALL: albedo decode+BC+upload loop
+    let norm_t0 = std::time::Instant::now();
 
     // Phase 2b: decode + upload every UNIQUE normal map, MIRRORING the albedo load but with a
     // LINEAR format (Rgba8Unorm) — normal maps are LINEAR data, NOT sRGB; the sRGB format would
@@ -2146,10 +2398,17 @@ fn prepare_gpu_buffers(
     // so GpuMaterial.normal_index stays aligned; a failed decode pushes a flat-normal placeholder.
     let mut normal_textures: Vec<Texture> = Vec::with_capacity(cpu.normal_paths.len());
     let mut normal_views: Vec<TextureView> = Vec::with_capacity(cpu.normal_paths.len());
-    for path in &cpu.normal_paths {
-        let (tex, view) = load_normal_texture(&render_device, &render_queue, path);
-        normal_textures.push(tex);
-        normal_views.push(view);
+    if let Some(prepared) = async_normal {
+        for (tex, view) in prepared {
+            normal_textures.push(tex);
+            normal_views.push(view);
+        }
+    } else {
+        for path in &cpu.normal_paths {
+            let (tex, view) = load_normal_texture(&render_device, &render_queue, path);
+            normal_textures.push(tex);
+            normal_views.push(view);
+        }
     }
     // binding_array needs >= 1 element; synth a 1x1 flat normal if this pack has no normal maps.
     if normal_views.is_empty() {
@@ -2158,6 +2417,7 @@ fn prepare_gpu_buffers(
         normal_views.push(view);
     }
     let normal_count = normal_views.len() as u32;
+    let normal_ms = norm_t0.elapsed().as_secs_f64() * 1000.0; // STALL: normal decode+BC+upload loop
 
     let albedo_sampler = render_device.create_sampler(&SamplerDescriptor {
         label: Some("eft_albedo_sampler"),
@@ -2593,6 +2853,23 @@ fn prepare_gpu_buffers(
     });
     commands.insert_resource(EftCullBindGroup(cull_bg));
     commands.insert_resource(EftDrawBindGroup(draw_bg));
+    // The map is now fully built + about to draw: clear the cross-world loading flag so the
+    // main-world `map_loading_indicator` toast dismisses.
+    if let Some(s) = &load_signal {
+        s.set(false);
+    }
+    eprintln!(
+        "[stall] prepare_gpu_buffers FINALIZE frame (render thread): {:.1} ms  \
+         [geo {:.1} | albedo {} tex {:.1} | normal {} tex {:.1} | SH+shadows {:.1}]{}",
+        prep_t0.elapsed().as_secs_f64() * 1000.0,
+        geo_ms,
+        tex_count,
+        albedo_ms,
+        normal_count,
+        normal_ms,
+        prep_t0.elapsed().as_secs_f64() * 1000.0 - geo_ms - albedo_ms - normal_ms,
+        if sync_load { "  (EFT_SYNC_LOAD: whole build in this one frame)" } else { "" },
+    );
     info!("gpu-driven: GPU buffers + bind groups built (once)");
 }
 
@@ -2879,16 +3156,19 @@ fn upload_bc3(
     (tex, view)
 }
 
-fn upload_rgba8_srgb(
+/// Upload a PRE-BUILT RGBA8 mip chain as an sRGB or linear texture. `create_texture_with_data`
+/// handles the 256-byte row-padding for the staging copy (per mip). Shared by the sync uploaders
+/// (which build the chain inline) and the async `upload_prepared` (chain built off-thread).
+fn upload_rgba8_chain(
     device: &RenderDevice,
     queue: &RenderQueue,
     width: u32,
     height: u32,
-    rgba: &[u8],
+    mips: u32,
+    chain: &[u8],
+    srgb: bool,
     label: &'static str,
 ) -> (Texture, TextureView) {
-    let (mips, chain) = build_mip_chain(width, height, rgba);
-    // create_texture_with_data handles the 256-byte row-padding for the staging copy (per mip).
     let tex = device.create_texture_with_data(
         queue,
         &TextureDescriptor {
@@ -2901,15 +3181,31 @@ fn upload_rgba8_srgb(
             mip_level_count: mips,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,
+            format: if srgb {
+                TextureFormat::Rgba8UnormSrgb
+            } else {
+                TextureFormat::Rgba8Unorm // LINEAR — normal vectors / data maps, not color
+            },
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         },
         TextureDataOrder::default(),
-        &chain,
+        chain,
     );
     let view = tex.create_view(&TextureViewDescriptor::default());
     (tex, view)
+}
+
+fn upload_rgba8_srgb(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    label: &'static str,
+) -> (Texture, TextureView) {
+    let (mips, chain) = build_mip_chain(width, height, rgba);
+    upload_rgba8_chain(device, queue, width, height, mips, &chain, true, label)
 }
 
 /// Phase 2b: upload RGBA8 bytes as a LINEAR (Rgba8Unorm) texture — for normal maps, whose texels
@@ -2925,28 +3221,144 @@ fn upload_rgba8_linear(
     label: &'static str,
 ) -> (Texture, TextureView) {
     let (mips, chain) = build_mip_chain(width, height, rgba);
-    // create_texture_with_data handles the 256-byte row-padding for the staging copy (per mip).
-    let tex = device.create_texture_with_data(
-        queue,
-        &TextureDescriptor {
-            label: Some(label),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: mips,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm, // LINEAR — NOT sRGB (normal vectors, not color)
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        TextureDataOrder::default(),
-        &chain,
-    );
-    let view = tex.create_view(&TextureViewDescriptor::default());
-    (tex, view)
+    upload_rgba8_chain(device, queue, width, height, mips, &chain, false, label)
+}
+
+// ---- Off-thread texture preparation (fixes the "Not Responding" load freeze) ----------------
+// The freeze was `prepare_gpu_buffers` decoding+BC-encoding+uploading ALL ~700 albedo + ~540 normal
+// textures SYNCHRONOUSLY in one render-thread pass (cold: >40 s; even warm-cache: ~3.9 s of
+// disk-read + upload). That blocked the render thread, which stalls the main thread's next extract,
+// which freezes the winit message pump -> Windows "Not Responding". Fix (hybrid A+B): the CPU-heavy
+// half (fs::read + PNG decode + mip + BC3 encode, or a warm shared-cache read) runs OFF-THREAD on
+// the AsyncComputeTaskPool (parallel across cores); the render thread only polls finished payloads
+// and does the fast `create_texture_with_data` uploads, TIME-BUDGETED across frames so no single
+// frame stalls. See `prepare_gpu_buffers` for the per-frame state machine.
+
+/// CPU-side texture payload produced OFF-THREAD by `prepare_tex_cpu` — the expensive work with NO
+/// GPU handles, so it parallelizes across cores while the render thread only does the fast upload.
+enum TexCpu {
+    /// A finished BC3 mip payload (`upload_bc3`); `srgb` is decided per-array at upload time.
+    Bc3 { w: u32, h: u32, mips: u32, payload: Vec<u8> },
+    /// A finished RGBA8 mip chain (small textures / data maps / decode failures): uploaded sRGB or
+    /// linear per-array. The mip chain is built OFF-THREAD here (not in `upload_*`) so the render
+    /// thread only does the GPU copy — otherwise a large data map's mip build stalls a frame.
+    Raw { w: u32, h: u32, mips: u32, chain: Vec<u8> },
+}
+
+/// OFF-THREAD texture preparation: exactly the CPU half of `load_albedo_texture` /
+/// `load_normal_texture` / `load_data_texture` (fs::read -> content hash -> warm shared-cache read
+/// OR PNG decode + mip chain + BC3 encode + cache write), returning a `TexCpu` the render thread
+/// uploads. NO `RenderDevice`/`RenderQueue`, so N of these run in parallel on the task pool.
+/// `bc` = BC compression enabled on this device (captured before spawn, folds in the feature + env
+/// gate). `data_linear` = terrain control/data map (raw RGBA, NEVER BC — BC's palette warps blend
+/// weights). `placeholder` = the 1x1 fill on any load/decode failure (magenta for albedo, flat
+/// normal for normals) so the bindless array index stays aligned with materials.json.
+fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, placeholder: [u8; 4]) -> TexCpu {
+    // Build the RGBA8 mip chain OFF-THREAD (the render thread just copies it) — mirrors what
+    // `upload_rgba8_srgb/linear` did inline, moved here so a big data map can't stall a frame.
+    let raw = |w: u32, h: u32, rgba: &[u8]| {
+        let (mips, chain) = build_mip_chain(w.max(1), h.max(1), rgba);
+        TexCpu::Raw { w: w.max(1), h: h.max(1), mips, chain }
+    };
+    if data_linear {
+        // Control/data map: raw linear, never block-compressed (mirrors `load_data_texture`).
+        return match image::open(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                raw(w, h, &rgba)
+            }
+            Err(e) => {
+                warn!("gpu-driven: data map '{path}' failed to load ({e}); using placeholder");
+                raw(1, 1, &[0, 0, 0, 255])
+            }
+        };
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            // Content-hash first: a shared-cache hit skips PNG decode AND BC encode entirely.
+            let hash = fnv64(&bytes);
+            if bc {
+                if let Some((w, h, mips, payload)) = texcache_read(hash) {
+                    return TexCpu::Bc3 { w, h, mips, payload };
+                }
+            }
+            let Ok(img) = image::load_from_memory(&bytes) else {
+                warn!("gpu-driven: texture '{path}' failed to decode; using placeholder");
+                return raw(1, 1, &placeholder);
+            };
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            // Same threshold as `bc_wanted` (feature already folded into `bc`): >= 64px each axis.
+            if bc && w >= 64 && h >= 64 {
+                let (mips, chain) = build_mip_chain(w, h, &rgba);
+                let payload = bc3_compress_chain(w, h, mips, &chain);
+                texcache_write(hash, w, h, mips, &payload);
+                return TexCpu::Bc3 { w, h, mips, payload };
+            }
+            raw(w, h, &rgba)
+        }
+        Err(e) => {
+            warn!("gpu-driven: texture '{path}' failed to load ({e}); using placeholder");
+            raw(1, 1, &placeholder)
+        }
+    }
+}
+
+/// Upload a `TexCpu` (produced off-thread) to the GPU — the fast half that MUST stay on the render
+/// thread. `srgb` selects the format (albedo = sRGB; normals + data maps = linear). Byte-identical
+/// to what the old inline `load_*_texture` path produced.
+fn upload_prepared(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    tex: &TexCpu,
+    srgb: bool,
+    label: &'static str,
+) -> (Texture, TextureView) {
+    match tex {
+        TexCpu::Bc3 { w, h, mips, payload } => {
+            upload_bc3(device, queue, *w, *h, *mips, payload, srgb, label)
+        }
+        TexCpu::Raw { w, h, mips, chain } => {
+            // Mip chain already built off-thread — the render thread only does the GPU copy.
+            upload_rgba8_chain(device, queue, *w, *h, *mips, chain, srgb, label)
+        }
+    }
+}
+
+/// Per-map GPU texture-build progress, held across frames in the RENDER world while
+/// `prepare_gpu_buffers` streams textures in. Present only DURING a build (kickoff -> finalize);
+/// removed when the build completes or the map swaps (`reset_gpu_map_if_epoch_changed`). Each frame
+/// polls the finished off-thread tasks and uploads a time-budgeted batch, so the render thread never
+/// stalls. `EFT_SYNC_LOAD=1` bypasses all of this (the whole build runs in one synchronous frame).
+#[derive(Resource)]
+struct GpuBuildState {
+    /// The `MapEpoch` this build is for; a newer epoch (map swap) discards it and re-kicks.
+    epoch: u64,
+    /// Off-thread CPU-prep tasks, in `albedo_paths` order. `Some` until polled+uploaded, then `None`.
+    albedo_tasks: Vec<Option<bevy::tasks::Task<TexCpu>>>,
+    normal_tasks: Vec<Option<bevy::tasks::Task<TexCpu>>>,
+    /// Uploaded `(Texture, View)` in the same order; `Some` once its task finished + uploaded.
+    albedo_tex: Vec<Option<(Texture, TextureView)>>,
+    normal_tex: Vec<Option<(Texture, TextureView)>>,
+    /// Instrumentation: wall-clock start, frames spent, and the longest single render-thread stall.
+    started: std::time::Instant,
+    frames: u32,
+    peak_ms: f64,
+}
+
+/// Per-frame render-thread upload budget (ms). Uploads run until this is exceeded, then yield to
+/// the next frame — keeps every frame well under a frame budget so the message pump + egui stay
+/// live. Tunable via `EFT_LOAD_BUDGET_MS`; default 6 ms (fast reveal, no perceptible hitch).
+fn upload_budget_ms() -> f64 {
+    static MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("EFT_LOAD_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| *v > 0.0)
+            .unwrap_or(6.0)
+    })
 }
 
 // ---- PrepareResources: upload the 6 frustum planes (tiny) each frame --------

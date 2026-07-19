@@ -288,6 +288,10 @@ fn poll_map_load(
     mut commands: Commands,
     epoch: Res<render::MapEpoch>,
     mut gfx: ResMut<render::GfxSettings>,
+    // Latch the "GPU build in progress" flag the instant the file load is applied, so the loading
+    // indicator stays visible with no 1-frame gap between PendingMapLoad clearing and the render
+    // world starting the (multi-frame) GPU build. GPU-driven path only (Option = absent under m0/std).
+    gpu_load: Option<Res<render::GpuLoadSignal>>,
 ) {
     let Some((_, task)) = pending.0.as_mut() else {
         return;
@@ -299,6 +303,9 @@ fn poll_map_load(
     let name = pending.0.take().map(|(n, _)| n).unwrap_or_default();
     match result {
         Ok(p) => {
+            if let Some(s) = &gpu_load {
+                s.begin(); // GPU build starts next frame (build_cpu_data); keep the toast up
+            }
             info!(
                 "map switch: '{}' loaded in place ({} meshes, {} instances)",
                 p.manifest.dataset,

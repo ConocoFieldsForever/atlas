@@ -22,7 +22,7 @@ pub mod instancing;
 pub mod ssao;
 pub mod standard;
 
-pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin};
+pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin, GpuLoadSignal};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 pub use ssao::SsaoPlugin;
