@@ -22,7 +22,11 @@ use std::collections::VecDeque;
 /// captured when it was enqueued; `SyncIntel` runs `tools/sync_intel.py` (no map/game args).
 #[derive(Clone)]
 pub enum Job {
-    BuildMap { map: String, game_dir: String },
+    /// `force` = the menu UPDATE path: run `build_map.py --force` so extraction/lights/SH/nav
+    /// re-run against the current game files instead of reusing stale extracted data (release
+    /// blocker: a plain build skips extraction when the old scene.json still exists). Plain BUILD
+    /// passes `force = false` and stays incremental.
+    BuildMap { map: String, game_dir: String, force: bool },
     SyncIntel,
     /// Install the Python build dependencies (venv + UnityPy/numpy/Pillow) from the menu.
     InstallDeps,
@@ -31,6 +35,7 @@ pub enum Job {
 impl Job {
     pub fn label(&self) -> String {
         match self {
+            // UPDATE and BUILD share a label so the worker won't run both for one map at once.
             Job::BuildMap { map, .. } => format!("build {map}"),
             Job::SyncIntel => "sync intel".to_string(),
             Job::InstallDeps => "install deps".to_string(),
@@ -45,7 +50,7 @@ impl Job {
     }
     fn spawn(&self) -> std::io::Result<BuildJob> {
         match self {
-            Job::BuildMap { map, game_dir } => BuildJob::spawn(map, game_dir),
+            Job::BuildMap { map, game_dir, force } => BuildJob::spawn(map, game_dir, *force),
             Job::SyncIntel => BuildJob::spawn_intel(),
             Job::InstallDeps => BuildJob::spawn_setup(),
         }

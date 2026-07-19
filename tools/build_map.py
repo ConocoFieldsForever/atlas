@@ -144,6 +144,14 @@ def main():
     dry = "--dry-run" in sys.argv
     self_contained = "--self-contained" in sys.argv
     sc_flag = ["--self-contained"] if self_contained else []
+    # FORCED REFRESH (menu UPDATE): after an EFT patch the plain build would SKIP extraction
+    # (stage 1 sees the old scene.json), reuse stale lights/SH/nav, then stamp the pack with the
+    # CURRENT fingerprint -> the menu flips to READY over stale geometry (release-blocker). --force
+    # / EFT_FORCE_REBUILD invalidates every game-derived cache below so all stages re-run against
+    # the live game files before the stamp. It deletes the CACHE GATES (scene.json, volume/nav/glb,
+    # light sidecars), never the big mesh/texture exports or the existing .eftpack, so a failed
+    # re-extract can't leave the user with nothing (the old pack stays playable until stage 4).
+    force = "--force" in sys.argv or os.environ.get("EFT_FORCE_REBUILD", "").strip() == "1"
     # --alllod (or EFT_ALLLOD=1): keep EVERY LOD level in the dataset + pack (instead of the default
     # LOD0-only resolve) so the viewer can offer a forced-LOD selector. ~47% bigger; opt-in. NOTE:
     # only takes effect on a FRESH extraction -- delete the existing LOD0 dataset first, else the
@@ -164,6 +172,23 @@ def main():
     total = 9
 
     print(f"[BUILD] map={m} dataset={dsname} dataset_dir={dataset}", flush=True)
+    if force and not dry:
+        # Invalidate the game-derived cache gates so stages 1/2/3/8 re-run instead of "exists ->
+        # skip". Best-effort: a missing file is fine; a locked one just means that stage re-runs
+        # anyway on its own exists-check (which now also honors `force`).
+        print(f"[BUILD] forced refresh: invalidating stale game-derived caches for {m}", flush=True)
+        stale = [os.path.join(dataset, "scene.json"),
+                 os.path.join(out_dir, "volume2.bin"), os.path.join(out_dir, "volume.bin"),
+                 os.path.join(out_dir, "nav.bin"), os.path.join(out_dir, "instanced_raw.glb")]
+        if os.path.isdir(dataset):
+            stale += [os.path.join(dataset, f) for f in os.listdir(dataset)
+                      if f.startswith("lights_") and f.endswith(".json")]
+        for s in stale:
+            try:
+                if os.path.isfile(s):
+                    os.remove(s)
+            except OSError as e:
+                print(f"  [force] could not remove {s}: {e}", flush=True)
     if dry:
         # --self-contained is noted on the stages it changes (assemble + grass emit
         # pack-relative, copied-in textures/sidecars instead of absolute references).
@@ -184,7 +209,7 @@ def main():
     #    so one click goes from "no data" to a playable pack. Resumable - a re-run skips already
     #    exported meshes/textures.
     print(f"[STAGE 1/{total}] check dataset", flush=True)
-    if not os.path.isfile(os.path.join(dataset, "scene.json")):
+    if force or not os.path.isfile(os.path.join(dataset, "scene.json")):
         levels = dataset_levels(m)
         if not levels:
             print(f"[BUILD FAILED] no dataset at {dataset} and no source.levels in the map config "
@@ -216,9 +241,9 @@ def main():
         print(f"[STAGE 2/{total}] WARNING: {m} splits lights across many scenes and none are "
               f"extracted - the bake will be SKY-ONLY (dark interiors). Run the fleet light "
               f"merge first for full lighting.", flush=True)
-    if lv is not None and not any(
+    if lv is not None and (force or not any(
         f.startswith("lights_") for f in os.listdir(dataset) if f.endswith(".json")
-    ):
+    )):
         # portable kit extractor (env-driven drop-in for the beamng warp_viz original);
         # --name is the DATASET folder name, it writes ASSETS/<dataset>/lights_<lv>.json
         run(2, total, "extract lights",
@@ -230,7 +255,7 @@ def main():
 
     # 3: GPU SH bake (the long stage; skip if a fresh volume2 already exists)
     v2 = os.path.join(out_dir, "volume2.bin")
-    if not os.path.isfile(v2):
+    if force or not os.path.isfile(v2):
         # portable kit baker: takes the MAP ID positionally, reads EFT_TARKMAP_ROOT itself
         # (run() passes it) and writes TK/out/<map id>/volume2.*; cwd-independent.
         # OPTIONAL: the SH bake needs an NVIDIA CUDA GPU + warp-lang. Without them (or on any bake
@@ -301,7 +326,7 @@ def main():
     #    nav.bin is missing or older than the glb (keeps routing in sync with the geometry).
     nav_bin = os.path.join(out_dir, "nav.bin")
     glb = os.path.join(out_dir, "instanced_raw.glb")
-    need_nav = (not os.path.isfile(nav_bin)) or (
+    need_nav = force or (not os.path.isfile(nav_bin)) or (
         os.path.isfile(glb) and os.path.getmtime(glb) > os.path.getmtime(nav_bin))
     if need_nav:
         if not os.path.isfile(glb):
@@ -343,7 +368,21 @@ def main():
     except Exception as e:
         print(f"  [dedup] skipped: {e}", flush=True)
 
-    print("[BUILD OK] pack ready", flush=True)
+    # Lighting completeness (finding 3a): a map we KNOW ships realtime lights (in LIGHT_LEVELS, or
+    # the multi-scene streets/ground_zero) that produced neither a light sidecar NOR an SH bake will
+    # render with dark/flat interiors. Don't hide that behind a clean [BUILD OK] - surface it so the
+    # menu log makes the gap obvious (the pack is still valid geometry, so exit stays 0).
+    expects_light = (m in LIGHT_LEVELS) or (m in ("streets", "ground_zero"))
+    have_lights = os.path.isdir(dataset) and any(
+        f.startswith("lights_") and f.endswith(".json") for f in os.listdir(dataset))
+    have_sh = os.path.isfile(os.path.join(out_dir, "volume.bin"))
+    if expects_light and not (have_lights or have_sh):
+        print(f"[BUILD WARN] no lighting for {m}: no *_Light extract and no SH bake - interiors "
+              f"will be dark/flat. Run the light extract and/or the CUDA SH bake "
+              f"(see extraction/README.md) then rebuild.", flush=True)
+        print(f"[BUILD OK] pack ready (WARNING: no lighting for {m})", flush=True)
+    else:
+        print("[BUILD OK] pack ready", flush=True)
 
 
 if __name__ == "__main__":

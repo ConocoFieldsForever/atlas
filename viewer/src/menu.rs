@@ -38,7 +38,14 @@ pub struct BuildJob {
     pub key: String,
     child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
     log: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Success flag — stored from the child's exit code. Read as the terminal outcome (`ok`).
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The single ATOMIC terminal signal: set true once the child has exited. Stored AFTER `done`
+    /// so any thread that observes `exited==true` also observes the final `done` value — closing the
+    /// race where a successful build was read as "finished but not-ok" (finding 10). `finished` is
+    /// read from this, not from the streamed "[exit]" log line (which a reader thread pushes on its
+    /// own schedule, independent of when `done` is stored).
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Some(exit-ok) once the child has been reaped.
     pub result: Option<bool>,
     /// Wall-clock build start — feeds the loading bar's ESTIMATED TIME readout.
@@ -52,11 +59,17 @@ pub struct BuildJob {
 }
 
 impl BuildJob {
-    pub fn spawn(key: &str, game_dir: &str) -> std::io::Result<Self> {
+    pub fn spawn(key: &str, game_dir: &str, force: bool) -> std::io::Result<Self> {
         // GUI builds are ALWAYS --self-contained: the pack copies its textures/sidecars in and
         // references them pack-relative, so it stays valid when shipped to a friend (without it,
         // assemble_bevy bakes absolute machine paths and the pack loads untextured elsewhere).
-        Self::spawn_script(key, game_dir, "tools/build_map.py", true, &["--self-contained"])
+        // `force` (menu UPDATE) adds --force so build_map.py re-extracts every game-derived artifact
+        // instead of reusing stale data (release blocker).
+        let mut extra: Vec<&str> = vec!["--self-contained"];
+        if force {
+            extra.push("--force");
+        }
+        Self::spawn_script(key, game_dir, "tools/build_map.py", true, &extra)
     }
 
     /// The menu's tarkov.dev INTEL refresh (tools/sync_intel.py) — same streaming-job shape as a
@@ -112,6 +125,7 @@ impl BuildJob {
             std::collections::VecDeque::<String>::with_capacity(512),
         ));
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let push = |log: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
                     line: String| {
             let mut l = log.lock().unwrap();
@@ -138,14 +152,24 @@ impl BuildJob {
         {
             // Reaper: flags completion without blocking the UI thread.
             let done_t = done.clone();
+            let exited_t = exited.clone();
             let log_t = log.clone();
             let child = std::sync::Arc::new(std::sync::Mutex::new(child));
             let child2 = child.clone();
             std::thread::spawn(move || {
-                let (done, log) = (done_t, log_t);
+                use std::sync::atomic::Ordering::SeqCst;
+                let (done, exited, log) = (done_t, exited_t, log_t);
                 loop {
                     match child2.lock().unwrap().try_wait() {
                         Ok(Some(status)) => {
+                            // ORDER MATTERS (finding 10): store the success flag FIRST, THEN publish
+                            // the terminal `exited` flag. `snapshot` reads `finished` from `exited`,
+                            // so an observer that sees the job finished is guaranteed to also see the
+                            // correct `done` value — no window where a succeeded build reads as failed.
+                            done.store(status.success(), SeqCst);
+                            exited.store(true, SeqCst);
+                            // The "[exit]" log line is display-only now (a reader thread may flush it
+                            // before/after this; it no longer gates the terminal state).
                             push(
                                 &log,
                                 format!(
@@ -153,8 +177,6 @@ impl BuildJob {
                                     status.code().map_or("?".into(), |c| c.to_string())
                                 ),
                             );
-                            done.store(status.success(), std::sync::atomic::Ordering::SeqCst);
-                            // done flag semantics: stored success; presence read via result parse
                             break;
                         }
                         Ok(None) => std::thread::sleep(std::time::Duration::from_millis(300)),
@@ -167,6 +189,7 @@ impl BuildJob {
                 child,
                 log,
                 done,
+                exited,
                 result: None,
                 started: std::time::Instant::now(),
                 max_frac: std::sync::atomic::AtomicU32::new(0),
@@ -209,11 +232,11 @@ impl BuildJob {
             .cloned()
             .unwrap_or_else(|| "starting...".into());
         let lines: Vec<String> = l.iter().rev().take(tail).cloned().collect();
-        let finished = l.iter().rev().any(|s| s.starts_with("[exit"));
-        let ok = l
-            .iter()
-            .any(|s| s.starts_with("[BUILD OK]") || s.starts_with("[SYNC OK]"))
-            || self.done.load(std::sync::atomic::Ordering::SeqCst);
+        // Terminal state from the atomics, NOT the streamed log (finding 10): `exited` is published
+        // AFTER `done`, so reading them in this order can never see finished-without-the-final-ok.
+        use std::sync::atomic::Ordering::SeqCst;
+        let finished = self.exited.load(SeqCst);
+        let ok = self.done.load(SeqCst);
         (stage, lines.into_iter().rev().collect(), finished, ok)
     }
 }
@@ -242,6 +265,10 @@ pub struct MenuState {
     /// Whether the build python has UnityPy/numpy/Pillow (None probe failure => treat as ok so we
     /// don't nag when there's no kit to build with anyway).
     pub deps_ok: bool,
+    /// Whether the Python build KIT (tools/build_map.py etc.) is present beside the exe / in the cwd
+    /// (`repo_root().is_some()`). A shipped-lite bundle has NO kit, so BUILD/UPDATE must be disabled
+    /// there (finding 11) — otherwise clicking them just hits a spawn error mid-pipeline.
+    pub build_kit_available: bool,
     /// INTEL strip stats: (loot.json age days, tasks.json age days, cached icon count).
     pub intel: (Option<f64>, Option<f64>, usize),
     /// Outcome note of the last finished sync ("refreshed" / failure), shown until the next one.
@@ -252,6 +279,9 @@ pub struct MenuState {
     pub seen_completed: u64,
     /// EFT_MENU_BUILD auto-build map key, enqueued once on the first menu frame (CLI/testing hook).
     pub autobuild: Option<String>,
+    /// Set when a config write FAILED (finding 12) — shown as a warning by the footer so the user
+    /// knows a setting won't persist, instead of it silently reverting on the next launch.
+    pub config_err: Option<String>,
 }
 
 /// Shared tarkov.dev data freshness: (loot.json age d, tasks.json age d, icon count).
@@ -427,8 +457,8 @@ fn config_game_dir() -> Option<String> {
     v.get("gameData").and_then(|s| s.as_str()).map(str::to_string)
 }
 
-pub fn save_config_game_dir(dir: &str) {
-    save_config_str("gameData", dir);
+pub fn save_config_game_dir(dir: &str) -> bool {
+    save_config_str("gameData", dir)
 }
 
 /// Generic single-key read from atlas.config.json (the game-dir helpers are the canonical example).
@@ -438,14 +468,29 @@ fn config_str(key: &str) -> Option<String> {
     v.get(key).and_then(|s| s.as_str()).map(str::to_string)
 }
 
-/// Generic single-key read-modify-write into atlas.config.json (preserves other keys).
-fn save_config_str(key: &str, val: &str) {
-    let mut v: serde_json::Value = std::fs::read_to_string(config_path())
+/// Generic single-key read-modify-write into atlas.config.json (preserves other keys). Returns
+/// false when the write FAILED (finding 12): the path is now the writable user-profile location,
+/// but a failure is no longer swallowed — it's logged and the boolean lets the caller warn the user
+/// their setting won't persist, instead of the old silent revert-on-restart.
+#[must_use]
+fn save_config_str(key: &str, val: &str) -> bool {
+    let path = config_path();
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     v[key] = serde_json::Value::String(val.to_string());
-    let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&v).unwrap_or_default());
+    // Ensure the parent dir exists (%APPDATA%\atlas may not yet) before writing.
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("menu: could not save config to {}: {e}", path.display());
+            false
+        }
+    }
 }
 
 /// True once the user (or an env var) has chosen where extracted datasets live — drives the
@@ -469,16 +514,16 @@ pub fn detect_assets_dir() -> String {
     crate::paths::exe_dir().join("eft_assets").to_string_lossy().into_owned()
 }
 
-pub fn save_config_assets_dir(dir: &str) {
-    save_config_str("assetsRoot", dir);
+pub fn save_config_assets_dir(dir: &str) -> bool {
+    save_config_str("assetsRoot", dir)
 }
 
 /// UI language override ("en"/"ru") persisted by the menu's language toggle (None = auto-detect).
 pub fn config_lang() -> Option<String> {
     config_str("lang")
 }
-pub fn save_config_lang(tag: &str) {
-    save_config_str("lang", tag);
+pub fn save_config_lang(tag: &str) -> bool {
+    save_config_str("lang", tag)
 }
 
 /// Shared EN|RU language switch, drawn as a self-contained FOREGROUND `Area` anchored to a window
@@ -723,6 +768,7 @@ pub fn build_state() -> MenuState {
         assets_dir,
         assets_ok: assets_configured(),
         deps_ok: deps_ready().unwrap_or(true),
+        build_kit_available: crate::paths::repo_root().is_some(),
         total_bytes,
         confirm_delete: None,
         show_rebuild: None,
@@ -731,6 +777,7 @@ pub fn build_state() -> MenuState {
         sync_note: None,
         seen_completed: 0,
         autobuild,
+        config_err: None,
     }
 }
 
@@ -884,7 +931,7 @@ pub fn menu_ui(
 
     // First-frame EFT_MENU_BUILD auto-build (enqueue once onto the shared worker).
     if let Some(map) = state.autobuild.take() {
-        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone() });
+        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone(), force: false });
     }
 
     // A job finished on the worker since we last looked: rescan the pack list + intel (a build
@@ -960,7 +1007,8 @@ pub fn menu_ui(
     // once after, so the ResMut is never aliased mid-closure. `enqueue_build` is the map key to
     // build; `cancel_current` cancels whatever job is in flight (build or sync).
     let mut enqueue_sync = false;
-    let mut enqueue_build: Option<String> = None;
+    // (map key, force): force = the UPDATE path (build_map.py --force re-extracts stale data).
+    let mut enqueue_build: Option<(String, bool)> = None;
     let mut enqueue_install = false;
     let mut cancel_current = false;
     let mut dismiss_build = false;
@@ -1073,7 +1121,8 @@ pub fn menu_ui(
             let mut rescan = false;
             let mut set_confirm: Option<usize> = None;
             let mut set_rebuild: Option<usize> = None;
-            let mut start_build: Option<String> = None;
+            // (map key, force): BUILD -> force=false (incremental), UPDATE -> force=true.
+            let mut start_build: Option<(String, bool)> = None;
             let confirm_idx = state.confirm_delete;
             // Which map (if any) is being built RIGHT NOW — marks that row BUILDING and blocks the
             // other BUILD buttons. A finished build no longer blocks (its panel lingers until CLOSE).
@@ -1082,7 +1131,10 @@ pub fn menu_ui(
             // (Copy locals so they reach the inner button closure without borrowing `state`). Without
             // this a user can click BUILD before INSTALL DEPS / before setting GAME INSTALL and hit a
             // confusing mid-pipeline failure. deps_ok is true when deps are present OR unprobed.
-            let can_build = state.deps_ok && state.game_fp.is_some();
+            // Also require the build KIT (finding 11): a shipped-lite bundle has no tools/ so BUILD
+            // and UPDATE must both stay disabled instead of spawn-erroring. UPDATE used to bypass
+            // this entirely — it now shares `can_build`.
+            let can_build = state.build_kit_available && state.deps_ok && state.game_fp.is_some();
             // Bound the map-row scroll so the build panel + LOG + footer below always stay on screen
             // (reserve grows when a build is showing / its log is expanded); the rows scroll in what
             // remains. Without this the expanded log runs off the bottom of the window.
@@ -1168,14 +1220,21 @@ pub fn menu_ui(
                                                 } else {
                                                     t(lg, K::Update)
                                                 });
-                                                if ui
-                                                    .add_enabled_ui(!any_building, |ui| {
+                                                // UPDATE needs the kit+deps just like BUILD
+                                                // (finding 11) and re-extracts stale data via
+                                                // --force (finding 1 / release blocker).
+                                                let resp = ui
+                                                    .add_enabled_ui(!any_building && can_build, |ui| {
                                                         ui.add_sized([84.0, 30.0], upd).on_hover_text(t(lg, K::UpdateTip))
                                                     })
-                                                    .inner
-                                                    .clicked()
-                                                {
-                                                    start_build = Some(e.key.to_string());
+                                                    .inner;
+                                                let resp = if !can_build {
+                                                    resp.on_disabled_hover_text(t(lg, K::BuildNeedsSetup))
+                                                } else {
+                                                    resp
+                                                };
+                                                if resp.clicked() {
+                                                    start_build = Some((e.key.to_string(), true));
                                                 }
                                             }
                                             // Tarkov-style destructive button: red fill, black text.
@@ -1210,7 +1269,7 @@ pub fn menu_ui(
                                                 resp
                                             };
                                             if resp.clicked() {
-                                                start_build = Some(e.key.to_string());
+                                                start_build = Some((e.key.to_string(), false));
                                             }
                                         }
                                     },
@@ -1254,9 +1313,12 @@ pub fn menu_ui(
 
             // Kick a build: enqueue on the shared worker after this closure (one at a time;
             // tools/build_map.py streams staged output; the completion handler up top rescans).
-            if let Some(key) = start_build {
-                info!("menu: queueing build '{key}' via tools/build_map.py");
-                enqueue_build = Some(key);
+            if let Some((key, force)) = start_build {
+                info!(
+                    "menu: queueing {} '{key}' via tools/build_map.py",
+                    if force { "UPDATE (forced re-extract)" } else { "build" }
+                );
+                enqueue_build = Some((key, force));
                 state.show_log = false; // fresh panel starts with the log collapsed
             }
 
@@ -1410,7 +1472,8 @@ pub fn menu_ui(
                 {
                     if valid_game_dir(&state.game_dir_edit) {
                         state.game_dir = state.game_dir_edit.clone();
-                        save_config_game_dir(&state.game_dir);
+                        state.config_err = (!save_config_game_dir(&state.game_dir))
+                            .then(|| "settings could not be saved (read-only folder?)".to_string());
                         state.game_fp = game_fingerprint(&state.game_dir);
                         let (entries, total) = scan(&state.game_fp);
                         state.entries = entries;
@@ -1446,7 +1509,8 @@ pub fn menu_ui(
                         let dir = p.to_string_lossy().into_owned();
                         state.assets_dir = dir.clone();
                         state.assets_dir_edit = dir.clone();
-                        save_config_assets_dir(&dir);
+                        state.config_err = (!save_config_assets_dir(&dir))
+                            .then(|| "settings could not be saved (read-only folder?)".to_string());
                         state.assets_ok = true;
                     }
                 }
@@ -1463,7 +1527,8 @@ pub fn menu_ui(
                     .clicked()
                 {
                     state.assets_dir = state.assets_dir_edit.clone();
-                    save_config_assets_dir(&state.assets_dir);
+                    state.config_err = (!save_config_assets_dir(&state.assets_dir))
+                        .then(|| "settings could not be saved (read-only folder?)".to_string());
                     state.assets_ok = true;
                 }
                 if state.assets_ok {
@@ -1487,7 +1552,21 @@ pub fn menu_ui(
         egui::vec2(-20.0, -14.0),
     ) {
         *lang = l;
-        save_config_lang(l.tag());
+        if !save_config_lang(l.tag()) {
+            state.config_err =
+                Some("language change could not be saved (read-only folder?)".to_string());
+        }
+    }
+
+    // A failed config write (finding 12) — surface it so the user knows the setting won't persist
+    // instead of it silently reverting on restart. Floated bottom-left, clear of the lang toggle.
+    if let Some(msg) = state.config_err.clone() {
+        egui::Area::new(egui::Id::new("menu_config_err"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(20.0, -14.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("\u{26A0} {msg}")).color(theme::DANGER_TEXT).size(11.0));
+            });
     }
 
     // ---- apply the worker intents collected above (single point of mutation) ----
@@ -1497,8 +1576,8 @@ pub fn menu_ui(
     if enqueue_sync {
         worker.enqueue(Job::SyncIntel);
     }
-    if let Some(map) = enqueue_build {
-        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone() });
+    if let Some((map, force)) = enqueue_build {
+        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone(), force });
     }
     if cancel_current {
         worker.cancel_current();
