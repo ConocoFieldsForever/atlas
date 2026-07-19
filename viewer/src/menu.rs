@@ -30,6 +30,11 @@ pub struct MapEntry {
     pub has_icons: bool,
     /// None = pack unstamped (unknown vintage); Some(true) = matches the live install.
     pub fp_match: Option<bool>,
+    /// A pack dir exists but is STRUCTURALLY complete/loadable (finding 4): manifest.json parses AND
+    /// meshes.bin + instances.bin are present. A false here means PLAY would open a blank window, so
+    /// the menu shows a DAMAGED badge + offers rebuild/delete instead of PLAY. Always true for a
+    /// not-installed row (no pack dir to be broken).
+    pub valid: bool,
 }
 
 /// A running `tools/build_map.py <map>` pipeline: stdout+stderr stream into `log` from a
@@ -405,15 +410,22 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
                 has_gamedata: false,
                 has_icons: false,
                 fp_match: None,
+                valid: true, // not installed: nothing to be broken
             });
             continue;
         }
         let size = dir_size(p);
         total += size;
-        let man: serde_json::Value = std::fs::read_to_string(&manifest)
+        // Parse the manifest once; a parse failure is itself a "damaged pack" signal (finding 4).
+        let man_parsed: Option<serde_json::Value> = std::fs::read_to_string(&manifest)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+            .and_then(|s| serde_json::from_str(&s).ok());
+        // Required binary payloads a loadable pack must carry. Without them PLAY opens a blank
+        // window (the async load fails) — so mark the pack invalid rather than showing it READY.
+        let valid = man_parsed.is_some()
+            && p.join("meshes.bin").is_file()
+            && p.join("instances.bin").is_file();
+        let man: serde_json::Value = man_parsed.unwrap_or_default();
         let stamped = man.get("sourceFingerprint").and_then(|v| v.as_str());
         let fp_match = match (stamped, game_fp.as_deref()) {
             (Some(s), Some(g)) => Some(s == g),
@@ -440,6 +452,7 @@ pub fn scan(game_fp: &Option<String>) -> (Vec<MapEntry>, u64) {
             has_icons: p.join("icons").is_dir()
                 || crate::paths::shared_dir().join("icons").is_dir(),
             fp_match,
+            valid,
         });
     }
     (entries, total)
@@ -1172,6 +1185,10 @@ pub fn menu_ui(
                                 // Status badge.
                                 let (txt, col) = if !installed {
                                     (t(lg, K::NotInstalled), DIM)
+                                } else if !e.valid {
+                                    // Pack dir present but manifest/meshes/instances broken or
+                                    // missing (finding 4): never show READY — PLAY would blank out.
+                                    (t(lg, K::Damaged), BAD)
                                 } else {
                                     match e.fp_match {
                                         Some(true) => (t(lg, K::Ready), OK),
@@ -1207,14 +1224,40 @@ pub fn menu_ui(
                                             building_key.as_deref() == Some(e.key);
                                         let any_building = building_key.is_some();
                                         if installed {
-                                            let play = theme::primary_button(t(lg, K::Play));
-                                            if ui.add_sized([84.0, 30.0], play).clicked() {
-                                                switch.0 = e.pack_dir.clone();
+                                            // Only a VALID pack is playable (finding 4). A damaged
+                                            // pack offers REBUILD (plain BUILD) where PLAY would be,
+                                            // so PLAY can never open a blank window; DELETE stays
+                                            // available below either way.
+                                            if e.valid {
+                                                let play = theme::primary_button(t(lg, K::Play));
+                                                if ui.add_sized([84.0, 30.0], play).clicked() {
+                                                    switch.0 = e.pack_dir.clone();
+                                                }
+                                            } else {
+                                                let reb = theme::warn_button(if this_building {
+                                                    "..."
+                                                } else {
+                                                    t(lg, K::Build)
+                                                });
+                                                let resp = ui
+                                                    .add_enabled_ui(!any_building && can_build, |ui| {
+                                                        ui.add_sized([84.0, 30.0], reb)
+                                                    })
+                                                    .inner;
+                                                let resp = if !can_build {
+                                                    resp.on_disabled_hover_text(t(lg, K::BuildNeedsSetup))
+                                                } else {
+                                                    resp
+                                                };
+                                                if resp.clicked() {
+                                                    start_build = Some((e.key.to_string(), false));
+                                                }
                                             }
                                             // UPDATE sits BETWEEN delete and play: shown when the
                                             // game-file hashes no longer match the pack's stamp —
-                                            // re-runs the pipeline so the data catches up.
-                                            if e.fp_match == Some(false) {
+                                            // re-runs the pipeline so the data catches up. (Not for a
+                                            // damaged pack — REBUILD above already covers that.)
+                                            if e.valid && e.fp_match == Some(false) {
                                                 let upd = theme::warn_button(if this_building {
                                                     "..."
                                                 } else {

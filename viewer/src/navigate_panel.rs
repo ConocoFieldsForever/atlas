@@ -167,8 +167,12 @@ pub fn navigate_tab(
                             .strong()
                             .color(theme::WARN),
                     );
+                    // Honest state (finding 2): routing needs a baked nav grid this pack doesn't
+                    // carry, and the ordinary menu build can't produce one — so don't promise a
+                    // rebuild enables it. When a pack DOES ship nav files the `ready` path above
+                    // takes over and this card never shows.
                     ui.label(
-                        RichText::new("Rebuild the map from the start menu to enable routing.")
+                        RichText::new("Routing has not been built for this map yet \u{2014} extract, POI browsing and camera flight still work.")
                             .size(theme::SIZE_CAPTION)
                             .color(theme::MUTED),
                     );
