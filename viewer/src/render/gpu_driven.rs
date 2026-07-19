@@ -355,9 +355,10 @@ const SH_NORMAL_BIAS: f32 = 0.75;
 // ---------------------------------------------------------------------------
 
 /// Default realtime light-intensity multiplier (EFT_LIGHT_SCALE overrides). Folded into
-/// `LightGridUniform::params.x`. The CUDA bake used scale 6.0; realtime uses inverse-square
-/// falloff so a slightly lower base reads comparably (tuned by headless A/B).
-const DEFAULT_LIGHT_SCALE: f32 = 4.0;
+/// `LightGridUniform::params.x`. Anchored to the CUDA bake's scale (6.0) — headless A/B on
+/// factory_rework showed 6.0 reads a touch more present than 4.0 with no extra blow-out
+/// (near-light pixels already saturate at both; broad interior fill is what lifts).
+const DEFAULT_LIGHT_SCALE: f32 = 6.0;
 
 /// Max cells in the world light grid before the cell size is grown to fit (keeps the grid
 /// buffer small on kilometre-scale maps).
