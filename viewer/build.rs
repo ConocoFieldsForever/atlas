@@ -33,6 +33,22 @@ fn main() {
     {
         println!("cargo:rerun-if-changed={head}");
     }
+    // `.git/HEAD` does NOT change on a commit (it keeps pointing at `refs/heads/<branch>`), so
+    // watching only it leaves ATLAS_GIT_SHA stale after every commit on an INCREMENTAL build — the
+    // version badge + update check then compare against an old tag. Also watch the reflog
+    // `.git/logs/HEAD`, which IS appended on every commit/checkout, so the SHA refreshes. (Clean
+    // release/CI + `build-clean` full rebuilds already captured it correctly; this fixes local dev.)
+    if let Some(logs) = Command::new("git")
+        .args(["rev-parse", "--git-path", "logs/HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        println!("cargo:rerun-if-changed={logs}");
+    }
 
     // --- 2. Windows icon embed -----------------------------------------------------------------
     println!("cargo:rerun-if-changed=resources/atlas.ico");
