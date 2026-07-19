@@ -430,7 +430,10 @@ fn solve(
         return Ok(Plan {
             stops,
             extract: ex.0,
-            polyline: crate::nav::simplify(&poly, grid.res * 0.4),
+            // `poly` is a concatenation of per-leg grid.path polylines, each ALREADY
+            // wall-aware-simplified with its endpoints pinned; a second plain Douglas–Peucker over
+            // the stitched line would corner-cut across the seams, so keep it verbatim.
+            polyline: poly,
             total_dist: total,
             total_value,
         });

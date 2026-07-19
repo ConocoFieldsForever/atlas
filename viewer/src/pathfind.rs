@@ -419,9 +419,12 @@ fn dispatch_route(
             if let Some(((pts, dist), l)) = r {
                 // Drop a variant that found no better detour (same length as an existing one).
                 if !options.iter().any(|o| (o.dist - dist).abs() < 1.0) {
+                    // `pts` is ALREADY wall-aware-simplified by grid.path/chain/tour; re-running a
+                    // plain Douglas–Peucker here would re-introduce corner-cuts across leg seams,
+                    // so use it verbatim (endpoints already pinned per leg).
                     options.push(RouteOption {
                         name,
-                        points: crate::nav::simplify(&pts, grid.res * 0.4),
+                        points: pts,
                         dist,
                     });
                     if label.is_none() {
