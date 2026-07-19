@@ -48,6 +48,30 @@ OUTROOT = os.environ.get("EFT_ASSETS_ROOT") or (
 )
 
 
+def _staging_dirs(name):
+    """Every chunk staging dir <name>__p<idx> currently on disk (idx = digits)."""
+    prefix = f"{name}__p"
+    out = []
+    if os.path.isdir(OUTROOT):
+        for d in os.listdir(OUTROOT):
+            if d.startswith(prefix) and d[len(prefix):].isdigit():
+                p = os.path.join(OUTROOT, d)
+                if os.path.isdir(p):
+                    out.append(p)
+    return out
+
+
+def _clean_staging(name):
+    """Remove all <name>__p* chunk staging dirs (idempotent). Skipped if EFT_KEEP_STAGING is set, so a
+    failed run's chunks can be inspected on demand. Chunk staging is a pure intermediate: after a
+    successful merge it is already empty, and on failure/interrupt it is safe to discard -- so this
+    prevents the GBs of orphaned __p* dirs a pre-merge crash used to leave behind."""
+    if os.environ.get("EFT_KEEP_STAGING"):
+        return
+    for p in _staging_dirs(name):
+        shutil.rmtree(p, ignore_errors=True)
+
+
 def _level_size(data_root, lv):
     """Bytes of level<lv> (schedule the biggest first to shrink the long tail)."""
     try:
@@ -212,6 +236,10 @@ def main():
         rc = subprocess.call([PY, EXTRACT, "--levels", args.levels, "--name", args.name] + passthrough)
         sys.exit(rc)
 
+    # A prior interrupted run can leave stale <name>__p* staging dirs (GBs). Clear them before starting so
+    # this run's chunk numbering is clean and old orphans don't linger.
+    _clean_staging(args.name)
+
     sized = sorted(((lv, _level_size(data_root, lv)) for lv in levels), key=lambda t: -t[1])
     chunks = _chunk(sized, jobs)
     n = len(chunks)
@@ -219,30 +247,30 @@ def main():
     _prog["total"] = len(levels)  # denominator for the [SUBPROGRESS] extraction bar
     T0 = time.time()
 
-    results = []
-    with ThreadPoolExecutor(max_workers=n) as pool:
-        futs = [pool.submit(_run_chunk, i, ch, args.name, passthrough) for i, ch in enumerate(chunks)]
-        for f in futs:
-            results.append(f.result())
-    failed = [i for i, rc in results if rc != 0]
-    if failed:
-        print(f"[BUILD FAILED] extractor chunk(s) {failed} failed - see the [pN] log above", flush=True)
-        sys.exit(1)
-    print(f"[PARALLEL] all {n} chunks done in {time.time()-T0:.0f}s - merging", flush=True)
+    # try/finally so a chunk failure, a merge error, or a Ctrl-C can NEVER leave the (multi-GB) chunk
+    # staging dirs orphaned on disk -- they are always cleaned on the way out (see _clean_staging).
+    try:
+        results = []
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            futs = [pool.submit(_run_chunk, i, ch, args.name, passthrough) for i, ch in enumerate(chunks)]
+            for f in futs:
+                results.append(f.result())
+        failed = [i for i, rc in results if rc != 0]
+        if failed:
+            print(f"[BUILD FAILED] extractor chunk(s) {failed} failed - see the [pN] log above", flush=True)
+            sys.exit(1)
+        print(f"[PARALLEL] all {n} chunks done in {time.time()-T0:.0f}s - merging", flush=True)
 
-    if os.path.isdir(out):
-        shutil.rmtree(out)
-    os.makedirs(out, exist_ok=True)
-    _merge(args.name, n, out, levels)
+        if os.path.isdir(out):
+            shutil.rmtree(out)
+        os.makedirs(out, exist_ok=True)
+        _merge(args.name, n, out, levels)
 
-    # cleanup the (now-emptied) chunk staging dirs
-    for i in range(n):
-        cout = os.path.join(OUTROOT, f"{args.name}__p{i}")
-        if os.path.isdir(cout):
-            shutil.rmtree(cout, ignore_errors=True)
-    if not os.path.isfile(os.path.join(out, "scene.json")):
-        print(f"[BUILD FAILED] merge produced no scene.json at {out}", flush=True)
-        sys.exit(1)
+        if not os.path.isfile(os.path.join(out, "scene.json")):
+            print(f"[BUILD FAILED] merge produced no scene.json at {out}", flush=True)
+            sys.exit(1)
+    finally:
+        _clean_staging(args.name)  # emptied dirs on success; full dirs on failure/interrupt -> no orphans
     print(f"[PARALLEL] done in {time.time()-T0:.0f}s -> {out}", flush=True)
 
 
