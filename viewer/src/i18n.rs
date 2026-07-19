@@ -134,6 +134,12 @@ pub enum K {
     InstallDepsTip,
     FolderTitle,
     LangLabel,
+    // update check (menu-only): version indicator + "update available" modal
+    UpdateAvailable,
+    UpdateTitle,
+    UpdateBody, // parameterized: a single `{}` is filled with the new version tag
+    UpdateWarn,
+    UpdateLater,
 }
 
 /// Localized display for a build STAGE name (the Python log text, already uppercased + ASCII). We
@@ -272,6 +278,18 @@ fn pair(k: K) -> [&'static str; 2] {
         ],
         FolderTitle => ["Choose a folder for extracted map assets", "Выберите папку для распакованных данных карт"],
         LangLabel => ["LANG", "ЯЗЫК"],
+        UpdateAvailable => ["update available", "доступно обновление"],
+        UpdateTitle => ["UPDATE AVAILABLE", "ДОСТУПНО ОБНОВЛЕНИЕ"],
+        // `{}` = the new version tag (e.g. v0.1.0-15061f1); filled with format! at the call site.
+        UpdateBody => [
+            "A new version ({}) of Atlas is available.",
+            "Доступна новая версия Atlas ({}).",
+        ],
+        UpdateWarn => [
+            "Atlas may not work as intended if you don't update.",
+            "Без обновления Atlas может работать некорректно.",
+        ],
+        UpdateLater => ["LATER", "ПОЗЖЕ"],
     }
 }
 
