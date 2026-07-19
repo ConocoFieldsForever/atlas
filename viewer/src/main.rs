@@ -18,6 +18,7 @@ mod maps;
 mod menu;
 mod menu_fx;
 mod nav;
+mod nav_bake;
 mod navigate_panel;
 mod pathfind;
 mod paths;
@@ -520,6 +521,15 @@ fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Trans
 }
 
 fn main() {
+    // Headless nav baker BEFORE any Bevy/GPU init: `atlas bake-nav <pack_dir> [--res R] [--layers K]`
+    // bakes the routing grid on the CPU (portable — AMD/NVIDIA/no-GPU) and exits, so the map-build
+    // pipeline can produce routing on any machine without CUDA. No window, no adapter.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if argv.get(1).map(String::as_str) == Some("bake-nav") {
+            std::process::exit(nav_bake::run_cli(&argv[2..]));
+        }
+    }
     // --version/--help fast path BEFORE any Bevy/GPU init: CI runners have no usable GPU, so
     // this is the only smoke test a workflow can run (redistribution PR5).
     if let Some(flag) = std::env::args().nth(1) {
@@ -530,6 +540,7 @@ fn main() {
         if matches!(flag.as_str(), "--help" | "-h") {
             println!(
                 "atlas [<pack-dir>] [m0|gpu]\n\
+                 atlas bake-nav <pack-dir> [--res 1.0] [--layers 8]  (headless CPU nav baker)\n\
                  no args: start menu (scans <exe>/packs).  env: EFT_PACK, EFT_RENDER, EFT_SHADOWS,\n\
                  EFT_GRADE/EFT_GRADE_EXPOSURE, EFT_FOG, EFT_UNCAPPED, EFT_HIDDEN, EFT_SHOT,\n\
                  EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0. Docs: README_DIST.md"

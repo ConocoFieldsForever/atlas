@@ -117,6 +117,11 @@ impl BuildJob {
             .env("EFT_ASSETS_ROOT", &assets_root)
             .env("EFT_TARKMAP_ROOT", &tarkmap_root)
             .arg(script);
+        // Hand the build the EXACT running viewer exe so its nav stage can invoke the portable
+        // `atlas bake-nav` baker without guessing at target/ paths (finding: routing by default).
+        if let Ok(exe) = std::env::current_exe() {
+            cmd.env("EFT_ATLAS_EXE", exe);
+        }
         if key_as_args {
             cmd.args(key.split([',', ' ']).filter(|s| !s.is_empty()));
         }

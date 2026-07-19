@@ -338,6 +338,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "image",
+ "rayon",
  "rfd",
  "serde",
  "serde_json",
