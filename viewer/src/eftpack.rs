@@ -22,7 +22,7 @@
 //! MIRROR flag bit instead of baking.
 
 use anyhow::{anyhow, Context, Result};
-use glam::{Affine3A, Mat3, Vec3};
+use glam::{Affine3A, Mat3, Quat, Vec3};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -375,6 +375,129 @@ pub struct MeshGeom {
 }
 
 // ---------------------------------------------------------------------------
+// Realtime lights (point/spot). EFT lights its maps with REALTIME lights (no baked
+// lightmaps/probes ship in the bundles). The pack carries the raw light set in the
+// `lights` sidecar; the viewer lights the scene entirely at runtime from it (see the
+// GPU light grid in render/gpu_driven.rs). We REDUCE each raw Unity light to a
+// viewer-world point/vector here — the ONLY transform is the EFT handedness flip
+// G3 = diag(-1,1,1) (X sign) applied to both position and the spot forward vector
+// (tarkov-unity-extraction skill §9); no TRS decompose.
+// ---------------------------------------------------------------------------
+
+/// A realtime point/spot light reduced to viewer world space and packed for the GPU
+/// light loop. Light intensity is folded into `color` at parse (linear_rgb * intensity).
+#[derive(Debug, Clone, Copy)]
+pub struct Light {
+    /// Viewer-world position (G3 X-flip applied to the raw Unity position).
+    pub pos: Vec3,
+    /// Linear RGB × intensity — the radiant color the shader multiplies by attenuation.
+    pub color: Vec3,
+    /// Range in meters (hard cutoff).
+    pub range: f32,
+    /// Spot forward direction, viewer-world, normalized. (0,0,0) for point lights.
+    pub dir: Vec3,
+    /// cos(spotAngle/2): -2.0 for point lights (so the spot factor is 1 everywhere).
+    pub cos_outer: f32,
+    /// cos(innerSpotAngle/2): -1.0 for point lights. Always > `cos_outer` (smoothstep edges).
+    pub cos_inner: f32,
+}
+
+/// Raw light record as authored in the `lights_*.json` sidecar (Unity world space).
+#[derive(Debug, Clone, Deserialize)]
+struct LightRaw {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    position: [f32; 3],
+    #[serde(default = "ident_quat")]
+    rotation: [f32; 4],
+    #[serde(default = "default_tint")]
+    color: [f32; 4],
+    #[serde(default = "one")]
+    intensity: f32,
+    #[serde(default)]
+    range: f32,
+    #[serde(rename = "spotAngle", default)]
+    spot_angle: f32,
+    #[serde(rename = "innerSpotAngle", default)]
+    inner_spot_angle: f32,
+    #[serde(default = "yes")]
+    on: bool,
+}
+fn ident_quat() -> [f32; 4] {
+    [0.0, 0.0, 0.0, 1.0]
+}
+
+/// The sidecar may be a bare array OR `{ "lights": [...] }`. Tolerate both.
+#[derive(Debug, Clone, Deserialize)]
+struct LightsWrapper {
+    #[serde(default)]
+    lights: Vec<LightRaw>,
+}
+
+/// Reduce a raw Unity light to a viewer-world `Light`, or `None` if it is off /
+/// contributes nothing (intensity<=0 or range<=0).
+fn reduce_light(r: &LightRaw) -> Option<Light> {
+    if !r.on || r.intensity <= 0.0 || r.range <= 0.0 {
+        return None;
+    }
+    // G3 = diag(-1,1,1): sign-flip X on the raw Unity world position.
+    let pos = Vec3::new(-r.position[0], r.position[1], r.position[2]);
+    let color = Vec3::new(r.color[0], r.color[1], r.color[2]) * r.intensity;
+    let is_spot = r.kind.eq_ignore_ascii_case("spot");
+    let (dir, cos_outer, cos_inner) = if is_spot {
+        // Unity forward is +Z; rotate by the light's quat, then apply the same G3 X-flip.
+        let q = Quat::from_xyzw(r.rotation[0], r.rotation[1], r.rotation[2], r.rotation[3]);
+        let q = if q.length_squared() > 1e-8 {
+            q.normalize()
+        } else {
+            Quat::IDENTITY
+        };
+        let f = q * Vec3::Z;
+        let fwd = Vec3::new(-f.x, f.y, f.z).normalize_or_zero();
+        let co = (r.spot_angle.to_radians() * 0.5).cos();
+        let mut ci = (r.inner_spot_angle.to_radians() * 0.5).cos();
+        // smoothstep(cos_outer, cos_inner, cosang) needs cos_inner > cos_outer.
+        if ci <= co {
+            ci = co + 1e-3;
+        }
+        (fwd, co, ci)
+    } else {
+        (Vec3::ZERO, -2.0, -1.0) // point: spot factor == 1 everywhere
+    };
+    Some(Light {
+        pos,
+        color,
+        range: r.range,
+        dir,
+        cos_outer,
+        cos_inner,
+    })
+}
+
+/// Best-effort parse of the lights sidecar. A missing / unreadable / unparseable file
+/// yields an empty vec — realtime lighting is optional; it must NEVER fail the load.
+fn parse_lights(root: &Path, sidecar: &str) -> Vec<Light> {
+    let path = if Path::new(sidecar).is_absolute() {
+        PathBuf::from(sidecar)
+    } else {
+        root.join(sidecar)
+    };
+    let s = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let raws: Vec<LightRaw> = match serde_json::from_str::<Vec<LightRaw>>(&s) {
+        Ok(v) => v,
+        Err(_) => match serde_json::from_str::<LightsWrapper>(&s) {
+            Ok(w) => w.lights,
+            Err(_) => return Vec::new(),
+        },
+    };
+    raws.iter().filter_map(reduce_light).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Loaded pack (CPU side).
 // ---------------------------------------------------------------------------
 pub struct Pack {
@@ -386,6 +509,9 @@ pub struct Pack {
     pub meshes_bin: Vec<u8>,
     /// Repacked, 16B-aligned instances.
     pub instances: Vec<GpuInstance>,
+    /// Realtime point/spot lights reduced to viewer world space (empty if the pack
+    /// ships no lights sidecar or it failed to parse — never fatal).
+    pub lights: Vec<Light>,
 }
 
 impl Pack {
@@ -435,12 +561,26 @@ impl Pack {
             ));
         }
 
+        // Realtime lights (best-effort; empty vec on any failure — never fatal).
+        let lights = manifest
+            .sidecars
+            .lights
+            .as_deref()
+            .map(|s| parse_lights(&root, s))
+            .unwrap_or_default();
+        eprintln!(
+            "  realtime lights: {} usable (from sidecar '{}')",
+            lights.len(),
+            manifest.sidecars.lights.as_deref().unwrap_or("<none>")
+        );
+
         Ok(Pack {
             root,
             manifest,
             materials,
             meshes_bin,
             instances,
+            lights,
         })
     }
 
