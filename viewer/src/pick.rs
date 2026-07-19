@@ -67,7 +67,7 @@ impl Plugin for PickPlugin {
         app.init_resource::<PickState>()
             .init_resource::<PickSpheres>()
             .add_systems(Startup, spawn_pick_ui)
-            .add_systems(Update, pick_system)
+            .add_systems(Update, (pick_system, sync_pick_ui_visibility))
             // In-place map swap: clear the lazy per-mesh bounding-sphere cache — it's indexed by the
             // OLD pack's mesh table (wrong centers/radii for the new pack). Re-armed by is_empty().
             .add_systems(
@@ -104,6 +104,26 @@ fn spawn_pick_ui(mut commands: Commands) {
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.6)),
         PickReadout,
     ));
+}
+
+/// Hide the pick readout while the START MENU is up (it's a persistent Bevy-UI node in the same
+/// top-left corner the menu draws over); show it in raid. Mirrors how `pos_hud` / the language toggle
+/// early-return on `menu.is_some()`. The menu is its own process, so this only ever resolves one way
+/// per launch, but it's cheap and keeps the debug hint off the menu screen.
+fn sync_pick_ui_visibility(
+    menu: Option<Res<crate::menu::MenuState>>,
+    mut q: Query<&mut Visibility, With<PickReadout>>,
+) {
+    let want = if menu.is_some() {
+        Visibility::Hidden
+    } else {
+        Visibility::Visible
+    };
+    for mut v in &mut q {
+        if *v != want {
+            *v = want;
+        }
+    }
 }
 
 /// A resolved triangle hit against the pack data.

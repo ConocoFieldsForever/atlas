@@ -1152,6 +1152,10 @@ fn build_cpu_data(
         Ok(s) => s,
         Err(e) => {
             error!("gpu-driven: bounding_spheres failed: {e:#}");
+            // Clear the load flag we latched above, else the loading toast spins forever with no map.
+            if let Some(s) = &load_signal {
+                s.set(false);
+            }
             return;
         }
     };
@@ -1884,6 +1888,10 @@ fn build_cpu_data(
     let instance_total = inst_cursor;
     if mesh_count == 0 || instance_total == 0 {
         warn!("gpu-driven: nothing to draw (0 meshes / 0 instances)");
+        // Clear the load flag we latched at the top, else the loading toast spins forever.
+        if let Some(s) = &load_signal {
+            s.set(false);
+        }
         return;
     }
 
