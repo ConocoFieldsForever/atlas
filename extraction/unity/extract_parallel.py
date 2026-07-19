@@ -72,6 +72,61 @@ def _clean_staging(name):
         shutil.rmtree(p, ignore_errors=True)
 
 
+# ---------------------------------------------------------------------------- resume progress manifest
+# A kill/shutdown mid-extraction must be RESUMABLE: <OUTROOT>/<name>.progress.json records this run's exact
+# chunk plan + status so a re-run can detect the interruption, keep the staging, and skip finished work. Written
+# atomically (temp + os.replace) so a kill mid-write can never leave a half-written/corrupt manifest.
+def _progress_path(name):
+    return os.path.join(OUTROOT, f"{name}.progress.json")
+
+
+def _write_progress(name, data):
+    os.makedirs(OUTROOT, exist_ok=True)
+    p = _progress_path(name)
+    tmp = f"{p}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)                      # atomic on the same volume (survives an ill-timed kill)
+
+
+def _write_progress_best_effort(name, data):
+    try:
+        _write_progress(name, data)
+    except Exception:
+        pass
+
+
+def _read_progress(name):
+    try:
+        with open(_progress_path(name), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None                         # missing or corrupt -> treat as no manifest (fresh start)
+
+
+def _delete_progress(name):
+    try:
+        os.remove(_progress_path(name))
+    except OSError:
+        pass
+
+
+def _chunk_scene_ok(name, idx):
+    """True iff chunk <name>__p<idx> finished last run: its scene.json exists AND parses (the extractor writes
+    scene.json LAST, so its presence == the chunk completed). A truncated/corrupt scene.json (kill mid-write of
+    the final json.dump) fails to parse -> False -> the chunk is re-run rather than trusted."""
+    fp = os.path.join(OUTROOT, f"{name}__p{idx}", "scene.json")
+    if not os.path.isfile(fp):
+        return False
+    try:
+        with open(fp, encoding="utf-8") as f:
+            return "instances" in json.load(f)
+    except Exception:
+        return False
+
+
 def _level_size(data_root, lv):
     """Bytes of level<lv> (schedule the biggest first to shrink the long tail)."""
     try:
@@ -236,31 +291,71 @@ def main():
         rc = subprocess.call([PY, EXTRACT, "--levels", args.levels, "--name", args.name] + passthrough)
         sys.exit(rc)
 
-    # A prior interrupted run can leave stale <name>__p* staging dirs (GBs). Clear them before starting so
-    # this run's chunk numbering is clean and old orphans don't linger.
-    _clean_staging(args.name)
-
+    # Deterministic chunk plan (greedy LPT on level file sizes). It depends ONLY on levels+jobs+on-disk sizes,
+    # so a re-run re-derives the SAME chunk<->levels assignment -> a resumed run lines up with existing staging.
     sized = sorted(((lv, _level_size(data_root, lv)) for lv in levels), key=lambda t: -t[1])
     chunks = _chunk(sized, jobs)
     n = len(chunks)
+    plan = {"name": args.name, "levels": levels, "jobs": jobs, "chunks": chunks}
+
+    # RESUME across a kill/shutdown: a matching, non-complete progress manifest means a prior run was
+    # interrupted. Its staging (<name>__p*) is reused -- completed chunks (valid scene.json) are skipped and
+    # re-run chunks reuse their already-written meshes/textures (eft_extract_v2's skip-if-exists + texcache).
+    # A missing / mismatched / complete manifest is a fresh start: clear any stale staging up front (as before).
+    prev = _read_progress(args.name)
+    resume = bool(prev and prev.get("status") != "complete"
+                  and prev.get("levels") == levels and prev.get("jobs") == jobs
+                  and prev.get("chunks") == chunks)
+    # If the previous run died DURING the merge, its move-based merge may have consumed (moved out) part of the
+    # staging, so a per-chunk "skip if scene.json present" would reference meshes no longer in staging. In that
+    # (rare) case re-run every chunk: eft_extract_v2 regenerates any moved-away meshes/textures before we re-merge.
+    merge_interrupted = resume and prev.get("phase") == "merge"
+    if resume:
+        print(f"[RESUME] in-progress manifest for {args.name} (status={prev.get('status')}, "
+              f"phase={prev.get('phase')}) -> keeping staging, skipping finished work", flush=True)
+        if merge_interrupted:
+            print("[RESUME] prior run was interrupted mid-merge -> re-running all chunks to rebuild staging", flush=True)
+    else:
+        # stale <name>__p* staging (GBs) from a mismatched/complete prior run: clear so numbering is clean.
+        _clean_staging(args.name)
+
     print(f"[PARALLEL] {len(levels)} levels across {n} chunks (jobs={jobs})", flush=True)
     _prog["total"] = len(levels)  # denominator for the [SUBPROGRESS] extraction bar
     T0 = time.time()
 
-    # try/finally so a chunk failure, a merge error, or a Ctrl-C can NEVER leave the (multi-GB) chunk
-    # staging dirs orphaned on disk -- they are always cleaned on the way out (see _clean_staging).
+    # Record the plan BEFORE any chunk runs (atomic temp+rename) so a kill leaves a resumable signal on disk.
+    phase = "extract"
+    _write_progress(args.name, {**plan, "status": "running", "phase": phase})
+
+    # Staging is cleaned ONLY after a successful merge (below), never in a blanket finally -- an interrupt must
+    # LEAVE the staging + manifest so the next run resumes. On a clean full run the end state is byte-identical.
     try:
         results = []
+        futs = []
         with ThreadPoolExecutor(max_workers=n) as pool:
-            futs = [pool.submit(_run_chunk, i, ch, args.name, passthrough) for i, ch in enumerate(chunks)]
+            for i, ch in enumerate(chunks):
+                if resume and not merge_interrupted and _chunk_scene_ok(args.name, i):
+                    print(f"[RESUME] chunk {i} already complete ({len(ch)} levels) -> skipping", flush=True)
+                    with _prog_lock:
+                        _prog["done"] += len(ch)
+                        d, t = _prog["done"], _prog["total"]
+                    if t:
+                        print(f"[SUBPROGRESS] extract {d}/{t}", flush=True)   # keep the loader bar honest on resume
+                    results.append((i, 0))
+                    continue
+                futs.append(pool.submit(_run_chunk, i, ch, args.name, passthrough))
             for f in futs:
                 results.append(f.result())
         failed = [i for i, rc in results if rc != 0]
         if failed:
             print(f"[BUILD FAILED] extractor chunk(s) {failed} failed - see the [pN] log above", flush=True)
+            _write_progress_best_effort(args.name, {**plan, "status": "interrupted", "phase": phase})
             sys.exit(1)
         print(f"[PARALLEL] all {n} chunks done in {time.time()-T0:.0f}s - merging", flush=True)
 
+        # Merging MOVES files out of staging; flag the phase so a mid-merge kill is recovered correctly on resume.
+        phase = "merge"
+        _write_progress(args.name, {**plan, "status": "running", "phase": phase})
         if os.path.isdir(out):
             shutil.rmtree(out)
         os.makedirs(out, exist_ok=True)
@@ -268,9 +363,19 @@ def main():
 
         if not os.path.isfile(os.path.join(out, "scene.json")):
             print(f"[BUILD FAILED] merge produced no scene.json at {out}", flush=True)
+            _write_progress_best_effort(args.name, {**plan, "status": "interrupted", "phase": phase})
             sys.exit(1)
-    finally:
-        _clean_staging(args.name)  # emptied dirs on success; full dirs on failure/interrupt -> no orphans
+
+        # SUCCESS: mark complete, THEN clean staging (honours EFT_KEEP_STAGING), THEN drop the manifest.
+        _write_progress(args.name, {**plan, "status": "complete", "phase": "done"})
+        _clean_staging(args.name)
+        _delete_progress(args.name)
+    except SystemExit:
+        raise                                   # already recorded interrupted above
+    except BaseException:
+        # kill (Ctrl-C) / unexpected error mid-run: leave staging + manifest so the next run resumes.
+        _write_progress_best_effort(args.name, {**plan, "status": "interrupted", "phase": phase})
+        raise
     print(f"[PARALLEL] done in {time.time()-T0:.0f}s -> {out}", flush=True)
 
 
