@@ -15,6 +15,8 @@ the codex/agent review:
   python extraction/unity/eft_extract_v2.py --levels 63 --name ix_terrain --terrain-only
 """
 import os, sys, json, argparse, time, gc
+import shutil, hashlib, threading
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eft_scene_extract import quat_to_mat, trs
@@ -33,6 +35,110 @@ ALB = ("_MainTex", "_Diffuse", "_BaseMap", "_AlbedoMap", "_MainTex0", "_BaseAlbe
        "_TopAlbedoASmoothness", "_Albedo", "_Aldebo", "_Tex", "_BaseColorMap", "_MainTexture")   # _Aldebo: MK4/Rock's
 #      albedo slot is literally misspelled in the game shader -> Woods rocks were untextured white without it (map-agnostic add)
 NRM = ("_BumpMap", "_NormalMap", "_Normalmap", "_Normal", "_BaseNormalMap", "_BumpMap0", "_TopNormalMap")   # _Normalmap: MK4/Rock
+
+# ---------------------------------------------------------------- perf: persistent tex cache + parallel PNG write
+# Textures are CONTENT-ADDRESSED: the same source texture always decodes to the same PNG (this is the very
+# property the parallel-extract merge already relies on). So:
+#  (1) PERSISTENT CACHE keyed on the source BYTES (+ format/dims/normal-flag/PIL version) lets any rebuild -- or a
+#      second map that shares a texture -- SKIP the ~95ms decode+PNG-encode by hardlinking the already-made PNG.
+#  (2) The PNG encode (zlib; releases the GIL; ~90% of texture cost) is handed to a small thread pool so the
+#      biggest level's ~700 textures aren't written one-at-a-time.
+# Both are correctness-preserving: a cache MISS or ANY error falls straight back to the exact current decode+save,
+# and the pool only ever runs PIL img.save() on a private img.copy() -- every UnityPy/texture2ddecoder call stays
+# on the main thread, so output PNGs are byte-identical (verified with a full md5 diff of the produced set).
+try:
+    import PIL as _PILmod
+    _PIL_VER = getattr(_PILmod, "__version__", "?")
+except Exception:
+    _PIL_VER = "?"
+
+_TEXCACHE_ENABLED = os.environ.get("EFT_TEXCACHE", "1") != "0"          # EFT_TEXCACHE=0 -> disable persistent cache
+_TEXCACHE_DIR = os.environ.get("EFT_TEXCACHE_DIR") or os.path.join(OUTROOT, ".texcache")
+_texstats = {"hit": 0, "miss": 0}
+
+
+def _tex_workers():
+    """EFT_TEX_WORKERS: PNG-write threads. A digit sets it exactly (1 = serial, the exact legacy path);
+    anything else = auto (a modest fraction of the cores so N concurrent chunk-processes don't thrash)."""
+    v = os.environ.get("EFT_TEX_WORKERS", "").strip()
+    if v.isdigit():
+        return max(1, int(v))
+    return max(1, min(8, (os.cpu_count() or 4) // 3))
+
+
+def _texcache_key_path(to, is_normal):
+    """Content-addressed cache path for a Texture2D read `to`: blake2b of the RESOLVED raw source bytes
+    (get_image_data() reads the .resS stream for streamed textures -- most EFT textures stream, so the plain
+    inline `image_data` is empty for them), plus width/height/format + the normal-swizzle flag + the PIL
+    version (so a PIL upgrade that changes the encoded PNG bytes auto-invalidates rather than serving stale
+    bytes). ~4ms per texture; immune to game updates (keyed on the actual bytes, not a path-id). Returns None
+    if anything is off -> caller just decodes normally (correctness-preserving fallback)."""
+    try:
+        try: raw = to.get_image_data()          # resolves m_StreamData (.resS) -> real bytes
+        except Exception: raw = None
+        if not raw:
+            raw = getattr(to, "image_data", None)  # inline fallback
+        if not raw:
+            if os.environ.get("EFT_TEXCACHE_DEBUG"): print(f"  [texcache-debug] raw empty for {getattr(to,'m_Name','?')}", flush=True)
+            return None
+        w = int(g(to, "m_Width", default=0) or 0); h = int(g(to, "m_Height", default=0) or 0)
+        fmt = g(to, "m_TextureFormat", default=0)
+        try: fmt = int(fmt)
+        except (TypeError, ValueError): fmt = int(getattr(fmt, "value", -1))
+        d = hashlib.blake2b(bytes(raw), digest_size=16)
+        d.update(f"|{w}x{h}|{fmt}|{'N' if is_normal else 'A'}|pil{_PIL_VER}".encode())
+        return os.path.join(_TEXCACHE_DIR, d.hexdigest() + ".png")
+    except Exception as e:
+        if os.environ.get("EFT_TEXCACHE_DEBUG"): print(f"  [texcache-debug] EXC {type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _link_or_copy(src, dst):
+    """Materialize dst from a fully-written PNG src as cheaply as possible: hardlink (zero extra bytes,
+    instant, same volume) else fall back to a byte copy. src is always complete, so dst is never partial."""
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        pass
+    except OSError:
+        try: shutil.copyfile(src, dst)
+        except Exception: pass
+
+
+def _publish_cache(out_fp, cache_fp):
+    """After writing out_fp, hardlink it into the cache (first writer wins; identical dup is a no-op)."""
+    if not cache_fp or os.path.exists(cache_fp):
+        return
+    _link_or_copy(out_fp, cache_fp)
+
+
+class _TexPool:
+    """Background PNG writer. Decode + normal-unswizzle stay on the CALLING (main) thread; only the pure
+    PIL img.save() (+ cache publish) runs on workers, and only on a private img.copy() so no UnityPy/
+    texture2ddecoder state is ever touched off the main thread. workers<=1 -> the exact serial legacy path."""
+    def __init__(self, workers):
+        self.workers = max(1, workers)
+        self.pool = ThreadPoolExecutor(max_workers=self.workers) if self.workers > 1 else None
+        self.sem = threading.Semaphore(self.workers + 2) if self.pool else None   # bound in-flight images (memory)
+        self.errors = 0
+
+    def save(self, img, out_fp, cache_fp):
+        if self.pool is None:
+            img.save(out_fp); _publish_cache(out_fp, cache_fp); return
+        img = img.copy()                                    # detach from UnityPy's lazy/reused decode buffer
+        self.sem.acquire()
+        def _job():
+            try:
+                img.save(out_fp); _publish_cache(out_fp, cache_fp)
+            except Exception:
+                self.errors += 1
+            finally:
+                self.sem.release()
+        self.pool.submit(_job)
+
+    def close(self):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True)
 
 
 def g(o, *names, default=None):
@@ -378,6 +484,11 @@ def main():
     lodgroups = []       # Stage A (LOD_PLAN.md): SSoT Unity LODGroup table; global index across levels. values verbatim from Unity
     terrain_manifest = {"tiles": {}, "layers": []}; _layer_saved = {}   # accumulate splat layers/maps across tiles
     splat_root = os.path.join(out, "terrain_layers")
+    if _TEXCACHE_ENABLED:
+        os.makedirs(_TEXCACHE_DIR, exist_ok=True)
+    texpool = _TexPool(_tex_workers())                                  # background PNG writer (exp_tex closes over it)
+    print(f"  tex: cache={'on -> ' + _TEXCACHE_DIR if _TEXCACHE_ENABLED else 'off'}  write-threads={texpool.workers}",
+          flush=True)
     T0 = time.time()
 
     def fidpid(pptr):
@@ -506,11 +617,18 @@ def main():
                 nm = san(g(to, "m_Name", default="t")) + f"__{stem}_{pid}"
                 if key not in tex_done:
                     tex_done.add(key)
-                    if not os.path.exists(os.path.join(td, nm + ".png")):   # skip if already on disk
-                        img = to.image
-                        if img:
-                            if is_normal: img = unswizzle_normal(img)
-                            img.save(os.path.join(td, nm + ".png"))
+                    out_fp = os.path.join(td, nm + ".png")
+                    if not os.path.exists(out_fp):          # skip if already on disk (this dataset, prior run)
+                        cache_fp = _texcache_key_path(to, is_normal) if _TEXCACHE_ENABLED else None
+                        if cache_fp and os.path.exists(cache_fp):
+                            _link_or_copy(cache_fp, out_fp)  # cache HIT: skip decode + PNG encode entirely
+                            _texstats["hit"] += 1
+                        else:
+                            img = to.image
+                            if img:
+                                if is_normal: img = unswizzle_normal(img)
+                                texpool.save(img, out_fp, cache_fp)   # serial or threaded save; publishes to cache
+                                _texstats["miss"] += 1
                 return nm
             except Exception:
                 return None
@@ -943,6 +1061,11 @@ def main():
         print(f"level{lv}: +{cnt} mesh +{tcnt} terrain  total={len(instances)} meshes={len([v for v in exported.values() if v])} tex={len(tex_done)} ({time.time()-t0:.0f}s)", flush=True)
         del env, tfm, wcache, go2tf; gc.collect()
 
+    texpool.close()                                                     # flush all background PNG writes to disk
+    if texpool.errors:
+        print(f"  WARNING: {texpool.errors} async PNG write(s) failed", flush=True)
+    if _TEXCACHE_ENABLED:
+        print(f"  texcache: {_texstats['hit']} hits, {_texstats['miss']} misses", flush=True)
     terrain_manifest["layers"] = sorted(_layer_saved.keys())
     if terrain_manifest["tiles"]:
         os.makedirs(splat_root, exist_ok=True)
