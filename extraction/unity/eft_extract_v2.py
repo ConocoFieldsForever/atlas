@@ -93,6 +93,40 @@ def _texcache_key_path(to, is_normal):
         return None
 
 
+def _atomic_write(final_path, write_fn):
+    """Write final_path atomically: write_fn(tmp) fills a sibling temp, then os.replace makes it appear
+    complete-or-not-at-all. This is what makes the RESUMABLE parallel extract safe -- a kill mid-write must never
+    leave a TRUNCATED file (half-written .obj / .vcol.npy / .png), because the resume path's skip-if-exists would
+    otherwise trust it and bake corrupt data into the merged pack (observed: a half-written .vcol.npy reused on
+    resume -> a mesh whose vertex colours failed to reshape). Byte-for-byte identical on the happy path (replacing
+    a fully-written temp == a direct write). Thread-unique temp name because texture saves run on a pool."""
+    tmp = f"{final_path}.tmp{os.getpid()}_{threading.get_ident()}"
+    try:
+        write_fn(tmp)
+        os.replace(tmp, final_path)                # atomic on the same directory/volume
+    except BaseException:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)                     # don't leave the partial temp lying around
+        except OSError:
+            pass
+        raise
+
+
+def _write_text_utf8(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _save_npy(path, arr):
+    with open(path, "wb") as f:                    # file object -> numpy won't append .npy to our temp name
+        np.save(f, arr)
+
+
+def _save_png(path, img):
+    img.save(path, format="PNG")                   # format explicit: the temp name has no .png extension to infer from
+
+
 def _link_or_copy(src, dst):
     """Materialize dst from a fully-written PNG src as cheaply as possible: hardlink (zero extra bytes,
     instant, same volume) else fall back to a byte copy. src is always complete, so dst is never partial."""
@@ -101,7 +135,7 @@ def _link_or_copy(src, dst):
     except FileExistsError:
         pass
     except OSError:
-        try: shutil.copyfile(src, dst)
+        try: _atomic_write(dst, lambda t: shutil.copyfile(src, t))   # atomic copy: never a truncated dst on kill
         except Exception: pass
 
 
@@ -124,12 +158,12 @@ class _TexPool:
 
     def save(self, img, out_fp, cache_fp):
         if self.pool is None:
-            img.save(out_fp); _publish_cache(out_fp, cache_fp); return
+            _atomic_write(out_fp, lambda t: _save_png(t, img)); _publish_cache(out_fp, cache_fp); return
         img = img.copy()                                    # detach from UnityPy's lazy/reused decode buffer
         self.sem.acquire()
         def _job():
             try:
-                img.save(out_fp); _publish_cache(out_fp, cache_fp)
+                _atomic_write(out_fp, lambda t: _save_png(t, img)); _publish_cache(out_fp, cache_fp)
             except Exception:
                 self.errors += 1
             finally:
@@ -443,7 +477,10 @@ def write_terrain_obj(td, path, step=4):
     # Match UnityPy's mesh.export() convention so the builder's uniform FLIPX/coord pipeline handles terrain
     # IDENTICALLY to every other mesh: negate X and reverse triangle winding. (Writing raw +X here would make
     # FLIPX wrongly flip the terrain, offsetting it from the rest of the map.) General, not a per-map fudge.
-    with open(path, "w", encoding="utf-8") as f:
+    # Atomic (temp + os.replace) so a kill mid-write can't leave a truncated terrain OBJ that the resume path's
+    # skip-if-exists ("if not os.path.exists(fp)") would later trust. Same bytes as a direct write on success.
+    tmp = f"{path}.tmp{os.getpid()}_{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as f:
         for r in range(rr):
             for c in range(cc):
                 f.write(f"v {-c*step*sx:.4f} {Hs[r,c]:.4f} {r*step*sz:.4f}\n")
@@ -454,6 +491,7 @@ def write_terrain_obj(td, path, step=4):
             for c in range(cc - 1):
                 a = r*cc + c + 1; b = r*cc + (c+1) + 1; d = (r+1)*cc + c + 1; e = (r+1)*cc + (c+1) + 1
                 f.write(f"f {b}/{b} {d}/{d} {a}/{a}\n"); f.write(f"f {e}/{e} {d}/{d} {b}/{b}\n")
+    os.replace(tmp, path)
     return (res - 1) * sx, (res - 1) * sz, float(Hw.max() - Hw.min())
 
 
@@ -855,7 +893,7 @@ def main():
                         # cp1252 encoder throws UnicodeEncodeError on those -> open('w') truncates the file to 0 bytes,
                         # export_mesh returns None, and the whole renderer is dropped (the invisible container-hospital
                         # WALLS). Writing UTF-8 fixes every non-ASCII-named mesh across all maps.
-                        open(fp, "w", encoding="utf-8").write(data); exported[key] = obj_fn
+                        _atomic_write(fp, lambda t: _write_text_utf8(t, data)); exported[key] = obj_fn
                     else:
                         exported[key] = None                # genuinely empty mesh (e.g. 0-vert road-decal stub)
                         if os.path.exists(fp) and os.path.getsize(fp) == 0:
@@ -873,7 +911,7 @@ def main():
                             if len(chs) > 3 and getattr(chs[3], "dimension", 0):
                                 from UnityPy.helpers.MeshHelper import MeshHandler
                                 mh = MeshHandler(mesh); mh.process(); _c = getattr(mh, "m_Colors", None)
-                                if _c is not None: np.save(vc_fp, np.asarray(_c, np.float32).reshape(-1, 4))
+                                if _c is not None: _atomic_write(vc_fp, lambda t: _save_npy(t, np.asarray(_c, np.float32).reshape(-1, 4)))
                         except Exception: pass
             except Exception:
                 exported[key] = None
@@ -1040,7 +1078,7 @@ def main():
                 # mesh-export size guard) so a pre-fix or partially-written albedo is never silently reused.
                 if (not os.path.exists(alb_path)) or os.path.getsize(alb_path) == 0:
                     alb = bake_terrain_albedo(tdata)
-                    if alb is not None: alb.save(alb_path)
+                    if alb is not None: _atomic_write(alb_path, lambda t: _save_png(t, alb))
                     else:
                         alb_name = None
                         if os.path.exists(alb_path) and os.path.getsize(alb_path) == 0:
