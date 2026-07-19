@@ -938,6 +938,10 @@ pub fn menu_ui(
     prop3d: Option<Res<crate::menu_fx::MenuCamProp>>,
     // UI language (EN/RU); the footer toggle flips + persists it.
     mut lang: ResMut<crate::i18n::Lang>,
+    // GitHub update check: the status drives the top-right version indicator + the update modal;
+    // `update_check.dismissed` is the LATER-this-session flag.
+    update_status: Res<crate::update::UpdateStatus>,
+    mut update_check: ResMut<crate::update::UpdateCheck>,
 ) {
     use bevy_egui::egui::{self, Color32, RichText};
     use crate::i18n::{map_title, t, K};
@@ -1615,6 +1619,119 @@ pub fn menu_ui(
             .show(ctx, |ui| {
                 ui.label(RichText::new(format!("\u{26A0} {msg}")).color(theme::DANGER_TEXT).size(11.0));
             });
+    }
+
+    // ---- version indicator + update modal (menu-only GitHub check) --------------------------------
+    // Both float on their OWN foreground Areas so a short window's overflow can't clip them, matching
+    // the lang-toggle / config-err pattern above. All colors/frames come from `theme` (ui_theme).
+    use crate::update::UpdateStatus;
+    let available = matches!(&*update_status, UpdateStatus::Available { .. });
+
+    // 1. Top-right version tag. Muted normally; an ACCENT dot + "update available" when a newer
+    //    release exists. Anchored just below the header so it clears the header's size readout.
+    egui::Area::new(egui::Id::new("menu_version"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 52.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if available {
+                    // A small accent badge dot before the label.
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.5, theme::ACCENT);
+                    ui.label(
+                        RichText::new(t(lg, K::UpdateAvailable))
+                            .size(11.0)
+                            .strong()
+                            .color(theme::ACCENT),
+                    );
+                }
+                ui.label(RichText::new(crate::update::APP_TAG).size(11.0).color(DIM));
+            });
+        });
+
+    // 2. The update MODAL — shown while Available AND not dismissed this session. A dim backdrop
+    //    (Middle order, below the card) swallows clicks to the menu behind it; the card (Foreground)
+    //    reuses the MapLoadError/confirm-dialog idiom: a CARD-filled Frame with an ACCENT stroke,
+    //    primary vs secondary theme buttons.
+    if available && !update_check.dismissed {
+        let (tag, url) = match &*update_status {
+            UpdateStatus::Available { tag, url } => (tag.clone(), url.clone()),
+            _ => (String::new(), String::new()),
+        };
+        let mut do_update = false;
+        let mut do_later = false;
+
+        // Dim backdrop.
+        egui::Area::new(egui::Id::new("update_modal_dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+                ui.allocate_rect(screen, egui::Sense::click()); // block the menu behind
+            });
+
+        // The card.
+        egui::Area::new(egui::Id::new("update_modal"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                    .inner_margin(egui::Margin::symmetric(22, 18))
+                    .corner_radius(0.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(440.0);
+                        ui.horizontal(|ui| {
+                            let (dot, _) =
+                                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            ui.painter().circle_filled(dot.center(), 4.0, theme::ACCENT);
+                            ui.label(
+                                RichText::new(t(lg, K::UpdateTitle))
+                                    .size(theme::SIZE_TITLE)
+                                    .strong()
+                                    .color(theme::TEXT_BRIGHT),
+                            );
+                        });
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(t(lg, K::UpdateBody).replace("{}", &tag))
+                                .size(theme::SIZE_BODY)
+                                .color(BONE),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(t(lg, K::UpdateWarn)).size(theme::SIZE_SMALL).color(WARN),
+                        );
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            // Primary: UPDATE (beige) opens the release page in the browser.
+                            if ui.add_sized([120.0, 30.0], theme::primary_button(t(lg, K::Update))).clicked() {
+                                do_update = true;
+                            }
+                            ui.add_space(8.0);
+                            // Secondary: LATER (neutral outlined) dismisses for this session.
+                            let later = egui::Button::new(
+                                RichText::new(t(lg, K::UpdateLater)).size(15.5).strong().color(BONE),
+                            )
+                            .fill(HEADER)
+                            .stroke(egui::Stroke::new(1.0, BORDER))
+                            .corner_radius(0.0);
+                            if ui.add_sized([120.0, 30.0], later).clicked() {
+                                do_later = true;
+                            }
+                        });
+                    });
+            });
+
+        if do_update {
+            crate::update::open_url(&url);
+            update_check.dismissed = true; // stop nagging once they've gone to the release page
+        } else if do_later {
+            update_check.dismissed = true;
+        }
     }
 
     // ---- apply the worker intents collected above (single point of mutation) ----

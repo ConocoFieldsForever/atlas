@@ -28,9 +28,11 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bevy_egui = { workspace = true }
-# On-demand pathfinding: blocking HTTP POST to the local :8091 GPU pathfind server (GraphQL).
-# default-features=false drops rustls/TLS — we only ever hit http://127.0.0.1, no cert machinery.
-ureq = { version = "2", default-features = false }
+# Tiny HTTP client. `native-tls` = schannel on Windows (uses the OS cert store, so no bundled
+# webpki-roots blob and no OpenSSL to fight +crt-static) — needed for the one HTTPS GET to the
+# public GitHub releases API in `update.rs` (menu update check). default-features=false still drops
+# gzip/cookies/json; the body is parsed with the workspace serde_json.
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
 texpresso = "2.0.2"
 # Native folder picker for the first-run onboarding (choose where extracted datasets live).
 # default-features off = just the OS-native dialog, no Linux async/portal runtimes.

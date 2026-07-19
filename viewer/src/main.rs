@@ -29,6 +29,7 @@ mod render;
 mod tasks_panel;
 mod ui;
 mod ui_theme;
+mod update;
 mod walk_ground;
 
 use bevy::diagnostic::{FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
@@ -813,6 +814,10 @@ fn main() {
     // behind the UI. EFT_MENU_TERRAIN=1 falls back to the old rippling triangle terrain.
     if menu_mode {
         app.insert_resource(menu::build_state());
+        // Menu-only GitHub update check: fires one token-less GET off-thread on startup and, if a
+        // newer release exists, drives the top-right version indicator + the themed update modal in
+        // menu::menu_ui. Offline-safe (folds to Unknown) and never blocks the first frame.
+        app.add_plugins(update::UpdatePlugin);
         // Default backdrop is the 2D reactive triangle field, painted in egui (menu::menu_ui ->
         // menu_fx::triangle_field) — no 3D world needed. The 3D backdrops are opt-in fallbacks:
         // EFT_MENU_EXFIL=1 = neon wireframe exfil, EFT_MENU_TERRAIN=1 = rippling triangle terrain.
