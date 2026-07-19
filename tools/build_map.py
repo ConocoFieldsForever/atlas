@@ -56,24 +56,66 @@ def _stage_python(envvar, legacy):
 PY_UNITY = _stage_python("EFT_PY_UNITY", r"C:\Users\user\anaconda3\python.exe")
 PY_BAKE = _stage_python("EFT_PY_BAKE", r"C:\Users\user\anaconda3\envs\5090\python.exe")
 
-# *_Light scene index per map (BuildSettings scene list). streets/ground_zero split lights
-# across many scenes and are handled by the batch fleet — the menu build skips lights there.
-LIGHT_LEVELS = {
-    "interchange": 64,
-    "lighthouse": 191,
-    "factory": 69,
-    # Factory 1.0 rework (the shipped roster's "Factory"): the live lights are in
-    # Factory_Rework_Day_Light.unity == BuildSettings level 526 (night bank = 541). Without this
-    # entry stage 2 skips light extraction and the SH bake is SKY-ONLY (dark, unlit interiors).
-    "factory_rework": 526,
-    "customs": 13,
-    "woods": 167,
-    "shoreline": 41,
-    "reserve": 146,
-    "labs": 114,
-    "labyrinth": 551,
-}
-INDOOR_NO_GRASS = {"factory", "factory_rework", "labs", "labyrinth"}
+# The `*_Light` BuildSettings scene indices per map are no longer hardcoded here -- they are DERIVED
+# by tools/gen_maps.py and shipped in extraction/maps/manifest.json ("light_levels", a LIST so
+# streets/ground_zero -- which split lighting across many district scenes -- get FULL lighting, not
+# the single-scene the old scalar table allowed). build_map reads that list; if the map isn't in the
+# manifest yet (a brand-new location a builder is adding) it falls back to deriving the list straight
+# from the live BuildSettings via gen_maps. Lights stay OPTIONAL -- an empty list just skips the
+# stage. There is no hardcoded INDOOR_NO_GRASS set anymore either: grass is data-driven (a map has
+# grass iff its dataset actually yields density grids), so indoor/no-terrain maps are skipped by
+# nature (see stage 5).
+MANIFEST_PATH = os.path.join(VIEWER, "extraction", "maps", "manifest.json")
+
+
+def _manifest_maps():
+    """{id: entry} from the shipped roster manifest, or {} if unreadable (fallback derivation)."""
+    try:
+        return {m["id"]: m for m in json.load(
+            open(MANIFEST_PATH, encoding="utf-8")).get("maps", [])}
+    except Exception as e:
+        print(f"[BUILD] note: could not read maps manifest ({e}) - deriving lights from "
+              f"BuildSettings", flush=True)
+        return {}
+
+
+def _config_unity_location(m):
+    """The map's game location folder (source.unity_location) from its config, or None -- the join
+    key for the manifest-miss light derivation. Workspace config wins over the kit copy."""
+    for p in (os.path.join(TK, "maps", m, "config.json"),
+              os.path.join(VIEWER, "extraction", "maps", m, "config.json")):
+        if os.path.isfile(p):
+            try:
+                return json.load(open(p, encoding="utf-8"))["source"].get("unity_location")
+            except Exception:
+                return None
+    return None
+
+
+def light_levels_for(m):
+    """List of `*_Light` BuildSettings level indices to extract for map m. Manifest first (the
+    shipped, committed roster); fall back to deriving from the LIVE BuildSettings for a map not yet
+    in the manifest. Returns [] when nothing can be found -- lights are OPTIONAL, the build never
+    fails on this."""
+    entry = _manifest_maps().get(m)
+    if entry is not None and entry.get("light_levels") is not None:
+        return [int(x) for x in entry["light_levels"]]
+    folder = _config_unity_location(m)
+    if not folder:
+        print(f"[BUILD] note: {m} not in the manifest and no source.unity_location in its config - "
+              f"lights will be skipped (optional)", flush=True)
+        return []
+    try:
+        out = subprocess.check_output(
+            [PY_UNITY, os.path.join(HERE, "gen_maps.py"), "--lights-for", folder],
+            text=True, encoding="utf-8", errors="replace", stderr=subprocess.DEVNULL)
+        levels = json.loads(out.strip().splitlines()[-1])
+        print(f"[BUILD] derived light levels for {m} from BuildSettings folder '{folder}': "
+              f"{levels}", flush=True)
+        return [int(x) for x in levels]
+    except Exception as e:
+        print(f"[BUILD] note: could not derive lights for {m} ({e}) - skipped (optional)", flush=True)
+        return []
 
 
 def run(stage, total, name, cmd, cwd, optional=False):
@@ -211,8 +253,13 @@ def main():
         # --self-contained is noted on the stages it changes (assemble + grass emit
         # pack-relative, copied-in textures/sidecars instead of absolute references).
         sc_note = " (self-contained)" if self_contained else ""
+        # Resolve + show the manifest-driven light levels so the plan reflects what stage 2 will do
+        # (proves the roster lookup / day-night pick / streets-GZ list without any heavy work).
+        dry_lights = light_levels_for(m)
+        light_note = (f" (levels {dry_lights})" if dry_lights
+                      else " (none known -> sky-only bake)")
         for i, name in enumerate(
-            ["check dataset", "extract lights", "bake lighting (GPU)",
+            ["check dataset", "extract lights" + light_note, "bake lighting (GPU)",
              "assemble pack" + sc_note, "grass" + sc_note,
              "gameplay zones", "item icons", "bake nav grid (CPU)",
              "stamp fingerprint"], 1):
@@ -240,10 +287,11 @@ def main():
         run(1, total, "extract dataset (geometry + textures)",
             [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "extract_parallel.py"),
              "--levels", levels, "--name", dsname] + alllod_extract, VIEWER)
-        if m not in INDOOR_NO_GRASS:
-            run(1, total, "extract grass density",
-                [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
-                 "--levels", levels, "--name", dsname], VIEWER, optional=True)
+        # Grass density is extracted for EVERY map here; indoor/no-terrain maps simply yield no
+        # grids and are skipped at pack time (stage 5) -- no hardcoded indoor list.
+        run(1, total, "extract grass density",
+            [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
+             "--levels", levels, "--name", dsname], VIEWER, optional=True)
         if not os.path.isfile(os.path.join(dataset, "scene.json")):
             print(f"[BUILD FAILED] extraction finished but no scene.json at {dataset} - check the "
                   f"log above (is UnityPy installed for EFT_PY_UNITY? is EFT_GAME_DATA correct and "
@@ -251,25 +299,27 @@ def main():
             sys.exit(3)
     print(f"[STAGE 1/{total}] check dataset: done", flush=True)
 
-    # 2: lights (optional; some maps have none / are fleet-handled)
-    lv = LIGHT_LEVELS.get(m)
-    if lv is None and m in ("streets", "ground_zero") and not any(
-        f.startswith("lights_") for f in os.listdir(dataset) if f.endswith(".json")
-    ):
-        print(f"[STAGE 2/{total}] WARNING: {m} splits lights across many scenes and none are "
-              f"extracted - the bake will be SKY-ONLY (dark interiors). Run the fleet light "
-              f"merge first for full lighting.", flush=True)
-    if lv is not None and (force or not any(
-        f.startswith("lights_") for f in os.listdir(dataset) if f.endswith(".json")
-    )):
-        # portable kit extractor (env-driven drop-in for the beamng warp_viz original);
-        # --name is the DATASET folder name, it writes ASSETS/<dataset>/lights_<lv>.json
-        run(2, total, "extract lights",
-            [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_lights.py"),
-             "--level", str(lv), "--name", dsname],
-            VIEWER, optional=True)
+    # 2: lights (optional) -- extract EVERY `*_Light` scene the map uses. The level LIST comes from
+    #    the manifest (or a BuildSettings-derived fallback), so streets/ground_zero -- which split
+    #    lighting across many district scenes -- now get full lighting, not just one scene.
+    levels_light = light_levels_for(m)
+    if not levels_light:
+        print(f"[STAGE 2/{total}] extract lights: none known for {m} - the bake will be SKY-ONLY "
+              f"(dark interiors) unless a light sidecar already exists.", flush=True)
     else:
-        print(f"[STAGE 2/{total}] extract lights: skipped (present or n/a)", flush=True)
+        # extract each level whose sidecar is missing (or all, on --force). --name is the DATASET
+        # folder; the extractor writes ASSETS/<dataset>/lights_<lv>.json. Optional: a failure on any
+        # single scene doesn't fail the build.
+        todo = [lv for lv in levels_light
+                if force or not os.path.isfile(os.path.join(dataset, f"lights_{lv}.json"))]
+        if not todo:
+            print(f"[STAGE 2/{total}] extract lights: skipped (all {len(levels_light)} sidecar(s) "
+                  f"present)", flush=True)
+        for lv in todo:
+            run(2, total, f"extract lights (level {lv})",
+                [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_lights.py"),
+                 "--level", str(lv), "--name", dsname],
+                VIEWER, optional=True)
 
     # 3: GPU SH bake (the long stage; skip if a fresh volume2 already exists)
     v2 = os.path.join(out_dir, "volume2.bin")
@@ -296,31 +346,33 @@ def main():
     run(4, total, "assemble pack",
         [PY, "-m", "eft_pipeline.assemble_bevy", m] + sc_flag + keeplods_flag, VIEWER)
 
-    # 5: grass (outdoor maps)
-    if m in INDOOR_NO_GRASS:
-        print(f"[STAGE 5/{total}] grass: skipped (indoor map)", flush=True)
-    else:
-        # The stage-1 inline extraction already extracts grass density on a FRESH build, so don't
-        # scan the (huge, Streets = 217-level) terrain bundle a second time here - just pack it.
-        tl = os.path.join(dataset, "terrain_layers")
-        have_grids = os.path.isdir(tl) and any(
+    # 5: grass -- DATA-DRIVEN: a map has grass iff its dataset actually yields density grids. Indoor/
+    #    no-terrain maps (Factory/Labs/Labyrinth) produce none and are skipped automatically -- no
+    #    hardcoded indoor list. The stage-1 inline extraction already produced grids on a FRESH build,
+    #    so don't rescan the (huge, Streets = 217-level) terrain bundle if they're already present.
+    tl = os.path.join(dataset, "terrain_layers")
+
+    def _have_grids():
+        return os.path.isdir(tl) and any(
             f.startswith("grass_density_") and f.endswith(".bin") for f in os.listdir(tl))
-        if have_grids:
-            print(f"[STAGE 5/{total}] grass: density grids already present - skip re-extract", flush=True)
-            ok = True
-        else:
-            gl = dataset_levels(m)
-            grass_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
-                         "--name", dsname]
-            if gl:
-                # pass the level list so the extractor finds the terrain bundle (without it, it
-                # auto-detects over an empty list and silently skips -> no grass on fresh datasets).
-                grass_cmd += ["--levels", gl]
-            ok = run(5, total, "grass: extract density grids", grass_cmd, VIEWER, optional=True)
-        if ok:
-            run(5, total, "grass: build grass.bin",
-                [PY, "-m", "eft_pipeline.build_grass", "--pack", pack] + sc_flag,
-                VIEWER, optional=True)
+
+    if _have_grids():
+        print(f"[STAGE 5/{total}] grass: density grids already present - skip re-extract", flush=True)
+    else:
+        gl = dataset_levels(m)
+        grass_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
+                     "--name", dsname]
+        if gl:
+            # pass the level list so the extractor finds the terrain bundle (without it, it
+            # auto-detects over an empty list and silently skips -> no grass on fresh datasets).
+            grass_cmd += ["--levels", gl]
+        run(5, total, "grass: extract density grids", grass_cmd, VIEWER, optional=True)
+    if _have_grids():
+        run(5, total, "grass: build grass.bin",
+            [PY, "-m", "eft_pipeline.build_grass", "--pack", pack] + sc_flag,
+            VIEWER, optional=True)
+    else:
+        print(f"[STAGE 5/{total}] grass: none (no density grids - indoor/no-terrain map)", flush=True)
 
     # 6: typed gameplay zones (exfils/mines/snipers/doors/loose loot). The extractor writes
     # to tarkmap/out/<map>/gamedata.json and only PRINTS the copy step - do the copy here.
@@ -370,11 +422,12 @@ def main():
     except Exception as e:
         print(f"  [dedup] skipped: {e}", flush=True)
 
-    # Lighting completeness (finding 3a): a map we KNOW ships realtime lights (in LIGHT_LEVELS, or
-    # the multi-scene streets/ground_zero) that produced neither a light sidecar NOR an SH bake will
-    # render with dark/flat interiors. Don't hide that behind a clean [BUILD OK] - surface it so the
-    # menu log makes the gap obvious (the pack is still valid geometry, so exit stays 0).
-    expects_light = (m in LIGHT_LEVELS) or (m in ("streets", "ground_zero"))
+    # Lighting completeness (finding 3a): a map we KNOW ships realtime lights (any derived
+    # light_levels, now including the multi-scene streets/ground_zero) that produced neither a light
+    # sidecar NOR an SH bake will render with dark/flat interiors. Don't hide that behind a clean
+    # [BUILD OK] - surface it so the menu log makes the gap obvious (the pack is still valid
+    # geometry, so exit stays 0).
+    expects_light = bool(levels_light)
     have_lights = os.path.isdir(dataset) and any(
         f.startswith("lights_") and f.endswith(".json") for f in os.listdir(dataset))
     have_sh = os.path.isfile(os.path.join(out_dir, "volume.bin"))
