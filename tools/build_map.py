@@ -50,6 +50,10 @@ LIGHT_LEVELS = {
     "interchange": 64,
     "lighthouse": 191,
     "factory": 69,
+    # Factory 1.0 rework (the shipped roster's "Factory"): the live lights are in
+    # Factory_Rework_Day_Light.unity == BuildSettings level 526 (night bank = 541). Without this
+    # entry stage 2 skips light extraction and the SH bake is SKY-ONLY (dark, unlit interiors).
+    "factory_rework": 526,
     "customs": 13,
     "woods": 167,
     "shoreline": 41,
@@ -57,7 +61,7 @@ LIGHT_LEVELS = {
     "labs": 114,
     "labyrinth": 551,
 }
-INDOOR_NO_GRASS = {"factory", "labs", "labyrinth"}
+INDOOR_NO_GRASS = {"factory", "factory_rework", "labs", "labyrinth"}
 
 
 def run(stage, total, name, cmd, cwd, optional=False):

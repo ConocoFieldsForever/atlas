@@ -717,7 +717,8 @@ def drape_zones(sink):
 DEV_API = "https://api.tarkov.dev/graphql"
 # tarkov.dev display name for the per-map lootLoose query (same per-map fetch pattern as
 # build_loot.py — the all-maps query 503s). Unlisted maps fall back to a title-cased key.
-DEV_NAME = {"lighthouse": "Lighthouse", "factory": "Factory", "labs": "The Lab",
+DEV_NAME = {"lighthouse": "Lighthouse", "factory": "Factory", "factory_rework": "Factory",
+            "labs": "The Lab",
             "streets": "Streets of Tarkov", "ground_zero": "Ground Zero", "labyrinth": "The Labyrinth"}
 
 

@@ -28,7 +28,9 @@ OUT = os.path.join(_TK, 'out', 'loot.json')
 API = "https://api.tarkov.dev/graphql"
 DEV_TO_ID = {
     'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
-    'factory': 'factory', 'night-factory': 'factory', 'woods': 'woods', 'customs': 'customs',
+    # The shipped roster's "Factory" is the 1.0 rework (id factory_rework). tarkov.dev still calls
+    # it factory / night-factory, so both map to factory_rework or the pack loads with no POI.
+    'factory': 'factory_rework', 'night-factory': 'factory_rework', 'woods': 'woods', 'customs': 'customs',
     'shoreline': 'shoreline', 'streets-of-tarkov': 'streets', 'reserve': 'reserve',
     'the-lab': 'labs', 'the-labs': 'labs', 'lighthouse': 'lighthouse',
     'the-labyrinth': 'labyrinth', 'labyrinth': 'labyrinth',
