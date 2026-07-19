@@ -834,11 +834,12 @@ pub fn triangle_field(ctx: &egui::Context) {
                     None => 0.0,
                 };
                 let band = 0.5 + 0.5 * (t * 0.7 - (cx + cy) * 0.006).sin();
-                let glow = g_cursor.max(0.16 * band);
-                // dim by default so the field is ambient texture, not a grid that fights the text;
-                // the cursor pool brightens locally but gently (a strong pool is distracting).
-                let edge_a = (7.0 + 105.0 * glow).clamp(0.0, 255.0) as u8;
-                let fill_a = (2.0 + 48.0 * g_cursor).clamp(0.0, 255.0) as u8;
+                let glow = g_cursor.max(0.06 * band);
+                // Very dim by default so the field is a FAINT ambient texture, not a grid that fights
+                // the text; the cursor pool brightens locally but gently. Alphas roughly halved from
+                // the original so the low-poly backdrop reads as subtle atmosphere, not a loud mesh.
+                let edge_a = (3.0 + 52.0 * glow).clamp(0.0, 255.0) as u8;
+                let fill_a = (1.0 + 22.0 * g_cursor).clamp(0.0, 255.0) as u8;
                 painter.add(egui::Shape::convex_polygon(
                     vec![tri[0], tri[1], tri[2]],
                     Color32::from_rgba_unmultiplied(40, 185, 214, fill_a),
