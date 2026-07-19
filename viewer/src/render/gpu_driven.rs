@@ -667,6 +667,11 @@ struct VolumeMeta {
     spacing: Option<[f32; 3]>,
     coeffs: u32,
     channels: u32,
+    /// Optional per-map SH GI intensity multiplier (the shader multiplies the sampled
+    /// irradiance/env by it via `vol_min.w`). Data-driven so a dark bake (e.g. Interchange) can be
+    /// lifted a couple of stops without a Rust rebuild. Absent -> 1.0 (unchanged behaviour).
+    #[serde(default)]
+    gi_intensity: Option<f32>,
 }
 
 /// CPU-staged SH irradiance volume, ready for a ONE-TIME GPU upload as three RGBA16Float 3D
@@ -680,6 +685,8 @@ struct ShVolumeCpu {
     max: [f32; 3],
     /// [sx, sy, sz] probe spacing (meters) — for the manual 8-tap leak-fix grid step.
     spacing: [f32; 3],
+    /// Per-map SH GI intensity (shader `vol_min.w`); from the sidecar's `gi_intensity`, else 1.0.
+    gi_intensity: f32,
     tex_r: Vec<u8>,
     tex_g: Vec<u8>,
     tex_b: Vec<u8>,
@@ -697,6 +704,7 @@ impl ShVolumeCpu {
             min: [0.0, 0.0, 0.0],
             max: [1.0, 1.0, 1.0],
             spacing: [1.0, 1.0, 1.0], // single probe: grid clamps to 0, any nonzero step is inert
+            gi_intensity: 1.0,
             tex_r: texel.to_vec(),
             tex_g: texel.to_vec(),
             tex_b: texel.to_vec(),
@@ -800,6 +808,12 @@ fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
         Some(s) => s,
         None => [derive_spacing(0), derive_spacing(1), derive_spacing(2)],
     };
+    // Per-map GI intensity (shader vol_min.w). Reject a non-finite / negative sidecar value so a
+    // bad bake can't NaN the whole GI term; absent -> 1.0 (behaviour unchanged for older packs).
+    let gi_intensity = meta
+        .gi_intensity
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(1.0);
 
     info!(
         "SH-GI: loaded irradiance volume {}x{}x{} ({} probes, {:.1} MB) min={:?} max={:?} spacing={:?}",
@@ -817,6 +831,7 @@ fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
         min: meta.min,
         max: meta.max,
         spacing,
+        gi_intensity,
         tex_r,
         tex_g,
         tex_b,
@@ -2848,8 +2863,16 @@ fn prepare_gpu_buffers(
         1.0 / (sh.max[1] - sh.min[1]).max(1e-6),
         1.0 / (sh.max[2] - sh.min[2]).max(1e-6),
     ];
+    // #3 GI intensity (shader multiplies GI/env by vol_min.w). Priority: EFT_GI env override >
+    // the pack's data-driven per-map `gi_intensity` (volume-meta sidecar) > 1.0. Lets a dark bake
+    // (Interchange reads ~2 stops dark) be lifted without a rebuild; NOT hardcoded per-map in Rust.
+    let gi_intensity = std::env::var("EFT_GI")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(sh.gi_intensity);
     let sh_uniform_data = ShVolumeUniform {
-        vol_min: [sh.min[0], sh.min[1], sh.min[2], 1.0], // w = gi_intensity (default 1.0)
+        vol_min: [sh.min[0], sh.min[1], sh.min[2], gi_intensity], // w = gi_intensity (EFT_GI / sidecar / 1.0)
         // w = normal_bias (meters) for the manual 8-tap leak fix.
         vol_inv_extent: [sh_inv_extent[0], sh_inv_extent[1], sh_inv_extent[2], SH_NORMAL_BIAS],
         // xyz = probe grid dims (as f32), for the manual 8-tap corner enumeration.
