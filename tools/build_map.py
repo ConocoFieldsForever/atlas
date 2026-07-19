@@ -144,6 +144,13 @@ def main():
     dry = "--dry-run" in sys.argv
     self_contained = "--self-contained" in sys.argv
     sc_flag = ["--self-contained"] if self_contained else []
+    # --alllod (or EFT_ALLLOD=1): keep EVERY LOD level in the dataset + pack (instead of the default
+    # LOD0-only resolve) so the viewer can offer a forced-LOD selector. ~47% bigger; opt-in. NOTE:
+    # only takes effect on a FRESH extraction -- delete the existing LOD0 dataset first, else the
+    # stage-1 "dataset exists" check reuses the LOD0 dataset.
+    all_lod = "--alllod" in sys.argv or os.environ.get("EFT_ALLLOD", "").strip() == "1"
+    alllod_extract = ["--alllod"] if all_lod else []
+    keeplods_flag = ["--keep-lods"] if all_lod else []
     if not args:
         print("usage: build_map.py <map> [--dry-run] [--self-contained]")
         sys.exit(2)
@@ -189,7 +196,7 @@ def main():
         # chunk) then merges — big maps go multi-core. EFT_JOBS=1 forces the plain serial extractor.
         run(1, total, "extract dataset (geometry + textures)",
             [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "extract_parallel.py"),
-             "--levels", levels, "--name", dsname], VIEWER)
+             "--levels", levels, "--name", dsname] + alllod_extract, VIEWER)
         if m not in INDOOR_NO_GRASS:
             run(1, total, "extract grass density",
                 [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
@@ -244,7 +251,7 @@ def main():
 
     # 4: assemble the pack (atomic; auto-ships loot/tasks/grade sidecars)
     run(4, total, "assemble pack",
-        [PY, "-m", "eft_pipeline.assemble_bevy", m] + sc_flag, VIEWER)
+        [PY, "-m", "eft_pipeline.assemble_bevy", m] + sc_flag + keeplods_flag, VIEWER)
 
     # 5: grass (outdoor maps)
     if m in INDOOR_NO_GRASS:

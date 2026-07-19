@@ -500,6 +500,7 @@ def main():
     MAP = argv[0] if argv and not argv[0].startswith('-') else 'interchange'
     LIMIT = int(argv[argv.index('--limit') + 1]) if '--limit' in argv else 0
     SELF_CONTAINED = '--self-contained' in argv     # redistribution PR3; default OFF (dev builds unchanged)
+    KEEP_LODS = '--keep-lods' in argv               # --alllod builds: keep every LOD shell for the viewer LOD selector
     OUT = (argv[argv.index('--out') + 1] if '--out' in argv
            else os.path.join(os.getcwd(), 'packs', f'{MAP}.eftpack'))
     # ATOMIC EMISSION (Codex review): write into a staging sibling and swap at the end. Writing
@@ -544,21 +545,24 @@ def main():
     # (Replaces the web payload split. Untagged instances -- terrain, ungrouped meshes -- are ALWAYS kept.
     #  lod.g is a global/cumulative index so (lv,g) == g, but keying on (lv,g) is redundant-but-safe. This is a
     #  NO-OP on an already-LOD0-resolved scene.json and yields the ~47% cut only on an --alllod extraction.)
-    gmin = {}
-    for it in inst:
-        L = it.get('lod')
-        if not L: continue
-        k = (it['lv'], L['g'])
-        gmin[k] = min(gmin.get(k, 1 << 30), L['i'])
-    n0 = len(inst)
-    kept = []
-    for it in inst:
-        L = it.get('lod')
-        if not L or L['i'] == gmin[(it['lv'], L['g'])]:
-            kept.append(it)
-    inst = kept
-    print(f"[bevy] LOD-shell dedup: {len(inst):,}/{n0:,} instances kept "
-          f"({n0 - len(inst):,} coarser LOD shells removed)")
+    if not KEEP_LODS:
+        gmin = {}
+        for it in inst:
+            L = it.get('lod')
+            if not L: continue
+            k = (it['lv'], L['g'])
+            gmin[k] = min(gmin.get(k, 1 << 30), L['i'])
+        n0 = len(inst)
+        kept = []
+        for it in inst:
+            L = it.get('lod')
+            if not L or L['i'] == gmin[(it['lv'], L['g'])]:
+                kept.append(it)
+        inst = kept
+        print(f"[bevy] LOD-shell dedup: {len(inst):,}/{n0:,} instances kept "
+              f"({n0 - len(inst):,} coarser LOD shells removed)")
+    else:
+        print(f"[bevy] --keep-lods: kept all {len(inst):,} LOD shells for the viewer LOD selector")
 
     # ---- STEP 4: global orientation (make_conjugator -- verbatim) --------------------------------------------
     G4 = cfg.coord_matrix()
