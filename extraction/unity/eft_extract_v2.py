@@ -917,9 +917,29 @@ def main():
                 exported[key] = None
             return exported[key]
 
-        def submesh_mats(mesh, mats):
-            try: tri_per = [int(g(s, "triangleCount", default=None) or s.indexCount // 3) for s in mesh.m_SubMeshes]
-            except Exception: tri_per = []
+        mesh_intrinsic = {}   # (lv,fid,pid) -> (submesh tri counts, world-AABB primitives, name): pure fn of the mesh
+        def mesh_info(mesh_pptr):
+            """Parse a shared mesh's INTRINSIC data (submesh triangle counts, local AABB, name) ONCE per unique
+            mesh, not once per renderer instance. The renderer loop used to re-`read()` (full typetree parse) the
+            SAME heavily-instanced mesh for every one of its instances; these consumers are pure functions of the
+            mesh, so memoize them keyed exactly like export_mesh's (lv,fid,pid). A read failure propagates to the
+            caller's try/except (skip renderer) EXACTLY as the old per-instance `mesh_pptr.read()` did."""
+            key = (lv, *fidpid(mesh_pptr))
+            v = mesh_intrinsic.get(key)
+            if v is None:
+                m = mesh_pptr.read()
+                try: tri = [int(g(s, "triangleCount", default=None) or s.indexCount // 3) for s in m.m_SubMeshes]
+                except Exception: tri = []
+                try:
+                    ab = g(m, "m_LocalAABB"); c = g(ab, "m_Center"); e = g(ab, "m_Extent")
+                    aabb = (float(c.x), float(c.y), float(c.z), abs(float(e.x)), abs(float(e.y)), abs(float(e.z)))
+                except Exception:
+                    aabb = None
+                nm = g(m, "m_Name", default="") or ""
+                v = mesh_intrinsic[key] = (tri, aabb, nm)
+            return v
+
+        def submesh_mats(tri_per, mats):
             subs = []
             for i, ntri in enumerate(tri_per):
                 mp = mats[min(i, len(mats) - 1)] if mats else None
@@ -936,15 +956,16 @@ def main():
                 subs = [_s]
             return subs
 
-        def _flat_water_plane(mesh, W):
+        def _flat_water_plane(aabb, W):
             """True iff this instance is a large, DEAD-FLAT, horizontal plane — a water/mirror sheet. World-space AABB from
-            the mesh LOCAL AABB transformed by the FULL world matrix (robust to a plane authored in XY then rotated flat).
-            Reflective props (wires/pipes/toilets) share the no-albedo reflective shader but have a real vertical extent, so
-            the flatness gate (world Y span < 1.5m) excludes them. No map/mesh names, no hardcoded water level — map-agnostic."""
+            the mesh LOCAL AABB (cached primitives cx,cy,cz,ex,ey,ez) transformed by the FULL world matrix (robust to a
+            plane authored in XY then rotated flat). Reflective props (wires/pipes/toilets) share the no-albedo reflective
+            shader but have a real vertical extent, so the flatness gate (world Y span < 1.5m) excludes them. No map/mesh
+            names, no hardcoded water level — map-agnostic."""
+            if aabb is None:
+                return False                                       # AABB unreadable -> as before, never water
             try:
-                aabb = g(mesh, "m_LocalAABB"); c = g(aabb, "m_Center"); e = g(aabb, "m_Extent")
-                cx, cy, cz = float(c.x), float(c.y), float(c.z)
-                ex, ey, ez = abs(float(e.x)), abs(float(e.y)), abs(float(e.z))
+                cx, cy, cz, ex, ey, ez = aabb
                 M3 = np.asarray(W[:3, :3], np.float64); T3 = np.asarray(W[:3, 3], np.float64)
                 corners = np.array([[cx + sx * ex, cy + sy * ey, cz + sz * ez]
                                     for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)], np.float64)
@@ -1032,8 +1053,7 @@ def main():
                             co = cp.read()
                             if co.__class__.__name__ == "MeshFilter": mesh_pptr = co.m_Mesh; break
                     if mesh_pptr is None or getattr(mesh_pptr, "path_id", 0) == 0: continue
-                    mesh = mesh_pptr.read()
-                    nm = g(mesh, "m_Name", default="") or ""
+                    tri_per, aabb, _mesh_nm = mesh_info(mesh_pptr)   # cached: parse this shared mesh ONCE, not per instance
                     # (removed the mesh-NAME LOD skip: keep_renderer already selects LOD0 via the LODGroup PPtrs, which
                     # is authoritative. A LOD0 renderer whose MESH is named "_LOD1" — e.g. the canopy metal-sheet covers
                     # 'metal_sheet_standing_LOD1' over the car — was wrongly dropped by the name heuristic. Only genuine
@@ -1042,10 +1062,10 @@ def main():
                     if not fn: continue
                     W = world_of_go(mr.m_GameObject.path_id)
                     if W is None: continue
-                    subs = submesh_mats(mesh, mr.m_Materials or [])
+                    subs = submesh_mats(tri_per, mr.m_Materials or [])
                     # WATER (geometric): a big dead-flat horizontal plane whose material has NO albedo texture is a water/
                     # mirror sheet (its flat `col` was the "white water"). Reflective props share the shader but aren't flat.
-                    if _flat_water_plane(mesh, W):
+                    if _flat_water_plane(aabb, W):
                         for _s in subs:
                             if _s.get("role") not in ("water", "cutout") and not _s.get("tex") \
                                     and not str(_s.get("sh") or "").lower().startswith("shadow"):
