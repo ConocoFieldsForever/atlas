@@ -294,7 +294,19 @@ def main():
     # Deterministic chunk plan (greedy LPT on level file sizes). It depends ONLY on levels+jobs+on-disk sizes,
     # so a re-run re-derives the SAME chunk<->levels assignment -> a resumed run lines up with existing staging.
     sized = sorted(((lv, _level_size(data_root, lv)) for lv in levels), key=lambda t: -t[1])
-    chunks = _chunk(sized, jobs)
+    # FINER chunks than `jobs` + a fixed-size worker pool (max_workers=jobs below) = dynamic WORK-STEALING: the pool
+    # runs only `jobs` chunks at once but pulls the next queued chunk onto whichever core frees up first, so the single
+    # heaviest chunk no longer sets the wall-clock while finished cores idle (the old static jobs==n LPT plan did).
+    # We make up to K*jobs chunks, but only split PAST `jobs` bins for levels big enough to amortize the ~1-3s
+    # per-process UnityPy re-import (<5%): a level below _SPLIT_MIN_BYTES is "small" and doesn't earn an extra chunk.
+    # Memory stays ~jobs concurrent processes (pool pinned to jobs, NOT n). The merge is partition-invariant
+    # (level-scoped meshes, content-addressed textures, offset LODGroup indices), so ANY chunk count yields the SAME
+    # merged dataset as a jobs=1 run. Deterministic (K + threshold fixed), so a resumed run re-derives the same plan.
+    K = 3
+    _SPLIT_MIN_BYTES = 8 * 1024 * 1024
+    n_heavy = sum(1 for _, sz in sized if sz >= _SPLIT_MIN_BYTES)
+    n_target = min(len(levels), max(jobs, min(K * jobs, n_heavy)))
+    chunks = _chunk(sized, n_target)
     n = len(chunks)
     plan = {"name": args.name, "levels": levels, "jobs": jobs, "chunks": chunks}
 
@@ -332,7 +344,7 @@ def main():
     try:
         results = []
         futs = []
-        with ThreadPoolExecutor(max_workers=n) as pool:
+        with ThreadPoolExecutor(max_workers=jobs) as pool:   # PIN to jobs (not n): >=jobs processes never run at once
             for i, ch in enumerate(chunks):
                 if resume and not merge_interrupted and _chunk_scene_ok(args.name, i):
                     print(f"[RESUME] chunk {i} already complete ({len(ch)} levels) -> skipping", flush=True)
