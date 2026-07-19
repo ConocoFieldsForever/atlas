@@ -542,17 +542,13 @@ def main():
         tfm = {o.path_id: o for o in env.objects if o.type.name == "Transform"}
         wcache = {}
 
-        _tfw = {}                     # tf_pid -> (father_tf_pid, local TRS 4x4)
-        def _tf_local(pid):
-            """Parse each Transform once (third leaf-only-memo quadratic walker, after
-            active_in_hierarchy and root_of - Icebreaker Indoor_02's 79k renderers)."""
-            v = _tfw.get(pid)
-            if v is None:
-                t = tfm[pid].read()
-                fp = getattr(t, "m_Father", None)
-                fpid = getattr(fp, "path_id", 0) if fp is not None else 0
-                v = _tfw[pid] = (fpid if fpid in tfm else 0, trs(t))
-            return v
+        # ONE shared per-Transform memo (built once below) replaces the FOUR separate re-reads of every Transform
+        # that used to exist: the go2tf build + _tf_local (world) + _tf_root_entry (root_of) + _tf_entry
+        # (active_in_hierarchy) each re-parsed the SAME Transform typetree into its own dict. Now every Transform is
+        # read exactly ONCE here into _tf, and every GameObject at most once into _goc (below). Same walk semantics:
+        # father resolution (fpid if fpid in tfm else 0), the 256-depth guard, and go2tf's try/except skip.
+        _I4 = np.eye(4)
+        _tf = {}                      # tf_pid -> (father_tf_pid, local TRS 4x4, m_GameObject ptr|None)
 
         def world(tf_obj):
             pid = tf_obj.path_id
@@ -561,39 +557,53 @@ def main():
             stack = []; cur = pid
             while cur and cur not in wcache and len(stack) < 256:
                 stack.append(cur)
-                cur = _tf_local(cur)[0]
+                cur = _tf.get(cur, (0, _I4, None))[0]     # father; identity/root-0 fallback if a Transform was unreadable
             W = wcache.get(cur) if cur else None
             if W is None: W = np.eye(4)
             for p in reversed(stack):     # W(node) = W(father) @ trs(node), cached per node
-                W = W @ _tf_local(p)[1]
+                W = W @ _tf.get(p, (0, _I4, None))[1]
                 wcache[p] = W
             return W
 
         go2tf = {}
-        for pid, o in tfm.items():
-            try: go2tf[o.read().m_GameObject.path_id] = pid
-            except Exception: pass
+        for pid, o in tfm.items():                       # read each Transform ONCE: father + local TRS + its GameObject ptr
+            try:
+                t = o.read()
+                fp = getattr(t, "m_Father", None)
+                fpid = getattr(fp, "path_id", 0) if fp is not None else 0
+                goptr = getattr(t, "m_GameObject", None)
+                _tf[pid] = (fpid if fpid in tfm else 0, trs(t), goptr)
+            except Exception:
+                continue                                 # unreadable/degenerate Transform: skipped from BOTH maps (old go2tf did)
+            gp = getattr(goptr, "path_id", None) if goptr is not None else None
+            if gp is not None:
+                go2tf[gp] = pid                          # last writer wins, SAME tfm.items() order as before
 
         def world_of_go(go_pid):
             tp = go2tf.get(go_pid)
             return world(tfm[tp]) if tp is not None else None
 
-        rcache = {}
-        _tfroot = {}                      # tf_pid -> (father_tf_pid, own GO name)
-        def _tf_root_entry(tp):
-            """Read each Transform/GameObject once (leaf-only memo made this quadratic on
-            deep hierarchies - same disease as active_in_hierarchy, see _tf_entry)."""
-            v = _tfroot.get(tp)
+        _goc = {}                         # tf_pid -> (own GO name, own GO m_IsActive); each GameObject read at most ONCE
+        def _go_entry(tp):
+            """Own GameObject's (name, activeSelf) for Transform tp, read ONCE and shared by root_of + active_in_
+            hierarchy (which used to EACH re-read every ancestor GameObject into a separate memo). Failure handling
+            matches the old walkers exactly: name via direct attr (missing -> ''), active via g(...,default=True)."""
+            v = _goc.get(tp)
             if v is None:
-                t = tfm[tp].read()
-                nm = ""
-                try: nm = t.m_GameObject.read().m_Name
-                except Exception: pass
-                fp = getattr(t, "m_Father", None)
-                fpid = getattr(fp, "path_id", 0) if fp is not None else 0
-                v = _tfroot[tp] = (fpid if fpid in tfm else 0, nm)
+                nm = ""; act = True
+                goptr = _tf.get(tp, (0, _I4, None))[2]
+                if goptr is not None:
+                    try: go = goptr.read()
+                    except Exception: go = None
+                    if go is not None:
+                        try: nm = go.m_Name                                # old _tf_root_entry: direct attr, AttributeError -> ""
+                        except Exception: nm = ""
+                        try: act = bool(g(go, "m_IsActive", default=True))  # old _tf_entry: g(...,default=True)
+                        except Exception: act = True
+                v = _goc[tp] = (nm, act)
             return v
 
+        rcache = {}
         def root_of(go_pid):
             """Top-level scene-root GameObject name (the game's own hierarchy grouping: 'SBG_*' = real content,
             'NewYear_Event' = event overlay, 'BLOCKER'/'JUSTPLANE' = proxies). Lets us cull by structure, not names."""
@@ -601,29 +611,12 @@ def main():
             tp = go2tf.get(go_pid); root = ""; gd = 0
             while tp and gd < 256:
                 gd += 1
-                fpid, nm = _tf_root_entry(tp)
+                nm = _go_entry(tp)[0]
                 if nm: root = nm
-                tp = fpid or None
+                tp = _tf.get(tp, (0, _I4, None))[0] or None
             rcache[go_pid] = root; return root
 
         ahcache = {}
-        _tfread = {}                      # tf_pid -> (father_tf_pid, own GO activeSelf)
-        def _tf_entry(tp):
-            """Read each Transform (and its GameObject's m_IsActive) exactly ONCE. The naive
-            chain walk re-parsed every ancestor's typetree per leaf renderer - quadratic on
-            deep hierarchies (Icebreaker Indoor_02: 79k renderers ground for an hour)."""
-            v = _tfread.get(tp)
-            if v is None:
-                t = tfm[tp].read()
-                act = True
-                try:
-                    act = bool(g(t.m_GameObject.read(), "m_IsActive", default=True))
-                except Exception: pass
-                fp = getattr(t, "m_Father", None)
-                fpid = getattr(fp, "path_id", 0) if fp is not None else 0
-                v = _tfread[tp] = (fpid if fpid in tfm else 0, act)
-            return v
-
         def active_in_hierarchy(go_pid):
             """activeInHierarchy = activeSelf AND every ancestor's activeSelf (serialized m_IsActive is LOCAL only).
             Walk Transform.m_Father to a root (same chain as world()); any inactive ancestor hides the whole subtree."""
@@ -631,9 +624,8 @@ def main():
             tp = go2tf.get(go_pid); ok = True; gd = 0
             while tp and gd < 256:
                 gd += 1
-                fpid, act = _tf_entry(tp)
-                if not act: ok = False; break
-                tp = fpid or None
+                if not _go_entry(tp)[1]: ok = False; break
+                tp = _tf.get(tp, (0, _I4, None))[0] or None
             ahcache[go_pid] = ok; return ok
 
         def srcid(pptr):
@@ -1117,7 +1109,7 @@ def main():
             except Exception as e:
                 print(f"  terrain err: {e}")
         print(f"level{lv}: +{cnt} mesh +{tcnt} terrain  total={len(instances)} meshes={len([v for v in exported.values() if v])} tex={len(tex_done)} ({time.time()-t0:.0f}s)", flush=True)
-        del env, tfm, wcache, go2tf; gc.collect()
+        del env, tfm, wcache, go2tf, _tf, _goc, mesh_intrinsic; gc.collect()
 
     texpool.close()                                                     # flush all background PNG writes to disk
     if texpool.errors:
