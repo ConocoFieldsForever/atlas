@@ -52,6 +52,13 @@ pub mod flags {
 pub struct Manifest {
     pub version: u32,
     pub dataset: String,
+    /// Canonical map id (== the roster / `config.json` `id` and the `.eftpack` basename), written by
+    /// `assemble_bevy` as `map`. This is the STABLE join key for loot / POI / tasks — unlike `dataset`,
+    /// which is the dataset DIRECTORY basename and can be `interchange_v2` / mismatch the intel key
+    /// (e.g. `factory_rework` vs a stale `factory`). Empty on an older pack that predates the field, in
+    /// which case the `dataset` + `_vN`-strip candidates still resolve.
+    #[serde(default)]
+    pub map: String,
     /// [minX,minY,minZ, maxX,maxY,maxZ] world AABB (computed by the emitter from
     /// world-space verts). Used for the initial camera framing.
     pub bounds: [f32; 6],

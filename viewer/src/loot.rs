@@ -162,6 +162,12 @@ pub(crate) fn spawn_loot(
     // no match) fall back to the sole map if the file is unambiguous.
     let mut keys: Vec<String> = Vec::new();
     if let Some(p) = pack.as_ref() {
+        // Canonical map id FIRST (the stable join key build_loot.py keys on); the dataset dir basename
+        // + `_vN` strip stay as fallbacks for older packs that predate the `map` manifest field.
+        let m = &p.0.manifest.map;
+        if !m.is_empty() {
+            keys.push(m.clone());
+        }
         let ds = &p.0.manifest.dataset;
         keys.push(ds.clone());
         if let Some((base, ver)) = ds.rsplit_once("_v") {

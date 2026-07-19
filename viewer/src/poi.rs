@@ -1186,8 +1186,13 @@ fn loose_info(lo: &Loose) -> MarkerInfo {
     }
 }
 
-/// dataset "interchange_v2" -> loot/semantics map key "interchange" (strip a `_vN` suffix).
-fn map_key(dataset: &str) -> String {
+/// Canonical map key for intel joins: the manifest's `map` (canonical id) if present, else the
+/// dataset dir basename with a `_vN` suffix stripped (e.g. `interchange_v2` -> `interchange`).
+fn map_key(manifest: &crate::eftpack::Manifest) -> String {
+    if !manifest.map.is_empty() {
+        return manifest.map.clone();
+    }
+    let dataset = &manifest.dataset;
     if let Some((base, ver)) = dataset.rsplit_once("_v") {
         if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit()) {
             return base.to_string();
@@ -1403,7 +1408,7 @@ fn spawn_pois(
     // Exfil", "Emercom Checkpoint"). The typed gamedata exfils carry raw scene ids ("NW Exfil",
     // "SE Exfil"), so each is renamed to the nearest dev extract within 60 m (XZ) below.
     let mut dev_extract_names: Vec<(String, Vec3)> = Vec::new();
-    let key = map_key(&lp.0.manifest.dataset);
+    let key = map_key(&lp.0.manifest);
     // ONE loot.json resolver for the whole app (loot.rs: env > pack > pack-parent shared >
     // shared_dir > cwd) - poi.rs used to re-implement a subset (audit A6).
     let loot_path = crate::loot::resolve_loot_json(Some(lp.0.root.as_path()));
