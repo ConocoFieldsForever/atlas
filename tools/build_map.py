@@ -23,6 +23,18 @@ import subprocess
 import sys
 import time
 
+# Robust output: a child pipeline stage can emit a non-ASCII byte (a material/mesh name — EFT
+# assets include Cyrillic), and our stdout is a cp1252 pipe/file. The BUNDLED embeddable Python
+# IGNORES PYTHONIOENCODING (its ._pth disables env-var handling), so the child's non-ASCII survived
+# our ascii-replace read as U+FFFD and crashed the build printing it (UnicodeEncodeError) mid-
+# assemble, before stages 5-9 (gamedata/POI, icons, fingerprint) could run. Force UTF-8 (+replace)
+# on our own streams so printing any line is always safe.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 VIEWER = os.path.dirname(HERE)
 # EFT_TARKMAP_ROOT is the tarkmap dir ITSELF (holds maps/ + out/), NOT the parent workspace.
@@ -68,13 +80,16 @@ def run(stage, total, name, cmd, cwd, optional=False):
     print(f"[STAGE {stage}/{total}] {name}", flush=True)
     print(f"  $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
-    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="ascii:replace")
+    # PYTHONUTF8=1 asks children to emit UTF-8 (respected by the venv Python; the embeddable one
+    # ignores it, but our own stdout is UTF-8 above and we read the child as UTF-8 below, so a
+    # non-ASCII line is handled either way instead of crashing the build).
+    env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     # pass the contract values as-is (TK = the maps/+out/ dir, ASSETS = the datasets dir)
     env.setdefault("EFT_TARKMAP_ROOT", TK)
     env.setdefault("EFT_ASSETS_ROOT", ASSETS)
     p = subprocess.Popen(
         cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="ascii", errors="replace",
+        encoding="utf-8", errors="replace",
     )
     for line in p.stdout:
         print("  " + line.rstrip(), flush=True)
