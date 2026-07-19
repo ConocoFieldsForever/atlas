@@ -62,19 +62,22 @@ That's it — no Python, no game files needed on your end.
 Atlas can build maps straight from your Escape from Tarkov install. This is the
 "full kit" and asks a bit more of you:
 
-- The Atlas download already includes everything the builder needs (`bootstrap.ps1`
-  and the `tools` / `eft_pipeline` / `extraction` folders).
-- You need **Python 3.10 or newer** installed.
+- The Atlas download already includes everything the builder needs — the `tools` /
+  `eft_pipeline` / `extraction` folders **and its own bundled Python**, so you do
+  **not** need to install Python.
 - You need **Escape from Tarkov installed** on the same PC.
-- You need an **internet connection while building** — Atlas fetches loot values,
-  quest data, and item icons from the free community API at
-  [tarkov.dev](https://tarkov.dev). (Viewing a finished map stays fully offline.)
+- You need an **internet connection while building** — Atlas fetches a few Python
+  packages the first time, plus loot values, quest data, and item icons from the free
+  community API at [tarkov.dev](https://tarkov.dev). (Viewing a finished map stays
+  fully offline.)
 
 Then:
 
-1. Right-click `bootstrap.ps1` → **Run with PowerShell** (one-time setup — it
-   installs what the builder needs and checks your setup).
-2. Launch `atlas.exe`. At the bottom of the menu:
+1. Launch `atlas.exe`. The first time, click **INSTALL DEPS** in the menu — it uses
+   the bundled Python to fetch the extraction packages (one-time, needs internet). No
+   Python install and no `bootstrap.ps1` needed. (Advanced/offline setups can still
+   run `bootstrap.ps1`.)
+2. At the bottom of the menu:
    - **GAME INSTALL** — point it at the **`EscapeFromTarkov_Data`** folder inside your
      Tarkov install (e.g. `…\Escape from Tarkov\EscapeFromTarkov_Data`; usually
      auto-fills — if not, paste that path and press **SET**).
