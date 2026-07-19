@@ -2438,7 +2438,7 @@ fn prepare_gpu_buffers(
                     // Terrain CONTROL maps are blend weights: load LINEAR + never BC (data_linear).
                     let data_linear = cpu.ctrl_tex_linear.contains(&(i as u32));
                     Some(pool.spawn(async move {
-                        prepare_tex_cpu(path, bc, data_linear, [255, 0, 255, 255]) // magenta placeholder
+                        prepare_tex_cpu(path, bc, data_linear, false, [255, 0, 255, 255]) // magenta placeholder
                     }))
                 })
                 .collect();
@@ -2448,7 +2448,7 @@ fn prepare_gpu_buffers(
                 .map(|path| {
                     let path = path.clone();
                     Some(pool.spawn(async move {
-                        prepare_tex_cpu(path, bc, false, [128, 128, 255, 255]) // flat-normal placeholder
+                        prepare_tex_cpu(path, bc, false, true, [128, 128, 255, 255]) // flat-normal placeholder (is_normal: raw linear, never BC)
                     }))
                 })
                 .collect();
@@ -3284,27 +3284,22 @@ fn load_normal_texture(
     queue: &RenderQueue,
     path: &str,
 ) -> (Texture, TextureView) {
+    // Normal maps are uploaded UNCOMPRESSED as Rgba8Unorm (LINEAR) — NEVER block-compressed.
+    // BC3 stores XYZ in a BC1-quality RGB565 block, so the small tangent-space X/Y variation
+    // (which IS the surface relief; Z/blue is near-constant ~0.96) is quantized to almost nothing
+    // and every normal-mapped surface reads flat. Raw RGBA8 keeps all channels, so the shader's
+    // base-normal decode (reads .rgb, keeps the real z from blue) works unchanged. The pack
+    // convention is "BC5 (normal, linear)"; raw RGBA8 is the lowest-risk equivalent (no new dep).
+    // ~540 unique normals uncompressed is a modest, acceptable VRAM cost. NOTE: the shared texcache
+    // stores BC3 payloads, so normals must NOT consult it (a hit would re-introduce the BC3 crush).
     match std::fs::read(path) {
         Ok(bytes) => {
-            let hash = fnv64(&bytes);
-            if bc_enabled(device) {
-                if let Some((w, h, mips, payload)) = texcache_read(hash) {
-                    return upload_bc3(device, queue, w, h, mips, &payload, false, "eft_normal");
-                }
-            }
             let Ok(img) = image::load_from_memory(&bytes) else {
                 warn!("gpu-driven Phase2b: normal '{path}' failed to decode; flat placeholder");
                 return upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing");
             };
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
-            // BC3 keeps all three tangent channels (the shader reads .rgb incl. z), unlike BC5.
-            if bc_wanted(device, w, h) {
-                let (mips, chain) = build_mip_chain(w, h, &rgba);
-                let payload = bc3_compress_chain(w, h, mips, &chain);
-                texcache_write(hash, w, h, mips, &payload);
-                return upload_bc3(device, queue, w, h, mips, &payload, false, "eft_normal");
-            }
             upload_rgba8_linear(device, queue, w.max(1), h.max(1), &rgba, "eft_normal")
         }
         Err(e) => {
@@ -3614,9 +3609,14 @@ enum TexCpu {
 /// uploads. NO `RenderDevice`/`RenderQueue`, so N of these run in parallel on the task pool.
 /// `bc` = BC compression enabled on this device (captured before spawn, folds in the feature + env
 /// gate). `data_linear` = terrain control/data map (raw RGBA, NEVER BC — BC's palette warps blend
-/// weights). `placeholder` = the 1x1 fill on any load/decode failure (magenta for albedo, flat
-/// normal for normals) so the bindless array index stays aligned with materials.json.
-fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, placeholder: [u8; 4]) -> TexCpu {
+/// weights). `is_normal` = tangent-space normal map (raw RGBA8 LINEAR, NEVER BC — BC3 crushes the
+/// small X/Y relief to flat; the shared texcache stores BC3 so normals must skip it too).
+/// `placeholder` = the 1x1 fill on any load/decode failure (magenta for albedo, flat normal for
+/// normals) so the bindless array index stays aligned with materials.json.
+fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, is_normal: bool, placeholder: [u8; 4]) -> TexCpu {
+    // Force the raw (uncompressed) path for normals: no texcache read (it stores BC3) and no BC
+    // encode, so the tangent-space detail survives. Mirrors the sync `load_normal_texture`.
+    let bc = bc && !is_normal;
     // Build the RGBA8 mip chain OFF-THREAD (the render thread just copies it) — mirrors what
     // `upload_rgba8_srgb/linear` did inline, moved here so a big data map can't stall a frame.
     let raw = |w: u32, h: u32, rgba: &[u8]| {
