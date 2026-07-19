@@ -886,12 +886,14 @@ fn build_cpu_data(
     pack: Option<Res<LoadedPack>>,
     epoch: Res<super::MapEpoch>,
     tags: Query<(), With<GpuDrivenTag>>,
+    lod: Res<crate::ForcedLod>,
 ) {
     let Some(pack) = pack else {
         return;
     };
     let pack = &pack.0;
-    let by_mesh = pack.instances_by_mesh();
+    // LOD selector (graphics panel): keep one LOD per group. No-op on lean LOD0-only packs.
+    let by_mesh = pack.instances_by_mesh_for_lod(lod.0);
     let local_spheres = match pack.bounding_spheres() {
         Ok(s) => s,
         Err(e) => {

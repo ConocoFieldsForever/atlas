@@ -150,6 +150,28 @@ fn apply_camera_fov(
 #[derive(Resource, Default)]
 pub struct MapSwitch(pub Option<String>);
 
+/// Forced LOD level for the GPU-driven viewer (the graphics-panel LOD selector). 0 = finest LOD
+/// (default / best detail); a higher value forces a coarser LOD per LODGroup (clamped to each
+/// group's max available level). Only meaningful on `--alllod` packs that carry multiple LODs; a
+/// no-op on lean LOD0-only packs. Changing it bumps `MapEpoch` so `build_cpu_data` rebuilds the
+/// instance set for the new level.
+#[derive(Resource)]
+pub struct ForcedLod(pub i32);
+impl Default for ForcedLod {
+    fn default() -> Self {
+        ForcedLod(0)
+    }
+}
+
+/// Re-trigger the per-map GPU rebuild when the LOD selector changes: bump `MapEpoch`, which the
+/// teardown/rebuild systems (incl. `build_cpu_data`, now LOD-aware) already gate on. Skips the
+/// initial add so it doesn't double-fire on startup.
+fn bump_epoch_on_lod_change(lod: Res<ForcedLod>, mut epoch: ResMut<render::MapEpoch>) {
+    if lod.is_changed() && !lod.is_added() {
+        epoch.0 = epoch.0.wrapping_add(1);
+    }
+}
+
 /// Set by the toolbar's "back to menu" button: relaunch the process with NO pack so the start menu
 /// (map manager) opens. The menu<->raid transition still relaunches (the in-place path is raid->raid
 /// only for now); a background build DOES die on this relaunch — full in-place menu is a follow-up.
@@ -668,6 +690,7 @@ fn main() {
         .init_resource::<MapSwitch>() // UI map dropdown -> switch to the selected pack (in place)
         .init_resource::<ReturnToMenu>() // toolbar "back to menu" button -> relaunch into the menu
         .init_resource::<PendingMapLoad>() // async in-place pack load (no frame freeze on switch)
+        .init_resource::<ForcedLod>() // graphics-panel LOD selector (meaningful on --alllod packs)
         .add_systems(Startup, setup)
         // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
         // exclusive by walk_mode) so they can't race the shared Transform. Disabled in the MENU
@@ -679,7 +702,7 @@ fn main() {
                 .chain()
                 .run_if(not(resource_exists::<menu::MenuState>)),
         )
-        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu))
+        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change))
         .add_systems(
             Update,
             (apply_gfx_camera, load_map, poll_map_load, flycam_scroll, apply_camera_fov, build_walk_ground),

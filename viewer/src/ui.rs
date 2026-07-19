@@ -469,6 +469,8 @@ fn min_value_label(v: i64) -> String {
 #[derive(bevy::ecs::system::SystemParam)]
 struct GfxUiParams<'w, 's> {
     gfx: ResMut<'w, crate::render::GfxSettings>,
+    /// Forced LOD level (graphics-panel LOD selector); meaningful on --alllod packs, no-op on lean.
+    forced_lod: ResMut<'w, crate::ForcedLod>,
     map_switch: ResMut<'w, crate::MapSwitch>,
     /// Active toolbar tab — layers_panel early-returns unless this is `Visibility` (bundled here
     /// to keep layers_panel under the 16-system-param limit).
@@ -1148,6 +1150,27 @@ fn layers_panel(
                             egui::Slider::new(&mut g.sharpen, 0.0..=1.0).text("sharpen"),
                         )
                         .on_hover_text("EFT-style unsharp mask (the game ships ~0.5); needs the grade LUT");
+                        // LOD selector: force ONE LOD level (0 = best/finest detail). Only meaningful
+                        // on --alllod packs that carry multiple LODs; a no-op on lean LOD0-only packs.
+                        // A real change marks ForcedLod changed -> bump_epoch_on_lod_change bumps
+                        // MapEpoch -> build_cpu_data rebuilds the instance set for the chosen level.
+                        ui.horizontal(|ui| {
+                            ui.label("LOD");
+                            let mut lod = gfx_ui.forced_lod.0;
+                            egui::ComboBox::from_id_salt("forced_lod")
+                                .selected_text(if lod == 0 { "0 (best)".to_string() } else { lod.to_string() })
+                                .show_ui(ui, |ui| {
+                                    for l in 0..=4 {
+                                        let label = if l == 0 { "0 (best)".to_string() } else { l.to_string() };
+                                        ui.selectable_value(&mut lod, l, label);
+                                    }
+                                });
+                            if lod != gfx_ui.forced_lod.0 {
+                                gfx_ui.forced_lod.0 = lod;
+                            }
+                        })
+                        .response
+                        .on_hover_text("Force a single LOD level (needs an --alllod pack; no effect on standard packs)");
                         if ui.small_button("reset to defaults").clicked() {
                             let keep = (g.grade_available, g.shadows_available);
                             g = crate::render::GfxSettings::default();
