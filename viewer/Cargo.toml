@@ -31,6 +31,9 @@ texpresso = "2.0.2"
 rfd = { version = "0.15", default-features = false }
 # System UI language detection for the EN/RU default (overridable in the menu).
 sys-locale = "0.3"
+# Data-parallel column casting in the portable CPU nav baker (nav_bake). Already in the tree as a
+# transitive dep (Bevy/wgpu), so this pins no new version — just makes it a direct dependency.
+rayon = "1"
 
 [features]
 # egui is structural (ui/menu/inspect are unconditional modules); the feature remains as a
