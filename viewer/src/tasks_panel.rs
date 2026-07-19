@@ -240,9 +240,13 @@ fn convert_task(t: RawTask) -> TaskDef {
     }
 }
 
-/// dataset "interchange_v2" -> tasks.json map key "interchange" (strip a `_vN` suffix). Same rule as
-/// `poi::map_key` (kept local so the module is standalone).
-fn map_key(dataset: &str) -> String {
+/// Canonical map key for tasks.json joins: the manifest's `map` (canonical id) if present, else the
+/// dataset dir basename with a `_vN` suffix stripped. Same rule as `poi::map_key`.
+fn map_key(manifest: &crate::eftpack::Manifest) -> String {
+    if !manifest.map.is_empty() {
+        return manifest.map.clone();
+    }
+    let dataset = &manifest.dataset;
     if let Some((base, ver)) = dataset.rsplit_once("_v") {
         if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit()) {
             return base.to_string();
@@ -485,7 +489,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             Some(lp) => {
                 let root = lp.0.root.clone();
                 let shared = root.parent().map(|pp| pp.join("shared").join("icons"));
-                (Some(map_key(&lp.0.manifest.dataset)), Some(root.join("icons")), shared)
+                (Some(map_key(&lp.0.manifest)), Some(root.join("icons")), shared)
             }
             None => (None, None, None),
         };
