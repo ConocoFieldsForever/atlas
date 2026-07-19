@@ -139,6 +139,24 @@ def dataset_levels(m):
     return ""
 
 
+def find_atlas_exe():
+    """Locate the built viewer binary that hosts `bake-nav` (the PORTABLE CPU nav baker). Order:
+    EFT_ATLAS_EXE (the viewer hands its own running exe path when it launches a build) > the cargo
+    target dirs (a dev build) > beside the repo / dist bundle. Returns a path or None."""
+    exe = "atlas.exe" if os.name == "nt" else "atlas"
+    env = os.environ.get("EFT_ATLAS_EXE")
+    if env and os.path.isfile(env):
+        return env
+    for c in (os.path.join(VIEWER, "target", "release", exe),
+              os.path.join(VIEWER, "target", "debug", exe),
+              os.path.join(VIEWER, exe),
+              os.path.join(VIEWER, "dist", exe),
+              os.path.join(HERE, exe)):
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     dry = "--dry-run" in sys.argv
@@ -196,7 +214,7 @@ def main():
         for i, name in enumerate(
             ["check dataset", "extract lights", "bake lighting (GPU)",
              "assemble pack" + sc_note, "grass" + sc_note,
-             "gameplay zones", "item icons", "bake nav grid (GPU)",
+             "gameplay zones", "item icons", "bake nav grid (CPU)",
              "stamp fingerprint"], 1):
             print(f"[STAGE {i}/{total}] {name}", flush=True)
             time.sleep(0.6)
@@ -319,40 +337,24 @@ def main():
         [PY, os.path.join(VIEWER, "extraction", "intel", "fetch_icons.py"), m],
         VIEWER, optional=True)
 
-    # 8: NAV GRID for the viewer's in-process CPU pathfinding (bake_nav.py, GPU). Baked from
-    #    instanced_raw.glb into TK/out/<map>/nav.* then COPIED into the pack, so the viewer routes on
-    #    the CPU with no server. OPTIONAL: a build on a non-CUDA machine (or without the glb) just skips
-    #    it and that map won't route until baked on a GPU box — the pack is still valid. Re-bakes when
-    #    nav.bin is missing or older than the glb (keeps routing in sync with the geometry).
-    nav_bin = os.path.join(out_dir, "nav.bin")
-    glb = os.path.join(out_dir, "instanced_raw.glb")
-    need_nav = force or (not os.path.isfile(nav_bin)) or (
-        os.path.isfile(glb) and os.path.getmtime(glb) > os.path.getmtime(nav_bin))
-    if need_nav:
-        if not os.path.isfile(glb):
-            # foundation glb (instance-preserving) — bake_nav raycasts against it. Plain python.
-            run(8, total, "nav: assemble instanced glb",
-                [PY, os.path.join(TK, "assemble_instanced.py"), m], TK, optional=True)
-        if os.path.isfile(glb):
-            run(8, total, "nav: bake grid (GPU)",
-                [PY_BAKE, os.path.join(TK, "bake_nav.py"), m], TK, optional=True)
-        else:
-            print(f"[STAGE 8/{total}] nav: skipped (no instanced_raw.glb; run assemble_instanced on a "
-                  f"build box) - this map won't route yet", flush=True)
+    # 8: NAV GRID for the viewer's in-process CPU pathfinding. Baked by the PORTABLE Rust baker
+    #    (`atlas bake-nav <pack>`) directly from the assembled pack's world triangles via a CPU BVH
+    #    raycast — no CUDA, no instanced_raw.glb. It runs on ANY machine (AMD/NVIDIA/no-GPU), so
+    #    routing is produced BY DEFAULT, and writes nav.bin/nav.json/nav_door.bin straight into the
+    #    pack (same layout the old CUDA bake_nav.py emitted, same tuning constants -> same quality).
+    #    Only skipped when no built viewer exe can be found (a kit without a compiled binary).
+    atlas_exe = find_atlas_exe()
+    if atlas_exe:
+        run(8, total, "bake nav grid (CPU)",
+            [atlas_exe, "bake-nav", pack], VIEWER, optional=True)
     else:
-        print(f"[STAGE 8/{total}] nav: skipped (fresh nav.bin exists)", flush=True)
-    # copy whatever nav files exist into the pack (grid + door/edge masks + params)
-    ncopied = 0
-    for f in ("nav.bin", "nav_door.bin", "nav_blk.bin", "nav.json"):
-        s = os.path.join(out_dir, f)
-        if os.path.isfile(s):
-            shutil.copyfile(s, os.path.join(pack, f))
-            ncopied += 1
-    if ncopied:
-        print(f"  nav grid -> pack ({ncopied} files)", flush=True)
-    else:
-        print("  nav grid: none packed (routing disabled for this map until baked on a GPU box)",
+        print(f"[STAGE 8/{total}] nav: skipped - viewer exe not found. Build it "
+              f"(`cargo build --release`) or set EFT_ATLAS_EXE, then rebuild to enable routing.",
               flush=True)
+    if os.path.isfile(os.path.join(pack, "nav.bin")):
+        print("  nav grid: baked into pack (in-process CPU routing enabled)", flush=True)
+    else:
+        print("  nav grid: none (routing disabled for this map until the baker runs)", flush=True)
 
     # 9: stamp the game fingerprint (menu update detection)
     run(9, total, "stamp fingerprint",
