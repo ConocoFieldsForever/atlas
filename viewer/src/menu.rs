@@ -37,11 +37,24 @@ pub struct MapEntry {
     pub valid: bool,
 }
 
+/// How the build panel reaches the running child. `Owned` = we hold the `Child` this process
+/// spawned (pipe OR detached-file mode while Atlas stays open) — reap via `try_wait`, cancel via
+/// PID + a `.kill()` fallback. `Detached` = a build started by a PREVIOUS Atlas process that we
+/// REATTACHED to on startup: we only have its PID (its `Child` died with the old process), so we
+/// poll liveness and cancel via `taskkill /T /PID`.
+enum ProcHandle {
+    Owned(std::sync::Arc<std::sync::Mutex<std::process::Child>>),
+    Detached(u32),
+}
+
 /// A running `tools/build_map.py <map>` pipeline: stdout+stderr stream into `log` from a
-/// reader thread; the UI shows the tail + the latest `[STAGE i/N]` marker. One at a time.
+/// reader/tailer thread; the UI shows the tail + the latest `[STAGE i/N]` marker. One at a time.
 pub struct BuildJob {
     pub key: String,
-    child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+    proc: ProcHandle,
+    /// When background mode wrote a `build_<map>.running.json` sidecar, its path — removed by the
+    /// reaper the moment the child exits so a stale sidecar can't trigger a phantom reattach.
+    sidecar: Option<std::path::PathBuf>,
     log: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     /// Success flag — stored from the child's exit code. Read as the terminal outcome (`ok`).
     done: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -64,7 +77,7 @@ pub struct BuildJob {
 }
 
 impl BuildJob {
-    pub fn spawn(key: &str, game_dir: &str, force: bool) -> std::io::Result<Self> {
+    pub fn spawn(key: &str, game_dir: &str, force: bool, background: bool) -> std::io::Result<Self> {
         // GUI builds are ALWAYS --self-contained: the pack copies its textures/sidecars in and
         // references them pack-relative, so it stays valid when shipped to a friend (without it,
         // assemble_bevy bakes absolute machine paths and the pack loads untextured elsewhere).
@@ -74,19 +87,22 @@ impl BuildJob {
         if force {
             extra.push("--force");
         }
-        Self::spawn_script(key, game_dir, "tools/build_map.py", true, &extra)
+        // `background` (the "Process in background" toggle, default ON): only MAP builds detach — a
+        // build is the long pipeline worth surviving an app-close; intel/deps are quick and have no
+        // row to reattach, so they always use the inherited-pipe path.
+        Self::spawn_script(key, game_dir, "tools/build_map.py", true, &extra, background)
     }
 
     /// The menu's tarkov.dev INTEL refresh (tools/sync_intel.py) — same streaming-job shape as a
     /// map build, no map args.
     pub fn spawn_intel() -> std::io::Result<Self> {
-        Self::spawn_script("__intel__", "", "tools/sync_intel.py", false, &[])
+        Self::spawn_script("__intel__", "", "tools/sync_intel.py", false, &[], false)
     }
 
     /// One-click Python dependency setup (tools/setup_deps.py) — creates a venv + installs the
     /// extraction requirements, streamed into the build panel. Key "__deps__" tags the panel.
     pub fn spawn_setup() -> std::io::Result<Self> {
-        Self::spawn_script("__deps__", "", "tools/setup_deps.py", false, &[])
+        Self::spawn_script("__deps__", "", "tools/setup_deps.py", false, &[], false)
     }
 
     fn spawn_script(
@@ -95,10 +111,15 @@ impl BuildJob {
         script: &str,
         key_as_args: bool,
         extra_args: &[&str],
+        background: bool,
     ) -> std::io::Result<Self> {
         use std::io::BufRead;
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console popping over the menu
+        // DETACHED_PROCESS: the child gets NO console and is NOT tied to Atlas's console/stdio, so it
+        // keeps running after Atlas exits (combined with file-redirected output below, nothing breaks
+        // when the parent's pipe would have closed).
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
         let root = crate::paths::repo_root().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -126,24 +147,79 @@ impl BuildJob {
             cmd.args(key.split([',', ' ']).filter(|s| !s.is_empty()));
         }
         cmd.args(extra_args);
-        let mut child = cmd
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()?;
         let log = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::<String>::with_capacity(512),
         ));
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let push = |log: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-                    line: String| {
-            let mut l = log.lock().unwrap();
-            if l.len() >= 500 {
-                l.pop_front();
-            }
-            l.push_back(line);
-        };
+
+        if background {
+            // ---- DETACHED + FILE OUTPUT: the build SURVIVES an Atlas close. ----
+            // stdout+stderr are redirected to build_<key>.log (NOT an inherited pipe that would
+            // break — and kill build_map.py — the moment the parent exits), stdin is null, and the
+            // child is spawned DETACHED (no console, not tied to Atlas's process/stdio). Result: if
+            // the user closes Atlas mid-build, the python pipeline keeps writing the log + the pack.
+            let logs = build_logs_dir();
+            let _ = std::fs::create_dir_all(&logs);
+            let log_path = build_log_path(key);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)?;
+            let file2 = file.try_clone()?;
+            let child = cmd
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::from(file))
+                .stderr(std::process::Stdio::from(file2))
+                .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+                .spawn()?;
+            let pid = child.id();
+            // Sidecar { pid, map, started, force } so a later launch can DETECT + reattach/clean this
+            // build. `force` is recovered from the args we're about to run with.
+            let sidecar = build_running_path(key);
+            let force = extra_args.contains(&"--force");
+            let manifest = serde_json::json!({
+                "pid": pid,
+                "map": key,
+                "started": now_epoch(),
+                "force": force,
+            });
+            let _ =
+                std::fs::write(&sidecar, serde_json::to_string_pretty(&manifest).unwrap_or_default());
+            // The live panel TAILS the file (same [STAGE]/[SUBPROGRESS] parsing as the pipe path).
+            spawn_log_tailer(log_path, log.clone(), exited.clone());
+            // While Atlas stays open we still OWN the child, so reap via try_wait (accurate exit code)
+            // and drop the sidecar the instant it exits.
+            let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+            spawn_owned_reaper(
+                child.clone(),
+                log.clone(),
+                Some(sidecar.clone()),
+                done.clone(),
+                exited.clone(),
+            );
+            return Ok(Self {
+                key: key.to_string(),
+                proc: ProcHandle::Owned(child),
+                sidecar: Some(sidecar),
+                log,
+                done,
+                exited,
+                result: None,
+                started: std::time::Instant::now(),
+                max_frac: std::sync::atomic::AtomicU32::new(0),
+            });
+        }
+
+        // ---- Legacy inherited-pipe path (toggle OFF; intel/deps always). Streams stdout+stderr
+        // through PIPEs read by reader threads. Dies with Atlas (the pipe closes) — acceptable for
+        // the OFF toggle and the quick intel/deps jobs. ----
+        let mut child = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
         for pipe in [
             child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
             child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
@@ -155,55 +231,90 @@ impl BuildJob {
             std::thread::spawn(move || {
                 let rd = std::io::BufReader::new(pipe);
                 for line in rd.lines().map_while(Result::ok) {
-                    push(&log, line);
+                    push_capped(&log, line);
                 }
             });
         }
-        {
-            // Reaper: flags completion without blocking the UI thread.
-            let done_t = done.clone();
-            let exited_t = exited.clone();
-            let log_t = log.clone();
-            let child = std::sync::Arc::new(std::sync::Mutex::new(child));
-            let child2 = child.clone();
-            std::thread::spawn(move || {
-                use std::sync::atomic::Ordering::SeqCst;
-                let (done, exited, log) = (done_t, exited_t, log_t);
-                loop {
-                    match child2.lock().unwrap().try_wait() {
-                        Ok(Some(status)) => {
-                            // ORDER MATTERS (finding 10): store the success flag FIRST, THEN publish
-                            // the terminal `exited` flag. `snapshot` reads `finished` from `exited`,
-                            // so an observer that sees the job finished is guaranteed to also see the
-                            // correct `done` value — no window where a succeeded build reads as failed.
-                            done.store(status.success(), SeqCst);
-                            exited.store(true, SeqCst);
-                            // The "[exit]" log line is display-only now (a reader thread may flush it
-                            // before/after this; it no longer gates the terminal state).
-                            push(
-                                &log,
-                                format!(
-                                    "[exit {}]",
-                                    status.code().map_or("?".into(), |c| c.to_string())
-                                ),
-                            );
-                            break;
-                        }
-                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(300)),
-                        Err(_) => break,
-                    }
-                }
-            });
-            return Ok(Self {
-                key: key.to_string(),
-                child,
-                log,
-                done,
-                exited,
-                result: None,
-                started: std::time::Instant::now(),
-                max_frac: std::sync::atomic::AtomicU32::new(0),
-            });
+        let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+        spawn_owned_reaper(child.clone(), log.clone(), None, done.clone(), exited.clone());
+        Ok(Self {
+            key: key.to_string(),
+            proc: ProcHandle::Owned(child),
+            sidecar: None,
+            log,
+            done,
+            exited,
+            result: None,
+            started: std::time::Instant::now(),
+            max_frac: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    /// REATTACH to a build that a PREVIOUS Atlas process started detached (toggle ON) and left
+    /// still-running when the app was closed. We only have its PID + log file (its `Child` died with
+    /// the old process), so the panel tails the file and a liveness reaper watches the PID — when it
+    /// dies we decide success from the pack/`[BUILD OK]` marker. `started` is reconstructed from the
+    /// sidecar so the ETA readout is continuous.
+    pub fn attach(
+        key: &str,
+        pid: u32,
+        log_path: std::path::PathBuf,
+        sidecar: std::path::PathBuf,
+        started: std::time::Instant,
+    ) -> Self {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::with_capacity(512),
+        ));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Tail from offset 0 so the panel back-fills the build's history (last 500 lines) and finds
+        // the latest [STAGE] marker immediately.
+        spawn_log_tailer(log_path, log.clone(), exited.clone());
+        spawn_detached_reaper(
+            pid,
+            key.to_string(),
+            log.clone(),
+            Some(sidecar.clone()),
+            done.clone(),
+            exited.clone(),
+        );
+        Self {
+            key: key.to_string(),
+            proc: ProcHandle::Detached(pid),
+            sidecar: Some(sidecar),
+            log,
+            done,
+            exited,
+            result: None,
+            started,
+            max_frac: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Build an ALREADY-FINISHED job from a detached build's leftover log — used by the startup scan
+    /// when a build died while Atlas was closed WITHOUT producing its pack (interrupted). Loads the
+    /// log tail so the panel can show what happened; `ok` is the (usually false) terminal outcome.
+    pub fn from_finished_log(key: &str, log_path: &std::path::Path, ok: bool) -> Self {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::<String>::with_capacity(512),
+        ));
+        if let Ok(content) = std::fs::read_to_string(log_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(500);
+            for line in &lines[start..] {
+                push_capped(&log, (*line).to_string());
+            }
+        }
+        Self {
+            key: key.to_string(),
+            proc: ProcHandle::Detached(0),
+            sidecar: None,
+            log,
+            done: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(ok)),
+            exited: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            result: Some(ok),
+            started: std::time::Instant::now(),
+            max_frac: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -211,14 +322,24 @@ impl BuildJob {
         // Kill the WHOLE process tree. build_map.py / setup_deps.py spawn heavy child processes
         // (eft_extract_v2, the GPU bake, pip). On Windows, killing only the direct child orphans
         // them — the extraction would keep churning after CANCEL. `taskkill /T` walks the tree;
-        // the direct .kill() is a fallback if the PID has already been reaped.
+        // the direct .kill() is a fallback if the PID has already been reaped. Works for a reattached
+        // (Detached) build too: its PID is still reachable by taskkill.
         use std::os::windows::process::CommandExt;
-        let pid = self.child.lock().unwrap().id();
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .creation_flags(0x0800_0000)
-            .output();
-        let _ = self.child.lock().unwrap().kill();
+        let pid = match &self.proc {
+            ProcHandle::Owned(c) => c.lock().ok().map(|c| c.id()),
+            ProcHandle::Detached(p) => Some(*p),
+        };
+        if let Some(pid) = pid.filter(|p| *p != 0) {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .creation_flags(0x0800_0000)
+                .output();
+        }
+        if let ProcHandle::Owned(c) = &self.proc {
+            if let Ok(mut c) = c.lock() {
+                let _ = c.kill();
+            }
+        }
     }
 
     /// Entire captured log (for the COPY LOG button — the panel only shows a tail).
@@ -249,6 +370,301 @@ impl BuildJob {
         let ok = self.done.load(SeqCst);
         (stage, lines.into_iter().rev().collect(), finished, ok)
     }
+}
+
+// ---- background-build plumbing (detached child + log-file tail + reattach) --------------------
+//
+// `<packs>/logs/build_<map>.log`      : the detached child's stdout+stderr (survives an app-close).
+// `<packs>/logs/build_<map>.running.json` : { pid, map, started, force } — a live build's sidecar,
+//                                       written at spawn and removed by the reaper on exit; the ONLY
+//                                       durable record a fresh Atlas launch uses to reattach/clean.
+
+/// Where a background build streams its log + drops its running sidecar. Under `packs/` so it lives
+/// beside the pack it produces and is writable wherever packs are (finding 12 location rules apply).
+fn build_logs_dir() -> std::path::PathBuf {
+    crate::paths::packs_root().join("logs")
+}
+fn build_log_path(key: &str) -> std::path::PathBuf {
+    build_logs_dir().join(format!("build_{key}.log"))
+}
+fn build_running_path(key: &str) -> std::path::PathBuf {
+    build_logs_dir().join(format!("build_{key}.running.json"))
+}
+
+/// Wall-clock seconds since the epoch (for the running-sidecar `started` stamp). 0 on the (never
+/// observed on Windows) clock-before-epoch error — panic=abort forbids unwrapping the Result.
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Append a line to the shared log ring, capped at 500 (matches the old inline closure). A poisoned
+/// mutex (only possible if a holder panicked — impossible under panic=abort) is silently skipped.
+fn push_capped(
+    log: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    line: String,
+) {
+    if let Ok(mut l) = log.lock() {
+        if l.len() >= 500 {
+            l.pop_front();
+        }
+        l.push_back(line);
+    }
+}
+
+/// Is a process with this PID currently running? Uses `tasklist` (no extra crate / no winapi): the
+/// CSV row for a live PID contains the quoted id; the "no tasks" notice does not.
+fn pid_alive(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .creation_flags(0x0800_0000)
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
+        Err(_) => false,
+    }
+}
+
+/// A pack for `key` looks present on disk (its manifest exists). The rigorous validity check lives
+/// in `scan`; this is just the completion signal for a reattached build whose exit code we never saw.
+fn pack_present(key: &str) -> bool {
+    crate::paths::packs_root().join(format!("{key}.eftpack")).join("manifest.json").is_file()
+}
+
+/// Does the captured log contain `marker` anywhere in its (capped) tail?
+fn log_has(
+    log: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    marker: &str,
+) -> bool {
+    log.lock().map(|l| l.iter().any(|s| s.contains(marker))).unwrap_or(false)
+}
+
+/// Read all currently-available bytes from a growing log file into `pending`, emitting each COMPLETE
+/// (`\n`-terminated) line into `log` — byte-accurate so a `[STAGE …]` marker is never torn across a
+/// read boundary. A partial trailing line stays in `pending` for the next call.
+fn drain_log_file(
+    file: &mut std::fs::File,
+    pending: &mut Vec<u8>,
+    log: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+) {
+    use std::io::Read;
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=pos).collect();
+                    let s = String::from_utf8_lossy(&line);
+                    push_capped(log, s.trim_end_matches(['\r', '\n']).to_string());
+                }
+            }
+        }
+    }
+}
+
+/// Tail a growing log FILE into `log` until `exited` is set and the file is fully drained. Used by
+/// BOTH a fresh detached-file build and a reattached one, so the panel + `snapshot` read `log`
+/// exactly as they did for the inherited-pipe path.
+fn spawn_log_tailer(
+    path: std::path::PathBuf,
+    log: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    std::thread::spawn(move || {
+        // The file is created by the spawner before this thread starts (or already exists on
+        // reattach); open defensively with a few retries in case we win the race.
+        let mut file = None;
+        for _ in 0..100 {
+            match std::fs::File::open(&path) {
+                Ok(f) => {
+                    file = Some(f);
+                    break;
+                }
+                Err(_) => {
+                    if exited.load(SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        let Some(mut file) = file else { return };
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            drain_log_file(&mut file, &mut pending, &log);
+            if exited.load(SeqCst) {
+                // The child has fully exited — one last drain catches its final flushed lines.
+                drain_log_file(&mut file, &mut pending, &log);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        // Emit any trailing line the process wrote without a newline.
+        if !pending.is_empty() {
+            let s = String::from_utf8_lossy(&pending);
+            let t = s.trim_end_matches(['\r', '\n']);
+            if !t.is_empty() {
+                push_capped(&log, t.to_string());
+            }
+        }
+    });
+}
+
+/// Reap a child we OWN (`try_wait`): store the exit-code success, publish `exited` (AFTER `done` —
+/// finding 10 ordering), stream an `[exit N]` line, and remove the running sidecar (if any). Serves
+/// both the inherited-pipe and the detached-file-while-open paths.
+fn spawn_owned_reaper(
+    child: std::sync::Arc<std::sync::Mutex<std::process::Child>>,
+    log: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    sidecar: Option<std::path::PathBuf>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    std::thread::spawn(move || loop {
+        let status = match child.lock() {
+            Ok(mut c) => c.try_wait(),
+            Err(_) => break,
+        };
+        match status {
+            Ok(Some(st)) => {
+                done.store(st.success(), SeqCst);
+                exited.store(true, SeqCst);
+                push_capped(
+                    &log,
+                    format!("[exit {}]", st.code().map_or("?".into(), |c| c.to_string())),
+                );
+                if let Some(s) = &sidecar {
+                    let _ = std::fs::remove_file(s);
+                }
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(300)),
+            Err(_) => break,
+        }
+    });
+}
+
+/// Reap a REATTACHED build (we hold only its PID) by polling liveness. When the PID dies we can't
+/// read an exit code, so success = the pack appeared OR the log shows `[BUILD OK]`. Removes the
+/// sidecar so it can't trigger a phantom reattach next launch.
+fn spawn_detached_reaper(
+    pid: u32,
+    key: String,
+    log: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    sidecar: Option<std::path::PathBuf>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    std::thread::spawn(move || loop {
+        if exited.load(SeqCst) {
+            break;
+        }
+        if !pid_alive(pid) {
+            // Give the tailer a moment to catch the final flushed lines ([BUILD OK] / traceback).
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            let ok = pack_present(&key) || log_has(&log, "[BUILD OK]");
+            done.store(ok, SeqCst);
+            exited.store(true, SeqCst);
+            if let Some(s) = &sidecar {
+                let _ = std::fs::remove_file(s);
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    });
+}
+
+/// STARTUP REATTACH SCAN (called once on the first menu frame). Look for `build_<map>.running.json`
+/// sidecars left by a detached build from a previous Atlas run:
+///   * PID still ALIVE  -> reattach as the in-flight job (panel tails its log, row shows BUILDING).
+///   * PID gone, pack present / `[BUILD OK]` -> it finished while we were closed: drop the sidecar +
+///     log (the normal pack rescan already shows the row installed).
+///   * PID gone, no pack -> interrupted: surface it as a finished-failed outcome (with its log) so
+///     the user can resume/rebuild, and drop the sidecar.
+/// Only ONE build can be in flight, so the first alive one is adopted; any others are left untouched.
+fn reattach_builds(worker: &mut crate::jobs::JobWorker, game_dir: &str) {
+    let Ok(rd) = std::fs::read_dir(build_logs_dir()) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(map) = name.strip_prefix("build_").and_then(|s| s.strip_suffix(".running.json"))
+        else {
+            continue;
+        };
+        let sidecar = e.path();
+        let Some((pid, started_epoch, force)) = read_running_sidecar(&sidecar) else {
+            let _ = std::fs::remove_file(&sidecar); // corrupt/partial sidecar — clean it up
+            continue;
+        };
+        let log_path = build_log_path(map);
+        if pid_alive(pid) {
+            if !worker.busy() {
+                let started = instant_from_epoch(started_epoch);
+                let bj = BuildJob::attach(map, pid, log_path, sidecar.clone(), started);
+                worker.reattach(
+                    crate::jobs::Job::BuildMap {
+                        map: map.to_string(),
+                        game_dir: game_dir.to_string(),
+                        force,
+                        background: true,
+                    },
+                    bj,
+                );
+            }
+            // else: a job is already in flight — leave this alive build's sidecar for a later launch.
+            continue;
+        }
+        // PID gone.
+        let finished_ok = pack_present(map) || file_has_build_ok(&log_path);
+        let _ = std::fs::remove_file(&sidecar);
+        if finished_ok {
+            let _ = std::fs::remove_file(&log_path); // the pack rescan shows the row installed
+        } else {
+            let bj = BuildJob::from_finished_log(map, &log_path, false);
+            worker.set_finished(
+                crate::jobs::Job::BuildMap {
+                    map: map.to_string(),
+                    game_dir: game_dir.to_string(),
+                    force,
+                    background: true,
+                },
+                bj,
+            );
+        }
+    }
+}
+
+/// Parse a `build_<map>.running.json` sidecar -> (pid, started_epoch, force). None if unreadable.
+fn read_running_sidecar(path: &std::path::Path) -> Option<(u32, u64, bool)> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let pid = v.get("pid").and_then(|x| x.as_u64())? as u32;
+    let started = v.get("started").and_then(|x| x.as_u64()).unwrap_or(0);
+    let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
+    Some((pid, started, force))
+}
+
+/// Reconstruct a build's start `Instant` from its epoch stamp so the ETA readout stays continuous
+/// across the app restart. Falls back to "now" if the clock math underflows.
+fn instant_from_epoch(started_epoch: u64) -> std::time::Instant {
+    let now = now_epoch();
+    let elapsed = now.saturating_sub(started_epoch);
+    std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(elapsed))
+        .unwrap_or_else(std::time::Instant::now)
+}
+
+/// Whole-file check for the `[BUILD OK]` success marker (the reattach scan's log evidence, used when
+/// the pack isn't detectable). Reads the file directly since there's no in-memory ring yet.
+fn file_has_build_ok(log_path: &std::path::Path) -> bool {
+    std::fs::read_to_string(log_path).map(|s| s.contains("[BUILD OK]")).unwrap_or(false)
 }
 
 /// Present ONLY in menu mode (bare launch, no pack): drives the fullscreen menu UI and
@@ -292,6 +708,12 @@ pub struct MenuState {
     /// Set when a config write FAILED (finding 12) — shown as a warning by the footer so the user
     /// knows a setting won't persist, instead of it silently reverting on the next launch.
     pub config_err: Option<String>,
+    /// "Process in background" toggle (default ON): a MAP build detaches + logs to a file so it keeps
+    /// running even if Atlas is closed. Persisted in atlas.config.json; the footer checkbox flips it.
+    pub process_in_background: bool,
+    /// One-shot guard: on the first menu frame we scan for detached builds a previous run left running
+    /// and reattach/surface them. Set true after that scan so it never re-runs.
+    pub reattached: bool,
 }
 
 /// Shared tarkov.dev data freshness: (loot.json age d, tasks.json age d, icon count).
@@ -509,6 +931,45 @@ fn save_config_str(key: &str, val: &str) -> bool {
             false
         }
     }
+}
+
+/// Generic single-key BOOL read from atlas.config.json (mirrors `config_str`). None when the key is
+/// absent / not a bool — callers supply the default.
+fn config_bool(key: &str) -> Option<bool> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+    v.get(key).and_then(|b| b.as_bool())
+}
+
+/// Generic single-key BOOL read-modify-write into atlas.config.json (preserves other keys). Returns
+/// false when the write FAILED, exactly like `save_config_str` (the caller warns the user).
+#[must_use]
+fn save_config_bool(key: &str, val: bool) -> bool {
+    let path = config_path();
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[key] = serde_json::Value::Bool(val);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("menu: could not save config to {}: {e}", path.display());
+            false
+        }
+    }
+}
+
+/// "Process in background" toggle (default ON): whether a MAP build detaches + streams to a log file
+/// so it SURVIVES closing Atlas. Persisted in atlas.config.json under `processInBackground`.
+pub fn config_process_in_background() -> bool {
+    config_bool("processInBackground").unwrap_or(true)
+}
+pub fn save_config_process_in_background(on: bool) -> bool {
+    save_config_bool("processInBackground", on)
 }
 
 /// True once the user (or an env var) has chosen where extracted datasets live — drives the
@@ -796,6 +1257,8 @@ pub fn build_state() -> MenuState {
         seen_completed: 0,
         autobuild,
         config_err: None,
+        process_in_background: config_process_in_background(),
+        reattached: false,
     }
 }
 
@@ -959,9 +1422,23 @@ pub fn menu_ui(
     let Ok(ctx) = contexts.ctx_mut() else { return };
     let lg = *lang; // Copy for reads; the toggle writes *lang
 
+    // First-frame startup scan: reattach to (or surface the result of) a detached build a PREVIOUS
+    // Atlas run left going when it was closed. Runs before the completion-rescan below so a build
+    // that finished-while-closed re-scans into an installed row, and a still-running one lights up
+    // the live panel + BUILDING row this same frame.
+    if !state.reattached {
+        state.reattached = true;
+        reattach_builds(&mut worker, &state.game_dir);
+    }
+
     // First-frame EFT_MENU_BUILD auto-build (enqueue once onto the shared worker).
     if let Some(map) = state.autobuild.take() {
-        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone(), force: false });
+        worker.enqueue(Job::BuildMap {
+            map,
+            game_dir: state.game_dir.clone(),
+            force: false,
+            background: state.process_in_background,
+        });
     }
 
     // A job finished on the worker since we last looked: rescan the pack list + intel (a build
@@ -1146,6 +1623,20 @@ pub fn menu_ui(
         .show(ctx, |ui| {
             ui.add_space(8.0);
             ui.separator();
+            // "Process in background" (default ON): keep a MAP build running even if Atlas is closed
+            // (it detaches + streams to a log file; a later launch reattaches). Persisted immediately.
+            ui.horizontal(|ui| {
+                let mut bg = state.process_in_background;
+                if ui
+                    .checkbox(&mut bg, RichText::new(t(lg, K::ProcessInBackground)).color(BONE).size(11.0))
+                    .on_hover_text(t(lg, K::ProcessInBackgroundTip))
+                    .changed()
+                {
+                    state.process_in_background = bg;
+                    state.config_err = (!save_config_process_in_background(bg))
+                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                }
+            });
             // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
             // (venv + pip) from here without closing the app; progress streams into the panel above.
             ui.horizontal(|ui| {
@@ -1808,7 +2299,12 @@ pub fn menu_ui(
         worker.enqueue(Job::SyncIntel);
     }
     if let Some((map, force)) = enqueue_build {
-        worker.enqueue(Job::BuildMap { map, game_dir: state.game_dir.clone(), force });
+        worker.enqueue(Job::BuildMap {
+            map,
+            game_dir: state.game_dir.clone(),
+            force,
+            background: state.process_in_background,
+        });
     }
     if cancel_current {
         worker.cancel_current();

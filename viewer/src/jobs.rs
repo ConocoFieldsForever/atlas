@@ -26,7 +26,11 @@ pub enum Job {
     /// re-run against the current game files instead of reusing stale extracted data (release
     /// blocker: a plain build skips extraction when the old scene.json still exists). Plain BUILD
     /// passes `force = false` and stays incremental.
-    BuildMap { map: String, game_dir: String, force: bool },
+    /// `background` = the "Process in background" toggle (default ON): the child is spawned DETACHED
+    /// with its stdout/stderr redirected to a log FILE (not an inherited pipe), so it SURVIVES the
+    /// app being closed mid-build. A later launch reattaches to it via the `build_<map>.running.json`
+    /// sidecar. `false` keeps the legacy inherited-pipe behavior (dies when Atlas closes).
+    BuildMap { map: String, game_dir: String, force: bool, background: bool },
     SyncIntel,
     /// Install the Python build dependencies (venv + UnityPy/numpy/Pillow) from the menu.
     InstallDeps,
@@ -50,7 +54,9 @@ impl Job {
     }
     fn spawn(&self) -> std::io::Result<BuildJob> {
         match self {
-            Job::BuildMap { map, game_dir, force } => BuildJob::spawn(map, game_dir, *force),
+            Job::BuildMap { map, game_dir, force, background } => {
+                BuildJob::spawn(map, game_dir, *force, *background)
+            }
             Job::SyncIntel => BuildJob::spawn_intel(),
             Job::InstallDeps => BuildJob::spawn_setup(),
         }
@@ -110,6 +116,26 @@ impl JobWorker {
     }
     pub fn busy(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Adopt a build started by a PREVIOUS Atlas process (survived an app-close because it was
+    /// spawned detached with file output). The menu's startup reattach scan builds a tail-only
+    /// `BuildJob` around the still-alive child (its PID + log file) and hands it here so the live
+    /// panel + BUILDING row light up again. No-op if a job is already in flight (only one at a time).
+    pub fn reattach(&mut self, job: Job, child: BuildJob) {
+        if self.current.is_none() {
+            self.current = Some((job, child));
+        }
+    }
+
+    /// Inject an ALREADY-FINISHED build as the lingering "last" outcome — used by the startup scan
+    /// when a detached build died while Atlas was closed WITHOUT completing (its pack never appeared):
+    /// surfaces the interrupted result + log so the user can resume/rebuild. Bumps `completed` so the
+    /// frontend re-scans exactly as it would for a job that finished in-process.
+    pub fn set_finished(&mut self, job: Job, child: BuildJob) {
+        self.last = Some((job, child));
+        self.last_dismissed = false;
+        self.completed = self.completed.wrapping_add(1);
     }
 
     // ---- in-flight job ----
