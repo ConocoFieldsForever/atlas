@@ -1468,16 +1468,18 @@ fn build_cpu_data(
             if detail_flags != 0 {
                 flags |= MAT_FLAG_DETAIL;
                 // detail_params: [albedoStrength, normalScale, fade_start, fade_end]. The fade window
-                // is env-tunable (EFT_DETAIL_FADE="near,far", default 8,15 m) so the detail range can
-                // be verified/tuned without a rebuild — the default camera sits ~15 m out, at which
-                // the shipping 8-15 m window has already faded detail to ~0.
+                // is env-tunable (EFT_DETAIL_FADE="near,far") so the detail range can be verified/tuned
+                // without a rebuild. Default raised to 40..120 m: this viewer's cold-load framing sits
+                // tens-to-hundreds of metres out, so the old 8..25 m window faded detail to ~0 before
+                // it was ever seen ("detail maps don't work"). 40..120 keeps detail subtle-but-visible
+                // at normal viewing distance and still fades tiling out in the far field.
                 let (fnear, ffar) = std::env::var("EFT_DETAIL_FADE")
                     .ok()
                     .and_then(|s| {
                         let v: Vec<f32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                         (v.len() == 2).then(|| (v[0], v[1]))
                     })
-                    .unwrap_or((8.0, 25.0)); // wider than the web's 8-15 m: this viewer orbits farther out
+                    .unwrap_or((40.0, 120.0)); // was 8..25 m — detail faded out before the camera reached it
                 detail_params = [det.albedo_strength, det.normal_scale, fnear, ffar];
                 // mean-neutralize divisor (offline mean of linear×4.5948); w=1 (unused lane).
                 detail_mean_gain = [
