@@ -333,6 +333,16 @@ def main():
     run(9, total, "stamp fingerprint",
         [PY, os.path.join(HERE, "stamp_fingerprint.py"), pack], VIEWER)
 
+    # Post-build storage dedup: a texture shared by several maps is byte-identical in each dataset's
+    # tex/ (source-identity naming), so it's stored once per map = pure waste. Hardlink the copies to
+    # a single physical file -- transparent (files stay in place) + lossless (no visual/behaviour
+    # change). Best-effort; never fail the build over it. (Re-run each build to re-link overwrites.)
+    try:
+        env = dict(os.environ, EFT_ASSETS_ROOT=ASSETS)
+        subprocess.call([sys.executable, os.path.join(HERE, "dedup_textures.py")], env=env)
+    except Exception as e:
+        print(f"  [dedup] skipped: {e}", flush=True)
+
     print("[BUILD OK] pack ready", flush=True)
 
 
