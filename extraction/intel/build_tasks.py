@@ -22,7 +22,9 @@ API = "https://api.tarkov.dev/graphql"
 # tarkov.dev map normalizedName -> our map id (matches tarkmap/maps/<id>). Extend as maps are added.
 DEV_TO_ID = {
     'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
-    'factory': 'factory', 'night-factory': 'factory', 'woods': 'woods', 'customs': 'customs',
+    # Shipped "Factory" is the 1.0 rework (id factory_rework); tarkov.dev still names it
+    # factory / night-factory, so map both to factory_rework or the quest layer is empty there.
+    'factory': 'factory_rework', 'night-factory': 'factory_rework', 'woods': 'woods', 'customs': 'customs',
     'shoreline': 'shoreline', 'streets-of-tarkov': 'streets', 'reserve': 'reserve',
     'the-lab': 'labs', 'the-labs': 'labs', 'lighthouse': 'lighthouse',
     'the-labyrinth': 'labyrinth', 'labyrinth': 'labyrinth',
