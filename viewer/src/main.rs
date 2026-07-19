@@ -459,8 +459,25 @@ fn main() {
     // NOTE: this runs BEFORE DefaultPlugins installs Bevy's log subscriber, so use
     // eprintln! (not info!/error!) or the diagnostics are silently dropped and a
     // bad pack opens an empty window with no message (Codex P2).
-    let pack = match &pack_dir {
-        Some(dir) => match Pack::load(dir) {
+    // COLD-LOAD LOADING SCREEN: when a pack is given, DON'T load it synchronously here — that blocks
+    // in main() before the window ever paints, so a big map (~60k instances) shows a FROZEN window
+    // for the whole load. Instead start in a "loading" mode (no pack yet, but NOT the menu) and hand
+    // the pack to the SAME async MapSwitch -> load_map -> PendingMapLoad -> poll_map_load path that
+    // in-place swaps use: the window opens immediately, the loading indicator animates, and
+    // Pack::load runs off-thread. Only the GPU-driven path has that epoch-aware async rebuild; the
+    // m0/std paths spawn geometry once at Startup, so they keep loading synchronously.
+    // EFT_SYNC_LOAD=1 forces the old blocking load.
+    let async_cold_load = pack_dir.is_some()
+        && render_path == RenderPath::GpuDriven
+        && !std::env::var("EFT_SYNC_LOAD").map(|v| v.trim() == "1").unwrap_or(false);
+    let pack = if async_cold_load {
+        eprintln!(
+            "cold load: '{}' loads async behind a loading screen (EFT_SYNC_LOAD=1 to disable)",
+            pack_dir.as_deref().unwrap_or("")
+        );
+        None
+    } else if let Some(dir) = &pack_dir {
+        match Pack::load(dir) {
             Ok(p) => {
                 eprintln!(
                     "loaded .eftpack '{}': {} unique meshes, {} instances, {} materials",
@@ -482,13 +499,14 @@ fn main() {
                 eprintln!("failed to load pack '{}': {:#}", dir, e);
                 None
             }
-        },
-        None => {
-            eprintln!("no pack given — opening the start menu.  direct: atlas <pack-dir>");
-            None
         }
+    } else {
+        eprintln!("no pack given — opening the start menu.  direct: atlas <pack-dir>");
+        None
     };
-    let menu_mode = pack.is_none();
+    // Menu = a bare launch (no pack arg) or a failed synchronous load. A cold-loading map is NOT the
+    // menu — it renders the loading screen while the pack streams in via the async path.
+    let menu_mode = pack.is_none() && !async_cold_load;
 
     // Play-alongside-a-game friendliness: by DEFAULT cap to vsync (don't render faster than the
     // monitor) and idle when the window loses focus (see WinitSettings below) — so with the game in
@@ -699,6 +717,13 @@ fn main() {
             app.add_systems(Startup, menu_fx::spawn_menu_scene.after(setup));
             app.add_systems(Update, menu_fx::menu_scene_update);
         }
+    }
+
+    // Cold-load kick-off: seed MapSwitch so load_map (frame 1) starts the async pack load down the
+    // same path as an in-place swap — the window is already up rendering the loading screen while
+    // Pack::load runs off-thread, instead of main() blocking before the first frame.
+    if async_cold_load {
+        app.insert_resource(MapSwitch(pack_dir));
     }
 
     app.run();
