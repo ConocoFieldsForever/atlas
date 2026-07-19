@@ -310,10 +310,11 @@ fn lang_toggle(
         ctx,
         *lang,
         "raid_lang_toggle",
-        // TOP-LEFT (was LEFT_BOTTOM): clears the background-job "MAP PROCESSING" pill, which also
-        // anchors bottom-left (jobs.rs). Sits above the pos_hud coords readout (fixed_pos 8,36).
+        // TOP-LEFT, BELOW the left-edge HUD stack: the pick tool's "double-click to identify" hint
+        // (pick.rs) sits at y~8 and the pos_hud coords readout at fixed_pos(8,36); anchoring the
+        // toggle at y=70 clears BOTH of those and the "MAP PROCESSING" jobs pill (bottom-left, jobs.rs).
         egui::Align2::LEFT_TOP,
-        egui::vec2(8.0, 8.0),
+        egui::vec2(8.0, 70.0),
     ) {
         *lang = l;
         crate::menu::save_config_lang(l.tag());
