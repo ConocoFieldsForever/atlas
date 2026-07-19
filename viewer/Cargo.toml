@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 description = "Native GPU-driven EFT map viewer consuming .eftpack v1 packs"
 publish = false
+build = "build.rs"
+
+# Windows-only: embed the app icon (resources/atlas.ico) into the .exe so it shows in Explorer / the
+# taskbar / a shortcut. No effect on other targets (the build.rs is a no-op there).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 bevy = { workspace = true }
