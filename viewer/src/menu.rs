@@ -1128,6 +1128,238 @@ pub fn menu_ui(
     // (menu-mode ClearColor is the same #090909, set in main.rs) becomes the field and the
     // prop shows through the right gutter. Header/cards keep their own opaque fills, so the
     // list looks identical either way.
+    // ---- Footer + live build panel, PINNED as bottom panels (never clipped on a short window) ----
+    // egui reserves each bottom panel's height and hands the CentralPanel only what's left, so these
+    // controls stay reachable at ANY window height while the map LIST scrolls in the middle. Declared
+    // BEFORE the CentralPanel (egui requirement), footer FIRST so it sits at the very bottom and the
+    // build panel stacks just above it. Transparent frames keep the 3D globe showing behind them.
+    egui::TopBottomPanel::bottom("menu_footer")
+        .frame(egui::Frame::new().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(24, 8)))
+        .show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.separator();
+            // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
+            // (venv + pip) from here without closing the app; progress streams into the panel above.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t(lg, K::BuildDeps)).color(DIM).size(11.0));
+                if worker.current_is_install() {
+                    let stage = worker.status().map(|(_, s)| s).unwrap_or_default();
+                    ui.label(
+                        RichText::new(format!("{}  {stage}", t(lg, K::Installing)))
+                            .color(theme::ACCENT)
+                            .size(11.0),
+                    );
+                } else if state.deps_ok {
+                    ui.label(RichText::new(t(lg, K::DepsReady)).color(OK).size(11.0));
+                } else {
+                    ui.label(RichText::new(t(lg, K::DepsMissing)).color(WARN).size(11.0));
+                    if ui
+                        .add_enabled(
+                            !worker.busy(),
+                            egui::Button::new(RichText::new(t(lg, K::InstallDeps)).color(BONE)),
+                        )
+                        .on_hover_text(t(lg, K::InstallDepsTip))
+                        .clicked()
+                    {
+                        enqueue_install = true;
+                    }
+                }
+            });
+            // Game install path: autodetected (env > saved > registry > probe), editable here;
+            // SET validates, persists to atlas.config.json and re-fingerprints the packs.
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t(lg, K::GameInstall)).color(DIM).size(11.0));
+                let mut edit = state.game_dir_edit.clone();
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit)
+                        .desired_width(520.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                state.game_dir_edit = edit;
+                let dirty = state.game_dir_edit != state.game_dir;
+                if ui
+                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
+                    .clicked()
+                {
+                    if valid_game_dir(&state.game_dir_edit) {
+                        state.game_dir = state.game_dir_edit.clone();
+                        state.config_err = (!save_config_game_dir(&state.game_dir))
+                            .then(|| "settings could not be saved (read-only folder?)".to_string());
+                        state.game_fp = game_fingerprint(&state.game_dir);
+                        let (entries, total) = scan(&state.game_fp);
+                        state.entries = entries;
+                        state.total_bytes = total;
+                    } else {
+                        error!("menu: '{}' does not look like EscapeFromTarkov_Data", state.game_dir_edit);
+                    }
+                }
+                match &state.game_fp {
+                    Some(fp) => ui.label(
+                        RichText::new(format!("[{}]", &fp[..8])).color(OK).size(11.0),
+                    ),
+                    None => ui.label(
+                        RichText::new(t(lg, K::GameNotFound)).color(WARN).size(11.0),
+                    ),
+                };
+            });
+
+            // Extracted-assets dir (EFT_ASSETS_ROOT): where the one-time full extraction writes the
+            // datasets that BUILD reads. On first run explain it; CHOOSE opens a native folder picker.
+            if !state.assets_ok {
+                ui.add_space(2.0);
+                ui.label(RichText::new(t(lg, K::FirstRunBanner)).color(WARN).size(11.0));
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(t(lg, K::ExtractedAssets)).color(DIM).size(11.0));
+                if ui.button(RichText::new(t(lg, K::Choose)).color(BONE)).clicked() {
+                    let mut dlg = rfd::FileDialog::new().set_title(t(lg, K::FolderTitle));
+                    if std::path::Path::new(&state.assets_dir).is_dir() {
+                        dlg = dlg.set_directory(&state.assets_dir);
+                    }
+                    if let Some(p) = dlg.pick_folder() {
+                        let dir = p.to_string_lossy().into_owned();
+                        state.assets_dir = dir.clone();
+                        state.assets_dir_edit = dir.clone();
+                        state.config_err = (!save_config_assets_dir(&dir))
+                            .then(|| "settings could not be saved (read-only folder?)".to_string());
+                        state.assets_ok = true;
+                    }
+                }
+                let mut edit = state.assets_dir_edit.clone();
+                ui.add(
+                    egui::TextEdit::singleline(&mut edit)
+                        .desired_width(420.0)
+                        .font(egui::TextStyle::Monospace),
+                );
+                state.assets_dir_edit = edit;
+                let dirty = state.assets_dir_edit != state.assets_dir;
+                if ui
+                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
+                    .clicked()
+                {
+                    state.assets_dir = state.assets_dir_edit.clone();
+                    state.config_err = (!save_config_assets_dir(&state.assets_dir))
+                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                    state.assets_ok = true;
+                }
+                if state.assets_ok {
+                    ui.label(RichText::new(t(lg, K::IsSet)).color(OK).size(11.0));
+                } else {
+                    ui.label(RichText::new(t(lg, K::UsingDefault)).color(WARN).size(11.0));
+                }
+            });
+        });
+
+    // Build progress panel: shown only while a build/deps job runs or its finished panel lingers. Its
+    // content is capped in an inner ScrollArea so a long streaming log scrolls INSIDE the panel
+    // instead of growing it up over the map list.
+    let mut toggle_log = false;
+    if bv.is_some() {
+        let show_log = state.show_log;
+        egui::TopBottomPanel::bottom("menu_build")
+            .frame(egui::Frame::new().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(24, 6)))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            if let Some(bv) = &bv {
+                let (stage, tail, key) = (&bv.stage, &bv.tail, &bv.key);
+                let (finished, ok) = (bv.finished, bv.ok);
+                let failed = finished && !ok;
+                ui.add_space(10.0);
+                egui::Frame::new()
+                    .fill(HEADER)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let title = if key == "__deps__" {
+                                t(lg, K::InstallingDeps).to_string()
+                            } else {
+                                format!("{}: {}", t(lg, K::Building), map_title(lg, key, key).to_uppercase())
+                            };
+                            ui.label(RichText::new(title).color(BONE).strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if finished {
+                                        let col = if ok { OK } else { BAD };
+                                        let txt = t(lg, if ok { K::Done } else { K::Failed });
+                                        ui.label(RichText::new(txt).color(col).strong());
+                                        if ui.button(t(lg, K::Close)).clicked() {
+                                            dismiss_build = true;
+                                        }
+                                    } else if ui
+                                        .button(RichText::new(t(lg, K::Cancel)).color(BAD))
+                                        .clicked()
+                                    {
+                                        cancel_current = true;
+                                    }
+                                    // The tail is hidden by default — the loader bar carries
+                                    // the status; the raw log is one click away.
+                                    if ui
+                                        .button(t(lg, if show_log { K::HideLog } else { K::ShowLog }))
+                                        .clicked()
+                                    {
+                                        toggle_log = true;
+                                    }
+                                    // Full captured log (the panel shows only a tail) — for
+                                    // diagnosing which stage failed / sharing the output.
+                                    if ui.button(t(lg, K::CopyLog)).clicked() {
+                                        ui.ctx().copy_text(bv.full_log.clone());
+                                    }
+                                },
+                            );
+                        });
+                        // Weighted, MONOTONIC progress — computed once in build_view (phases weighted by
+                        // real relative duration so the ETA stops overshooting on the long extraction;
+                        // clamped so a nested sub-script's [STAGE i/M] marker can't jump the bar backward).
+                        let frac = bv.frac;
+                        // "LOADING OBJECTS..." style stage line for the loader bar: the text
+                        // between the [STAGE] marker and its status suffix, uppercased and
+                        // ASCII-whitelisted (menu glyph set is plain ASCII only).
+                        let stage_txt = if failed {
+                            t(lg, K::BuildFailed).to_string()
+                        } else if finished {
+                            t(lg, K::BuildComplete).to_string()
+                        } else {
+                            let mut en = stage
+                                .split(']')
+                                .nth(1)
+                                .unwrap_or("")
+                                .split(':')
+                                .next()
+                                .unwrap_or("")
+                                .trim()
+                                .to_ascii_uppercase();
+                            en.retain(|c| c.is_ascii_graphic() || c == ' ');
+                            // The raw log is ASCII-only; the Russian stage name comes from our map
+                            // (not the log), so it renders fine past the ASCII whitelist above.
+                            let mut s = crate::i18n::stage_ru(lg, &en).map(str::to_string).unwrap_or(en);
+                            if s.is_empty() {
+                                s = t(lg, K::Starting).to_string();
+                            }
+                            // char-safe cap (Cyrillic is multi-byte; String::truncate would panic).
+                            let capped: String = s.chars().take(38).collect();
+                            format!("{capped}...")
+                        };
+                        ui.add_space(8.0);
+                        crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed, lg);
+                        if show_log {
+                            ui.add_space(6.0);
+                            for line in tail {
+                                ui.label(
+                                    RichText::new(line).color(DIM).size(11.0).monospace(),
+                                );
+                            }
+                        }
+                    });
+            }
+                });
+            });
+    }
+    if toggle_log {
+        state.show_log = !state.show_log;
+    }
+
     egui::CentralPanel::default()
         .frame(
             // TRANSPARENT so the 3D neon globe (menu_fx::spawn_menu_globe, glowing in the 3D world
@@ -1157,22 +1389,15 @@ pub fn menu_ui(
             // and UPDATE must both stay disabled instead of spawn-erroring. UPDATE used to bypass
             // this entirely — it now shares `can_build`.
             let can_build = state.build_kit_available && state.deps_ok && state.game_fp.is_some();
-            // Bound the map-row scroll so the build panel + LOG + footer below always stay on screen
-            // (reserve grows when a build is showing / its log is expanded); the rows scroll in what
-            // remains. Without this the expanded log runs off the bottom of the window.
-            // Footer now carries deps + game-install + assets + language rows (plus the first-run
-            // banner), so reserve enough that they + any build panel stay on screen below the list.
-            let reserve = match (bv.is_some(), state.show_log) {
-                (true, true) => 450.0,  // loader + 12 log lines + footer
-                (true, false) => 250.0, // loader + footer
-                (false, _) => 150.0,    // footer only
-            };
-            let rows_h = (ui.available_height() - reserve).max(180.0);
+            // The map LIST fills whatever height the header + the pinned bottom panels (build +
+            // footer) leave: a plain ScrollArea::vertical() caps itself to that and scrolls the rows.
+            // (The old fixed `reserve` estimate is gone — the footer + build panel are their own
+            // bottom panels now, so they can no longer be clipped and need no height reservation.)
             // Card fill: FULLY opaque so no backdrop lines show through the menu rows and the
             // vignette (Background layer, behind every opaque panel) only ever darkens the blue
             // background between/around them, never the UI text.
             let card_bg = CARD;
-            egui::ScrollArea::vertical().max_height(rows_h).show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));
                 for i in 0..state.entries.len() {
@@ -1373,223 +1598,6 @@ pub fn menu_ui(
                 enqueue_build = Some((key, force));
                 state.show_log = false; // fresh panel starts with the log collapsed
             }
-
-            // ---- Build progress (EFT loader style): segmented bar + stage line; the raw
-            // streaming tail stays collapsed behind SHOW LOG. Rendered from the shared worker's
-            // per-frame build snapshot (`bv`): the running build, else the finished one lingering
-            // until CLOSE. Completion/rescan is handled at the top of menu_ui. ----
-            let mut toggle_log = false;
-            let show_log = state.show_log;
-            if let Some(bv) = &bv {
-                let (stage, tail, key) = (&bv.stage, &bv.tail, &bv.key);
-                let (finished, ok) = (bv.finished, bv.ok);
-                let failed = finished && !ok;
-                ui.add_space(10.0);
-                egui::Frame::new()
-                    .fill(HEADER)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let title = if key == "__deps__" {
-                                t(lg, K::InstallingDeps).to_string()
-                            } else {
-                                format!("{}: {}", t(lg, K::Building), map_title(lg, key, key).to_uppercase())
-                            };
-                            ui.label(RichText::new(title).color(BONE).strong());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if finished {
-                                        let col = if ok { OK } else { BAD };
-                                        let txt = t(lg, if ok { K::Done } else { K::Failed });
-                                        ui.label(RichText::new(txt).color(col).strong());
-                                        if ui.button(t(lg, K::Close)).clicked() {
-                                            dismiss_build = true;
-                                        }
-                                    } else if ui
-                                        .button(RichText::new(t(lg, K::Cancel)).color(BAD))
-                                        .clicked()
-                                    {
-                                        cancel_current = true;
-                                    }
-                                    // The tail is hidden by default — the loader bar carries
-                                    // the status; the raw log is one click away.
-                                    if ui
-                                        .button(t(lg, if show_log { K::HideLog } else { K::ShowLog }))
-                                        .clicked()
-                                    {
-                                        toggle_log = true;
-                                    }
-                                    // Full captured log (the panel shows only a tail) — for
-                                    // diagnosing which stage failed / sharing the output.
-                                    if ui.button(t(lg, K::CopyLog)).clicked() {
-                                        ui.ctx().copy_text(bv.full_log.clone());
-                                    }
-                                },
-                            );
-                        });
-                        // Weighted, MONOTONIC progress — computed once in build_view (phases weighted by
-                        // real relative duration so the ETA stops overshooting on the long extraction;
-                        // clamped so a nested sub-script's [STAGE i/M] marker can't jump the bar backward).
-                        let frac = bv.frac;
-                        // "LOADING OBJECTS..." style stage line for the loader bar: the text
-                        // between the [STAGE] marker and its status suffix, uppercased and
-                        // ASCII-whitelisted (menu glyph set is plain ASCII only).
-                        let stage_txt = if failed {
-                            t(lg, K::BuildFailed).to_string()
-                        } else if finished {
-                            t(lg, K::BuildComplete).to_string()
-                        } else {
-                            let mut en = stage
-                                .split(']')
-                                .nth(1)
-                                .unwrap_or("")
-                                .split(':')
-                                .next()
-                                .unwrap_or("")
-                                .trim()
-                                .to_ascii_uppercase();
-                            en.retain(|c| c.is_ascii_graphic() || c == ' ');
-                            // The raw log is ASCII-only; the Russian stage name comes from our map
-                            // (not the log), so it renders fine past the ASCII whitelist above.
-                            let mut s = crate::i18n::stage_ru(lg, &en).map(str::to_string).unwrap_or(en);
-                            if s.is_empty() {
-                                s = t(lg, K::Starting).to_string();
-                            }
-                            // char-safe cap (Cyrillic is multi-byte; String::truncate would panic).
-                            let capped: String = s.chars().take(38).collect();
-                            format!("{capped}...")
-                        };
-                        ui.add_space(8.0);
-                        crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed, lg);
-                        if show_log {
-                            ui.add_space(6.0);
-                            for line in tail {
-                                ui.label(
-                                    RichText::new(line).color(DIM).size(11.0).monospace(),
-                                );
-                            }
-                        }
-                    });
-            }
-            if toggle_log {
-                state.show_log = !state.show_log;
-            }
-
-            ui.add_space(8.0);
-            ui.separator();
-            // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
-            // (venv + pip) from here without closing the app; progress streams into the panel above.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(t(lg, K::BuildDeps)).color(DIM).size(11.0));
-                if worker.current_is_install() {
-                    let stage = worker.status().map(|(_, s)| s).unwrap_or_default();
-                    ui.label(
-                        RichText::new(format!("{}  {stage}", t(lg, K::Installing)))
-                            .color(theme::ACCENT)
-                            .size(11.0),
-                    );
-                } else if state.deps_ok {
-                    ui.label(RichText::new(t(lg, K::DepsReady)).color(OK).size(11.0));
-                } else {
-                    ui.label(RichText::new(t(lg, K::DepsMissing)).color(WARN).size(11.0));
-                    if ui
-                        .add_enabled(
-                            !worker.busy(),
-                            egui::Button::new(RichText::new(t(lg, K::InstallDeps)).color(BONE)),
-                        )
-                        .on_hover_text(t(lg, K::InstallDepsTip))
-                        .clicked()
-                    {
-                        enqueue_install = true;
-                    }
-                }
-            });
-            // Game install path: autodetected (env > saved > registry > probe), editable here;
-            // SET validates, persists to atlas.config.json and re-fingerprints the packs.
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(t(lg, K::GameInstall)).color(DIM).size(11.0));
-                let mut edit = state.game_dir_edit.clone();
-                ui.add(
-                    egui::TextEdit::singleline(&mut edit)
-                        .desired_width(520.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                state.game_dir_edit = edit;
-                let dirty = state.game_dir_edit != state.game_dir;
-                if ui
-                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
-                    .clicked()
-                {
-                    if valid_game_dir(&state.game_dir_edit) {
-                        state.game_dir = state.game_dir_edit.clone();
-                        state.config_err = (!save_config_game_dir(&state.game_dir))
-                            .then(|| "settings could not be saved (read-only folder?)".to_string());
-                        state.game_fp = game_fingerprint(&state.game_dir);
-                        let (entries, total) = scan(&state.game_fp);
-                        state.entries = entries;
-                        state.total_bytes = total;
-                    } else {
-                        error!("menu: '{}' does not look like EscapeFromTarkov_Data", state.game_dir_edit);
-                    }
-                }
-                match &state.game_fp {
-                    Some(fp) => ui.label(
-                        RichText::new(format!("[{}]", &fp[..8])).color(OK).size(11.0),
-                    ),
-                    None => ui.label(
-                        RichText::new(t(lg, K::GameNotFound)).color(WARN).size(11.0),
-                    ),
-                };
-            });
-
-            // Extracted-assets dir (EFT_ASSETS_ROOT): where the one-time full extraction writes the
-            // datasets that BUILD reads. On first run explain it; CHOOSE opens a native folder picker.
-            if !state.assets_ok {
-                ui.add_space(2.0);
-                ui.label(RichText::new(t(lg, K::FirstRunBanner)).color(WARN).size(11.0));
-            }
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(t(lg, K::ExtractedAssets)).color(DIM).size(11.0));
-                if ui.button(RichText::new(t(lg, K::Choose)).color(BONE)).clicked() {
-                    let mut dlg = rfd::FileDialog::new().set_title(t(lg, K::FolderTitle));
-                    if std::path::Path::new(&state.assets_dir).is_dir() {
-                        dlg = dlg.set_directory(&state.assets_dir);
-                    }
-                    if let Some(p) = dlg.pick_folder() {
-                        let dir = p.to_string_lossy().into_owned();
-                        state.assets_dir = dir.clone();
-                        state.assets_dir_edit = dir.clone();
-                        state.config_err = (!save_config_assets_dir(&dir))
-                            .then(|| "settings could not be saved (read-only folder?)".to_string());
-                        state.assets_ok = true;
-                    }
-                }
-                let mut edit = state.assets_dir_edit.clone();
-                ui.add(
-                    egui::TextEdit::singleline(&mut edit)
-                        .desired_width(420.0)
-                        .font(egui::TextStyle::Monospace),
-                );
-                state.assets_dir_edit = edit;
-                let dirty = state.assets_dir_edit != state.assets_dir;
-                if ui
-                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
-                    .clicked()
-                {
-                    state.assets_dir = state.assets_dir_edit.clone();
-                    state.config_err = (!save_config_assets_dir(&state.assets_dir))
-                        .then(|| "settings could not be saved (read-only folder?)".to_string());
-                    state.assets_ok = true;
-                }
-                if state.assets_ok {
-                    ui.label(RichText::new(t(lg, K::IsSet)).color(OK).size(11.0));
-                } else {
-                    ui.label(RichText::new(t(lg, K::UsingDefault)).color(WARN).size(11.0));
-                }
-            });
-
         });
 
     // Language switch — floated on its OWN foreground Area anchored to the window bottom-right so a
