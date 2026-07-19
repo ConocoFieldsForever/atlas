@@ -116,6 +116,7 @@ pub enum K {
     CopyLog,
     BuildFailed,
     BuildComplete,
+    DepsDone,
     Starting,
     EstimatedTime,
     // INTEL strip
@@ -254,6 +255,7 @@ fn pair(k: K) -> [&'static str; 2] {
         CopyLog => ["COPY LOG", "КОПИРОВАТЬ ЛОГ"],
         BuildFailed => ["BUILD FAILED", "СБОРКА НЕ УДАЛАСЬ"],
         BuildComplete => ["BUILD COMPLETE", "СБОРКА ЗАВЕРШЕНА"],
+        DepsDone => ["DEPENDENCIES INSTALLED", "ЗАВИСИМОСТИ УСТАНОВЛЕНЫ"],
         Starting => ["STARTING", "ЗАПУСК"],
         EstimatedTime => ["ESTIMATED TIME", "ОЦЕНКА ВРЕМЕНИ"],
         IntelRefreshed => ["intel refreshed", "данные обновлены"],

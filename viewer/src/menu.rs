@@ -889,6 +889,14 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
         None
     }?;
     let (stage, tail, finished, ok) = job.snapshot(12);
+    // Auto-dismiss a successfully finished MAP build: its row flips to installed via the completion
+    // rescan (see the `worker.completed` check in `render`), so the loader panel should DISAPPEAR
+    // rather than linger at 100% — the user wants the bar visible only WHILE processing. Deps-install
+    // success stays (there is no map row to appear, so its "done" line is the only feedback); ALL
+    // failures stay visible (error + CLOSE) so nothing is silently hidden.
+    if finished && ok && job.key != "__deps__" {
+        return None;
+    }
     // Weighted progress, clamped MONOTONIC on the persistent BuildJob so nested sub-script `[STAGE i/M]`
     // markers can't drop the bar. The sub-fraction moves the bar WITHIN the long extraction stage via
     // the parallel extractor's `[SUBPROGRESS] <done>/<total>` marker.
@@ -1259,7 +1267,9 @@ pub fn menu_ui(
         egui::TopBottomPanel::bottom("menu_build")
             .frame(egui::Frame::new().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(24, 6)))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+            // The title row + progress bar are PINNED in the panel (always fully visible while a build
+            // runs); only the raw log below scrolls, in its OWN capped ScrollArea. Previously the whole
+            // panel was wrapped in one ScrollArea, so a long log could scroll the loading bar off-screen.
             if let Some(bv) = &bv {
                 let (stage, tail, key) = (&bv.stage, &bv.tail, &bv.key);
                 let (finished, ok) = (bv.finished, bv.ok);
@@ -1319,7 +1329,14 @@ pub fn menu_ui(
                         let stage_txt = if failed {
                             t(lg, K::BuildFailed).to_string()
                         } else if finished {
-                            t(lg, K::BuildComplete).to_string()
+                            // Only a deps-install reaches here now (a successful MAP build auto-dismisses
+                            // in build_view), so say "dependencies installed" rather than "BUILD COMPLETE"
+                            // — the user was confused that a finished deps install looked like a built map.
+                            if key == "__deps__" {
+                                t(lg, K::DepsDone).to_string()
+                            } else {
+                                t(lg, K::BuildComplete).to_string()
+                            }
                         } else {
                             let mut en = stage
                                 .split(']')
@@ -1345,15 +1362,17 @@ pub fn menu_ui(
                         crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed, lg);
                         if show_log {
                             ui.add_space(6.0);
-                            for line in tail {
-                                ui.label(
-                                    RichText::new(line).color(DIM).size(11.0).monospace(),
-                                );
-                            }
+                            // Only the streaming log scrolls (capped) — the loading bar above stays pinned.
+                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                for line in tail {
+                                    ui.label(
+                                        RichText::new(line).color(DIM).size(11.0).monospace(),
+                                    );
+                                }
+                            });
                         }
                     });
             }
-                });
             });
     }
     if toggle_log {
