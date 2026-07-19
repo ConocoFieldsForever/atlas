@@ -8,6 +8,27 @@ packs/
 *.eftpack
 eft_assets/
 tarkmap/out/
+/out/
+
+# game-extracted map assets — belt-and-suspenders so extracted geometry/textures/scenes can
+# NEVER be committed even if the pipeline writes loose files inside the tree (the dirs above
+# cover the normal locations; these catch stray files anywhere). None of these types have a
+# legitimate place in a Rust/Python source tree — they are always game-derived output.
+*.obj
+*.glb
+*.gltf
+*.fbx
+*.dds
+*.ktx
+*.ktx2
+*.basis
+*.tga
+scene.json
+meshes.bin
+volume.bin
+volume.json
+vis.bin
+grass_density_*.bin
 
 # transient build/staging dirs
 *.building/
