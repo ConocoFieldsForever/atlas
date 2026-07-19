@@ -181,6 +181,12 @@ pub struct Sidecars {
     pub terrain_layers: Option<String>,
     #[serde(default)]
     pub lights: Option<String>,
+    /// EVERY light sidecar the assembler emitted (`lightsAll`). A multi-scene map (or any pack with
+    /// several `lights_*.json`) writes them all here; the single `lights` field is just the primary
+    /// one. The loader parses+merges ALL of these so multi-file light maps aren't reduced to one file
+    /// (finding 3b). Empty/absent -> fall back to the single `lights` field.
+    #[serde(rename = "lightsAll", default)]
+    pub lights_all: Vec<String>,
     #[serde(default)]
     pub volume: Option<String>,
     #[serde(default)]
@@ -435,16 +441,36 @@ struct LightsWrapper {
     lights: Vec<LightRaw>,
 }
 
-/// Reduce a raw Unity light to a viewer-world `Light`, or `None` if it is off /
-/// contributes nothing (intensity<=0 or range<=0).
-fn reduce_light(r: &LightRaw) -> Option<Light> {
+/// Outcome of reducing one raw light: a usable point/spot `Light`, a deliberate skip because the
+/// light is off / contributes nothing, or a skip because its Unity type isn't a point/spot the
+/// realtime loop supports (Directional/Rectangle/Disc/Area). The last variant is counted + warned
+/// so an unsupported type is never silently mis-coerced into a point light (finding 3c).
+enum Reduced {
+    Light(Light),
+    /// off / zero-intensity / zero-range — expected, not warned.
+    Inactive,
+    /// unsupported Light type (kind names it) — skipped, warned in aggregate.
+    Unsupported,
+}
+
+/// Reduce a raw Unity light to a viewer-world point/spot `Light`. Directional/area (Rectangle/Disc)
+/// and any other non-point/spot type is reported `Unsupported` (skipped, not mis-coerced): the
+/// viewer lights interiors from the baked SH + sky sun, so a Directional (sun) is NOT a local point
+/// light and must not be dropped into the point loop at the sun's position.
+fn reduce_light(r: &LightRaw) -> Reduced {
+    // Classify the Unity light type. Empty kind is legacy "point" (older sidecars omitted it).
+    let k = r.kind.trim().to_ascii_lowercase();
+    let is_spot = k == "spot";
+    let is_point = k.is_empty() || k == "point";
+    if !is_spot && !is_point {
+        return Reduced::Unsupported; // Directional / Rectangle / Disc / Area / unknown
+    }
     if !r.on || r.intensity <= 0.0 || r.range <= 0.0 {
-        return None;
+        return Reduced::Inactive;
     }
     // G3 = diag(-1,1,1): sign-flip X on the raw Unity world position.
     let pos = Vec3::new(-r.position[0], r.position[1], r.position[2]);
     let color = Vec3::new(r.color[0], r.color[1], r.color[2]) * r.intensity;
-    let is_spot = r.kind.eq_ignore_ascii_case("spot");
     let (dir, cos_outer, cos_inner) = if is_spot {
         // Unity forward is +Z; rotate by the light's quat, then apply the same G3 X-flip.
         let q = Quat::from_xyzw(r.rotation[0], r.rotation[1], r.rotation[2], r.rotation[3]);
@@ -465,7 +491,7 @@ fn reduce_light(r: &LightRaw) -> Option<Light> {
     } else {
         (Vec3::ZERO, -2.0, -1.0) // point: spot factor == 1 everywhere
     };
-    Some(Light {
+    Reduced::Light(Light {
         pos,
         color,
         range: r.range,
@@ -475,9 +501,11 @@ fn reduce_light(r: &LightRaw) -> Option<Light> {
     })
 }
 
-/// Best-effort parse of the lights sidecar. A missing / unreadable / unparseable file
-/// yields an empty vec — realtime lighting is optional; it must NEVER fail the load.
-fn parse_lights(root: &Path, sidecar: &str) -> Vec<Light> {
+/// Parse ONE lights sidecar into usable point/spot lights, appending to `out`. Returns the count of
+/// UNSUPPORTED-type lights skipped (Directional/Rectangle/Disc/…). A missing / unreadable /
+/// unparseable file logs a clear WARNING and contributes nothing — realtime lighting is optional and
+/// must NEVER fail the load, but a parse failure is no longer SILENT (finding 3c).
+fn parse_lights_into(root: &Path, sidecar: &str, out: &mut Vec<Light>) -> usize {
     let path = if Path::new(sidecar).is_absolute() {
         PathBuf::from(sidecar)
     } else {
@@ -485,16 +513,30 @@ fn parse_lights(root: &Path, sidecar: &str) -> Vec<Light> {
     };
     let s = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            eprintln!("  lights: WARNING could not read '{}': {e}", path.display());
+            return 0;
+        }
     };
     let raws: Vec<LightRaw> = match serde_json::from_str::<Vec<LightRaw>>(&s) {
         Ok(v) => v,
         Err(_) => match serde_json::from_str::<LightsWrapper>(&s) {
             Ok(w) => w.lights,
-            Err(_) => return Vec::new(),
+            Err(e) => {
+                eprintln!("  lights: WARNING could not parse '{}': {e}", path.display());
+                return 0;
+            }
         },
     };
-    raws.iter().filter_map(reduce_light).collect()
+    let mut unsupported = 0usize;
+    for r in &raws {
+        match reduce_light(r) {
+            Reduced::Light(l) => out.push(l),
+            Reduced::Inactive => {}
+            Reduced::Unsupported => unsupported += 1,
+        }
+    }
+    unsupported
 }
 
 // ---------------------------------------------------------------------------
@@ -561,27 +603,150 @@ impl Pack {
             ));
         }
 
-        // Realtime lights (best-effort; empty vec on any failure — never fatal).
-        let lights = manifest
+        // Realtime lights (best-effort; empty vec on any failure — never fatal). Parse+merge EVERY
+        // sidecar in `lightsAll` (finding 3b); fall back to the single `lights` field when the list
+        // is empty (older packs). De-dup identical entries so `lights` + `lightsAll` overlap once.
+        let mut light_files: Vec<&str> = manifest
             .sidecars
-            .lights
-            .as_deref()
-            .map(|s| parse_lights(&root, s))
-            .unwrap_or_default();
+            .lights_all
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if light_files.is_empty() {
+            if let Some(s) = manifest.sidecars.lights.as_deref() {
+                light_files.push(s);
+            }
+        }
+        light_files.sort_unstable();
+        light_files.dedup();
+        let mut lights = Vec::new();
+        let mut unsupported = 0usize;
+        for f in &light_files {
+            unsupported += parse_lights_into(&root, f, &mut lights);
+        }
         eprintln!(
-            "  realtime lights: {} usable (from sidecar '{}')",
+            "  realtime lights: {} usable from {} sidecar(s){}",
             lights.len(),
-            manifest.sidecars.lights.as_deref().unwrap_or("<none>")
+            light_files.len(),
+            if unsupported > 0 {
+                format!(" ({unsupported} unsupported-type light(s) skipped: Directional/area handled by SH+sky, not the point loop)")
+            } else {
+                String::new()
+            }
         );
 
-        Ok(Pack {
+        let pack = Pack {
             root,
             manifest,
             materials,
             meshes_bin,
             instances,
             lights,
-        })
+        };
+        // Complete checked structural validation BEFORE the pack is exposed (finding 5): a malformed
+        // manifest that parsed fine but whose offsets/ranges/ids are out of bounds would otherwise
+        // panic-abort later at a GPU slice (release builds are panic=abort). Returning Err here lets
+        // the loader's existing error path handle it gracefully.
+        pack.validate().context("validating pack structure")?;
+        Ok(pack)
+    }
+
+    /// Complete checked structural validation of a parsed pack (finding 5). Verifies every
+    /// manifest-declared offset / range / id lands inside the buffer or table it indexes, so no
+    /// later unchecked read (`mesh_geom`, the GPU submesh slice in `gpu_driven`, an instance's
+    /// mesh_id lookup) can panic on user-supplied data. Returns a descriptive Err on the first
+    /// violation. Called once at the end of `load`.
+    fn validate(&self) -> Result<()> {
+        let vl = &self.manifest.vertex;
+        let stride = vl.stride as usize;
+        if stride == 0 {
+            return Err(anyhow!("vertex stride is 0"));
+        }
+        // Every vertex attribute must lie fully within one stride record. `mesh_geom` reads each
+        // attribute at `base + offset`, so an attr whose [offset, offset+size] overruns the stride
+        // reads past the last vertex's bytes (e.g. stride=12 with position.offset=8 reads byte 19).
+        for a in &vl.attrs {
+            let size = fmt_byte_size(&a.fmt).ok_or_else(|| {
+                anyhow!("vertex attr '{}' has unknown format '{}'", a.name, a.fmt)
+            })?;
+            let end = a.offset as usize + size;
+            if end > stride {
+                return Err(anyhow!(
+                    "vertex attr '{}' [{}, {}) overruns stride {}",
+                    a.name,
+                    a.offset,
+                    end,
+                    stride
+                ));
+            }
+        }
+        let mat_count = self.materials.len();
+        let mesh_count = self.manifest.meshes.len();
+        let blen = self.meshes_bin.len();
+        for m in &self.manifest.meshes {
+            // Mesh vertex + index byte ranges must fit meshes.bin.
+            let vtx_end = m
+                .vtx_offset
+                .checked_add(m.vtx_count as u64 * stride as u64)
+                .ok_or_else(|| anyhow!("mesh {} vtx range overflow", m.id))? as usize;
+            let idx_end = m
+                .idx_offset
+                .checked_add(m.idx_count as u64 * 4)
+                .ok_or_else(|| anyhow!("mesh {} idx range overflow", m.id))? as usize;
+            if vtx_end > blen || idx_end > blen {
+                return Err(anyhow!(
+                    "mesh {} '{}' byte range out of bounds (vtx_end {}, idx_end {}, meshes.bin {})",
+                    m.id,
+                    m.name,
+                    vtx_end,
+                    idx_end,
+                    blen
+                ));
+            }
+            // Each submesh index window must fit WITHIN this mesh's index run, and its material id
+            // must exist. A submesh with idx_start > idx_count panics the GPU slice in gpu_driven.
+            for (si, sm) in m.submeshes.iter().enumerate() {
+                let sub_end = sm
+                    .idx_start
+                    .checked_add(sm.idx_count)
+                    .ok_or_else(|| anyhow!("mesh {} submesh {} idx overflow", m.id, si))?;
+                if sub_end > m.idx_count {
+                    return Err(anyhow!(
+                        "mesh {} '{}' submesh {} index window [{}, {}) exceeds mesh idxCount {}",
+                        m.id,
+                        m.name,
+                        si,
+                        sm.idx_start,
+                        sub_end,
+                        m.idx_count
+                    ));
+                }
+                if mat_count > 0 && sm.material_id as usize >= mat_count {
+                    return Err(anyhow!(
+                        "mesh {} '{}' submesh {} materialId {} out of range (materials {})",
+                        m.id,
+                        m.name,
+                        si,
+                        sm.material_id,
+                        mat_count
+                    ));
+                }
+            }
+        }
+        // Every instance must reference a real mesh (mesh_id indexes manifest.meshes / the GPU
+        // mesh-meta buffer). `instances_by_mesh` silently drops out-of-range ids, but the GPU path
+        // indexes with them directly.
+        for (i, inst) in self.instances.iter().enumerate() {
+            if inst.mesh_id as usize >= mesh_count {
+                return Err(anyhow!(
+                    "instance {} references mesh_id {} but only {} meshes exist",
+                    i,
+                    inst.mesh_id,
+                    mesh_count
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Interleaved vertex bytes for a mesh (length = vtxCount * vertex.stride).
@@ -907,6 +1072,25 @@ fn read_i32(b: &[u8], o: usize) -> i32 {
 #[inline]
 fn read_vec3(b: &[u8], o: usize) -> Vec3 {
     Vec3::new(read_f32(b, o), read_f32(b, o + 4), read_f32(b, o + 8))
+}
+
+/// Byte size of a vertex-attribute format string ("f32x3"=12, "unorm8x4"=4, "u32"=4, "f16x2"=4…).
+/// `None` for an unrecognized format so `validate` rejects a manifest it can't bounds-check rather
+/// than guessing. Grammar: `<base>[x<count>]`; per-component bytes by base type, times an optional
+/// `x<count>` lane count.
+fn fmt_byte_size(fmt: &str) -> Option<usize> {
+    let (base, count) = match fmt.split_once('x') {
+        Some((b, c)) => (b, c.parse::<usize>().ok()?),
+        None => (fmt, 1),
+    };
+    let per = match base {
+        "f32" | "u32" | "i32" | "unorm32" | "snorm32" => 4,
+        "f16" | "u16" | "i16" | "unorm16" | "snorm16" => 2,
+        "u8" | "i8" | "unorm8" | "snorm8" => 1,
+        "f64" => 8,
+        _ => return None,
+    };
+    Some(per * count)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
