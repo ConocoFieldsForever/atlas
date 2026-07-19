@@ -43,6 +43,12 @@ pub struct BuildJob {
     pub result: Option<bool>,
     /// Wall-clock build start — feeds the loading bar's ESTIMATED TIME readout.
     pub started: std::time::Instant,
+    /// Monotonic max progress fraction seen for THIS build (as f32 bits). The loading bar must never
+    /// regress, but a nested sub-script (`assemble_bevy`, the bake) emits its OWN `[STAGE i/M]` with a
+    /// different M, which `build_frac` would map to a LOWER value — hence the "50% then back down"
+    /// jumps. Clamping to this max fixes it. AtomicU32 = interior mutability through the `&BuildJob`
+    /// the menu polls; a new build is a new BuildJob (starts at 0), so nothing leaks across builds.
+    max_frac: std::sync::atomic::AtomicU32,
 }
 
 impl BuildJob {
@@ -163,6 +169,7 @@ impl BuildJob {
                 done,
                 result: None,
                 started: std::time::Instant::now(),
+                max_frac: std::sync::atomic::AtomicU32::new(0),
             });
         }
     }
@@ -801,6 +808,8 @@ struct BuildView {
     finished: bool,
     ok: bool,
     full_log: String,
+    /// Monotonic weighted progress in [0,1] (see `build_view` — never regresses).
+    frac: f32,
 }
 
 #[cfg(feature = "egui")]
@@ -815,6 +824,28 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
         None
     }?;
     let (stage, tail, finished, ok) = job.snapshot(12);
+    // Weighted progress, clamped MONOTONIC on the persistent BuildJob so nested sub-script `[STAGE i/M]`
+    // markers can't drop the bar. The sub-fraction moves the bar WITHIN the long extraction stage via
+    // the parallel extractor's `[SUBPROGRESS] <done>/<total>` marker.
+    let sub = if stage.starts_with("[STAGE 1/") {
+        tail.iter().rev().find_map(|l| {
+            let rest = l.split("[SUBPROGRESS]").nth(1)?;
+            let tok = rest.split_whitespace().last()?; // "<d>/<t>"
+            let (d, t) = tok.split_once('/')?;
+            let (d, t) = (d.trim().parse::<f32>().ok()?, t.trim().parse::<f32>().ok()?);
+            (t > 0.0).then(|| (d / t).clamp(0.0, 1.0))
+        })
+    } else {
+        None
+    };
+    let raw = if finished && ok { 1.0 } else { build_frac(&stage, sub) };
+    let frac = {
+        use std::sync::atomic::Ordering::Relaxed;
+        let prev = f32::from_bits(job.max_frac.load(Relaxed));
+        let v = raw.max(prev).clamp(0.0, 1.0);
+        job.max_frac.store(v.to_bits(), Relaxed);
+        v
+    };
     Some(BuildView {
         key: job.key.clone(),
         stage,
@@ -823,6 +854,7 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
         finished,
         ok,
         full_log: job.full_log(),
+        frac,
     })
 }
 
@@ -1283,22 +1315,10 @@ pub fn menu_ui(
                                 },
                             );
                         });
-                        // Weighted progress (build_frac): phases weighted by real relative duration,
-                        // not equal stages, so the ETA stops overshooting on the long extraction. The
-                        // extraction stage ([STAGE 1/N]) also moves within itself via a [SUBPROGRESS]
-                        // <done>/<total-levels> marker the parallel extractor emits.
-                        let sub = if stage.starts_with("[STAGE 1/") {
-                            tail.iter().rev().find_map(|l| {
-                                let rest = l.split("[SUBPROGRESS]").nth(1)?;
-                                let tok = rest.split_whitespace().last()?; // "<d>/<t>"
-                                let (d, t) = tok.split_once('/')?;
-                                let (d, t) = (d.trim().parse::<f32>().ok()?, t.trim().parse::<f32>().ok()?);
-                                (t > 0.0).then(|| (d / t).clamp(0.0, 1.0))
-                            })
-                        } else {
-                            None
-                        };
-                        let frac = if finished && ok { 1.0 } else { build_frac(stage, sub) };
+                        // Weighted, MONOTONIC progress — computed once in build_view (phases weighted by
+                        // real relative duration so the ETA stops overshooting on the long extraction;
+                        // clamped so a nested sub-script's [STAGE i/M] marker can't jump the bar backward).
+                        let frac = bv.frac;
                         // "LOADING OBJECTS..." style stage line for the loader bar: the text
                         // between the [STAGE] marker and its status suffix, uppercased and
                         // ASCII-whitelisted (menu glyph set is plain ASCII only).
