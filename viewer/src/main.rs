@@ -331,14 +331,19 @@ fn poll_map_load(
 }
 
 /// On an in-place map swap (`MapEpoch` bump), re-frame the single reused camera on the new pack and
-/// rebuild its skybox. The FIRST observation (startup) is skipped — `setup` already framed the
-/// initial pack; menu mode (no pack) is skipped entirely (no skybox / framing there).
+/// rebuild its skybox. The first observation is skipped ONLY when `setup` already framed this pack in
+/// the SYNCHRONOUS load path (detected by the camera having a skybox). On the default ASYNC cold-load
+/// path `setup` runs pack-less (menu pose, no skybox), so the first pack observation here must
+/// actually frame the map + INSERT the skybox — otherwise the map opens at the menu vantage over a
+/// flat grey backdrop. Menu mode (no pack) is skipped entirely.
 fn reset_map_view(
+    mut commands: Commands,
     pack: Option<Res<LoadedPack>>,
     epoch: Res<render::MapEpoch>,
     mut images: ResMut<Assets<Image>>,
     mut cam: Query<
         (
+            Entity,
             &mut Transform,
             &mut Projection,
             &mut FlyCam,
@@ -354,32 +359,49 @@ fn reset_map_view(
     if *last == Some(cur) {
         return;
     }
-    let first = last.is_none();
+    let was_first = last.is_none();
     *last = Some(cur);
-    if first {
-        return; // setup already framed the initial pack
-    }
-    let Ok((mut tf, mut proj, mut fly, mut walk, skybox)) = cam.single_mut() else {
+    let Ok((cam_entity, mut tf, mut proj, mut fly, mut walk, skybox)) = cam.single_mut() else {
         return;
     };
-    let (cam_pos, _target, far, yaw, pitch) = frame_for_pack(Some(&pack.0));
-    tf.translation = cam_pos;
-    tf.rotation = Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(Vec3::X, pitch);
-    fly.yaw = yaw;
-    fly.pitch = pitch;
-    if let Projection::Perspective(pp) = &mut *proj {
-        pp.far = far;
+    // Skip only if `setup` already framed this pack AND built its skybox (sync path). On the async
+    // cold-load path the camera has NO skybox yet, so fall through to frame + insert it.
+    if was_first && skybox.is_some() {
+        return;
+    }
+    // Debug overrides (EFT_POSE / EFT_LOOK) pin the camera in `setup`; don't clobber them with the
+    // content-anchor reframe here (the skybox insert below still runs so the sky is correct).
+    if std::env::var("EFT_POSE").is_err() && std::env::var("EFT_LOOK").is_err() {
+        let (cam_pos, _target, far, yaw, pitch) = frame_for_pack(Some(&pack.0));
+        tf.translation = cam_pos;
+        tf.rotation = Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(Vec3::X, pitch);
+        fly.yaw = yaw;
+        fly.pitch = pitch;
+        if let Projection::Perspective(pp) = &mut *proj {
+            pp.far = far;
+        }
     }
     // Drop stale ground/velocity from the old map (else the fell-through-world backstop can teleport
     // the player to a nonexistent old-map Y, and a mid-jump vy carries over).
     *walk = walk_ground::WalkState::default();
-    // Rebuild the skybox for the new sun; free the old cubemap image so it doesn't leak each swap.
+    // Rebuild the skybox for the new sun. SWAP an existing cubemap (in-place swap / sync path, frees
+    // the old image so it doesn't leak each swap) or INSERT one when the camera has none yet (the
+    // async cold-load first frame — same params as `setup`'s insert).
     let (sun_dir, _) = pack_sun_dir(Some(&pack.0));
     let new_sky = build_sky_cubemap(&mut images, sun_dir);
-    if let Some(mut sb) = skybox {
-        let old = sb.image.clone();
-        sb.image = new_sky;
-        images.remove(&old);
+    match skybox {
+        Some(mut sb) => {
+            let old = sb.image.clone();
+            sb.image = new_sky;
+            images.remove(&old);
+        }
+        None => {
+            commands.entity(cam_entity).insert(Skybox {
+                image: new_sky,
+                brightness: 900.0,
+                rotation: Quat::IDENTITY,
+            });
+        }
     }
 }
 
