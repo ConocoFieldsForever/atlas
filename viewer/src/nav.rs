@@ -72,6 +72,10 @@ pub struct NavGrid {
     /// these keeps the route centred in corridors instead of hugging walls / threading the
     /// sub-cell gaps the thin edge-ray can miss — an agent-radius clearance nudge (Unity erode).
     near_wall: Vec<bool>,
+    /// nx*nz: 1 = a wall triangle occupies this cell's body column (baked `nav_wallcell.bin`). The
+    /// wall-aware simplifier refuses to straighten a chord THROUGH such a cell, so the drawn line
+    /// never cuts a sub-cell wall that blocks no cell-edge (invisible to `blk`). Absent = all-zero.
+    wall_cell: Vec<u8>,
 }
 
 /// Reusable per-query A* scratch (generation-stamped so no full clears). One `Scratch` is reused
@@ -120,9 +124,11 @@ impl NavGrid {
         let m = nx * nz * k;
 
         let h = read_f32(&dir.join("nav.bin"), m)?;
-        // Door / block masks are optional; absent -> no doors / no blocked edges (graceful).
+        // Door / block / wall-cell masks are optional; absent -> no doors / no blocked edges / no
+        // wall cells (graceful — old packs baked before these existed still load & route).
         let door = read_u8(&dir.join("nav_door.bin"), nx * nz).unwrap_or_else(|| vec![0; nx * nz]);
         let blk = read_u8(&dir.join("nav_blk.bin"), m).unwrap_or_else(|| vec![0; m]);
+        let wall_cell = read_u8(&dir.join("nav_wallcell.bin"), nx * nz).unwrap_or_else(|| vec![0; nx * nz]);
 
         // Agent-clearance field: a cell is "near a wall" if it (or a neighbour) has any blocked
         // edge. Dilated by one cell so the penalty biases routes ~1 cell (res) off walls — the
@@ -157,13 +163,13 @@ impl NavGrid {
         info!(
             "nav: loaded grid {}x{}x{} @ {}m ({:.0} MB); step_up {:.2}m slope {:.0}deg; from {}",
             nx, nz, k, res,
-            (h.len() * 4 + door.len() + blk.len()) as f32 / 1e6,
+            (h.len() * 4 + door.len() + blk.len() + wall_cell.len()) as f32 / 1e6,
             step_up, slope_deg,
             dir.display()
         );
         Some(NavGrid {
             min_x, min_z, res, nx, nz, k, miss, climb, drop_max, step_up, slope_tan, h, door, blk,
-            near_wall,
+            near_wall, wall_cell,
         })
     }
 
@@ -174,13 +180,56 @@ impl NavGrid {
     #[inline]
     fn walkable_step(&self, up: f32, run: f32, forced: bool) -> bool {
         if forced {
-            return true;
+            // Doors bypass the step/slope/thin-wall rule for UP moves and small downs, but a forced
+            // edge still must not authorize a lethal multi-storey fall — cap the drop at drop_max.
+            return up >= 0.0 || -up <= self.drop_max;
         }
         if up > 0.0 {
             up <= self.step_up || (up <= self.climb && up <= run * self.slope_tan)
         } else {
             -up <= self.drop_max
         }
+    }
+
+    /// One shared-ortho side of a diagonal is passable iff its edge isn't wall-blocked, the ortho
+    /// cell has a floor near `h_ref`, and that step is walkable from `h_ref`. `blk_c` is the block
+    /// mask of the diagonal's SOURCE (cell,layer). `o` is the ortho neighbour dir index (0..4).
+    #[inline]
+    fn ortho_ok(&self, ix: i64, iz: i64, h_ref: f32, blk_c: u8, o: usize) -> bool {
+        if (blk_c >> o) & 1 != 0 {
+            return false; // the ortho edge itself is a wall
+        }
+        let (dx, dz) = (NB[o].0 as i64, NB[o].1 as i64);
+        let (jx, jz) = (ix + dx, iz + dz);
+        if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+            return false;
+        }
+        let oc = (jz * self.nx as i64 + jx) as usize;
+        let nl = self.best_layer(oc, h_ref);
+        if nl < 0 {
+            return false;
+        }
+        let up = self.h_lay(oc, nl as usize) - h_ref;
+        let run = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+        self.walkable_step(up, run, false)
+    }
+
+    /// Strict diagonal corner-cut test: diagonal `d` (4..8) is allowed only when BOTH shared ortho
+    /// sides are floored near `h_ref`, walkable from `h_ref`, AND blk-unblocked in `blk_c`. A
+    /// 0.64 m-wide capsule can't squeeze a corner where either side is a wall or a missing floor,
+    /// so both must pass (combining the floor AND the block mask, since a wall reads as unblocked
+    /// in blk when it only removes the far cell's floor).
+    #[inline]
+    fn diag_ok(&self, ix: i64, iz: i64, h_ref: f32, blk_c: u8, d: usize) -> bool {
+        // ortho pair composing diagonal d: o1 = (dx,0) step, o2 = (0,dz) step.
+        let (o1, o2) = match d {
+            4 => (0usize, 2usize), // (1,1)  -> +x, +z
+            5 => (0, 3),           // (1,-1) -> +x, -z
+            6 => (1, 2),           // (-1,1) -> -x, +z
+            7 => (1, 3),           // (-1,-1)-> -x, -z
+            _ => return true,
+        };
+        self.ortho_ok(ix, iz, h_ref, blk_c, o1) && self.ortho_ok(ix, iz, h_ref, blk_c, o2)
     }
 
     /// Node count (nx*nz*K) — the size a `Scratch` must match.
@@ -384,9 +433,6 @@ impl NavGrid {
             let h_cur = self.h_lay(c, l);
             let blk_c = self.blk[cur];
             for d in 0..8 {
-                if (blk_c >> d) & 1 != 0 {
-                    continue; // thin wall/fence blocks this edge
-                }
                 let (dx, dz) = (NB[d].0 as i64, NB[d].1 as i64);
                 let (jx, jz) = (ix + dx, iz + dz);
                 if jx < 0 || jz < 0 || jx >= nx || jz >= nz {
@@ -400,18 +446,19 @@ impl NavGrid {
                 let nl = nl as usize;
                 let h_n = self.h_lay(nc, nl);
                 let up = h_n - h_cur;
-                let forced = self.door[nc] == 1;
+                // A door on EITHER side forces the seam passable (symmetric — fixes the
+                // leaving-a-door asymmetry). Gate the block mask AFTER nc/forced exist so a stray
+                // blk bit on a door edge can never break a door.
+                let forced = self.door[c] == 1 || self.door[nc] == 1;
+                if !forced && (blk_c >> d) & 1 != 0 {
+                    continue; // thin wall/fence blocks this edge
+                }
                 let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
                 if !self.walkable_step(up, horiz, forced) {
                     continue; // too steep/tall to scale, or too deep a drop (doors bypass)
                 }
-                if dx != 0 && dz != 0 {
-                    // no corner-cut through a wall: at least one of the two ortho cells must be floor
-                    let a = (iz * nx + jx) as usize;
-                    let b = (jz * nx + ix) as usize;
-                    if self.best_layer(a, h_cur) < 0 && self.best_layer(b, h_cur) < 0 && !forced {
-                        continue;
-                    }
+                if dx != 0 && dz != 0 && !forced && !self.diag_ok(ix, iz, h_cur, blk_c, d) {
+                    continue; // strict corner-cut: both ortho sides must be clear + unblocked
                 }
                 let nn = nc * k + nl;
                 let mut step = (horiz * horiz + (up * VERT) * (up * VERT)).sqrt();
@@ -485,9 +532,6 @@ impl NavGrid {
             let h_cur = self.h_lay(c, l);
             let blk_c = self.blk[cur];
             for d in 0..8 {
-                if (blk_c >> d) & 1 != 0 {
-                    continue;
-                }
                 let (dx, dz) = (NB[d].0 as i64, NB[d].1 as i64);
                 let (jx, jz) = (ix + dx, iz + dz);
                 if jx < 0 || jz < 0 || jx >= nx || jz >= nz {
@@ -501,17 +545,17 @@ impl NavGrid {
                 let nl = nl as usize;
                 let h_n = self.h_lay(nc, nl);
                 let up = h_n - h_cur;
-                let forced = self.door[nc] == 1;
+                // Same door/blk ordering + strict corner-cut as astar — reachability MUST agree.
+                let forced = self.door[c] == 1 || self.door[nc] == 1;
+                if !forced && (blk_c >> d) & 1 != 0 {
+                    continue;
+                }
                 let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
                 if !self.walkable_step(up, horiz, forced) {
                     continue; // same connectivity as astar (reachability must agree)
                 }
-                if dx != 0 && dz != 0 {
-                    let a = (iz * nx + jx) as usize;
-                    let b = (jz * nx + ix) as usize;
-                    if self.best_layer(a, h_cur) < 0 && self.best_layer(b, h_cur) < 0 && !forced {
-                        continue;
-                    }
+                if dx != 0 && dz != 0 && !forced && !self.diag_ok(ix, iz, h_cur, blk_c, d) {
+                    continue;
                 }
                 let nn = nc * k + nl;
                 // Pure geometric step (NO clearance/avoid penalty) — the field is a distance
@@ -562,6 +606,226 @@ impl NavGrid {
         )
     }
 
+    /// Line-of-sight for the wall-aware simplifier: true when the straight XZ segment `a`->`b` can
+    /// be WALKED end-to-end — every cell it enters has a floor, no cell-edge it crosses is a
+    /// blocked (thin-wall) edge, every step is walkable, and diagonal corner crossings satisfy the
+    /// strict corner-cut rule. Traverses the grid with a supercover DDA (Amanatides–Woo; a corner
+    /// hit is a diagonal step) enumerating EVERY entered cell + EVERY crossed edge, so a grazing
+    /// blocked edge a point-sampler would skip is still caught. Layers are resolved by the running
+    /// floor (A*-consistent). Doors keep their seam passable. A chord that would float off the
+    /// floor (tunnel over a pit / through a mezzanine) is rejected.
+    fn segment_clear(&self, a: Vec3, b: Vec3) -> bool {
+        let res = self.res;
+        let (nxi, nzi) = (self.nx as i64, self.nz as i64);
+        // Cell-space with cell CENTRES at integers -> shift +0.5 so index = floor(u) and cell
+        // boundaries land on integers (clean AW).
+        let u0 = (a.x - self.min_x) / res + 0.5;
+        let w0 = (a.z - self.min_z) / res + 0.5;
+        let u1 = (b.x - self.min_x) / res + 0.5;
+        let w1 = (b.z - self.min_z) / res + 0.5;
+        let du = u1 - u0;
+        let dw = w1 - w0;
+        let mut ix = u0.floor() as i64;
+        let mut iz = w0.floor() as i64;
+        let ixe = u1.floor() as i64;
+        let ize = w1.floor() as i64;
+        if ix < 0 || iz < 0 || ix >= nxi || iz >= nzi {
+            return false;
+        }
+        let mut cur_cell = (iz * nxi + ix) as usize;
+        let l0 = self.best_layer(cur_cell, a.y);
+        if l0 < 0 {
+            return false;
+        }
+        // A multi-cell chord LEAVING a wall cell can clip that cell's wall at an angle the raw edge
+        // avoids, so never straighten OUT of a wall cell either (only the trivial same-cell span is
+        // allowed). Combined with the per-step wall_cell reject below, EVERY cell the chord touches
+        // is wall-free — the drawn line is provably wall-clear.
+        if (ix != ixe || iz != ize) && self.wall_cell.get(cur_cell).is_some_and(|&w| w != 0) {
+            return false;
+        }
+        let mut cur_layer = l0 as usize;
+        let mut cur_floor = self.h_lay(cur_cell, cur_layer);
+        let step_x: i64 = if du > 0.0 { 1 } else { -1 };
+        let step_z: i64 = if dw > 0.0 { 1 } else { -1 };
+        let tdelta_x = if du != 0.0 { 1.0 / du.abs() } else { f32::INFINITY };
+        let tdelta_z = if dw != 0.0 { 1.0 / dw.abs() } else { f32::INFINITY };
+        let mut tmax_x = if du > 0.0 {
+            ((ix + 1) as f32 - u0) / du
+        } else if du < 0.0 {
+            (ix as f32 - u0) / du
+        } else {
+            f32::INFINITY
+        };
+        let mut tmax_z = if dw > 0.0 {
+            ((iz + 1) as f32 - w0) / dw
+        } else if dw < 0.0 {
+            (iz as f32 - w0) / dw
+        } else {
+            f32::INFINITY
+        };
+        let dy = b.y - a.y;
+        // How far the drawn chord may sit off the real floor before it's "floating". Kept TIGHT
+        // (a free step) so the chord hugs the ground: a straight span is only accepted where it
+        // tracks the floor within a step, which also keeps stairs from flattening into a ramp that
+        // floats up past the wall_cell body band and clips a ledge/rail the mask can't see.
+        let float_tol = self.step_up;
+        let max_steps = (du.abs() + dw.abs()) as usize + 4;
+        let mut guard = 0usize;
+        loop {
+            if ix == ixe && iz == ize {
+                break;
+            }
+            guard += 1;
+            if guard > max_steps + 8 {
+                return false; // safety: never spin (panic=abort) — treat as not-clear
+            }
+            let (odx, odz, t_at);
+            if (tmax_x - tmax_z).abs() < 1.0e-6 {
+                // exact corner: cross both boundaries at once (diagonal step)
+                odx = step_x;
+                odz = step_z;
+                t_at = tmax_x;
+                ix += step_x;
+                iz += step_z;
+                tmax_x += tdelta_x;
+                tmax_z += tdelta_z;
+            } else if tmax_x < tmax_z {
+                odx = step_x;
+                odz = 0;
+                t_at = tmax_x;
+                ix += step_x;
+                tmax_x += tdelta_x;
+            } else {
+                odx = 0;
+                odz = step_z;
+                t_at = tmax_z;
+                iz += step_z;
+                tmax_z += tdelta_z;
+            }
+            if ix < 0 || iz < 0 || ix >= nxi || iz >= nzi {
+                return false;
+            }
+            let d = match (odx, odz) {
+                (1, 0) => 0,
+                (-1, 0) => 1,
+                (0, 1) => 2,
+                (0, -1) => 3,
+                (1, 1) => 4,
+                (1, -1) => 5,
+                (-1, 1) => 6,
+                (-1, -1) => 7,
+                _ => return false,
+            };
+            let new_cell = (iz * nxi + ix) as usize;
+            let forced = self.door[cur_cell] == 1 || self.door[new_cell] == 1;
+            let blk_c = self.blk[cur_cell * self.k + cur_layer];
+            if !forced && (blk_c >> d) & 1 != 0 {
+                return false; // crosses a thin-wall edge
+            }
+            // Strict corner-cut on the diagonal micro-step (source = the cell we're leaving).
+            if odx != 0 && odz != 0 && !forced && !self.diag_ok(ix - odx, iz - odz, cur_floor, blk_c, d)
+            {
+                return false;
+            }
+            let nnl = self.best_layer(new_cell, cur_floor);
+            if nnl < 0 {
+                return false; // ran off the walkable floor
+            }
+            let nnl = nnl as usize;
+            // Refuse to STRAIGHTEN into/through ANY cell whose body column holds a wall (including
+            // the destination cell — a chord's final approach must not clip a wall right at the
+            // endpoint). The per-edge blk mask can't see a sub-cell wall that blocks no cell-centre
+            // edge, but a long chord cutting at an angle CAN clip it. `wall_cell` is baked from the
+            // SAME wall geometry as the acceptance test, so rejecting straightening through every
+            // wall cell provably keeps the drawn chord clear of walls. Only the START (anchor) cell
+            // is exempt (it's a pinned route point, checked as `cur_cell`, never as `new_cell`).
+            // Falls back to the raw staircase near walls; open spans still straighten.
+            if self.wall_cell.get(new_cell).is_some_and(|&w| w != 0) {
+                return false;
+            }
+            let new_floor = self.h_lay(new_cell, nnl);
+            let up = new_floor - cur_floor;
+            let run = if odx != 0 && odz != 0 {
+                res * std::f32::consts::SQRT_2
+            } else {
+                res
+            };
+            if !self.walkable_step(up, run, forced) {
+                return false; // a true riser/drop across this edge — can't straighten through it
+            }
+            let y_interp = a.y + dy * t_at.clamp(0.0, 1.0);
+            if (new_floor - y_interp).abs() > float_tol {
+                return false; // the chord would float off the floor here
+            }
+            cur_cell = new_cell;
+            cur_layer = nnl;
+            cur_floor = new_floor;
+        }
+        true
+    }
+
+    /// Wall-aware simplification of a raw 8-connected node path: an LOS-constrained greedy
+    /// string-pull. Keeps a vertex only when the straight line from the last kept anchor to the
+    /// NEXT vertex is not [`Self::segment_clear`], so every kept segment is guaranteed wall-clear.
+    /// Falls back to the raw staircase for any span that can't be straightened (correctness over
+    /// cosmetics) — never emits a chord that cuts a wall/fence corner the way plain Douglas–Peucker
+    /// could. Endpoints are always pinned.
+    pub fn simplify_route(&self, pts: &[Vec3]) -> Vec<Vec3> {
+        let n = pts.len();
+        if n < 3 {
+            return pts.to_vec();
+        }
+        let mut keep = vec![false; n];
+        keep[0] = true;
+        let mut anchor = 0usize;
+        for i in 1..n - 1 {
+            // anchor..pts[i] is known clear; if extending to pts[i+1] would cross a wall, plant a
+            // kept vertex at i and restart the pull from there.
+            if !self.segment_clear(pts[anchor], pts[i + 1]) {
+                keep[i] = true;
+                anchor = i;
+            }
+        }
+        keep[n - 1] = true;
+        (0..n).filter(|&i| keep[i]).map(|i| pts[i]).collect()
+    }
+
+    /// Bake self-check helper: return the RAW 8-connected node path AND its wall-aware
+    /// simplification for a->b (or None). Lets the machine proof attribute wall-crossings to the
+    /// A* connectivity (raw) vs the simplifier (simplified).
+    pub fn route_debug(&self, a: Vec3, b: Vec3, s: &mut Scratch) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
+        let (sc, sl) = self.snap_start(a.x, a.y, a.z, 16)?;
+        let mut dc = self.cell_of(b.x, b.z);
+        if dc < 0 {
+            let cix = (((b.x - self.min_x) / self.res).round() as i64).clamp(0, self.nx as i64 - 1);
+            let ciz = (((b.z - self.min_z) / self.res).round() as i64).clamp(0, self.nz as i64 - 1);
+            dc = ciz * self.nx as i64 + cix;
+        }
+        let dc = dc as usize;
+        for dl in self.layers_by_height(dc, b.y) {
+            if let Some(path) = self.astar(sc, sl, dc, dl, s, None, &mut None) {
+                let simp = self.simplify_route(&path);
+                return Some((path, simp));
+            }
+        }
+        None
+    }
+
+    /// Test/bake-only: zero the wall block mask + clearance + wall-cell fields to reproduce OLD
+    /// routing (packs with no nav_blk.bin/nav_wallcell.bin) for the self-check before/after contrast.
+    pub fn clear_wall_data(&mut self) {
+        for b in self.blk.iter_mut() {
+            *b = 0;
+        }
+        for w in self.near_wall.iter_mut() {
+            *w = false;
+        }
+        for w in self.wall_cell.iter_mut() {
+            *w = 0;
+        }
+    }
+
     /// Route a->b: snap the start, try dest layers nearest b.y. Returns (polyline, walkable length).
     /// The reported length is the REAL walked metres (avoid penalties shape the path, not the number).
     pub fn path(
@@ -585,8 +849,9 @@ impl NavGrid {
                 // Report the length of the SIMPLIFIED polyline (what actually gets drawn + walked),
                 // not the raw 8-connected staircase: the staircase over-measures a diagonal-ish leg
                 // by the grid metrication error (~up to 8%). Simplifying first makes the displayed
-                // metres match the drawn line and the true walked distance.
-                let simp = simplify(&path, self.res * 0.4);
+                // metres match the drawn line and the true walked distance. The wall-aware pull
+                // guarantees the drawn chords never cut through a wall the cell path avoided.
+                let simp = self.simplify_route(&path);
                 let dist = polyline_len(&simp);
                 return Some((simp, dist));
             }
@@ -616,7 +881,7 @@ impl NavGrid {
         for dl in self.layers_by_height(dc, b.y) {
             let mut trace: Option<Vec<(Vec3, f32)>> = Some(Vec::new());
             if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, &mut trace) {
-                let simp = simplify(&path, self.res * 0.4);
+                let simp = self.simplify_route(&path);
                 let dist = polyline_len(&simp);
                 let mut tr = trace.unwrap_or_default();
                 // Down-sample the wavefront (keeps g-order) so the animated draw stays cheap.
@@ -754,42 +1019,6 @@ impl NavGrid {
         }
         (full.len() > 1).then_some((full, total))
     }
-}
-
-/// Douglas–Peucker in 3-D (perpendicular distance incl. Y) — drops the 8-connected staircase but
-/// KEEPS ramps/stairs (an XZ-only reduction would float a straight diagonal up through floors).
-pub fn simplify(pts: &[Vec3], eps: f32) -> Vec<Vec3> {
-    if pts.len() < 3 {
-        return pts.to_vec();
-    }
-    let mut keep = vec![false; pts.len()];
-    keep[0] = true;
-    *keep.last_mut().unwrap() = true;
-    let mut st = vec![(0usize, pts.len() - 1)];
-    while let Some((a, b)) = st.pop() {
-        let (aa, bb) = (pts[a], pts[b]);
-        let u = bb - aa;
-        let len = u.length().max(1e-6);
-        let (mut md, mut mi) = (0.0f32, usize::MAX);
-        for i in (a + 1)..b {
-            let p = pts[i] - aa;
-            let d = p.cross(u).length() / len; // |(P-A) x u| / |u|
-            if d > md {
-                md = d;
-                mi = i;
-            }
-        }
-        if md > eps && mi != usize::MAX {
-            keep[mi] = true;
-            st.push((a, mi));
-            st.push((mi, b));
-        }
-    }
-    pts.iter()
-        .enumerate()
-        .filter(|(i, _)| keep[*i])
-        .map(|(_, p)| *p)
-        .collect()
 }
 
 fn polyline_len(p: &[Vec3]) -> f32 {
