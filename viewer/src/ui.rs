@@ -225,8 +225,13 @@ impl Plugin for UiPlugin {
                 tasks_tab,
                 crate::navigate_panel::navigate_tab,
                 pos_hud,
-                lang_toggle,
+                // NOTE: the in-raid EN/RU toggle is intentionally NOT registered (finding 8). It
+                // flipped the shared Lang but the raid panels (navigate/tasks) are hardcoded
+                // English, so it changed only the badge and misrepresented that RU took effect.
+                // Language is set in the START MENU (which IS fully localized) until raid
+                // localization exists; `lang_toggle` was removed rather than lie in-raid.
                 map_loading_indicator,
+                map_load_error_panel,
                 fit_camera_viewport,
             )
                 .chain(),
@@ -289,37 +294,76 @@ fn map_loading_indicator(
         });
 }
 
-/// EN|RU language switch, always reachable IN-RAID (the start menu draws its own). Floats on a
-/// foreground `Area` anchored bottom-LEFT so it clears the right-edge toolbar/layers panels. Shares
-/// the `lang_switch_area` helper + the one global `Lang` resource with the menu, so flipping it here
-/// takes effect everywhere next frame and persists identically.
+/// A failed async PLAY (corrupt/partial pack) used to leave a blank window with no message and no
+/// way back (finding 4). This centered error card shows what failed + a "Back to menu" button
+/// (relaunches into the start menu) and a "Dismiss" that just clears the error. Only shown outside
+/// menu mode when `MapLoadError` is set.
 #[cfg(feature = "egui")]
-fn lang_toggle(
+fn map_load_error_panel(
     mut contexts: bevy_egui::EguiContexts,
     menu: Option<Res<crate::menu::MenuState>>,
-    mut lang: ResMut<crate::i18n::Lang>,
+    mut err: ResMut<crate::MapLoadError>,
+    mut back: ResMut<crate::ReturnToMenu>,
 ) {
-    use bevy_egui::egui;
-    if menu.is_some() {
-        return; // start menu owns the screen + draws its own toggle
+    use bevy_egui::egui::{self, RichText};
+    use crate::ui_theme as theme;
+    if menu.is_some() || err.0.is_none() {
+        return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    if let Some(l) = crate::menu::lang_switch_area(
-        ctx,
-        *lang,
-        "raid_lang_toggle",
-        // TOP-LEFT, BELOW the left-edge HUD stack: the pick tool's "double-click to identify" hint
-        // (pick.rs) sits at y~8 and the pos_hud coords readout at fixed_pos(8,36); anchoring the
-        // toggle at y=70 clears BOTH of those and the "MAP PROCESSING" jobs pill (bottom-left, jobs.rs).
-        egui::Align2::LEFT_TOP,
-        egui::vec2(8.0, 70.0),
-    ) {
-        *lang = l;
-        crate::menu::save_config_lang(l.tag());
+    let msg = err.0.clone().unwrap_or_default();
+    let mut dismiss = false;
+    let mut go_back = false;
+    egui::Area::new(egui::Id::new("map_load_error"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, theme::DANGER))
+                .inner_margin(egui::Margin::symmetric(20, 16))
+                .show(ui, |ui| {
+                    ui.set_max_width(460.0);
+                    ui.label(
+                        RichText::new("MAP FAILED TO LOAD")
+                            .size(16.0)
+                            .strong()
+                            .color(theme::DANGER_TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&msg).size(12.0).color(theme::TEXT_BRIGHT));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("The pack may be corrupt or incomplete \u{2014} rebuild it from the start menu.")
+                            .size(11.0)
+                            .color(theme::MUTED),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(theme::primary_button("BACK TO MENU")).clicked() {
+                            go_back = true;
+                        }
+                        if ui.button("Dismiss").clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+        });
+    if go_back {
+        back.0 = true;
+        err.0 = None;
+    } else if dismiss {
+        err.0 = None;
     }
 }
+
+// (removed) `lang_toggle`: the in-raid EN/RU switch (finding 8). It persisted the shared `Lang` but
+// the raid panels (navigate_panel / tasks_panel) hardcode English, so clicking RU changed only the
+// language badge while viewing a map — a false claim that RU localization works in-raid. Language is
+// chosen in the START MENU (fully localized) instead. `lang_switch_area` (menu.rs) is unchanged and
+// still drives the menu toggle; re-register a raid toggle here once the raid panels are localized.
 
 /// Re-center the 3D scene in the area egui leaves free (the window minus the right-side rail +
 /// content panel) so it isn't just hidden behind the panel. We do NOT shrink the camera's viewport:
@@ -491,6 +535,9 @@ struct GfxUiParams<'w, 's> {
     gfx: ResMut<'w, crate::render::GfxSettings>,
     /// Forced LOD level (graphics-panel LOD selector); meaningful on --alllod packs, no-op on lean.
     forced_lod: ResMut<'w, crate::ForcedLod>,
+    /// Active render path — the graphics panel greys out the GPU-driven-only controls when the
+    /// viewer fell back to the M0/Standard path (which don't consume them; finding 9).
+    render_path: Option<Res<'w, crate::render::RenderPath>>,
     map_switch: ResMut<'w, crate::MapSwitch>,
     /// Active toolbar tab — layers_panel early-returns unless this is `Visibility` (bundled here
     /// to keep layers_panel under the 16-system-param limit).
@@ -1119,9 +1166,27 @@ fn layers_panel(
                     .default_open(false)
                     .show(ui, |ui| {
                         let mut g = gfx_ui.gfx.clone();
-                        ui.add(egui::Slider::new(&mut g.fog, 0.0..=2.0).text("fog"));
-                        ui.add(egui::Slider::new(&mut g.sky_refl, 0.0..=2.0).text("sky reflections"));
-                        ui.add(egui::Slider::new(&mut g.emissive, 0.0..=3.0).text("emissive"));
+                        // Finding 9: fog / sky-refl / emissive / shadows / grass / cull / LOD ride the
+                        // GPU-driven shader uniforms and do NOTHING on the M0 (fixed flat-light) or
+                        // Standard (Bevy PBR) fallbacks. Grey them out there so a fallback user can't
+                        // fiddle dead sliders. Bloom / grade LUT / SSAO / sharpen run in the shared
+                        // camera+post chain on every path, so they stay enabled.
+                        let is_gpu = gfx_ui
+                            .render_path
+                            .as_deref()
+                            .map(|p| *p == crate::render::RenderPath::GpuDriven)
+                            .unwrap_or(true);
+                        if !is_gpu {
+                            ui.label(
+                                RichText::new("compatibility renderer: some effects below need the GPU-driven path")
+                                    .size(10.0)
+                                    .italics()
+                                    .color(theme::WARN),
+                            );
+                        }
+                        ui.add_enabled(is_gpu, egui::Slider::new(&mut g.fog, 0.0..=2.0).text("fog"));
+                        ui.add_enabled(is_gpu, egui::Slider::new(&mut g.sky_refl, 0.0..=2.0).text("sky reflections"));
+                        ui.add_enabled(is_gpu, egui::Slider::new(&mut g.emissive, 0.0..=3.0).text("emissive"));
                         ui.horizontal(|ui| {
                             ui.checkbox(&mut g.bloom, "bloom");
                             ui.add_enabled(
@@ -1141,17 +1206,19 @@ fn layers_panel(
                                 egui::Checkbox::new(&mut g.vignette, "vignette"),
                             );
                         });
-                        ui.add_enabled_ui(g.shadows_available, |ui| {
+                        ui.add_enabled_ui(g.shadows_available && is_gpu, |ui| {
                             ui.checkbox(&mut g.shadows, "sun shadows")
                                 .on_hover_text("real-time cascades; marginal on the baked-GI look");
                         });
-                        ui.checkbox(&mut g.grass, "grass");
-                        ui.add(
+                        ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.grass, "grass"));
+                        ui.add_enabled(
+                            is_gpu,
                             egui::Slider::new(&mut g.cull_px, 0.0..=8.0)
                                 .text("prop cull px")
                                 .clamping(egui::SliderClamping::Always),
                         );
-                        ui.add(
+                        ui.add_enabled(
+                            is_gpu,
                             egui::Slider::new(&mut g.cull_px_grass, 0.0..=16.0)
                                 .text("grass cull px"),
                         );
@@ -1174,7 +1241,7 @@ fn layers_panel(
                         // on --alllod packs that carry multiple LODs; a no-op on lean LOD0-only packs.
                         // A real change marks ForcedLod changed -> bump_epoch_on_lod_change bumps
                         // MapEpoch -> build_cpu_data rebuilds the instance set for the chosen level.
-                        ui.horizontal(|ui| {
+                        ui.add_enabled_ui(is_gpu, |ui| ui.horizontal(|ui| {
                             ui.label("LOD");
                             let mut lod = gfx_ui.forced_lod.0;
                             egui::ComboBox::from_id_salt("forced_lod")
@@ -1188,7 +1255,7 @@ fn layers_panel(
                             if lod != gfx_ui.forced_lod.0 {
                                 gfx_ui.forced_lod.0 = lod;
                             }
-                        })
+                        }).inner)
                         .response
                         .on_hover_text("Force a single LOD level (needs an --alllod pack; no effect on standard packs)");
                         if ui.small_button("reset to defaults").clicked() {
@@ -1196,6 +1263,10 @@ fn layers_panel(
                             g = crate::render::GfxSettings::default();
                             g.grade_available = keep.0;
                             g.shadows_available = keep.1;
+                            // Reset the LOD selector too (finding 7) — it lives outside GfxSettings.
+                            if gfx_ui.forced_lod.0 != 0 {
+                                gfx_ui.forced_lod.0 = 0;
+                            }
                         }
                         if g != *gfx_ui.gfx {
                             *gfx_ui.gfx = g;

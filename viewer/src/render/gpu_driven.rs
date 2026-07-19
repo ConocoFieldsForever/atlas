@@ -968,6 +968,68 @@ impl GpuLoadSignal {
     }
 }
 
+/// Shared "the real render device can't do GPU-driven" flag (finding 6). The preflight probe in
+/// `render::gpu_driven_supported` is surface-less and can disagree with the device Bevy actually
+/// creates (hybrid-adapter mismatch): if `init_gpu_pipelines` then finds the required indirect /
+/// bindless features missing it disables the whole path -> EMPTY view. Instead of leaving that empty
+/// view, the render world sets this flag; the SAME `Arc` lives in the main world where
+/// `gpu_fallback_relaunch` reads it and relaunches into the M0 instanced path (honest geometry).
+#[derive(Resource, Clone)]
+pub struct GpuFallback(pub Arc<AtomicBool>);
+
+impl Default for GpuFallback {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+/// Main-world system: when the render world signals the GPU-driven path is unsupported on the real
+/// device (`GpuFallback`), relaunch the process into the M0 instanced path instead of sitting on a
+/// blank view. Only fires when the path was AUTO-selected (no explicit `EFT_RENDER` override — an
+/// explicit `EFT_RENDER=gpu` is the user's choice, so we log + leave it). One-shot via the Local.
+pub fn gpu_fallback_relaunch(
+    fallback: Option<Res<GpuFallback>>,
+    mut exit: MessageWriter<AppExit>,
+    mut fired: Local<bool>,
+) {
+    if *fired {
+        return;
+    }
+    let Some(fallback) = fallback else { return };
+    if !fallback.0.load(Ordering::SeqCst) {
+        return;
+    }
+    *fired = true; // whatever we decide, don't re-evaluate every frame
+    // Respect an explicit override: if the user forced EFT_RENDER we don't second-guess them.
+    if std::env::var("EFT_RENDER").map(|v| !v.trim().is_empty()).unwrap_or(false) {
+        error!(
+            "gpu-driven: the render device lacks the required features, but EFT_RENDER is set \
+             explicitly - leaving the view as-is. Re-run with EFT_RENDER=m0 for the instanced path."
+        );
+        return;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => {
+            let mut cmd = std::process::Command::new(exe);
+            for a in std::env::args().skip(1) {
+                cmd.arg(a); // preserve the pack argv; EFT_RENDER=m0 below overrides any render token
+            }
+            cmd.env("EFT_RENDER", "m0");
+            match cmd.spawn() {
+                Ok(_) => {
+                    eprintln!(
+                        "gpu-driven unsupported on the real device - relaunching into the M0 \
+                         instanced path (honest geometry instead of an empty view)"
+                    );
+                    exit.write(AppExit::Success);
+                }
+                Err(e) => error!("gpu fallback: relaunch into M0 failed: {e}"),
+            }
+        }
+        Err(e) => error!("gpu fallback: current_exe failed: {e}"),
+    }
+}
+
 /// Marker for the camera whose frustum drives the GPU cull. Extracted so the render
 /// world can pick THE player view out of Bevy's multiple ExtractedViews â€” otherwise
 /// `views.iter().next()` grabs a prepass/default view nondeterministically and the cull
@@ -1010,6 +1072,10 @@ impl Plugin for EftGpuDrivenPlugin {
         // build finishes). Insert into the MAIN app here; the render sub-app clone is inserted below.
         let load_signal = GpuLoadSignal::default();
         app.insert_resource(load_signal.clone());
+        // Shared GPU-unsupported flag (finding 6): render world sets it, main world relaunches M0.
+        let fallback = GpuFallback::default();
+        app.insert_resource(fallback.clone());
+        app.add_systems(Update, gpu_fallback_relaunch);
         app.add_plugins((
             ExtractComponentPlugin::<GpuDrivenTag>::default(),
             ExtractComponentPlugin::<CullCamera>::default(),
@@ -1027,6 +1093,7 @@ impl Plugin for EftGpuDrivenPlugin {
         let render_app = app.sub_app_mut(RenderApp);
         render_app
             .insert_resource(load_signal)
+            .insert_resource(fallback) // render world raises it in init_gpu_pipelines on a guard miss
             .add_render_command::<Transparent3d, DrawGpuDriven>()
             .init_resource::<SpecializedRenderPipelines<EftDrawPipeline>>()
             .add_systems(RenderStartup, init_gpu_pipelines)
@@ -2105,6 +2172,8 @@ fn init_gpu_pipelines(
     mesh_pipeline: Res<MeshPipeline>,
     asset_server: Res<AssetServer>,
     pipeline_cache: Res<PipelineCache>,
+    // Raised when a guard below disables the path, so the main world relaunches into M0 (finding 6).
+    fallback: Option<Res<GpuFallback>>,
 ) {
     // HARD GUARD (verify finding): every mesh but the first bakes a nonzero
     // first_instance (= instance_base) into the GPU-written indirect args. Without
@@ -2122,9 +2191,11 @@ fn init_gpu_pipelines(
     if !render_device.features().contains(need) {
         error!(
             "gpu-driven: adapter lacks INDIRECT_FIRST_INSTANCE | MULTI_DRAW_INDIRECT â€” the \
-             GPU-driven path is DISABLED (view will be empty). Re-run with EFT_RENDER=m0 for \
-             the instanced path."
+             GPU-driven path is DISABLED. Falling back to the M0 instanced path."
         );
+        if let Some(f) = &fallback {
+            f.0.store(true, Ordering::SeqCst); // main world relaunches into M0 (finding 6)
+        }
         return; // no pipeline resources inserted â†’ entire gpu-driven path no-ops
     }
     // M3 bindless guard (graceful-disable, same as MULTI_DRAW above). TEXTURE_BINDING_ARRAY:
@@ -2142,9 +2213,11 @@ fn init_gpu_pipelines(
         error!(
             "gpu-driven M3: adapter lacks TEXTURE_BINDING_ARRAY | \
              SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING â€” the textured \
-             GPU-driven path is DISABLED (view will be empty). Re-run with EFT_RENDER=m0 for \
-             the instanced path."
+             GPU-driven path is DISABLED. Falling back to the M0 instanced path."
         );
+        if let Some(f) = &fallback {
+            f.0.store(true, Ordering::SeqCst); // main world relaunches into M0 (finding 6)
+        }
         return; // no pipeline resources inserted â†’ entire gpu-driven path no-ops
     }
 

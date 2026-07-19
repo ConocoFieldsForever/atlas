@@ -169,9 +169,13 @@ impl RenderPath {
 /// Probe a throwaway wgpu adapter for the features the GPU-driven path hard-requires
 /// (`init_gpu_pipelines` disables that path — empty view — without them). Uses the same
 /// `HighPerformance` preference Bevy defaults to, so on a single-GPU AMD/NVIDIA box we inspect
-/// the very adapter Bevy will pick. The instance/adapter are dropped immediately. Any probe
-/// failure returns `true` (assume capable) so we never regress a working machine into M0 on a
-/// transient enumeration hiccup — the render-world guard is the real backstop either way.
+/// the very adapter Bevy will pick. The instance/adapter are dropped immediately.
+///
+/// Finding 6: a probe ERROR now returns `false` (UNSUPPORTED -> M0). The M0 instanced path renders
+/// honest geometry, so falling back on a probe hiccup is strictly safer than optimistically choosing
+/// GPU-driven and risking the empty-view guard. If the probe SUCCEEDS but the real Bevy device still
+/// lacks the features (hybrid-adapter mismatch), the render-world guard relaunches into M0 via
+/// `GpuFallback` — so there is no reachable blank-view path either way.
 fn gpu_driven_supported() -> bool {
     use bevy::render::settings::WgpuFeatures;
     let need = WgpuFeatures::MULTI_DRAW_INDIRECT
@@ -194,6 +198,9 @@ fn gpu_driven_supported() -> bool {
             );
             ok
         }
-        Err(_) => true,
+        Err(e) => {
+            eprintln!("gpu probe: adapter request failed ({e}) - treating GPU-driven as UNSUPPORTED, using M0");
+            false
+        }
     }
 }

@@ -166,8 +166,27 @@ impl Default for ForcedLod {
 /// Re-trigger the per-map GPU rebuild when the LOD selector changes: bump `MapEpoch`, which the
 /// teardown/rebuild systems (incl. `build_cpu_data`, now LOD-aware) already gate on. Skips the
 /// initial add so it doesn't double-fire on startup.
-fn bump_epoch_on_lod_change(lod: Res<ForcedLod>, mut epoch: ResMut<render::MapEpoch>) {
-    if lod.is_changed() && !lod.is_added() {
+///
+/// Finding 7: a `MapEpoch` bump is DESTRUCTIVE (it reframes the camera and clears nav/pins/routes/
+/// plans/quests). On a LOD0-only pack — which every SHIPPED pack is — changing the LOD selector
+/// yields the IDENTICAL instance set (`instances_by_mesh_for_lod` collapses to the full set), so the
+/// bump would nuke all that state for no visual change. Only bump when the pack ACTUALLY carries
+/// multiple LODs (an `--alllod` pack), so the selector is a true no-op on standard packs and never
+/// touches camera/nav/POI/plan state there. (Reset-to-defaults also resets `ForcedLod`, in ui.rs.)
+fn bump_epoch_on_lod_change(
+    lod: Res<ForcedLod>,
+    pack: Option<Res<LoadedPack>>,
+    mut epoch: ResMut<render::MapEpoch>,
+) {
+    if !lod.is_changed() || lod.is_added() {
+        return;
+    }
+    // Effective LOD set is unchanged unless the pack has any grouped instance beyond LOD0.
+    let has_multi_lod = pack
+        .as_ref()
+        .map(|p| p.0.instances.iter().any(|i| i.lod_group >= 0 && i.lod_index > 0))
+        .unwrap_or(false);
+    if has_multi_lod {
         epoch.0 = epoch.0.wrapping_add(1);
     }
 }
@@ -268,6 +287,21 @@ fn load_map(
     pending.0 = Some((name, task));
 }
 
+/// Clear a stale `MapLoadError` the moment a NEW async load is kicked off, so the error toast from a
+/// previous failed attempt doesn't linger over a fresh (possibly succeeding) load.
+fn clear_map_error_on_new_load(pending: Res<PendingMapLoad>, mut err: ResMut<MapLoadError>) {
+    if pending.is_changed() && pending.loading().is_some() && err.0.is_some() {
+        err.0 = None;
+    }
+}
+
+/// Last async map-load FAILURE (finding 4): a corrupt/partial pack whose off-thread `Pack::load`
+/// returned Err. `poll_map_load` sets it; the UI (`ui::map_load_error_panel`) shows a clear error
+/// with a "Back to menu" action instead of leaving a blank window. Cleared when a new load starts or
+/// one succeeds.
+#[derive(Resource, Default)]
+pub struct MapLoadError(pub Option<String>);
+
 /// A pack being loaded off-thread for an in-place swap: (display name, load task). The current map
 /// keeps rendering until `poll_map_load` applies the result — so a switch never freezes the frame.
 #[derive(Resource, Default)]
@@ -288,6 +322,7 @@ fn poll_map_load(
     mut commands: Commands,
     epoch: Res<render::MapEpoch>,
     mut gfx: ResMut<render::GfxSettings>,
+    mut load_err: ResMut<MapLoadError>,
     // Latch the "GPU build in progress" flag the instant the file load is applied, so the loading
     // indicator stays visible with no 1-frame gap between PendingMapLoad clearing and the render
     // world starting the (multi-frame) GPU build. GPU-driven path only (Option = absent under m0/std).
@@ -325,8 +360,15 @@ fn poll_map_load(
             commands.remove_resource::<walk_ground::GroundGrid>();
             commands.insert_resource(LoadedPack(p));
             commands.insert_resource(render::MapEpoch(epoch.0.wrapping_add(1)));
+            load_err.0 = None; // a successful load clears any prior failure toast
         }
-        Err(e) => error!("map switch: failed to load pack '{name}': {e}"),
+        Err(e) => {
+            error!("map switch: failed to load pack '{name}': {e}");
+            // Surface the failure (finding 4): `pending` is now cleared (loading toast gone) and no
+            // MapEpoch bump means the GPU build never starts, so the window would otherwise sit blank
+            // with no message. The MapLoadError panel shows the error + a "Back to menu" action.
+            load_err.0 = Some(format!("Could not load {name}: {e}"));
+        }
     }
 }
 
@@ -719,6 +761,7 @@ fn main() {
         .init_resource::<MapSwitch>() // UI map dropdown -> switch to the selected pack (in place)
         .init_resource::<ReturnToMenu>() // toolbar "back to menu" button -> relaunch into the menu
         .init_resource::<PendingMapLoad>() // async in-place pack load (no frame freeze on switch)
+        .init_resource::<MapLoadError>() // async load failure -> UI error + back-to-menu (finding 4)
         .init_resource::<ForcedLod>() // graphics-panel LOD selector (meaningful on --alllod packs)
         .add_systems(Startup, setup)
         // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
@@ -734,7 +777,7 @@ fn main() {
         .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change))
         .add_systems(
             Update,
-            (apply_gfx_camera, load_map, poll_map_load, flycam_scroll, apply_camera_fov, build_walk_ground),
+            (apply_gfx_camera, load_map, poll_map_load, clear_map_error_on_new_load, flycam_scroll, apply_camera_fov, build_walk_ground),
         )
         // In-place map swap: re-frame the reused camera + rebuild the skybox on a MapEpoch bump.
         .add_systems(Update, reset_map_view.run_if(resource_changed::<render::MapEpoch>));
