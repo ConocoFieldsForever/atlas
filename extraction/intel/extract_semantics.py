@@ -54,7 +54,11 @@ FLOOR_RE = re.compile(r"Floor\s?([0-3])", re.I)
 
 
 def get_G3(map_id):
-    gm = _cfg['coordinates']['global_matrix']              # config already loaded above (workspace/kit maps dir)
+    # global_matrix is a constant X-flip and is no longer stored per-config; default to it when
+    # absent (config already loaded above, workspace/kit maps dir).
+    gm = (_cfg.get('coordinates') or {}).get('global_matrix')
+    if not gm:
+        return np.diag([-1.0, 1.0, 1.0, 1.0])[:3, :3]
     return np.array(gm, np.float64).reshape(4, 4)[:3, :3]
 
 
