@@ -14,32 +14,6 @@
     "texture_dir": "tex"
   },
   "coordinates": {
-    "global_matrix": [
-      [
-        -1,
-        0,
-        0,
-        0
-      ],
-      [
-        0,
-        1,
-        0,
-        0
-      ],
-      [
-        0,
-        0,
-        1,
-        0
-      ],
-      [
-        0,
-        0,
-        0,
-        1
-      ]
-    ],
     "flip_winding_on_negative_determinant": true
   }
 }

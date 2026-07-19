@@ -119,8 +119,11 @@ class MapConfig:
     def src_path(self, *parts): return os.path.join(self.dataset, *parts)
 
     def coord_matrix(self):
+        # The Unity->viewer world transform is a CONSTANT X-flip (diag(-1,1,1)) for EVERY EFT map (a
+        # handedness fix), so it is the DEFAULT here rather than being repeated in all 39 map configs.
+        # A config MAY still set coordinates.global_matrix to override it (none currently do).
         m = self.get("coordinates.global_matrix")
-        return np.array(m, np.float64).reshape(4, 4) if m else np.eye(4)
+        return np.array(m, np.float64).reshape(4, 4) if m else np.diag([-1.0, 1.0, 1.0, 1.0])
 
     def __repr__(self): return f"<MapConfig {self.id} dataset={self.dataset}>"
 

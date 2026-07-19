@@ -85,7 +85,10 @@ if LEVELS is None:
     LEVELS = [int(x) for x in (_cfg["source"].get("levels") or [])]
 if OUT is None:
     OUT = os.path.join(TK, "out", MAP, "gamedata.json")
-G3 = np.array(_cfg["coordinates"]["global_matrix"], np.float64).reshape(4, 4)[:3, :3]
+# global_matrix is a constant X-flip and is no longer stored per-config; default to it when absent.
+_gm = (_cfg.get("coordinates") or {}).get("global_matrix")
+G3 = (np.array(_gm, np.float64).reshape(4, 4) if _gm
+      else np.diag([-1.0, 1.0, 1.0, 1.0]))[:3, :3]
 
 # faction from the component TYPE — the whole point of this extractor.
 EXFIL_CLASSES = {
