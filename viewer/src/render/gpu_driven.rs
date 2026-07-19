@@ -346,6 +346,196 @@ pub struct ShVolumeUniform {
 const SH_NORMAL_BIAS: f32 = 0.75;
 
 // ---------------------------------------------------------------------------
+// REALTIME point/spot lighting (no CUDA SH bake needed). EFT lights its maps with
+// realtime lights; the pack carries the raw set (eftpack::Light). We build a static
+// world CSR light grid on the CPU once per map and a fragment loop shades each pixel
+// from the few lights whose range-sphere covers its cell. Auto-selected against the
+// baked SH volume to avoid double-counting: a REAL volume already integrates the
+// practicals (realtime OFF); a dummy volume (no CUDA) -> realtime ON.
+// ---------------------------------------------------------------------------
+
+/// Default realtime light-intensity multiplier (EFT_LIGHT_SCALE overrides). Folded into
+/// `LightGridUniform::params.x`. The CUDA bake used scale 6.0; realtime uses inverse-square
+/// falloff so a slightly lower base reads comparably (tuned by headless A/B).
+const DEFAULT_LIGHT_SCALE: f32 = 4.0;
+
+/// Max cells in the world light grid before the cell size is grown to fit (keeps the grid
+/// buffer small on kilometre-scale maps).
+const LIGHT_GRID_MAX_CELLS: u64 = 4_000_000;
+
+/// group(3) @binding(8) uniform. 48 bytes. Byte-identical to the WGSL `LightGrid`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct LightGridUniform {
+    /// xyz = grid world-min corner, w = cell size (meters).
+    grid_min: [f32; 4],
+    /// xyz = grid dims, w = n_lights (0 => the shader skips the whole loop).
+    grid_dims: [u32; 4],
+    /// x = light_scale, y = ambient_scale, z = rt_enabled (1/0), w unused.
+    params: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<LightGridUniform>() == 48);
+
+/// CPU-staged realtime light set + CSR world grid, uploaded once in `prepare_gpu_buffers`.
+/// Rides in `CpuData` (Arc-extracted, then freed with the rest of the staging blob).
+struct LightGridCpu {
+    uniform: LightGridUniform,
+    /// 3 vec4 per light: v0=(pos.xyz,range) v1=(color.rgb,cos_outer) v2=(dir.xyz,cos_inner).
+    /// Always >= 1 element (a dummy light when the pack has none) so the storage binding is valid.
+    lights: Vec<[f32; 4]>,
+    /// CSR: `[0..=nCells]` prefix-sum offsets (each already includes the base = nCells+1) then the
+    /// concatenated per-cell light-index lists. cell i's lights = `grid[grid[i]..grid[i+1]]`.
+    grid: Vec<u32>,
+}
+
+/// Read an f32 env knob with a default (best-effort; unparseable -> default).
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+/// Build the static world light grid from the pack's reduced lights + the viewer-world AABB.
+/// `rt_enabled` (auto-selected against the SH volume upstream) gates whether the grid is actually
+/// populated: when off, a tiny 1-cell/0-light grid is emitted so the GPU binding stays valid but the
+/// shader skips the loop (no wasted memory on maps that use the baked SH path).
+fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enabled: bool) -> LightGridCpu {
+    let light_scale = env_f32("EFT_LIGHT_SCALE", DEFAULT_LIGHT_SCALE);
+    let ambient_scale = env_f32("EFT_AMBIENT_SCALE", 1.0);
+
+    // Pack the light records (>=1 element so the storage buffer is never zero-sized).
+    let mut lbuf: Vec<[f32; 4]> = Vec::with_capacity(lights.len().max(1) * 3);
+    for l in lights {
+        lbuf.push([l.pos.x, l.pos.y, l.pos.z, l.range]);
+        lbuf.push([l.color.x, l.color.y, l.color.z, l.cos_outer]);
+        lbuf.push([l.dir.x, l.dir.y, l.dir.z, l.cos_inner]);
+    }
+    if lbuf.is_empty() {
+        lbuf.extend_from_slice(&[[0.0; 4], [0.0; 4], [0.0; 4]]); // dummy light 0 (n_lights stays 0)
+    }
+
+    let min = Vec3::new(bounds[0], bounds[1], bounds[2]);
+    let max = Vec3::new(bounds[3], bounds[4], bounds[5]);
+
+    let active = rt_enabled && !lights.is_empty();
+    if !active {
+        // 1-cell / 0-light grid: valid bindings, shader skips (grid_dims.w == 0).
+        // offsets for the single cell: base = nCells+1 = 2, empty range [2,2).
+        return LightGridCpu {
+            uniform: LightGridUniform {
+                grid_min: [min.x, min.y, min.z, 8.0],
+                grid_dims: [1, 1, 1, 0],
+                params: [light_scale, ambient_scale, 0.0, 0.0],
+            },
+            lights: lbuf,
+            grid: vec![2u32, 2u32],
+        };
+    }
+
+    let extent = (max - min).max(Vec3::splat(1e-3));
+    // Cell size = median light range clamped [4,12] m (small avg lights/cell, cheap fragment loop).
+    let mut cell = {
+        let mut ranges: Vec<f32> = lights.iter().map(|l| l.range).collect();
+        ranges.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ranges[ranges.len() / 2].clamp(4.0, 12.0)
+    };
+    let dims_for = |cell: f32| -> [u32; 3] {
+        [
+            ((extent.x / cell).ceil() as i64).clamp(1, 256) as u32,
+            ((extent.y / cell).ceil() as i64).clamp(1, 256) as u32,
+            ((extent.z / cell).ceil() as i64).clamp(1, 256) as u32,
+        ]
+    };
+    let mut dims = dims_for(cell);
+    let mut guard = 0;
+    while (dims[0] as u64 * dims[1] as u64 * dims[2] as u64) > LIGHT_GRID_MAX_CELLS && guard < 64 {
+        cell *= 1.5;
+        dims = dims_for(cell);
+        guard += 1;
+    }
+    let [nx, ny, nz] = dims;
+    let n_cells = nx as usize * ny as usize * nz as usize;
+
+    // Range of cells a light's range-sphere AABB overlaps, clamped to the grid.
+    let cell_range = |l: &crate::eftpack::Light| -> ([u32; 3], [u32; 3]) {
+        let idx = |v: f32, axis_min: f32, dim: u32| -> u32 {
+            (((v - axis_min) / cell).floor() as i64).clamp(0, dim as i64 - 1) as u32
+        };
+        let lo = l.pos - Vec3::splat(l.range);
+        let hi = l.pos + Vec3::splat(l.range);
+        (
+            [idx(lo.x, min.x, nx), idx(lo.y, min.y, ny), idx(lo.z, min.z, nz)],
+            [idx(hi.x, min.x, nx), idx(hi.y, min.y, ny), idx(hi.z, min.z, nz)],
+        )
+    };
+
+    // Two-pass CSR build: count per cell, prefix-sum (base-included), then scatter light indices.
+    let mut counts = vec![0u32; n_cells];
+    for l in lights {
+        let (c0, c1) = cell_range(l);
+        for z in c0[2]..=c1[2] {
+            for y in c0[1]..=c1[1] {
+                let row = (z as usize * ny as usize + y as usize) * nx as usize;
+                for x in c0[0]..=c1[0] {
+                    counts[row + x as usize] += 1;
+                }
+            }
+        }
+    }
+    let base = (n_cells + 1) as u32;
+    let mut offsets = vec![0u32; n_cells + 1];
+    let mut acc = base;
+    for i in 0..n_cells {
+        offsets[i] = acc;
+        acc += counts[i];
+    }
+    offsets[n_cells] = acc;
+    let total_ins = (acc - base) as usize;
+    let mut grid = vec![0u32; (n_cells + 1) + total_ins];
+    grid[..n_cells + 1].copy_from_slice(&offsets);
+    let mut cursor = offsets; // reuse as write cursors
+    for (li, l) in lights.iter().enumerate() {
+        let (c0, c1) = cell_range(l);
+        for z in c0[2]..=c1[2] {
+            for y in c0[1]..=c1[1] {
+                let row = (z as usize * ny as usize + y as usize) * nx as usize;
+                for x in c0[0]..=c1[0] {
+                    let ci = row + x as usize;
+                    grid[cursor[ci] as usize] = li as u32;
+                    cursor[ci] += 1;
+                }
+            }
+        }
+    }
+
+    info!(
+        "gpu-driven realtime lights: {} lights, grid {}x{}x{} ({} cells, cell {:.1} m), {} index entries, \
+         scale={:.2} ambient={:.2}",
+        lights.len(),
+        nx,
+        ny,
+        nz,
+        n_cells,
+        cell,
+        total_ins,
+        light_scale,
+        ambient_scale,
+    );
+
+    LightGridCpu {
+        uniform: LightGridUniform {
+            grid_min: [min.x, min.y, min.z, cell],
+            grid_dims: [nx, ny, nz, lights.len() as u32],
+            params: [light_scale, ambient_scale, 1.0, 0.0],
+        },
+        lights: lbuf,
+        grid,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // #5 Dynamic sun shadows — 2-cascade near-field contact CSM.
 // ---------------------------------------------------------------------------
 // A near-field, sun-aligned contact shadow map. The SH volume already bakes the BROAD sun shadow,
@@ -723,6 +913,10 @@ pub struct CpuData {
     /// the volume sidecar has no valid `sun_dir` (the shadow feature then disables itself; no
     /// invented fallback direction). Mirrors standard.rs's exact access + flip.
     sun_dir: Option<Vec3>,
+    /// Realtime point/spot light set + static world CSR grid, built once per map. Uploaded to
+    /// group(3) bindings 8/9/10 in `prepare_gpu_buffers`. Always present (a 1-cell/0-light dummy
+    /// when the pack uses the baked SH path or ships no lights).
+    light_grid: LightGridCpu,
     instance_total: u32,
     mesh_count: u32,
 }
@@ -1703,6 +1897,26 @@ fn build_cpu_data(
     // Phase 1 SH-GI: load + repack the baked irradiance volume (volume.bin + volume.json).
     let sh_volume = load_sh_volume(pack);
 
+    // REALTIME lights: auto-select against the baked SH volume to avoid DOUBLE-COUNTING. A real
+    // SH volume already integrates the practical lights (baked WITH them) -> realtime OFF; a pack
+    // with no volume (the no-CUDA case) renders FLAT under SH alone -> realtime ON. `EFT_LIGHTS`
+    // overrides: `auto` (default rule), `rt` (force on, for A/B on a volume pack), `sh` (force off).
+    let has_real_volume = sh_volume.is_some();
+    let rt_mode = std::env::var("EFT_LIGHTS")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_else(|_| "auto".to_string());
+    let rt_enabled = match rt_mode.as_str() {
+        "rt" | "on" | "1" => true,
+        "sh" | "off" | "0" => false,
+        _ => !has_real_volume, // auto
+    };
+    info!(
+        "gpu-driven realtime lights: EFT_LIGHTS={rt_mode} real_volume={has_real_volume} \
+         -> realtime {}",
+        if rt_enabled { "ON" } else { "OFF" }
+    );
+    let light_grid = build_light_grid(&pack.lights, &pack.manifest.bounds, rt_enabled);
+
     // #5 shadows: source the sun direction from the SAME volume.json sidecar the SH bake used, with
     // the SAME X-flip standard.rs applies (Lsun = normalize(-raw.x, raw.y, raw.z), pointing TOWARD
     // the sun). `None` (missing/degenerate) => the shadow feature disables itself downstream.
@@ -1762,6 +1976,7 @@ fn build_cpu_data(
         ctrl_tex_linear,
         blend_meshes,
         sun_dir,
+        light_grid,
         instance_total,
         mesh_count,
     }), epoch.0));
@@ -1860,6 +2075,15 @@ struct EftShResources {
     views: Vec<TextureView>,
     #[allow(dead_code)]
     sampler: Sampler,
+    /// Realtime lighting group(3) additions (bindings 8/9/10): the LightGrid uniform, the packed
+    /// light records storage buffer, and the CSR grid storage buffer. Kept alive so `EftShBindGroup`
+    /// stays valid; torn down with the rest of the per-map group(3) on an epoch swap.
+    #[allow(dead_code)]
+    light_uniform: Buffer,
+    #[allow(dead_code)]
+    lights_buf: Buffer,
+    #[allow(dead_code)]
+    light_grid_buf: Buffer,
 }
 
 #[derive(Resource)]
@@ -2747,8 +2971,30 @@ fn prepare_gpu_buffers(
         zero_initialize_workgroup_memory: false,
     });
 
+    // ---- REALTIME lights (group(3) bindings 8/9/10) --------------------------------------------
+    // Tiny CPU-built buffers (a few KB of light records + a few 100 KB grid) — no streaming needed;
+    // build them here on the render thread in the same finalize as the SH/shadow group(3) resources.
+    // Torn down with the rest of group(3) on an epoch swap (EftShResources/EftShBindGroup removed).
+    let lg = &cpu.light_grid;
+    let light_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_light_grid_uniform"),
+        contents: bytemuck::bytes_of(&lg.uniform),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+    let lights_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_lights"),
+        contents: bytemuck::cast_slice(&lg.lights),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let light_grid_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_light_grid"),
+        contents: bytemuck::cast_slice(&lg.grid),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+
     // group(3): ShVolume uniform (0) + 3 SH 3D textures (1,2,3) + filtering sampler (4) + #5 shadow
-    // additions: SunShadowUniform (5) + depth-2d-array (6) + comparison sampler (7). SHARED by both
+    // additions: SunShadowUniform (5) + depth-2d-array (6) + comparison sampler (7) + realtime-light
+    // additions: LightGrid uniform (8) + lights storage (9) + CSR grid storage (10). SHARED by both
     // the opaque and BLEND pipeline specializations (like the group(2) material layout).
     let sh_layout = render_device.create_bind_group_layout(
         "eft_sh_layout",
@@ -2763,6 +3009,9 @@ fn prepare_gpu_buffers(
                 (5, uniform_buffer_sized(false, None)),          // #5 SunShadowUniform
                 (6, texture_2d_array(TextureSampleType::Depth)), // #5 texture_depth_2d_array
                 (7, sampler(SamplerBindingType::Comparison)),    // #5 sampler_comparison
+                (8, uniform_buffer_sized(false, None)),          // realtime LightGrid uniform
+                (9, storage_buffer_read_only_sized(false, None)), // realtime packed light records
+                (10, storage_buffer_read_only_sized(false, None)), // realtime CSR light grid
             ),
         ),
     );
@@ -2778,6 +3027,9 @@ fn prepare_gpu_buffers(
             (5, shadow_main_uniform.as_entire_binding()),
             (6, &shadow_array_view),
             (7, &shadow_cmp_sampler),
+            (8, light_uniform.as_entire_binding()),
+            (9, lights_buf.as_entire_binding()),
+            (10, light_grid_buf.as_entire_binding()),
         )),
     );
 
@@ -2805,6 +3057,9 @@ fn prepare_gpu_buffers(
         textures: vec![sh_r_tex, sh_g_tex, sh_b_tex],
         views: vec![sh_r_view, sh_g_view, sh_b_view],
         sampler: sh_sampler,
+        light_uniform,
+        lights_buf,
+        light_grid_buf,
     });
     commands.insert_resource(EftShBindGroup(sh_bg));
     // #5 shadows: the runtime switch, the queued pipeline + cascade layout, and the GPU resources.

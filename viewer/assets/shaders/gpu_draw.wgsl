@@ -234,6 +234,22 @@ struct SunShadowUniform {
 @group(3) @binding(6) var shadow_map: texture_depth_2d_array;
 @group(3) @binding(7) var shadow_cmp: sampler_comparison;
 
+// --- REALTIME point/spot lights (added to lighting group 3; NOT a 5th bind group) ----------------
+// EFT lights its maps with realtime lights; the pack ships the raw set. A static world CSR grid
+// (built once on the CPU) buckets lights into cells; each fragment loops only the handful whose
+// range-sphere covers its cell. `params.z` (rt_enabled) is auto-selected on the CPU vs the baked SH
+// volume so the two never double-count. Byte-identical to the Rust `LightGridUniform` (48 bytes).
+struct LightGrid {
+    grid_min: vec4<f32>,   // xyz = grid world-min corner, w = cell size (meters)
+    grid_dims: vec4<u32>,  // xyz = grid dims, w = n_lights (0 => skip the loop)
+    params: vec4<f32>,     // x = light_scale, y = ambient_scale, z = rt_enabled (1/0), w unused
+};
+@group(3) @binding(8) var<uniform> lgrid: LightGrid;
+// 3 vec4 per light: v0=(pos.xyz,range) v1=(color.rgb,cos_outer) v2=(dir.xyz,cos_inner).
+@group(3) @binding(9) var<storage, read> lights: array<vec4<f32>>;
+// CSR: [0..=nCells] offsets (base-included) then concatenated per-cell light indices.
+@group(3) @binding(10) var<storage, read> light_grid: array<u32>;
+
 // Reconstruct diffuse IRRADIANCE (÷π folded in: cosine-convolved A0=π, A1=2π/3; the
 // π cancels the Lambert 1/π) from the L1 radiance SH at `world_pos`, for surface
 // normal `n`. Per channel: E/π = 0.282095*c0 + 0.325735*(c1*n.y + c2*n.z + c3*n.x).
@@ -358,6 +374,68 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     // keep their current tuning; isotropic probes smoothly lose the phantom highlight.
     out.radiance = max(vec3<f32>(rr, rg, rb), vec3<f32>(0.0)) * out.directionality;
     return out;
+}
+
+// --- REALTIME point/spot light evaluation ------------------------------------
+// Loops the lights bucketed into this fragment's grid cell, accumulating Lambert diffuse (÷π folded,
+// so it drops straight into the SH `gi` irradiance term) and GGX/Cook-Torrance specular using the
+// SAME dielectric BRDF the SH-dominant path uses. Reads only storage buffers + arithmetic (NO
+// derivatives / textureSample), so it is uniformity-safe to call anywhere — even after a discard.
+struct RtLight {
+    diffuse: vec3<f32>, // irradiance/π (pre-albedo), add into the SH `gi` term
+    spec: vec3<f32>,    // GGX specular radiance, add into spec_rgb
+};
+fn eval_realtime_lights(world_pos: vec3<f32>, N: vec3<f32>, V: vec3<f32>, rough: f32) -> RtLight {
+    var acc_d = vec3<f32>(0.0);
+    var acc_s = vec3<f32>(0.0);
+    if (lgrid.params.z > 0.5 && lgrid.grid_dims.w > 0u) {
+        let dims = lgrid.grid_dims.xyz;
+        let cellf = clamp(floor((world_pos - lgrid.grid_min.xyz) / lgrid.grid_min.w),
+                          vec3<f32>(0.0), vec3<f32>(dims) - vec3<f32>(1.0));
+        let cell = vec3<u32>(cellf);
+        let ci = (cell.z * dims.y + cell.y) * dims.x + cell.x;
+        let s = light_grid[ci];
+        let e = light_grid[ci + 1u];
+        let NdotV = max(dot(N, V), 1e-3);
+        let a  = rough * rough;
+        let a2 = a * a;
+        let sk = (rough + 1.0) * (rough + 1.0) / 8.0; // Smith k (direct lighting)
+        let scale = lgrid.params.x;
+        for (var k = s; k < e; k = k + 1u) {
+            let li = light_grid[k];
+            let L0 = lights[li * 3u];
+            let L1 = lights[li * 3u + 1u];
+            let L2 = lights[li * 3u + 2u];
+            let Lp = L0.xyz; let range = L0.w;
+            let lcol = L1.rgb; let cos_outer = L1.w;
+            let ldir = L2.xyz; let cos_inner = L2.w;
+            let Lv = Lp - world_pos;
+            let d2 = dot(Lv, Lv);
+            if (d2 >= range * range) { continue; }
+            let d = sqrt(max(d2, 1e-8));
+            let l = Lv / d;
+            let win = saturate(1.0 - d2 / (range * range));
+            let atten = win * win / max(d2, 0.0625);          // (1-(d/r)^2)^2 / d^2, near-singularity capped
+            let cosang = dot(-l, ldir);
+            let spot = smoothstep(cos_outer, cos_inner, cosang); // point: cos_outer=-2,cos_inner=-1 => 1
+            let ndl = max(dot(N, l), 0.0);
+            if (ndl <= 0.0 || spot <= 0.0) { continue; }
+            let radiance = lcol * (scale * atten * spot);
+            acc_d = acc_d + radiance * ndl;
+            // GGX/Cook-Torrance specular — identical BRDF to the SH-dominant lobe (dielectric F0=0.04).
+            let H = normalize(V + l);
+            let NdotH = max(dot(N, H), 0.0);
+            let VdotH = max(dot(V, H), 0.0);
+            let dd = (NdotH * NdotH * (a2 - 1.0) + 1.0);
+            let D  = a2 / (3.14159265 * dd * dd);
+            let gv = NdotV / (NdotV * (1.0 - sk) + sk);
+            let gl = ndl / (ndl * (1.0 - sk) + sk);
+            let G  = gv * gl;
+            let F  = 0.04 + 0.96 * pow(1.0 - VdotH, 5.0);
+            acc_s = acc_s + radiance * (D * G * F / (4.0 * NdotV * ndl + 1e-4)) * ndl * SPEC_STRENGTH;
+        }
+    }
+    return RtLight(acc_d * 0.31830989, acc_s); // 1/π on the diffuse (matches the SH ÷π convention)
 }
 
 // --- Analytic sky environment for glossy reflections -------------------------
@@ -855,7 +933,8 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let diffuse_cap = select(sun.combine.x, 0.0, sun.combine.w > 0.5);
     let removable = max(gi - ambient_floor, vec3<f32>(0.0));
     let gi_shadowed = gi - removable * (diffuse_cap * shadow_event);
-    let lit = albedo.rgb * gi_shadowed * sh.vol_min.w; // vol_min.w = gi_intensity
+    // `lit` is computed BELOW, after `rough` + the realtime-light loop, so the realtime diffuse
+    // folds into the same albedo × irradiance term (see eval_realtime_lights).
 
     // --- Specular: dielectric GGX / Cook-Torrance ON TOP of the SH diffuse (Phase 1.6) -----
     // Unity-Standard-style spec lobe lit from the SH volume's own dominant light dir + color,
@@ -887,6 +966,17 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         rough = clamp(1.0 - 0.30 * vp_smooth, 0.72, 1.0);
     }
 
+    // --- REALTIME point/spot lights ----------------------------------------------
+    // Direct contribution from the pack's realtime lights (auto-gated vs the baked SH volume so they
+    // never double-count). Diffuse folds into the SH `gi` irradiance (÷π-consistent); spec adds to the
+    // GGX lobe. `ambient_scale` (params.y, default 1.0) trims the SH ambient — on the no-CUDA path the
+    // SH is a flat ~0.28 dummy, so this is the gentle base the realtime bubbles sit on. Both terms are
+    // zero when realtime is off (params.z==0), so the baked-SH path renders byte-identically.
+    let rt = eval_realtime_lights(o.world_pos, N, V, rough);
+    // SH ambient (× gi_intensity × ambient_scale) + the realtime diffuse (which carries its own
+    // light_scale, independent of gi_intensity), all modulated by albedo.
+    let lit = albedo.rgb * (gi_shadowed * sh.vol_min.w * lgrid.params.y + rt.diffuse);
+
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {
         let Ld = dom.dir;
@@ -910,7 +1000,9 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // #5: the GGX lobe is the ONLY real-time directional-looking term, and it is NOT baked into the
     // SH volume, so it takes the FULL shadow (unlike the capped diffuse). Safe from double-darkening
     // because sun_lit_gate already required SH directionality + sun alignment.
-    spec_rgb = spec_rgb * (1.0 - shadow_event);
+    // The realtime-light GGX (rt.spec) is added AFTER the sun-shadow attenuation — it's lit by the
+    // practicals, not the sun, so the sun-shadow term must not darken it.
+    spec_rgb = spec_rgb * (1.0 - shadow_event) + rt.spec;
 
     // --- Environment reflection (analytic sky + sun, anchored to the baked SH) --------------------
     // Two environments: the SH volume (scene-accurate color, but a dull ground-level probe) and an
