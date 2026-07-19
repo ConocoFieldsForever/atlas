@@ -100,6 +100,8 @@ pub enum K {
     FirstRunBanner,
     FirstBuildHint,
     LanguageTip,
+    ProcessInBackground,
+    ProcessInBackgroundTip,
     BuildDeps,
     DepsReady,
     DepsMissing,
@@ -238,6 +240,11 @@ fn pair(k: K) -> [&'static str; 2] {
             "Первая СБОРКА карты запускает однократную распаковку ~1-6 ГБ - сначала закройте игру.",
         ],
         LanguageTip => ["Language / Язык (override auto-detect)", "Язык / Language (переопределить)"],
+        ProcessInBackground => ["Process in background", "Обрабатывать в фоне"],
+        ProcessInBackgroundTip => [
+            "Builds keep running even if you close Atlas - reopen it later to see the progress or the finished map.",
+            "Сборка продолжается, даже если закрыть Atlas - откройте его позже, чтобы увидеть прогресс или готовую карту.",
+        ],
         BuildDeps => ["BUILD DEPS", "ЗАВИСИМОСТИ"],
         DepsReady => ["ready", "готово"],
         DepsMissing => [
