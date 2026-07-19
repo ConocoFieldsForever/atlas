@@ -241,14 +241,31 @@ fn map_loading_indicator(
     mut contexts: bevy_egui::EguiContexts,
     menu: Option<Res<crate::menu::MenuState>>,
     pending: Res<crate::PendingMapLoad>,
+    // The GPU build streams textures across many frames AFTER the .eftpack file finishes loading
+    // (which is all `PendingMapLoad` tracks). Honor the render world's build flag too, so the toast
+    // stays up for the WHOLE load — file load + GPU build — not just the file load.
+    gpu_load: Option<Res<crate::render::GpuLoadSignal>>,
+    pack: Option<Res<crate::render::LoadedPack>>,
 ) {
     use bevy_egui::egui::{self, RichText};
     use crate::ui_theme as theme;
     if menu.is_some() {
         return;
     }
-    let Some(name) = pending.loading() else {
-        return;
+    let building = gpu_load.as_ref().map(|s| s.in_progress()).unwrap_or(false);
+    // Name to show: the loading file's name while it loads; once loaded, the pack's dataset name
+    // (the GPU build phase); fall back to a generic label.
+    let owned_name;
+    let name = if let Some(n) = pending.loading() {
+        n
+    } else if building {
+        owned_name = pack
+            .as_ref()
+            .map(|p| p.0.manifest.dataset.clone())
+            .unwrap_or_else(|| "map".to_string());
+        owned_name.as_str()
+    } else {
+        return; // nothing loading and no GPU build in progress
     };
     let label = titlecase(name);
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -293,8 +310,10 @@ fn lang_toggle(
         ctx,
         *lang,
         "raid_lang_toggle",
-        egui::Align2::LEFT_BOTTOM,
-        egui::vec2(8.0, -8.0),
+        // TOP-LEFT (was LEFT_BOTTOM): clears the background-job "MAP PROCESSING" pill, which also
+        // anchors bottom-left (jobs.rs). Sits above the pos_hud coords readout (fixed_pos 8,36).
+        egui::Align2::LEFT_TOP,
+        egui::vec2(8.0, 8.0),
     ) {
         *lang = l;
         crate::menu::save_config_lang(l.tag());
