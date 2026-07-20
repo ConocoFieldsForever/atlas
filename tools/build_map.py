@@ -321,30 +321,60 @@ def main():
                  "--level", str(lv), "--name", dsname],
                 VIEWER, optional=True)
 
-    # 3: GPU SH bake (the long stage; skip if a fresh volume2 already exists)
-    v2 = os.path.join(out_dir, "volume2.bin")
-    if force or not os.path.isfile(v2):
-        # portable kit baker: takes the MAP ID positionally, reads EFT_TARKMAP_ROOT itself
-        # (run() passes it) and writes TK/out/<map id>/volume2.*; cwd-independent.
-        # OPTIONAL: the SH bake needs an NVIDIA CUDA GPU + warp-lang. Without them (or on any bake
-        # error) the build continues and the pack renders with flat ambient light (README: "No CUDA
-        # GPU? Skip this step - the viewer still runs"). A mandatory bake wrongly failed the whole
-        # build for anyone without the GPU bake deps.
-        run(3, total, "bake lighting (GPU)",
-            [PY_BAKE, os.path.join(VIEWER, "extraction", "bake", "bake_volume2.py"), m],
-            VIEWER, optional=True)
+    # 3: SH irradiance-volume bake. DEFAULT = the PORTABLE Rust baker (`atlas bake-sh`), which runs
+    #    POST-ASSEMBLE (it reads the assembled pack's world triangles + BVH, exactly like bake-nav) on
+    #    ANY machine -- AMD/Intel/no-GPU, no CUDA, no warp-lang -- so EVERY build ships baked lighting
+    #    instead of the flat realtime fallback. That step is below, right after assemble. Set
+    #    EFT_BAKE=warp to instead use the author-side CUDA baker (bake_volume2.py: NVIDIA + warp-lang,
+    #    adds the diffuse bounce), which runs HERE (pre-assemble, from the dataset) and whose volume is
+    #    promoted into the pack by assemble.
+    bake_mode = os.environ.get("EFT_BAKE", "").strip().lower()
+    if bake_mode == "warp":
+        v2 = os.path.join(out_dir, "volume2.bin")
+        if force or not os.path.isfile(v2):
+            # portable kit baker: takes the MAP ID positionally, reads EFT_TARKMAP_ROOT itself
+            # (run() passes it) and writes TK/out/<map id>/volume2.*; cwd-independent.
+            # OPTIONAL: needs an NVIDIA CUDA GPU + warp-lang. Without them (or on any bake error) the
+            # build continues and the post-assemble portable baker below fills in the volume instead.
+            run(3, total, "bake lighting (warp/CUDA)",
+                [PY_BAKE, os.path.join(VIEWER, "extraction", "bake", "bake_volume2.py"), m],
+                VIEWER, optional=True)
+        else:
+            print(f"[STAGE 3/{total}] bake lighting: skipped (volume2 exists)", flush=True)
+        # promote volume2.* -> volume.* (assemble reads volume.*). vis.bin is NOT promoted:
+        # nothing in the native viewer reads it (legacy web-viewer artifact; provenance audit).
+        for src, dst in [("volume2.bin", "volume.bin"), ("volume2.json", "volume.json")]:
+            s = os.path.join(out_dir, src)
+            if os.path.isfile(s):
+                shutil.copyfile(s, os.path.join(out_dir, dst))
     else:
-        print(f"[STAGE 3/{total}] bake lighting: skipped (volume2 exists)", flush=True)
-    # promote volume2.* -> volume.* (assemble reads volume.*). vis.bin is NOT promoted:
-    # nothing in the native viewer reads it (legacy web-viewer artifact; provenance audit).
-    for src, dst in [("volume2.bin", "volume.bin"), ("volume2.json", "volume.json")]:
-        s = os.path.join(out_dir, src)
-        if os.path.isfile(s):
-            shutil.copyfile(s, os.path.join(out_dir, dst))
+        print(f"[STAGE 3/{total}] bake lighting: portable CPU SH (runs post-assemble)", flush=True)
 
     # 4: assemble the pack (atomic; auto-ships loot/tasks/grade sidecars)
     run(4, total, "assemble pack",
         [PY, "-m", "eft_pipeline.assemble_bevy", m] + sc_flag + keeplods_flag, VIEWER)
+
+    # 3 (portable, post-assemble): bake the SH irradiance volume with the PORTABLE Rust baker. It runs
+    #    HERE, not up at stage 3, because it reads the ASSEMBLED pack's world triangles + BVH (shared
+    #    with bake-nav) -- no CUDA, no warp-lang, no dataset re-read -- so it runs on ANY machine and
+    #    every build ships baked lighting instead of the flat realtime fallback. Writes volume.json/
+    #    volume.bin straight into the pack (the exact format the viewer's load_sh_volume reads). Skipped
+    #    in warp mode (the CUDA volume is already in the pack) UNLESS that bake produced nothing, in
+    #    which case this is the fallback so the pack still ships lighting. Skipped only when no built
+    #    viewer exe can be found (a kit without a compiled binary).
+    if bake_mode != "warp" or not os.path.isfile(os.path.join(pack, "volume.bin")):
+        atlas_exe = find_atlas_exe()
+        if atlas_exe:
+            run(3, total, "bake lighting (portable CPU SH)",
+                [atlas_exe, "bake-sh", pack], VIEWER, optional=True)
+        else:
+            print(f"[STAGE 3/{total}] lighting: skipped - viewer exe not found. Build it "
+                  f"(`cargo build --release`) or set EFT_ATLAS_EXE, then rebuild to bake lighting.",
+                  flush=True)
+    if os.path.isfile(os.path.join(pack, "volume.bin")):
+        print("  lighting: SH irradiance volume baked into pack", flush=True)
+    else:
+        print("  lighting: none (flat realtime fallback until the baker runs)", flush=True)
 
     # 5: grass -- DATA-DRIVEN: a map has grass iff its dataset actually yields density grids. Indoor/
     #    no-terrain maps (Factory/Labs/Labyrinth) produce none and are skipped automatically -- no

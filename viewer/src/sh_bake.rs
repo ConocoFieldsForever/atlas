@@ -7,13 +7,18 @@
 //! reusing `nav_bake`'s world-triangle assembly + BVH (shared code, one geometry path). Invoked
 //! headless as `atlas bake-sh <pack_dir>`, exactly like `atlas bake-nav`.
 //!
-//! MILESTONE 1 (this file): SKY-VISIBILITY bake — per probe, cast a Fibonacci sphere of rays; a ray
-//! that escapes the geometry sees a neutral sky gradient, an occluded ray sees nothing. Project the
-//! visible sky radiance into L1 SH. That alone replaces the flat dummy SH with genuine, directional
-//! sky-occlusion lighting (open areas bright + directional, enclosed areas darker) on any GPU.
-//! M2 adds shadow-tested practical lights; M3 adds the diffuse bounce + emissive. The OUTPUT FORMAT
-//! is already final (volume.json + volume.bin, the exact layout `NavGrid`/the viewer's `load_sh_volume`
-//! reads) so each milestone just improves the numbers, never the plumbing.
+//! MILESTONES:
+//!   M1 SKY-VISIBILITY — per probe, cast a Fibonacci sphere of rays; a ray that escapes the geometry
+//!      sees a neutral sky gradient, an occluded ray sees nothing. Project the visible sky radiance
+//!      into L1 SH -> genuine directional sky-occlusion lighting (open areas bright + directional,
+//!      enclosed areas darker) on any GPU.
+//!   M2 PRACTICALS (this milestone) — add the pack's live point/spot lights: physical 1/d^2 falloff
+//!      with a smooth range window + spot cones, each SHADOW-TESTED against the same BVH, projected
+//!      as delta lights into the SH. Fills interiors that see no sky. Mirrors bake_volume2.py's direct
+//!      pass exactly (LIGHT_SCALE=6, MIN_D2=0.25), so a portable bake matches the author-side CUDA one.
+//!   M3 (next) — one diffuse bounce + emissive-surface gather.
+//! The OUTPUT FORMAT is already final (volume.json + volume.bin, the exact layout the viewer's
+//! `load_sh_volume` reads) so each milestone just improves the numbers, never the plumbing.
 //!
 //! OUTPUT (byte-compatible with bake_volume2.py — see packs/*/volume.json `layout`):
 //!   <pack>/volume.json  — { min, max, dims:[nx,ny,nz], spacing, coeffs:4, channels:3, layout, sun_dir, bounces }
@@ -32,6 +37,10 @@ use std::time::Instant;
 const XZ_TARGET: f32 = 3.0; // target XZ probe spacing floor (m)
 const Y_SPACING: f32 = 4.0; // Y probe spacing (m)
 const RAY_EPS: f32 = 0.02; // ray origin push-off so a probe on a surface doesn't self-hit
+const MIN_D2: f32 = 0.25; // 1/d^2 clamp within 0.5m of a bulb (probe-on-lamp); matches bake_volume2
+const LIGHT_RANGE_FLOOR: f32 = 4.0; // floor a light's BAKE range (bake_volume2 `max(r,4.0)`): the probe
+                                    // grid is coarse (~4-7m cells) so a sub-floor light would influence
+                                    // ~no probes and vanish. Bake-only; realtime keeps the authored range.
 const GRID_MAX_XY: u64 = 8192; // ny*nz cap (WebGL tex height, same as bake_volume2)
 const GRID_MAX_X: usize = 4096;
 const GRID_MAX_PROBES: u64 = 2_600_000;
@@ -86,11 +95,13 @@ fn sky(d: Vec3, scale: f32) -> Vec3 {
 
 // ---- 3D ray vs the (nav) BVH: any-hit occlusion test ------------------------------------------
 
-/// True if the ray `o + t*d` (t in (eps, inf)) hits ANY triangle in the BVH — i.e. the ray does NOT
-/// escape to the sky. Slab-prunes each node's AABB, Möller–Trumbore at leaves, early-out on first hit.
-/// Reuses the SAME `Bvh` (nodes + tris) `nav_bake` builds — the node AABBs are full 3-D, so the
-/// X/Z-split tree is a valid (if not Y-optimal) accelerator for arbitrary rays.
-fn ray_occluded(bvh: &Bvh, o: Vec3, d: Vec3, stack: &mut Vec<u32>) -> bool {
+/// True if the ray `o + t*d` (t in (eps, t_max)) hits ANY triangle in the BVH. For a SKY ray pass
+/// `t_max = f32::INFINITY` (does the ray escape to the sky?); for a SHADOW ray to a bulb at distance
+/// `dist` pass `t_max = dist - 0.1` (is there an occluder BETWEEN probe and bulb?). Slab-prunes each
+/// node's AABB, Möller–Trumbore at leaves, early-out on first hit. Reuses the SAME `Bvh` (nodes +
+/// tris) `nav_bake` builds — the node AABBs are full 3-D, so the X/Z-split tree is a valid (if not
+/// Y-optimal) accelerator for arbitrary rays.
+fn ray_occluded(bvh: &Bvh, o: Vec3, d: Vec3, t_max: f32, stack: &mut Vec<u32>) -> bool {
     if bvh.tris.is_empty() {
         return false;
     }
@@ -106,13 +117,13 @@ fn ray_occluded(bvh: &Bvh, o: Vec3, d: Vec3, stack: &mut Vec<u32>) -> bool {
         let tmax = t0.max(t1);
         let enter = tmin.x.max(tmin.y).max(tmin.z).max(RAY_EPS);
         let exit = tmax.x.min(tmax.y).min(tmax.z);
-        if enter > exit {
-            continue;
+        if enter > exit || enter > t_max {
+            continue; // ray misses the box, or the box starts beyond the segment end
         }
         if node.count > 0 {
             let s = node.start as usize;
             for t in &bvh.tris[s..s + node.count as usize] {
-                if ray_tri(o, d, t) {
+                if ray_tri(o, d, t, t_max) {
                     return true;
                 }
             }
@@ -124,9 +135,9 @@ fn ray_occluded(bvh: &Bvh, o: Vec3, d: Vec3, stack: &mut Vec<u32>) -> bool {
     false
 }
 
-/// Möller–Trumbore: does the ray `o + t*d` cross triangle `t` at some t > RAY_EPS?
+/// Möller–Trumbore: does the ray `o + t*d` cross triangle `t` at some t in (RAY_EPS, t_max)?
 #[inline]
-fn ray_tri(o: Vec3, d: Vec3, t: &Tri) -> bool {
+fn ray_tri(o: Vec3, d: Vec3, t: &Tri, t_max: f32) -> bool {
     let e1 = t.b - t.a;
     let e2 = t.c - t.a;
     let p = d.cross(e2);
@@ -146,7 +157,7 @@ fn ray_tri(o: Vec3, d: Vec3, t: &Tri) -> bool {
         return false;
     }
     let tt = e2.dot(q) * inv;
-    tt > RAY_EPS
+    tt > RAY_EPS && tt < t_max
 }
 
 // ---- grid + bake ------------------------------------------------------------------------------
@@ -164,6 +175,7 @@ fn percentile(v: &mut [f32], q: f32) -> f32 {
 fn bake(pack: &Pack) -> Result<Baked> {
     let n_dir = env_usize("EFT_SH_RAYS", 256).max(8);
     let sky_scale = env_f32("EFT_SKY", 2.0);
+    let light_scale = env_f32("EFT_LIGHT_SCALE", 6.0); // Unity color*intensity -> SH radiance (bake_volume2 default)
 
     // --- geometry: reuse nav_bake's world-triangle assembly (floors+ceilings+walls = the occluder) ---
     let t_geo = Instant::now();
@@ -233,6 +245,13 @@ fn bake(pack: &Pack) -> Result<Baked> {
     // --- sun_dir: reuse the pack's brightest directional-ish light if any, else a neutral default ---
     let sun_dir = pack_sun_dir(pack);
 
+    // --- M2: live practical lights (already viewer-world, color = linear*intensity, spot cones baked) ---
+    let lights = &pack.lights;
+    eprintln!(
+        "  sh-bake: {} live practical light(s), shadow-tested @ scale {light_scale}",
+        lights.len()
+    );
+
     // --- per-probe sky-visibility SH, parallel over Z-rows ---
     let t_bake = Instant::now();
     let inside = std::sync::atomic::AtomicUsize::new(0);
@@ -255,11 +274,12 @@ fn bake(pack: &Pack) -> Result<Baked> {
                     gmin.y + y as f32 * spacing[1],
                     gmin.z + z as f32 * spacing[2],
                 );
+                // --- M1: sky-visibility (each escaping Fibonacci ray sees a neutral sky gradient) ---
                 let mut sh = [Vec3::ZERO; 4];
                 let mut n_sky = 0u32;
                 for (d, basis) in &dirs {
-                    if ray_occluded(&bvh, o, *d, stack) {
-                        continue; // occluded -> sees no sky (M1: hits contribute nothing)
+                    if ray_occluded(&bvh, o, *d, f32::INFINITY, stack) {
+                        continue; // occluded -> sees no sky (hits contribute nothing at M1/M2)
                     }
                     n_sky += 1;
                     let l = sky(*d, sky_scale);
@@ -270,8 +290,44 @@ fn bake(pack: &Pack) -> Result<Baked> {
                 if n_sky == 0 {
                     inside.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // --- M2: live practicals. Physical 1/d^2 * smooth range window, spot cone, SHADOW-TESTED
+                //     against the same BVH. A delta light projects into the SH directly and is NOT
+                //     weighted by the ray solid angle `norm`, so it accumulates in a separate `sh_lit`
+                //     that is added AFTER the sky term is scaled (identical to bake_volume2's kernel). ---
+                let mut sh_lit = [Vec3::ZERO; 4];
+                for lgt in lights {
+                    let tol = lgt.pos - o;
+                    let dist = tol.length();
+                    let r = lgt.range.max(LIGHT_RANGE_FLOOR); // floor to match the CUDA reference
+                    if dist <= 0.05 || dist >= r {
+                        continue; // on the bulb, or out of range
+                    }
+                    let dl = tol / dist;
+                    let spot = if lgt.cos_outer > -1.5 {
+                        // spot cone smoothstep; point lights (sentinel cos_outer=-2.0) stay factor 1
+                        let cosang = -dl.dot(lgt.dir);
+                        ((cosang - lgt.cos_outer) / (lgt.cos_inner - lgt.cos_outer + 1.0e-4))
+                            .clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    if spot <= 0.0 {
+                        continue; // outside the cone
+                    }
+                    let x = dist / r;
+                    let win = (1.0 - x * x * x * x).clamp(0.0, 1.0);
+                    let at = win * win / (dist * dist).max(MIN_D2);
+                    if ray_occluded(&bvh, o, dl, dist - 0.1, stack) {
+                        continue; // occluder between probe and bulb -> shadowed
+                    }
+                    let rad = lgt.color * (at * spot * light_scale);
+                    let basis = sh_basis(dl);
+                    for c in 0..4 {
+                        sh_lit[c] += rad * basis[c];
+                    }
+                }
                 for c in 0..4 {
-                    let v = sh[c] * norm;
+                    let v = sh[c] * norm + sh_lit[c];
                     out[c * 3] = f16_bits(v.x);
                     out[c * 3 + 1] = f16_bits(v.y);
                     out[c * 3 + 2] = f16_bits(v.z);
@@ -342,7 +398,7 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
         "layout": "float16 LE, probe-major; probe index = ((z*ny)+y)*nx + x; within each probe 12 halfs ordered coeff0.r,coeff0.g,coeff0.b, coeff1.r,coeff1.g,coeff1.b, coeff2.r,coeff2.g,coeff2.b, coeff3.r,coeff3.g,coeff3.b. Coeffs are RADIANCE SH (L1 real basis): 0=Y00(0.282095), 1=Y1-1(0.488603*y), 2=Y10(0.488603*z), 3=Y11(0.488603*x). Viewer reconstructs IRRADIANCE via cosine convolution A0=pi, A1=2pi/3.",
         "sun_dir": b.sun_dir,
         "bounces": 0,
-        "baker": "atlas-cpu-sh (sh_bake.rs, M1 sky-visibility)",
+        "baker": "atlas-cpu-sh (sh_bake.rs, M2 sky-visibility + shadow-tested practicals)",
     });
     std::fs::write(dir.join("volume.json"), serde_json::to_string_pretty(&meta)?)
         .with_context(|| format!("writing {}", dir.join("volume.json").display()))?;
