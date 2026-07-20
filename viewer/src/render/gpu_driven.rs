@@ -276,6 +276,14 @@ pub const MAT_FLAG_PUDDLE_LUMA: u32 = 1 << 8;
 /// per repeat (vs a puddle's few). Those are matte, NOT reflective puddles, so the shader drops the
 /// mirror + sun glint for them. Set at load from the per-material world-meters-per-uv-repeat.
 pub const MAT_FLAG_WATER_MATTE: u32 = 1 << 9;
+/// `GpuMaterial::flags` bit: plain surface decal. Transparent texels mask every lighting term;
+/// glass intentionally keeps its reflection outside that coverage mask.
+pub const MAT_FLAG_DECAL: u32 = 1 << 10;
+/// Per-mesh transparent-pass membership. A mixed-material mesh may set more than one bit and is
+/// then submitted to each relevant specialization; the fragment material flag keeps only its class.
+const BLEND_MESH_SOFTCUTOUT: u32 = 1 << 0;
+const BLEND_MESH_OVERLAY: u32 = 1 << 1;
+const BLEND_MESH_TRANSPARENT: u32 = 1 << 2;
 /// `GpuMaterial::detail_flags` bit0: this material has a detail ALBEDO texture.
 pub const DETAIL_FLAG_ALBEDO: u32 = 1 << 0;
 /// `GpuMaterial::detail_flags` bit1: this material has a detail NORMAL texture.
@@ -601,15 +609,17 @@ struct SunShadowUniform {
 }
 
 /// Runtime shadow feature switch + the pack's sun direction (already X-flipped into pack space).
-/// `enabled=false` (missing sun_dir or `not EFT_SHADOWS=1`) makes the whole pass a no-op.
+/// Default ON; `enabled=false` (missing sun_dir, EFT_SHADOWS=0, or the UI toggle off) makes the
+/// whole pass a strict no-op.
 #[derive(Resource)]
 struct EftShadowConfig {
     /// Lsun: points TOWARD the sun (light travels along -Lsun). Unit. Y-up sentinel when disabled.
     lsun: Vec3,
     /// EFFECTIVE switch consulted by the extrusion / uniform / shadow node — refreshed every
-    /// frame by `sync_gfx_shadow_toggle` from env_enabled OR the UI toggle (gated on sun_ok).
+    /// frame by `sync_gfx_shadow_toggle` = env_enabled AND the UI toggle, gated on sun_ok.
     enabled: bool,
-    /// The EFT_SHADOWS=1 env opt-in captured at startup.
+    /// Env ALLOW flag captured at startup: true by default, false only if EFT_SHADOWS=0/false (a
+    /// hard dev/perf veto). ANDed with the UI toggle, so BOTH must permit shadows.
     env_enabled: bool,
     /// The pack HAS a valid sun_dir (lsun is real, not the sentinel) — the runtime UI toggle may
     /// enable shadows even when the EFT_SHADOWS env opt-in was off.
@@ -625,7 +635,9 @@ fn sync_gfx_shadow_toggle(
     settings: Option<Res<crate::render::GfxSettings>>,
 ) {
     if let (Some(mut c), Some(s)) = (config, settings) {
-        let eff = (c.env_enabled || s.shadows) && c.sun_ok;
+        // Default ON: shadows show whenever the env doesn't veto (env_enabled), the UI toggle is on,
+        // and the pack has a sun_dir. Either the env veto (EFT_SHADOWS=0) or the UI toggle disables.
+        let eff = c.env_enabled && s.shadows && c.sun_ok;
         if c.enabled != eff {
             c.enabled = eff;
         }
@@ -927,9 +939,10 @@ pub struct CpuData {
     /// Bindless albedo indices that are terrain CONTROL maps (blend weights = data, not color):
     /// uploaded LINEAR instead of sRGB so the weights aren't gamma-warped toward one layer.
     ctrl_tex_linear: std::collections::HashSet<u32>,
-    /// Meshes with >=1 BLEND submesh: (mesh index, first-instance world center). Drives the
-    /// per-mesh sorted blend items (back-to-front) instead of a whole-scene P2 re-raster.
-    blend_meshes: Vec<(u32, [f32; 3])>,
+    /// Meshes with >=1 BLEND submesh: (mesh index, first-instance world center, pass mask).
+    /// The mask separates depth-writing SoftCutout coverage, surface overlays, and true
+    /// transparency so coplanar roads never share glass's render state.
+    blend_meshes: Vec<(u32, [f32; 3], u32)>,
     /// #5 shadows: sun direction (points TOWARD the sun) X-flipped into pack space, or `None` when
     /// the volume sidecar has no valid `sun_dir` (the shadow feature then disables itself; no
     /// invented fallback direction). Mirrors standard.rs's exact access + flip.
@@ -1367,6 +1380,9 @@ fn build_cpu_data(
         {
             flags |= MAT_FLAG_BLEND;
         }
+        if mat.role == "decal" {
+            flags |= MAT_FLAG_DECAL;
+        }
         // Per-pixel roughness from the albedo alpha (Unity Standard smoothness-in-alpha).
         // Opaque-only: glass keeps its authored sharp 0.05, cutout alpha is coverage. 82% of
         // materials carry this — without it everything specular-shades at one constant roughness.
@@ -1487,7 +1503,11 @@ fn build_cpu_data(
             if albedo_index != NO_ALBEDO {
                 flags |= MAT_FLAG_BLEND;
                 // Route the puddle shape mask to luma when its alpha is constant (atlas puddles).
-                if mat.albedo.as_deref().is_some_and(puddle_alpha_is_constant) {
+                if mat
+                    .albedo
+                    .as_deref()
+                    .is_some_and(|p| puddle_alpha_is_constant(&pack.resolve_path(p)))
+                {
                     flags |= MAT_FLAG_PUDDLE_LUMA;
                 }
                 // Stretched floor decal (tire marks / wet-ground) -> matte, no mirror (pre-pass above).
@@ -1789,7 +1809,7 @@ fn build_cpu_data(
     // Blend-pass restructure (Codex review): per-mesh material class + a representative center
     // for back-to-front sorting of the per-mesh blend draws. class: 0=opaque-only, 1=blend-only,
     // 2=mixed (drawn in both passes; fragment class-discard splits it).
-    let mut blend_meshes: Vec<(u32, [f32; 3])> = Vec::new();
+    let mut blend_meshes: Vec<(u32, [f32; 3], u32)> = Vec::new();
 
     let mut vtx_cursor: u32 = 0;
     let mut idx_cursor: u32 = 0;
@@ -1834,10 +1854,92 @@ fn build_cpu_data(
             }
         }
 
+        // --- Puddle re-UV (load-time; fixes hard-edged water/puddle decals) ---------------------
+        // EFT's real puddles are small `decal_plane` quads (~5 m) whose [0,1] UVs map the WHOLE
+        // City_puddle_big soft-blob stamp -> soft feathered edges. But some puddle materials are baked
+        // onto huge ROAD-strip submeshes (e.g. 77x318 m) with the puddle texture mapped ~[0,1] across
+        // the ENTIRE strip. Every visible fragment then samples a <3% UV window deep in the blob's
+        // OPAQUE CORE (alpha ~1 there, at ANY mip), so the strip renders as a uniform HARD-edged slab.
+        // Fix: for such STRETCHED water strips, ignore the unreliable baked UVs and planar-project the
+        // LOCAL position onto the strip's plane at a fixed PUDDLE-sized metric scale, so the blob (soft
+        // rim included) repeats every few metres -> a field of soft-edged puddles like the decal_planes.
+        // Data-driven + map-agnostic (geometry only, no texture/mesh names):
+        //   * textured water only (untextured deep water is the opaque path);
+        //   * STRETCHED: local extent / baked-UV-span >> a puddle. The 5 m decal_planes are ~5 m/tile and
+        //     stay untouched; the 300 m road strips are ~200 m/tile -> re-projected.
+        //   * genuinely 2D: the strip's SECOND-widest axis must exceed a puddle, else it is a 1D
+        //     tire-mark / water-trail streak authored to tile along one axis -> leave it alone.
+        // (The matte flag is deliberately NOT a gate: the stretched-water heuristic mis-tags these big
+        // road puddles as matte; matte only kills reflection in the shader, not edge softness.)
+        const PUDDLE_TARGET_M: f32 = 6.0; // one soft blob per ~6 m (decal_plane puddles are ~5 m)
+        const PUDDLE_STRETCH_MIN: f32 = 15.0; // m-per-UV-tile above which a water decal is "stretched"
+        const PUDDLE_MIN_WIDTH_M: f32 = 3.0; // 2nd-widest local axis must exceed this (else a 1D streak)
+        let mut vert_uv: Vec<[f32; 2]> = geom.uvs.clone();
+        if vert_uv.len() < n {
+            vert_uv.resize(n, [0.0, 0.0]);
+        }
+        for sm in &m.submeshes {
+            let mid = sm.material_id as usize;
+            let Some(mt) = materials_gpu.get(mid) else { continue };
+            if mt.flags & MAT_FLAG_WATER == 0 || mt.albedo_index == NO_ALBEDO {
+                continue;
+            }
+            let s0 = sm.idx_start as usize;
+            let s1 = (s0 + sm.idx_count as usize).min(geom.indices.len());
+            if s1 <= s0 {
+                continue;
+            }
+            let idx = &geom.indices[s0..s1];
+            // Local position bounds + baked-UV span (span only used to detect the stretch ratio).
+            let (mut pmin, mut pmax) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+            let (mut umin, mut umax) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+            for &vi in idx {
+                if let Some(p) = geom.positions.get(vi as usize) {
+                    let v = Vec3::from(*p);
+                    pmin = pmin.min(v);
+                    pmax = pmax.max(v);
+                }
+                if let Some(uv) = geom.uvs.get(vi as usize) {
+                    umin[0] = umin[0].min(uv[0]);
+                    umax[0] = umax[0].max(uv[0]);
+                    umin[1] = umin[1].min(uv[1]);
+                    umax[1] = umax[1].max(uv[1]);
+                }
+            }
+            if !pmin.is_finite() {
+                continue;
+            }
+            let psz = pmax - pmin;
+            let uv_span = (umax[0] - umin[0]).max(umax[1] - umin[1]).max(1.0e-3);
+            let m_per_tile = psz.length() / uv_span;
+            // Sort local axes by extent: widest two are the plane, smallest is the surface normal.
+            let mut ax = [(psz.x, 0usize), (psz.y, 1usize), (psz.z, 2usize)];
+            ax.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let (a_u, a_v, second_width) = (ax[0].1, ax[1].1, ax[1].0);
+            if m_per_tile < PUDDLE_STRETCH_MIN || second_width < PUDDLE_MIN_WIDTH_M {
+                continue;
+            }
+            // Planar projection: LOCAL position -> UV at a fixed puddle scale, centred so the tiling
+            // straddles the strip symmetrically. Repeat addressing tiles the blob down the strip.
+            let cu = 0.5 * (pmin[a_u] + pmax[a_u]);
+            let cv = 0.5 * (pmin[a_v] + pmax[a_v]);
+            for &vi in idx {
+                let vi = vi as usize;
+                if vi < n && vert_mat[vi] == sm.material_id {
+                    if let Some(p) = geom.positions.get(vi) {
+                        vert_uv[vi] = [
+                            (p[a_u] - cu) / PUDDLE_TARGET_M,
+                            (p[a_v] - cv) / PUDDLE_TARGET_M,
+                        ];
+                    }
+                }
+            }
+        }
+
         for k in 0..n {
             let p = geom.positions[k];
             let nrm = *geom.normals.get(k).unwrap_or(&[0.0, 1.0, 0.0]);
-            let uv = *geom.uvs.get(k).unwrap_or(&[0.0, 0.0]);
+            let uv = *vert_uv.get(k).unwrap_or(&[0.0, 0.0]);
             // M3b2: per-vertex COLOR_0 vert-paint weight. Every mesh in this pack carries a
             // color attr (unorm8x4 @32) so geom.colors is populated; default opaque-white for
             // any mesh that lacks it (color.a=1 -> SoftCutout coverage stays fully covered).
@@ -1886,6 +1988,7 @@ fn build_cpu_data(
 
         // Blend class from the submeshes' FINAL material flags (terrain tagging ran earlier).
         let (mut has_blend, mut has_opaque) = (false, false);
+        let mut blend_passes = 0u32;
         for sm in &m.submeshes {
             let f = materials_gpu
                 .get(sm.material_id as usize)
@@ -1893,6 +1996,13 @@ fn build_cpu_data(
                 .unwrap_or(0);
             if f & MAT_FLAG_BLEND != 0 {
                 has_blend = true;
+                if f & MAT_FLAG_SOFTCUTOUT != 0 {
+                    blend_passes |= BLEND_MESH_SOFTCUTOUT;
+                } else if f & (MAT_FLAG_DECAL | MAT_FLAG_WATER) != 0 {
+                    blend_passes |= BLEND_MESH_OVERLAY;
+                } else {
+                    blend_passes |= BLEND_MESH_TRANSPARENT;
+                }
             } else {
                 has_opaque = true;
             }
@@ -1906,6 +2016,7 @@ fn build_cpu_data(
             blend_meshes.push((
                 mesh_meta.len() as u32,
                 first_center.unwrap_or(Vec3::ZERO).to_array(),
+                blend_passes,
             ));
         }
 
@@ -1934,15 +2045,39 @@ fn build_cpu_data(
         let side = std::fs::read_to_string(pack.root.join("grass_sidecar.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let grass_albedo = side
+        let grass_albedo_raw = side
             .as_ref()
             .and_then(|v| v.get("albedo").and_then(|a| a.as_str()))
             .unwrap_or("")
             .to_string();
-        if grass_albedo.is_empty() {
+        if grass_albedo_raw.is_empty() {
             warn!("gpu-driven grass: no grass albedo in sidecar — skipping");
             break 'grass;
         }
+        // Resolve the grass albedo PORTABLY. A correct sidecar carries a pack-relative name
+        // ("grass_albedo.png"). A broken build can bake an ABSOLUTE build-time path (a personal-path
+        // leak) that may even point at ANOTHER map's texture — observed on customs, whose sidecar
+        // referenced `.../eft_assets/interchange_v2/terrain_layers/grass_Grass3_D.png`. Trust an
+        // absolute path only if that exact file exists on THIS machine; otherwise look for a pack-local
+        // file of the same basename. If nothing resolves, SKIP grass instead of loading the magenta
+        // placeholder — that placeholder is the "pink grass all over customs" bug.
+        let grass_albedo = {
+            let raw = std::path::Path::new(&grass_albedo_raw);
+            let cand = if raw.is_absolute() && raw.is_file() {
+                raw.to_path_buf()
+            } else {
+                pack.root.join(raw.file_name().unwrap_or(raw.as_os_str()))
+            };
+            if cand.is_file() {
+                cand.to_string_lossy().into_owned()
+            } else {
+                warn!(
+                    "gpu-driven grass: albedo '{grass_albedo_raw}' not found in pack \
+                     (non-portable / wrong-map build) — skipping grass to avoid the magenta placeholder"
+                );
+                break 'grass;
+            }
+        };
         let grass_tint = side
             .as_ref()
             .and_then(|v| v.get("tint").and_then(|a| a.as_array()))
@@ -2191,9 +2326,9 @@ struct EftGpuBuffers {
     /// from depth-sorted Transparent3d items — no whole-scene re-raster, stable back-to-front.
     indirect_blend: Buffer,
     cull_uniform: Buffer,
-    /// (mesh index, first-instance world center) for every mesh with a BLEND submesh — the
-    /// per-frame sort key source for the per-mesh blend items.
-    blend_meshes: Vec<(u32, [f32; 3])>,
+    /// (mesh index, first-instance world center, transparent-pass mask) for every mesh with a
+    /// BLEND submesh — the per-frame sort key and render-state classification source.
+    blend_meshes: Vec<(u32, [f32; 3], u32)>,
     mesh_count: u32,
     instance_total: u32,
 }
@@ -2960,23 +3095,26 @@ fn prepare_gpu_buffers(
     // (binding 5). Everything here is allocated unconditionally so the group(3) LAYOUT is stable
     // whether or not shadows are enabled; the runtime switch lives in the SunShadowUniform (enabled)
     // and `EftShadowConfig`.
-    // #5 sun shadows are OPT-IN, default OFF: the baked SH volume already contains the sun's
-    // static shadows, so the real-time contact term is a marginal add that still needs bias/gate
-    // tuning. Enable explicitly with EFT_SHADOWS=1; otherwise the pass is a strict no-op.
-    let shadows_env_on = std::env::var("EFT_SHADOWS")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
+    // #5 sun shadows now default ON for every map that has a sun_dir (the baked SH volume carries
+    // soft static GI; the real-time cascade adds the crisp directional contact term daytime maps
+    // need). EFT_SHADOWS=0 (or =false) is a HARD VETO (dev/perf); the in-app graphics toggle
+    // (GfxSettings.shadows, default on) is the user control — sync_gfx_shadow_toggle ANDs the two.
+    let shadows_env_allow = std::env::var("EFT_SHADOWS")
+        .map(|v| {
+            let t = v.trim();
+            t != "0" && !t.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(true);
     let shadow_debug = std::env::var("EFT_SHADOW_DEBUG")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
     let (lsun, shadows_enabled) = match cpu.sun_dir {
-        Some(d) if shadows_env_on => (d, true), // opt-in via EFT_SHADOWS=1
-        Some(d) => (d, false),                  // sun present but not requested -> default OFF
-        None => (Vec3::Y, false),               // no sun_dir -> disabled (Y-up sentinel; never sampled)
+        Some(d) => (d, shadows_env_allow), // sun present -> on unless EFT_SHADOWS vetoes (UI refines/frame)
+        None => (Vec3::Y, false),          // no sun_dir -> disabled (Y-up sentinel; never sampled)
     };
     info!(
         "gpu-driven #5 shadows: enabled={shadows_enabled} debug={shadow_debug} Lsun={lsun:?} \
-         (2 cascades, {sz}²×{n} Depth32Float; opt-in EFT_SHADOWS=1, diag EFT_SHADOW_DEBUG=1)",
+         (2 cascades, {sz}²×{n} Depth32Float; default ON, EFT_SHADOWS=0 to disable, diag EFT_SHADOW_DEBUG=1)",
         sz = SHADOW_MAP_SIZE,
         n = SHADOW_CASCADES,
     );
@@ -3241,7 +3379,7 @@ fn prepare_gpu_buffers(
     commands.insert_resource(EftShadowConfig {
         lsun,
         enabled: shadows_enabled,
-        env_enabled: shadows_enabled,
+        env_enabled: shadows_env_allow,
         sun_ok: cpu.sun_dir.is_some(),
         debug: shadow_debug,
     });
@@ -4070,8 +4208,9 @@ fn queue_gpu_driven(
         let Some(phase) = transparent_phases.get_mut(&view.retained_view_entity) else {
             continue;
         };
-        // THREE specializations of the same shader/mesh, selected by `DrawPass` (Opaque / Blend /
-        // Decal). Distinct keys so the cache yields three distinct pipeline ids.
+        // Five specializations of the same shader/mesh. Surface overlays and SoftCutout roads need
+        // stronger coplanar handling than glass, while SoftCutout uses a depth-only coverage pass
+        // followed by a non-depth-writing color pass to avoid road-on-road z-fighting.
         let opaque_pipeline = pipelines.specialize(
             &pipeline_cache,
             &draw_pipeline,
@@ -4090,15 +4229,31 @@ fn queue_gpu_driven(
                 pass: DrawPass::Blend,
             },
         );
-        // Decal (softcutout road) pipeline: depth-writing so roads occlude the underground
-        // geometry + the Bevy POIs/gizmos below them (DEFECT 1 fix).
-        let decal_pipeline = pipelines.specialize(
+        let overlay_pipeline = pipelines.specialize(
             &pipeline_cache,
             &draw_pipeline,
             EftDrawKey {
                 samples: msaa.samples(),
                 hdr: view.hdr,
-                pass: DrawPass::Decal,
+                pass: DrawPass::Overlay,
+            },
+        );
+        let decal_depth_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey {
+                samples: msaa.samples(),
+                hdr: view.hdr,
+                pass: DrawPass::DecalDepth,
+            },
+        );
+        let decal_color_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey {
+                samples: msaa.samples(),
+                hdr: view.hdr,
+                pass: DrawPass::DecalColor,
             },
         );
 
@@ -4120,58 +4275,71 @@ fn queue_gpu_driven(
                 extra_index: PhaseItemExtraIndex::None,
                 indexed: true,
             });
-            for (mesh_idx, center) in &_buffers.blend_meshes {
+            for (mesh_idx, center, pass_mask) in &_buffers.blend_meshes {
                 let d = (cam_pos - Vec3::from_array(*center)).length();
-                // DECAL pass FIRST (right after the opaque multidraw, BEFORE the alpha blends):
-                // the softcutout road frags in this mesh draw depth-writing so they occlude the
-                // opaque geometry below (underground ceilings) and the Bevy POIs/gizmos. Meshes
-                // with no softcutout frag draw nothing here (all discarded) — cheap. Fixed sort
-                // key just above the opaque item so every decal writes depth before ANY alpha blend.
-                phase.add(Transparent3d {
+                let item = |pipeline, distance| Transparent3d {
                     entity: (entity, *main_entity),
-                    pipeline: decal_pipeline,
+                    pipeline,
                     draw_function: draw_fn,
-                    distance: -1.0e29, // after opaque (-1e30), before all alpha blends (-d, d finite)
+                    distance,
                     batch_range: 0..1,
                     extra_index: PhaseItemExtraIndex::IndirectParametersIndex {
                         range: *mesh_idx..(*mesh_idx + 1),
                         batch_set_index: None,
                     },
                     indexed: true,
-                });
-                phase.add(Transparent3d {
-                    entity: (entity, *main_entity),
-                    pipeline: blend_pipeline,
-                    draw_function: draw_fn,
-                    // increases toward the camera; all values > -1e30 so opaque still sorts first
-                    distance: -d,
-                    batch_range: 0..1,
-                    extra_index: PhaseItemExtraIndex::IndirectParametersIndex {
-                        range: *mesh_idx..(*mesh_idx + 1),
-                        batch_set_index: None,
-                    },
-                    indexed: true,
-                });
+                };
+                if pass_mask & BLEND_MESH_SOFTCUTOUT != 0 {
+                    // THE road-decal flicker fix. Two coplanar SoftCutout roads at the bus stop
+                    // (Bus_stop_road_01 mat 776 + _02 mat 724) flickered on ANY camera rotate/zoom.
+                    // Root cause was a two-part depth+order interaction, not a simple z-fight:
+                    // the coverage-only depth PREPASS used to draw FIRST and wrote BOTH decals' depth,
+                    // so each decal's COLOR was then GreaterEqual-tested against the OTHER decal's
+                    // prepass depth. Rotating (even in place — view-space z changes) flipped that test
+                    // per-pixel so a decal dropped in/out, and their `-d` distance sort also swapped
+                    // which composited on top. No depth bias / NDC-push could fix it: the interaction
+                    // was decal-vs-decal in the depth buffer.
+                    //
+                    // Fix mirrors Unity's fixed decal render-queue: composite the COLORS FIRST, tested
+                    // ONLY against real opaque scene depth (the prepass has not run yet), in a stable
+                    // camera-INDEPENDENT order — so decals never cull or reorder against each other,
+                    // only against solid geometry. `mesh_idx` is the unique, deterministic, view-
+                    // invariant build index -> a strict total order (base 2e6 keeps idx increments
+                    // f32-distinct; a 1e28 base collapses all to one tie). The +1e-3*w clip push
+                    // (gpu_draw.wgsl) still lifts the color over the coplanar OPAQUE ground.
+                    phase.add(item(decal_color_pipeline, -2.0e6 - (*mesh_idx as f32)));
+                    // Coverage-only depth prepass drawn AFTER the colors: re-asserts the road's raw
+                    // depth so it still occludes the underground ceiling + POIs drawn later (0d95be1),
+                    // but can no longer gate the decal colors above. No NDC push (a depth writer would
+                    // peter-pan). Fixed key, less-negative than the colors (draws after them) and far
+                    // more negative than the -d Overlay/Blend bands (draws before them).
+                    phase.add(item(decal_depth_pipeline, -1.5e6));
+                }
+                if pass_mask & BLEND_MESH_OVERLAY != 0 {
+                    phase.add(item(overlay_pipeline, -d - 0.001));
+                }
+                if pass_mask & BLEND_MESH_TRANSPARENT != 0 {
+                    phase.add(item(blend_pipeline, -d));
+                }
             }
         }
     }
 }
 
-/// Which of the THREE GPU-driven draw specializations a pipeline is. Part of `EftDrawKey`'s
+/// Which GPU-driven draw specialization a pipeline is. Part of `EftDrawKey`'s
 /// Hash/Eq so each caches as a SEPARATE pipeline.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum DrawPass {
     /// P1 OPAQUE: blend None, depth-write ON, no bias, A2C for cutout edges. Discards BLEND frags.
     Opaque,
-    /// P2 BLEND: alpha blending, depth-write OFF, toward-camera bias, `BLEND_PASS` def. Draws the
-    /// genuinely-translucent materials (glass / water film / plain decals); discards non-BLEND AND
-    /// softcutout frags (softcutout now draws depth-writing in the Decal pass).
+    /// True transparency (currently glass): alpha blend, depth-write off, no coplanar bias.
     Blend,
-    /// P1.5 DECAL (POI-occlusion fix): softcutout road/track surfaces. depth-write ON + toward-
-    /// camera bias + alpha-to-coverage, `DECAL_PASS` def. Writes depth so the road OCCLUDES the
-    /// underground geometry (ceilings) AND the Bevy POIs/gizmos below it, while the edge still
-    /// feathers into the terrain via A2C. Discards non-softcutout frags.
-    Decal,
+    /// Plain decal and textured-water surface overlays: alpha blend, depth-write off, strong bias.
+    Overlay,
+    /// SoftCutout coverage-only depth prepass (A2C); keeps road occlusion without color fighting.
+    DecalDepth,
+    /// SoftCutout premultiplied color, blended after its depth prepass with a slightly larger bias.
+    DecalColor,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -4212,33 +4380,30 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             .clone()
             .expect("EftDrawPipeline.sh_layout must be set before specialize (SH-GI)");
 
-        // --- M3b1 pass-dependent state -----------------------------------------------
-        // P2 (blend_pass) uses non-premultiplied alpha blending (matches Unity _Color*_MainTex),
-        // turns OFF depth-write (transparents must not occlude each other or later opaques), and
-        // nudges decals TOWARD the camera under reverse-z so they win the coplanar z-test against
-        // the ground they lie on. P1 (opaque) keeps the original opaque state exactly.
-        // Toward-camera depth bias for coplanar decals/roads under Bevy REVERSE-Z (near=1.0,
-        // far=0.0, depth_compare GreaterEqual). The rasterizer bias is ADDED to window-space depth
-        // [0,1]; a POSITIVE bias INCREASES depth = pulls the fragment TOWARD the camera (larger
-        // reverse-z value), so the decal beats the coplanar ground P1 wrote and passes GreaterEqual.
-        // (Matches Bevy StandardMaterial: positive depth bias renders "closer to the camera".) A
-        // negative bias would push decals BEHIND the ground and drop them. Shared by Blend AND Decal.
-        // TODO(depth-bias magnitude): CORE_3D_DEPTH_FORMAT is Depth32Float, so the `constant` unit
-        // scales with the polygon's depth exponent and huge Tarkov map distances can make constant:2
-        // too weak. If road markings still z-fight after the first visual test, RAISE magnitude
-        // (constant: 4..16 and/or slope_scale: 2.0..4.0), keeping BOTH positive. Never flip negative.
-        let toward_cam_bias = DepthBiasState {
-            constant: 2,
-            slope_scale: 1.0,
-            clamp: 0.0,
-        };
-        let (blend, depth_write_enabled, bias, frag_defs): (
+        // --- pass-dependent state ----------------------------------------------------
+        // Coplanar road/water decals are separated from the ground in CLIP space (the DECAL_NDC_PUSH
+        // vertex offset in gpu_draw.wgsl), NOT with a rasterizer DepthBiasState. Under Bevy REVERSE-Z
+        // (near=1.0, far=0.0, GreaterEqual) on a Depth32Float target, the rasterizer bias `constant`
+        // is `constant * 2^(exponent(z) - 23)` (D3D spec) — it rides the fragment's depth EXPONENT,
+        // which drifts as the camera zooms/rotates, so NO constant value is stable (8 -> 256 -> 512
+        // all still flickered). A `clip.z += eps*clip.w` push is exactly +eps on z_ndc after the
+        // perspective divide, exponent-INDEPENDENT, so the decal wins GreaterEqual at every
+        // distance/angle. So these passes run with ZERO rasterizer bias; DecalDepth still writes
+        // depth, so an open road over a void still occludes the underground (keeps 0d95be1).
+        let (blend, depth_write_enabled, bias, frag_defs, write_mask): (
             Option<BlendState>,
             bool,
             DepthBiasState,
             Vec<bevy::shader::ShaderDefVal>,
+            ColorWrites,
         ) = match key.pass {
-            DrawPass::Opaque => (None, true, DepthBiasState::default(), vec![]),
+            DrawPass::Opaque => (
+                None,
+                true,
+                DepthBiasState::default(),
+                vec![],
+                ColorWrites::ALL,
+            ),
             DrawPass::Blend => (
                 // PREMULTIPLIED (src=One, dst=OneMinusSrcAlpha): the fragment premultiplies its
                 // DIFFUSE by the transmission alpha but ADDS specular/reflection/emissive at full
@@ -4247,20 +4412,43 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                 // of its sky reflection and read as a dark tinted slab (render-audit finding #18).
                 Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 false,
-                toward_cam_bias,
+                DepthBiasState::default(),
                 vec!["BLEND_PASS".into()],
+                ColorWrites::ALL,
             ),
-            // DECAL: like Blend for coplanarity (toward-camera bias) but depth-write ON + opaque
-            // color target (A2C feathers the edge from the fragment's coverage-as-alpha). Writing
-            // depth is the whole point — the road then occludes the underground ceiling + POIs.
-            DrawPass::Decal => (None, true, toward_cam_bias, vec!["DECAL_PASS".into()]),
+            DrawPass::Overlay => (
+                Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                false,
+                DepthBiasState::default(),
+                vec!["BLEND_PASS".into(), "OVERLAY_PASS".into(), "DECAL_NDC_PUSH".into()],
+                ColorWrites::ALL,
+            ),
+            DrawPass::DecalDepth => (
+                None,
+                true,
+                DepthBiasState::default(),
+                // NO DECAL_NDC_PUSH: this prepass writes the road's RAW depth purely to occlude the
+                // underground over voids; pushing a depth-WRITER would peter-pan. The COLOR passes
+                // (DecalColor/Overlay) carry the push and clear this prepass + coplanar road decals.
+                vec!["DECAL_DEPTH_PASS".into()],
+                ColorWrites::empty(),
+            ),
+            DrawPass::DecalColor => (
+                Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                false,
+                DepthBiasState::default(),
+                vec!["BLEND_PASS".into(), "DECAL_COLOR_PASS".into(), "DECAL_NDC_PUSH".into()],
+                ColorWrites::ALL,
+            ),
         };
 
         RenderPipelineDescriptor {
             label: Some(match key.pass {
                 DrawPass::Opaque => "eft_gpu_draw_opaque".into(),
                 DrawPass::Blend => "eft_gpu_draw_blend".into(),
-                DrawPass::Decal => "eft_gpu_draw_decal".into(),
+                DrawPass::Overlay => "eft_gpu_draw_overlay".into(),
+                DrawPass::DecalDepth => "eft_gpu_draw_decal_depth".into(),
+                DrawPass::DecalColor => "eft_gpu_draw_decal_color".into(),
             }),
             layout: vec![
                 view_layout,
@@ -4327,11 +4515,10 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             multisample: MultisampleState {
                 count: key.samples,
                 mask: !0,
-                // Opaque + Decal passes + MSAA: alpha-to-coverage dithers the coverage ramp the
-                // fragment outputs (grass/foliage cutout edges + softcutout road edges anti-alias
-                // instead of hard 1-bit alias). Non-cutout opaque materials output alpha 1.0 = full
-                // coverage (bit-identical). The Blend pass uses real alpha blending, not A2C.
-                alpha_to_coverage_enabled: key.pass != DrawPass::Blend && key.samples > 1,
+                // Only opaque cutouts and the coverage-only road depth pass use A2C. Every color
+                // overlay uses real alpha blending for a continuous, non-quantized edge.
+                alpha_to_coverage_enabled: matches!(key.pass, DrawPass::Opaque | DrawPass::DecalDepth)
+                    && key.samples > 1,
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
@@ -4342,7 +4529,7 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                 targets: vec![Some(ColorTargetState {
                     format,
                     blend,
-                    write_mask: ColorWrites::ALL,
+                    write_mask,
                 })],
             }),
             zero_initialize_workgroup_memory: false,

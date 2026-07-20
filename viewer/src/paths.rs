@@ -31,11 +31,36 @@ pub fn exe_dir() -> &'static Path {
 pub fn packs_root() -> &'static Path {
     static D: OnceLock<PathBuf> = OnceLock::new();
     D.get_or_init(|| {
+        // A `packs` dir only counts as the root if it holds REAL content — a `.eftpack` or the shared
+        // intel — NOT merely a `shared/texcache` the BC cache may have created beside the exe. Without
+        // this, a texcache-only <exe>/packs HIJACKS the root away from the actual packs dir: the menu's
+        // INTEL strip then reads <exe>/packs/shared (empty) and shows "synced never / 0 icons" even
+        // though loot.json is present and syncs write it to <cwd>/packs/shared (where the pack loader,
+        // which resolves relative to the LOADED pack, correctly finds it). So the two disagreed.
+        let has_content = |p: &Path| -> bool {
+            p.join("shared").join("loot.json").is_file()
+                || p.join("shared").join("tasks.json").is_file()
+                || std::fs::read_dir(p)
+                    .map(|rd| {
+                        rd.flatten()
+                            .any(|e| e.path().extension().map_or(false, |x| x == "eftpack"))
+                    })
+                    .unwrap_or(false)
+        };
         let exe = exe_dir().join("packs");
+        let cwd = PathBuf::from("packs");
+        // Prefer whichever real packs dir has content; exe-beside wins ties (the release layout).
+        if has_content(&exe) {
+            return exe;
+        }
+        if has_content(&cwd) {
+            return std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        }
+        // Neither has content yet (fresh install, pre-sync): keep the old preference so first-run
+        // writes land somewhere sane — exe-beside if present, else cwd/packs.
         if exe.is_dir() {
             return exe;
         }
-        let cwd = PathBuf::from("packs");
         if cwd.is_dir() {
             return std::fs::canonicalize(&cwd).unwrap_or(cwd);
         }
@@ -52,6 +77,16 @@ pub fn shared_dir() -> PathBuf {
 /// save; finding 12). None when APPDATA is unset (non-Windows dev / stripped env).
 pub fn appdata_config() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("atlas").join("atlas.config.json"))
+}
+
+/// Writable, per-user task/key progress. Kept outside packs so changing maps or replacing a pack
+/// never loses the user's checklist.
+pub fn progress_path() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| exe_dir().to_path_buf())
+        .join("atlas")
+        .join("progress.json")
 }
 
 /// Resolved config path. READ order prefers an EXISTING file so pre-portability installs (config

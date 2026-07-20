@@ -19,12 +19,12 @@ Re-run per wipe (prices/containers shift). No game files needed (tarkov.dev only
 import os, json, urllib.request, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# portable kit: output goes to the workspace tarkmap/out so assemble_bevy.py auto-ships it into packs.
+REPO = os.path.dirname(os.path.dirname(HERE))
 _TK = os.environ.get("EFT_TARKMAP_ROOT")
-if not _TK:
-    raise SystemExit("build_loot: EFT_TARKMAP_ROOT is not set. Point it at your workspace tarkmap dir "
-                     "(the one holding maps/ and out/), e.g.  setx EFT_TARKMAP_ROOT D:\\eft_work\\tarkmap")
-OUT = os.path.join(_TK, 'out', 'loot.json')
+_OUT_DIR = os.environ.get("EFT_INTEL_OUT_DIR") or (
+    os.path.join(_TK, "out") if _TK else os.path.join(REPO, "packs", "shared")
+)
+OUT = os.path.join(_OUT_DIR, 'loot.json')
 API = "https://api.tarkov.dev/graphql"
 DEV_TO_ID = {
     'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
@@ -107,25 +107,31 @@ def bridge(p):
 LOOSE_MIN_EV = 120000
 
 QUERY = """{ maps {
-  normalizedName
-  name
+  normalizedName name wiki description enemies raidDuration players minPlayerLevel maxPlayerLevel
   spawns { zoneName sides categories position { x y z } }
   bosses { boss { name normalizedName } spawnChance spawnTime spawnTrigger
            escorts { boss { normalizedName } amount { count chance } }
            spawnLocations { name chance } }
   lootContainers { lootContainer { name normalizedName } position { x y z } }
-  locks { lockType needsPower key { name shortName avg24hPrice category { name } } position { x y z } }
-  switches { name switchType position { x y z } }
+  locks { lockType needsPower key { name shortName avg24hPrice low24hPrice high24hPrice changeLast48hPercent category { name } } position { x y z } }
+  switches { id name switchType position { x y z } activatedBy { id name }
+             activates { operation target { ... on MapSwitch { id name } ... on MapExtract { id name } } } }
   transits { description conditions map { normalizedName } position { x y z } }
   hazards { hazardType name position { x y z } }
   stationaryWeapons { stationaryWeapon { name } position { x y z } }
-  extracts { name faction position { x y z } }
-  accessKeys { name shortName }
+  extracts { id name faction position { x y z } outline { x y z } top bottom switches { id name }
+             transferItem { item { name shortName avg24hPrice } count quantity } }
+  accessKeys { name shortName avg24hPrice }
+  btrStops { name x y z }
+  artillery { zones { position { x y z } outline { x y z } top bottom } }
 } }"""
 
 # lootLoose is ~6.4k points across all maps — folding it into the big query (or even one all-maps
 # loose query) 503s / drops the 4 MB reply, so it's fetched PER MAP (small, robust) by display name.
-LOOSE_QUERY = '{ maps(name:"%s"){ lootLoose { position { x y z } items { shortName name avg24hPrice } } } }'
+LOOSE_QUERY = '''{ maps(name:"%s"){ lootLoose { position { x y z } items {
+  shortName name avg24hPrice low24hPrice high24hPrice changeLast48hPercent
+  sellFor { priceRUB vendor { name } }
+} } } }'''
 
 
 def fetch_loose(display_name):
@@ -278,13 +284,27 @@ def main():
             if k:
                 cat = ((k.get('category') or {}).get('name') or '').lower()
                 keys.append({'n': k.get('name'), 's': k.get('shortName'),
-                             'card': 1 if cat == 'keycard' else 0, 'pr': k.get('avg24hPrice')})
+                             'card': 1 if cat == 'keycard' else 0, 'pr': k.get('avg24hPrice'),
+                             'low': k.get('low24hPrice'), 'high': k.get('high24hPrice'),
+                             'trend': k.get('changeLast48hPercent')})
             locks.append({'pos': p, 'lt': lk.get('lockType') or 'lock',
                           'pw': 1 if lk.get('needsPower') else 0, 'keys': keys})
 
         # ---- switches / transits / hazards / stationary weapons / faction-tagged extracts ----
-        switches = [x for x in ({'pos': bridge(s.get('position')), 'name': s.get('name') or 'Switch',
-                                 'st': s.get('switchType') or ''} for s in (m['switches'] or [])) if x['pos']]
+        switches = []
+        for s in (m['switches'] or []):
+            p = bridge(s.get('position'))
+            if not p:
+                continue
+            activates = []
+            for op in (s.get('activates') or []):
+                target = op.get('target') or {}
+                activates.append({'op': op.get('operation') or 'activates',
+                                  'id': target.get('id'), 'name': target.get('name')})
+            switches.append({'id': s.get('id'), 'pos': p, 'name': s.get('name') or 'Switch',
+                             'st': s.get('switchType') or '',
+                             'activated_by': (s.get('activatedBy') or {}).get('name'),
+                             'activates': activates})
         transits = [x for x in ({'pos': bridge(t.get('position')), 'to': (t.get('map') or {}).get('normalizedName') or '?',
                                  'desc': t.get('description') or '', 'cond': t.get('conditions') or ''}
                                 for t in (m['transits'] or [])) if x['pos']]
@@ -293,8 +313,32 @@ def main():
         stationary = [x for x in ({'pos': bridge(w.get('position')),
                                    'name': (w.get('stationaryWeapon') or {}).get('name') or 'Stationary weapon'}
                                   for w in (m['stationaryWeapons'] or [])) if x['pos']]
-        extracts_dev = [x for x in ({'pos': bridge(e.get('position')), 'name': e.get('name') or 'Extract',
-                                     'fac': e.get('faction') or 'shared'} for e in (m['extracts'] or [])) if x['pos']]
+        extracts_dev = []
+        for e in (m['extracts'] or []):
+            p = bridge(e.get('position'))
+            if not p:
+                continue
+            transfer = e.get('transferItem') or {}
+            ti = transfer.get('item') or {}
+            extracts_dev.append({
+                'id': e.get('id'), 'pos': p, 'name': e.get('name') or 'Extract',
+                'fac': e.get('faction') or 'shared',
+                'outline': [bridge(x) for x in (e.get('outline') or [])],
+                'top': e.get('top'), 'bottom': e.get('bottom'),
+                'switches': [x.get('name') for x in (e.get('switches') or []) if x.get('name')],
+                'transfer': ({'n': ti.get('name'), 's': ti.get('shortName'),
+                              'count': transfer.get('count') if transfer.get('count') is not None else transfer.get('quantity'),
+                              'pr': ti.get('avg24hPrice')} if ti else None),
+            })
+
+        btr = [{'name': x.get('name') or 'BTR stop', 'pos': bridge(x)} for x in (m.get('btrStops') or [])]
+        btr = [x for x in btr if x['pos']]
+        artillery = []
+        for z in ((m.get('artillery') or {}).get('zones') or []):
+            p = bridge(z.get('position'))
+            if p:
+                artillery.append({'pos': p, 'outline': [bridge(x) for x in (z.get('outline') or [])],
+                                  'top': z.get('top'), 'bottom': z.get('bottom')})
 
         # ---- valuable LOOSE loot points (filtered to GPU/LEDX/keycard-tier so the layer isn't clutter) ----
         loose = []
@@ -306,12 +350,24 @@ def main():
             if best and (best.get('avg24hPrice') or 0) >= LOOSE_MIN_EV:
                 p = bridge(ll.get('position'))
                 if p:
-                    loose.append({'pos': p, 's': best.get('shortName'), 'n': best.get('name'), 'pr': best.get('avg24hPrice')})
+                    vendors = sorted((best.get('sellFor') or []), key=lambda x: x.get('priceRUB') or 0, reverse=True)
+                    sell = vendors[0] if vendors else {}
+                    loose.append({'pos': p, 's': best.get('shortName'), 'n': best.get('name'),
+                                  'pr': best.get('avg24hPrice'), 'low': best.get('low24hPrice'),
+                                  'high': best.get('high24hPrice'), 'trend': best.get('changeLast48hPercent'),
+                                  'vendor': (sell.get('vendor') or {}).get('name'), 'sell': sell.get('priceRUB'),
+                                  't': 2, 'jackpot': 1})
 
         out[mid] = {'containers': containers, 'pmc_nodes': pmc_nodes, 'scav_nodes': scav_nodes, 'boss_nodes': boss_nodes,
                     'locks': locks, 'switches': switches, 'transits': transits, 'hazards': hazards,
                     'stationary': stationary, 'extracts_dev': extracts_dev, 'loose': loose,
-                    'access_keys': [{'n': k.get('name'), 's': k.get('shortName')} for k in (m.get('accessKeys') or [])]}
+                    'btr': btr, 'artillery': artillery,
+                    'meta': {'name': m.get('name'), 'wiki': m.get('wiki'), 'description': m.get('description'),
+                             'enemies': m.get('enemies') or [], 'raid_minutes': m.get('raidDuration'),
+                             'players': m.get('players'), 'min_level': m.get('minPlayerLevel'),
+                             'max_level': m.get('maxPlayerLevel')},
+                    'access_keys': [{'n': k.get('name'), 's': k.get('shortName'), 'pr': k.get('avg24hPrice')}
+                                    for k in (m.get('accessKeys') or [])]}
         eff = sum(c['ev'] * c['spawn'] for c in containers)
         from collections import Counter as _C
         by_cls = _C(c['cls'] for c in containers)
@@ -322,13 +378,14 @@ def main():
               + (f"  [unmapped: {dict(list(unknown.items())[:5])}]" if unknown else ""))
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    json.dump({'version': 2, 'source': 'tarkov.dev', 'built': int(time.time()),
+    json.dump({'version': 3, 'source': 'tarkov.dev', 'built': int(time.time()),
                'coord_bridge': 'viewer = diag(-1,1,1) * unity',
                'value_model': {'pmc_kill_ev': PMC_KILL_EV, 'boss_fight_t': BOSS_FIGHT_T, 'loose_min_ev': LOOSE_MIN_EV,
                                'note': 'container ev = type-average filled value; effective value = ev*spawn (fill rate). '
                                        'boss_nodes.ev already = kit_value * real spawnChance. PMC nodes carry n (spawn-point '
                                        'density) — the planner weights PMC value by n/mean. v2 adds locks(+keys/keycards), '
-                                       'switches, transits, hazards, stationary, extracts_dev(faction), loose(valuable). '
+                                       'v3 adds raid metadata, switch/extract dependencies, extract footprints and fees, '
+                                       'BTR stops, artillery zones, and loose-loot price ranges/trends/vendor values. '
                                        'tune ev tables in build_loot.py'},
                'maps': out}, open(OUT, 'w'), separators=(',', ':'))
     print(f"[loot] -> {OUT} ({os.path.getsize(OUT)/1e3:.0f} KB, {len(out)} maps)")

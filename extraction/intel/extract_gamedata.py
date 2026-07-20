@@ -96,8 +96,11 @@ EXFIL_CLASSES = {
     "ScavExfiltrationPoint": "scav",
     "SharedExfiltrationPoint": "shared",
     "SecretExfiltrationPoint": "secret",
+    # Vehicle extracts are separate typed components in newer scenes.
+    "CarExtraction": "shared",
 }
-DOOR_CLASSES = {"Door": "door", "Trunk": "trunk", "KeycardDoor": "door", "SlidingDoor": "door"}
+DOOR_CLASSES = {"Door": "door", "Trunk": "trunk", "KeycardDoor": "door", "SlidingDoor": "door",
+                "ExfiltrationDoor": "exfil_door"}
 # EDoorState (EFT.Interactive) — flags; scenes serialize a single initial state.
 DOOR_STATE = {0: "none", 1: "locked", 2: "shut", 4: "open", 8: "interacting", 16: "breach"}
 # EPlayerSideMask
@@ -107,6 +110,12 @@ SIDE_MASK = {1: "usec", 2: "bear", 3: "pmc", 4: "savage", 5: "usec+savage", 6: "
 # field (validated: lighthouse level524 x110, factory level68 x42).
 QUEST_TRIGGER_CLASSES = {"PlaceItemTrigger": "place_item", "ExperienceTrigger": "visit",
                          "FlareShootDetectorZone": "flare", "QuestTrigger": "quest"}
+BUFFER_ZONE_CLASSES = {
+    "BufferGates": "buffer_gate", "BufferGate": "buffer_gate", "BufferZone": "buffer",
+    "IgnorePlayerInputZone": "input_lock", "LighthouseKeeperZone": "lightkeeper",
+    "EventObjectInteractive": "event_interactive",
+    "InteractiveObjectCutsceneTrigger": "cutscene",
+}
 
 
 def read_cstr(buf, off):
@@ -435,7 +444,8 @@ def scan_level(lv, sink):
         if cls not in EXFIL_CLASSES and cls not in DOOR_CLASSES \
                 and cls not in QUEST_TRIGGER_CLASSES and cls not in (
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
-                "SpawnPointMarker", "MineDirectional", "LootPoint", "LighthouseTraderZone"):
+                "SpawnPointMarker", "MineDirectional", "LootPoint", "LootPointsGroup",
+                "LighthouseTraderZone", "BufferGateSwitcher") and cls not in BUFFER_ZONE_CLASSES:
             continue
         go_pid = (hdr.get("m_GameObject") or {}).get("m_PathID")
         if not go_pid:
@@ -520,6 +530,24 @@ def scan_level(lv, sink):
             box = cols[0] if cols else None
             sink["trader_zones"].append({
                 "pos": col_center(M, box) if box else tpos, "name": name,
+                "outline": footprint(M, box) if box else [], "active": active, "lv": lv,
+            })
+        elif cls == "BufferGateSwitcher":
+            sink["buffer_switches"].append({
+                "pos": tpos, "name": name or "Buffer gate switch", "kind": cls,
+                "active": active, "lv": lv,
+            })
+        elif cls in BUFFER_ZONE_CLASSES:
+            box = cols[0] if cols else None
+            sink["buffer_zones"].append({
+                "pos": col_center(M, box) if box else tpos, "name": name,
+                "kind": BUFFER_ZONE_CLASSES[cls],
+                "outline": footprint(M, box) if box else [], "active": active, "lv": lv,
+            })
+        elif cls == "LootPointsGroup":
+            box = cols[0] if cols else None
+            sink["loot_groups"].append({
+                "pos": col_center(M, box) if box else tpos, "name": name or "Loot points group",
                 "outline": footprint(M, box) if box else [], "active": active, "lv": lv,
             })
         elif cls == "LootPoint":
@@ -667,7 +695,8 @@ def outline_extent(outline):
 
 # Ground-hugging zones (colliders that genuinely sit on the terrain): drape to the ground so
 # the outline follows undulating terrain instead of floating/sinking at the flat collider face.
-DRAPE_KEYS = ("exfils", "transit_points", "quest_triggers", "trader_zones")
+DRAPE_KEYS = ("exfils", "transit_points", "quest_triggers", "trader_zones",
+              "buffer_zones", "loot_groups")
 # Elevated collider zones (minefields, sniper zones, directional mines): keep the collider's own
 # world height. Their trigger boxes are frequently TALL volumes whose bottom face reaches the base
 # terrain far below a raised platform (e.g. ground_zero Minefield_LowPower: collider center Y=15.65
@@ -884,7 +913,8 @@ def main():
     sink = {k: [] for k in ("exfils", "minefields", "sniper_zones", "doors",
                             "transit_points", "stationary", "spawn_points",
                             "mines_directional", "loose_points",
-                            "quest_triggers", "trader_zones")}
+                            "quest_triggers", "trader_zones", "buffer_switches",
+                            "buffer_zones", "loot_groups")}
     t0 = time.time()
     scanned = list(LEVELS)
     for lv in LEVELS:
@@ -900,7 +930,7 @@ def main():
     sink["exfils"] = dedupe(sink["exfils"], lambda r: (r["faction"], r["name"]))
     sink["doors"] = dedupe(sink["doors"], lambda r: r["id"] or (r["name"], tuple(r["pos"])))
     for k in ("minefields", "sniper_zones", "transit_points", "stationary", "mines_directional",
-              "quest_triggers", "trader_zones"):
+              "quest_triggers", "trader_zones", "buffer_switches", "buffer_zones", "loot_groups"):
         sink[k] = dedupe(sink[k], lambda r: (r.get("name"), tuple(r["pos"])))
     sink["spawn_points"] = dedupe(sink["spawn_points"], lambda r: (r.get("name"), tuple(r["pos"])))
 

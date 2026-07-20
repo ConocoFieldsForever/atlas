@@ -154,6 +154,7 @@ const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW
 const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpGpu at _pad2)
 const MAT_FLAG_PUDDLE_LUMA: u32 = 256u;   // bit8: puddle shape mask in luma(rgb), not alpha (atlas)
 const MAT_FLAG_WATER_MATTE: u32 = 512u;   // bit9: STRETCHED floor water-decal (tire marks / wet-ground) -> matte, no mirror
+const MAT_FLAG_DECAL: u32 = 1024u;        // bit10: plain surface decal; mask ALL lighting terms by texture coverage
 const DETAIL_HAS_ALBEDO: u32 = 1u;        // detail_flags bit0: has detail albedo texture
 const DETAIL_HAS_NORMAL: u32 = 2u;        // detail_flags bit1: has detail normal texture
 const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed in linear space
@@ -621,6 +622,22 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
 
     var o: VOut;
     o.clip = position_world_to_clip(world);
+#ifdef DECAL_NDC_PUSH
+    // Coplanar-decal separation in CLIP space, NOT the rasterizer DepthBiasState (whose `constant`
+    // is `constant * 2^(exponent(z)-23)` on Depth32Float — it rides the depth exponent, drifts as the
+    // camera zooms/rotates, so no magnitude is stable). After the perspective divide this is exactly
+    // +eps on z_ndc, exponent-INDEPENDENT. Reverse-Z (near=1, GreaterEqual): +z = toward camera = wins.
+    //
+    // This def is ONLY on the decal COLOR passes (DecalColor / Overlay), which DON'T write depth, so a
+    // comfortably LARGE eps can't peter-pan (it moves only the depth used for the test, never a written
+    // depth or the screen xy). It must clear EVERY coplanar surface underneath: not just the opaque
+    // road but OTHER overlapping road decals' depth-prepass writes — the real bug is two stacked
+    // SoftCutout roads (e.g. Bus_stop_road_01 + _02) whose color passes each failed GreaterEqual against
+    // the OTHER's prepass. The depth prepass (DecalDepth) does NOT get this push (it writes raw depth
+    // for void occlusion; a push there WOULD peter-pan). eps large enough to clear coplanar rounding,
+    // small enough that genuinely-closer geometry (walls, props) still occludes the decal.
+    o.clip.z = o.clip.z + 1.0e-3 * o.clip.w;
+#endif
     o.world_normal = normalize(cofactor(col0, col1, col2) * v.normal);
     o.uv = v.uv;
     o.material_index = v.material_index;
@@ -756,17 +773,26 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // class; the discard is fine here because no derivative-requiring op follows it.
     let is_blend = (m.flags & MAT_FLAG_BLEND) != 0u;
     let is_softcutout = (m.flags & MAT_FLAG_SOFTCUTOUT) != 0u;
-#ifdef DECAL_PASS
-    // DECAL pipeline (DEFECT 1 fix): keep ONLY softcutout road/track surfaces. They render here
-    // depth-writing (A2C feather + toward-camera bias) so they occlude the geometry + POIs below.
+#ifdef DECAL_DEPTH_PASS
+    // Coverage-only depth prepass for SoftCutout road/track surfaces.
+    if (!is_softcutout) { discard; }
+#else
+#ifdef DECAL_COLOR_PASS
+    // The color pass uses a stronger bias than the coverage depth pass and never writes depth,
+    // preventing overlapping road pieces from fighting as the view direction changes.
     if (!is_softcutout) { discard; }
 #else
 #ifdef BLEND_PASS
-    // BLEND pipeline: genuinely-translucent materials EXCEPT softcutout (softcutout draws in the
-    // depth-writing DECAL pass above; leaving it here too would double-draw + re-blend it).
-    if (!is_blend || is_softcutout) { discard; }
+    let is_overlay = (m.flags & (MAT_FLAG_DECAL | MAT_FLAG_WATER)) != 0u;
+#ifdef OVERLAY_PASS
+    if (!is_blend || is_softcutout || !is_overlay) { discard; }
+#else
+    // True transparency (glass) has no coplanar bias; surface overlays use OVERLAY_PASS.
+    if (!is_blend || is_softcutout || is_overlay) { discard; }
+#endif
 #else
     if (is_blend) { discard; }  // OPAQUE pipeline: keep everything except BLEND (cutout stays)
+#endif
 #endif
 #endif
 
@@ -1022,22 +1048,26 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // water (sea / basins) is OPAQUE (P1) so depth sorts it correctly under glass.
     let is_water = (m.flags & MAT_FLAG_WATER) != 0u;
 
-#ifdef DECAL_PASS
-    // DECAL pass (DEFECT 1 fix): softcutout road/track surfaces, DEPTH-WRITING. Coverage is the
+#ifdef DECAL_DEPTH_PASS
+    // Softcutout road/track coverage for the DEPTH-ONLY prepass. Coverage is the
     // PER-VERTEX COLOR_0.a modulated by the SoftCutout params (tex.a is SMOOTHNESS here, NOT
-    // coverage). Output it as the fragment alpha so alpha-to-coverage feathers the road EDGE into
-    // the terrain while the (near-1) INTERIOR writes solid depth — occluding the underground
-    // ceiling + the Bevy POIs below it. rgb stays the lit road (tex.rgb*tint.rgb); matte (no env
-    // reflection, keeps asphalt from mirroring). The extra ×color.a keeps feather tails soft where
-    // _AlphaStrength (≥2) would re-saturate them (web/WebGPU-viewer parity — the validated look).
+    // coverage). Alpha-to-coverage writes only covered samples; color writes are disabled in the
+    // pipeline. The extra ×color.a keeps feather tails soft where _AlphaStrength would re-saturate.
     //   coverage = clamp(color.a*_AlphaStrength - (_Cutoff - _AlphaHeight), 0, 1) * color.a
     let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0) * o.color.a;
-    return vec4<f32>(apply_fog(lit + spec_rgb, o.world_pos, dom.directionality), coverage);
+    return vec4<f32>(0.0, 0.0, 0.0, coverage);
+#else
+#ifdef DECAL_COLOR_PASS
+    // Continuous premultiplied color feather. Depth was established by DECAL_DEPTH_PASS; this pass
+    // uses a slightly stronger bias, tests but does not write depth, so overlapping roads blend in
+    // stable phase order rather than competing in the depth buffer.
+    let coverage = clamp(o.color.a * m.vp.x - (m.vp.y - m.vp.z), 0.0, 1.0) * o.color.a;
+    let col = apply_fog(lit + spec_rgb, o.world_pos, dom.directionality);
+    return vec4<f32>(col * coverage, coverage);
 #else
 #ifdef BLEND_PASS
-    // BLEND pass: emit the REAL computed opacity. Non-premultiplied to match the pipeline's
-    // BlendState::ALPHA_BLENDING (src=SrcAlpha, dst=OneMinusSrcAlpha), i.e. Unity _Color*_MainTex.
-    // Softcutout roads are DISCARDED up top — they draw depth-writing in the DECAL pass above.
+    // Transparent/overlay pass: emit premultiplied rgb plus the real computed opacity.
+    // Softcutout roads are handled by the dedicated depth + color pair above.
     //  * Water/mirror (role=water): untextured water had albedo=tint=WHITE -> a flat white slab.
     //    Emit a translucent dark wet sheen instead (animated flow deferred).
     //  * Other blend (glass / plain decal): keep the tex.a*tint.a coverage.
@@ -1060,7 +1090,11 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         // opaque-white COLOR_0 for non-vp meshes, so `o.color.a` = 1.0 here and (mask + 1.0)*1.52
         // hard-slabbed the puddle. Force COLOR_0.a = 0 -> the game's exact mask-driven coverage.
         let color0_a = 0.0; // puddle decals have no painted COLOR_0; Unity's decal default is 0, not 1
-        let coverage = clamp((mask_ch + color0_a) * 1.52, 0.0, 1.0);
+        let raw_coverage = clamp((mask_ch + color0_a) * 1.52, 0.0, 1.0);
+        // BC/mip filtering can leave a few percent of mask outside the authored puddle. Multiplying
+        // that tail by the material tint made the physical quad boundary visible. Suppress only the
+        // near-zero tail with a smooth ramp; authored mid/high coverage remains unchanged.
+        let coverage = raw_coverage * smoothstep(0.015, 0.10, raw_coverage);
         // A large STRETCHED floor decal (texture mapped at tens-to-hundreds of meters per repeat,
         // flagged per-material at load) is matte wet-ground / tire marks, NOT a reflective puddle —
         // kill the sky mirror + sun glint so it reads as a dark decal. Real puddles keep both.
@@ -1076,10 +1110,18 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         // the reflection is DELIBERATELY weighted by coverage here (it wets the road), unlike glass.
         return vec4<f32>(apply_fog(col, o.world_pos, dom.directionality) * a, a);
     }
-    // Glass / plain decal: PREMULTIPLIED. Transmission alpha scales only the DIFFUSE (lit) — the env
-    // reflection, GGX glint and emissive are ADDED at full strength so a clear pane mirrors the
-    // bright overcast sky instead of reading as a dark tinted slab. Emissive rides here too
-    // (lit windows / signage panes).
+    // Plain surface decal: PREMULTIPLIED, with EVERY contribution coverage-masked. Decal atlases
+    // commonly have transparent RGB texels around the visible pothole/stain/tire mark. Letting
+    // specular or environment light escape the mask paints the atlas quad as a pale rectangle even
+    // where albedo.a == 0 (the Lighthouse pothole atlas is 61% fully transparent). This is the
+    // material-class distinction that the shared glass/decal branch previously lost.
+    if ((m.flags & MAT_FLAG_DECAL) != 0u) {
+        let col = apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality);
+        return vec4<f32>(col * albedo.a, albedo.a);
+    }
+    // Glass: PREMULTIPLIED. Transmission alpha scales only the DIFFUSE (lit) — the env reflection,
+    // GGX glint and emissive are ADDED at full strength so a clear pane mirrors the bright overcast
+    // sky instead of reading as a dark tinted slab. Emissive rides here too (lit windows/signage).
     return vec4<f32>(
         apply_fog(lit, o.world_pos, dom.directionality) * albedo.a + spec_rgb + refl_rgb + em_rgb,
         albedo.a
@@ -1153,6 +1195,7 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality),
         select(1.0, cov, is_cut)
     );
+#endif
 #endif
 #endif
 }

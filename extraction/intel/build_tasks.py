@@ -12,12 +12,15 @@ Re-run per wipe (task data changes per wipe, not per session). No game files nee
 import os, json, urllib.request, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# portable kit: output goes to the workspace tarkmap/out so assemble_bevy.py auto-ships it into packs.
+REPO = os.path.dirname(os.path.dirname(HERE))
+# Standalone viewers may not have the old tarkmap source tree. Prefer an explicit build-output
+# directory, retain the legacy EFT_TARKMAP_ROOT contract, then fall back to the viewer's shared
+# pack data so the in-app SYNC button works on a clean checkout.
 _TK = os.environ.get("EFT_TARKMAP_ROOT")
-if not _TK:
-    raise SystemExit("build_tasks: EFT_TARKMAP_ROOT is not set. Point it at your workspace tarkmap dir "
-                     "(the one holding maps/ and out/), e.g.  setx EFT_TARKMAP_ROOT D:\\eft_work\\tarkmap")
-OUT = os.path.join(_TK, 'out', 'tasks.json')
+_OUT_DIR = os.environ.get("EFT_INTEL_OUT_DIR") or (
+    os.path.join(_TK, "out") if _TK else os.path.join(REPO, "packs", "shared")
+)
+OUT = os.path.join(_OUT_DIR, 'tasks.json')
 API = "https://api.tarkov.dev/graphql"
 # tarkov.dev map normalizedName -> our map id (matches tarkmap/maps/<id>). Extend as maps are added.
 DEV_TO_ID = {
@@ -36,18 +39,29 @@ def bridge(p):
 
 QUERY = """
 { tasks {
-    id name normalizedName kappaRequired lightkeeperRequired experience wikiLink minPlayerLevel
+    id name normalizedName kappaRequired lightkeeperRequired experience wikiLink taskImageLink
+    minPlayerLevel factionName restartable availableDelaySecondsMin availableDelaySecondsMax
     trader { name } map { normalizedName }
     taskRequirements { task { name } status }
+    traderRequirements { trader { name } requirementType compareMethod value }
+    finishRewards {
+      traderStanding { trader { name } standing }
+      items { item { name shortName avg24hPrice } count quantity }
+      offerUnlock { trader { name } level item { name shortName } }
+      skillLevelReward { name level }
+      traderUnlock { name }
+      achievement { name rarity }
+      customization { name customizationTypeName }
+    }
     objectives {
       id type description optional maps { normalizedName }
-      ... on TaskObjectiveBasic { zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveExtract { exitStatus exitName zoneNames count }
-      ... on TaskObjectiveItem { items { name } count foundInRaid zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveMark { markerItem { name } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveQuestItem { questItem { name } count possibleLocations { map { normalizedName } positions { x y z } } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveShoot { targetNames count shotType bodyParts distance { compareMethod value } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveUseItem { count zoneNames zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
+      ... on TaskObjectiveBasic { requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
+      ... on TaskObjectiveExtract { exitStatus exitName zoneNames count requiredKeys { name shortName avg24hPrice } }
+      ... on TaskObjectiveItem { items { name } count foundInRaid minDurability maxDurability requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
+      ... on TaskObjectiveMark { markerItem { name } requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
+      ... on TaskObjectiveQuestItem { questItem { name } count requiredKeys { name shortName avg24hPrice } possibleLocations { map { normalizedName } positions { x y z } } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
+      ... on TaskObjectiveShoot { targetNames count shotType bodyParts usingWeapon { name } usingWeaponMods { name } wearing { name } notWearing { name } distance { compareMethod value } timeFromHour timeUntilHour requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
+      ... on TaskObjectiveUseItem { count zoneNames useAny { name } requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
       ... on TaskObjectiveBuildItem { item { name } }
       ... on TaskObjectivePlayerLevel { playerLevel }
       ... on TaskObjectiveTraderLevel { trader { name } level }
@@ -79,6 +93,54 @@ def conv_zone(z):
             'top': z.get('top'), 'bottom': z.get('bottom')}
 
 
+def item_ref(i):
+    """Small, stable item shape used by rewards/keys without shipping the full API object."""
+    return {'n': i.get('name'), 's': i.get('shortName'), 'pr': i.get('avg24hPrice')}
+
+
+def flat_items(value):
+    """Yield Item objects from API fields that may be Item[], Item[][], or null."""
+    for x in value or []:
+        if isinstance(x, list):
+            yield from flat_items(x)
+        elif isinstance(x, dict):
+            yield x
+
+
+def conv_rewards(r):
+    r = r or {}
+    out = {}
+    items = []
+    for x in r.get('items') or []:
+        if not x.get('item'):
+            continue
+        v = item_ref(x['item'])
+        v['count'] = x.get('count') if x.get('count') is not None else x.get('quantity')
+        items.append(v)
+    if items:
+        out['items'] = items
+    standing = [{'trader': x['trader']['name'], 'value': x.get('standing')}
+                for x in (r.get('traderStanding') or []) if x.get('trader')]
+    if standing:
+        out['standing'] = standing
+    offers = [{'trader': x['trader']['name'], 'level': x.get('level'),
+               'item': (x.get('item') or {}).get('name')}
+              for x in (r.get('offerUnlock') or []) if x.get('trader')]
+    if offers:
+        out['offers'] = offers
+    skills = [{'name': x.get('name'), 'level': x.get('level')}
+              for x in (r.get('skillLevelReward') or [])]
+    if skills:
+        out['skills'] = skills
+    for src, dst, key in (('traderUnlock', 'traders', 'name'),
+                          ('achievement', 'achievements', 'name'),
+                          ('customization', 'customization', 'name')):
+        vals = [x.get(key) for x in (r.get(src) or []) if x.get(key)]
+        if vals:
+            out[dst] = vals
+    return out
+
+
 def main():
     print("[tarkov.dev] fetching tasks...")
     data = gql(QUERY)
@@ -105,6 +167,26 @@ def main():
             if o.get('count'): oo['count'] = o['count']
             if o.get('foundInRaid'): oo['fir'] = True
             if o.get('exitName'): oo['exit'] = o['exitName']
+            if o.get('requiredKeys'):
+                # GraphQL currently returns a flat list, but tolerate nested alternative-key groups.
+                raw_keys = o['requiredKeys']
+                if raw_keys and isinstance(raw_keys[0], list):
+                    oo['requiredKeys'] = [[item_ref(k) for k in flat_items(group)] for group in raw_keys]
+                else:
+                    oo['requiredKeys'] = [[item_ref(k) for k in flat_items(raw_keys)]]
+            for src, dst in (('usingWeapon', 'weapons'), ('usingWeaponMods', 'weaponMods'),
+                             ('wearing', 'wearing'), ('notWearing', 'notWearing'),
+                             ('useAny', 'useAny')):
+                vals = [i.get('name') for i in flat_items(o.get(src)) if i.get('name')]
+                if vals: oo[dst] = vals
+            if o.get('distance'):
+                oo['distance'] = o['distance']
+            if o.get('bodyParts'): oo['bodyParts'] = o['bodyParts']
+            if o.get('shotType'): oo['shotType'] = o['shotType']
+            if o.get('timeFromHour') or o.get('timeUntilHour'):
+                oo['timeWindow'] = [o.get('timeFromHour') or 0, o.get('timeUntilHour') or 0]
+            if o.get('minDurability') is not None: oo['minDurability'] = o['minDurability']
+            if o.get('maxDurability') is not None: oo['maxDurability'] = o['maxDurability']
             if o.get('possibleLocations'):
                 oo['itemLocations'] = [{'map': map_id(pl['map']['normalizedName']),
                                         'pts': [bridge(p) for p in (pl['positions'] or [])]}
@@ -118,7 +200,15 @@ def main():
             'map': map_id(t['map']['normalizedName']) if t.get('map') else None,
             'minLevel': t.get('minPlayerLevel') or 0, 'kappa': bool(t.get('kappaRequired')),
             'lk': bool(t.get('lightkeeperRequired')), 'wiki': t.get('wikiLink'),
+            'image': t.get('taskImageLink'), 'xp': t.get('experience') or 0,
+            'faction': t.get('factionName'), 'restartable': bool(t.get('restartable')),
+            'delayMin': t.get('availableDelaySecondsMin') or 0,
+            'delayMax': t.get('availableDelaySecondsMax') or 0,
             'requires': [r['task']['name'] for r in (t.get('taskRequirements') or []) if r.get('task')],
+            'traderReqs': [{'trader': r['trader']['name'], 'type': r.get('requirementType'),
+                            'compare': r.get('compareMethod'), 'value': r.get('value')}
+                           for r in (t.get('traderRequirements') or []) if r.get('trader')],
+            'rewards': conv_rewards(t.get('finishRewards')),
             'maps': sorted(m for m in task_maps if m),
             'objectives': objs,
         }
@@ -143,7 +233,7 @@ def main():
         print(f"[tasks] zone patch: {applied} supplemental zone(s) applied")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    doc = {'version': 1, 'source': 'tarkov.dev', 'built': int(time.time()),
+    doc = {'version': 2, 'source': 'tarkov.dev', 'built': int(time.time()),
            'coord_bridge': 'viewer = diag(-1,1,1) * unity', 'count': len(out_tasks),
            'map_task_count': map_task_count, 'tasks': out_tasks}
     json.dump(doc, open(OUT, 'w'), separators=(',', ':'))

@@ -77,6 +77,14 @@ load control maps LINEAR not sRGB; detail maps #6.)
   is smoothness). Matte roughness.
 - **Status:** custom path already implements this (log: "133 SoftCutout + M3b2"). → fixed by
   targeting the custom path. VERIFY on it.
+- **2026-07-20 follow-up:** plain `role=decal` atlases still shared the glass response in the
+  premultiplied blend pass. Diffuse respected `albedo.a`, but uncovered specular/environment
+  terms remained nonzero at alpha 0, painting transparent tire-track/pothole texels as pale
+  rectangles. `MAT_FLAG_DECAL` now coverage-masks every lighting term; glass keeps the original
+  full-strength reflection behavior.
+- **2026-07-20 follow-up 2:** water-decal mask detection was opening the pack-relative texture
+  path from the process CWD, so constant-alpha puddle atlases never switched to their RGB mask and
+  rendered full quads. Resolve before inspecting; smoothly suppress the BC/mip near-zero tail.
 - **Refs:** `tarkmap-decal-alpha-coverage`, `tarkmap-vp-shader-variants`
 
 ### 3. Road splines torn / floating tire-track sheets  —  STATUS: ✅ VERIFIED fixed on custom path (2026-07-15)
@@ -88,6 +96,10 @@ load control maps LINEAR not sRGB; detail maps #6.)
 - **REJECTED — do NOT re-do:** cutting the paved footprint out of the terrain geometry
   (`terrain_cut.py` / `bake_roads_into_terrain`). User rejected it; terrain must stay whole.
 - **Refs:** `tarkmap-road-terrain-matte-and-hole-bake`
+- **2026-07-20 z-fight follow-up:** two overlapping SoftCutout road meshes both wrote color+depth
+  with the same weak bias. Split them into an A2C coverage-only depth prepass and a premultiplied,
+  non-depth-writing color pass with a stronger bias. Plain surface overlays get their own biased
+  pass; glass stays unbiased.
 
 ### 4. No grass  —  STATUS: ✅ DONE on custom path (2026-07-15)
 Implemented: `build_grass.py` reads the 4 density grids + terrain meshes → `grass.bin`

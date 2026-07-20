@@ -32,8 +32,8 @@ pub struct PlanRequest {
     pub min_value: i64,
     /// Stop cap (the tour visits at most this many loot points).
     pub max_stops: usize,
-    /// Walking-distance budget in metres (start -> stops -> extract).
-    pub budget_m: f32,
+    /// Total raid-time budget in seconds, including search time and extract reserve.
+    pub budget_s: f32,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -53,6 +53,7 @@ pub struct PlanStop {
     pub pos: Vec3,
     /// Real walkable metres from the previous stop (leg INTO this stop).
     pub leg: f32,
+    pub loot_s: f32,
 }
 
 /// The current plan (ordered stops + totals) for the panel list; the tour polyline itself lives
@@ -63,6 +64,7 @@ pub struct PlanResult {
     pub stops: Vec<PlanStop>,
     pub total_value: i64,
     pub total_dist: f32,
+    pub total_time: f32,
     /// Name of the extract the run ends at.
     pub extract: String,
 }
@@ -75,6 +77,7 @@ struct Plan {
     extract: String,
     polyline: Vec<Vec3>,
     total_dist: f32,
+    total_time: f32,
     total_value: i64,
 }
 
@@ -112,7 +115,7 @@ fn teardown_plan(
     route.clear();
 }
 
-/// Headless-QA aid (mirrors `EFT_ROUTE`): `EFT_PLAN="min_value,max_stops,budget_m"` (or `1` for
+/// Headless-QA aid: `EFT_PLAN="min_value,max_stops,budget_minutes"` (or `1` for
 /// defaults) fires ONE plan request a few frames in so a screenshot shows a real loot run.
 fn debug_plan(mut frame: Local<u32>, mut done: Local<bool>, mut w: MessageWriter<PlanRequest>) {
     if *done {
@@ -130,13 +133,13 @@ fn debug_plan(mut frame: Local<u32>, mut done: Local<bool>, mut w: MessageWriter
     let req = PlanRequest {
         min_value: nums.first().map(|v| *v as i64).filter(|&v| v > 1).unwrap_or(100_000),
         max_stops: nums.get(1).map(|v| *v as usize).unwrap_or(10),
-        budget_m: nums.get(2).copied().unwrap_or(1500.0),
+        budget_s: nums.get(2).copied().unwrap_or(25.0) * 60.0,
     };
     info!(
-        "planner: EFT_PLAN debug plan requested (min {}k, {} stops, {:.0} m)",
+        "planner: EFT_PLAN debug plan requested (min {}k, {} stops, {:.0} min)",
         req.min_value / 1000,
         req.max_stops,
-        req.budget_m
+        req.budget_s / 60.0
     );
     w.write(req);
 }
@@ -146,7 +149,9 @@ fn debug_plan(mut frame: Local<u32>, mut done: Local<bool>, mut w: MessageWriter
 struct Cand {
     name: String,
     value: i64,
+    score_value: f32,
     pos: Vec3,
+    loot_s: f32,
 }
 
 /// Gather candidates + extracts, then solve on the compute pool.
@@ -163,7 +168,11 @@ fn dispatch_plan(
         &crate::poi::MarkerValue,
         Option<&crate::loot::LootClass>,
         Option<&crate::poi::PoiLayer>,
+        Option<&crate::loot::LootTime>,
+        Option<&crate::poi::LootJackpot>,
     )>,
+    locks: Query<(&GlobalTransform, &crate::poi::LockKeys)>,
+    progress: Res<crate::progress::PlayerProgress>,
     all_marks: Query<
         (&crate::poi::PoiLayer, &GlobalTransform, &crate::inspect::MarkerInfo, Option<&crate::poi::SceneInactive>),
         Without<crate::poi::ZoneWall>,
@@ -194,15 +203,24 @@ fn dispatch_plan(
     // top-120 by value so the optimizer stays bounded on loot-dense maps (streets: 2k+ points).
     let mut cands: Vec<Cand> = loot
         .iter()
-        .filter(|(_, _, v, cls, layer)| {
+        .filter(|(_, _, v, cls, layer, _, _)| {
             v.0 >= req.min_value
                 && (cls.is_some() // loot.rs container
                     || matches!(layer, Some(crate::poi::PoiLayer::LooseLoot))) // priced loose
         })
-        .map(|(gt, info, v, _, _)| Cand {
+        .filter(|(gt, _, _, _, _, _, _)| {
+            !locks.iter().any(|(lock_gt, keys)| {
+                lock_gt.translation().distance(gt.translation()) <= 14.0
+                    && !keys.0.is_empty()
+                    && !keys.0.iter().any(|key| progress.owns_key(key))
+            })
+        })
+        .map(|(gt, info, v, _, _, loot_time, jackpot)| Cand {
             name: info.title.clone(),
             value: v.0,
+            score_value: v.0 as f32 * if jackpot.is_some() { 0.18 } else { 1.0 },
             pos: gt.translation(),
+            loot_s: loot_time.map(|t| t.0).unwrap_or(5.0),
         })
         .collect();
     cands.sort_by(|a, b| b.value.cmp(&a.value));
@@ -239,7 +257,7 @@ fn dispatch_plan(
 
     plan.status = PlanStatus::Pending;
     route_result.status = RouteStatus::Pending;
-    let (max_stops, budget) = (req.max_stops, req.budget_m.max(200.0));
+    let (max_stops, budget) = (req.max_stops, req.budget_s.max(300.0));
     let t = AsyncComputeTaskPool::get().spawn(async move {
         let avoid = (!avoid_pts.is_empty()).then(|| grid.build_avoid(&avoid_pts, 4.0));
         solve(&grid, start, cands, extracts, max_stops, budget, avoid.as_ref())
@@ -260,13 +278,16 @@ fn solve(
     // Straight-line with a detour factor approximates walkable distance for the FAST phases;
     // ~1.35 matches sampled A*/straight ratios (open lot ~1.1, indoor ~1.7).
     const DETOUR: f32 = 1.35;
+    const WALK_MPS: f32 = 1.65;
+    const EXTRACT_BUFFER_S: f32 = 120.0;
     let est = |a: Vec3, b: Vec3| a.distance(b) * DETOUR;
 
     // ---- phase 0: ONE bounded Dijkstra flood from the start prunes unreachable candidates
     // up front. Without this, every shelf/roof loot point that isn't on the nav mesh cost a
     // full EXHAUSTIVE failed A* during threading (seconds each — the planner looked hung).
     let mut field_s = Scratch::new(grid.nodes());
-    if !grid.dijkstra_field(start, budget * 1.4, &mut field_s) {
+    let walk_budget_m = ((budget - EXTRACT_BUFFER_S).max(60.0) * WALK_MPS).max(200.0);
+    if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
         return Err("start is off the walkable mesh".into());
     }
     let cands: Vec<Cand> = cands
@@ -305,7 +326,7 @@ fn solve(
             ex
         }
     };
-    let mut est_total = est(start, ex0.1);
+    let mut est_total = est(start, ex0.1) / WALK_MPS + EXTRACT_BUFFER_S;
     while tour.len() < max_stops {
         let mut best: Option<(usize, usize, f32, f32)> = None; // (cand, slot, delta, score)
         for (ci, c) in cands.iter().enumerate() {
@@ -315,13 +336,13 @@ fn solve(
             for slot in 0..=tour.len() {
                 let a = node_pos(slot, &tour, ex0.1);
                 let b = node_pos(slot + 1, &tour, ex0.1);
-                let delta = est(a, c.pos) + est(c.pos, b) - est(a, b);
+                let delta = (est(a, c.pos) + est(c.pos, b) - est(a, b)) / WALK_MPS + c.loot_s;
                 if est_total + delta > budget {
                     continue;
                 }
-                // Value per marginal metre; the 15 m floor keeps "free" on-path stops from
+                // Expected value per marginal second; the floor keeps "free" on-path stops from
                 // swallowing the whole cap before anything valuable gets a slot.
-                let score = c.value as f32 / delta.max(15.0);
+                let score = c.score_value / delta.max(5.0);
                 if best.map_or(true, |(_, _, _, s)| score > s) {
                     best = Some((ci, slot, delta, score));
                 }
@@ -404,12 +425,14 @@ fn solve(
             return Err("no walkable path to any extract".into());
         };
         total += exd;
-        if total > budget * 1.15 && tour.len() > 1 {
-            // Over budget in the real world: drop the worst value-per-metre stop and re-thread.
+        let loot_time: f32 = tour.iter().map(|&ci| cands[ci].loot_s).sum();
+        let total_time = total / WALK_MPS + loot_time + EXTRACT_BUFFER_S;
+        if total_time > budget * 1.15 && tour.len() > 1 {
+            // Over budget in the real world: drop the worst expected-value-per-second stop.
             let worst = (0..tour.len())
                 .min_by(|&a, &b| {
-                    (cands[tour[a]].value as f32 / legs[a].max(1.0))
-                        .total_cmp(&(cands[tour[b]].value as f32 / legs[b].max(1.0)))
+                    (cands[tour[a]].score_value / (legs[a] / WALK_MPS + cands[tour[a]].loot_s).max(1.0))
+                        .total_cmp(&(cands[tour[b]].score_value / (legs[b] / WALK_MPS + cands[tour[b]].loot_s).max(1.0)))
                 })
                 .unwrap();
             tour.remove(worst);
@@ -424,6 +447,7 @@ fn solve(
                 value: cands[ci].value,
                 pos: cands[ci].pos,
                 leg: l,
+                loot_s: cands[ci].loot_s,
             })
             .collect();
         let total_value = stops.iter().map(|st| st.value).sum();
@@ -435,6 +459,7 @@ fn solve(
             // the stitched line would corner-cut across the seams, so keep it verbatim.
             polyline: poly,
             total_dist: total,
+            total_time,
             total_value,
         });
     }
@@ -457,15 +482,17 @@ fn poll_plan(
         match res {
             Ok(p) => {
                 info!(
-                    "planner: {} stops, ~{}k value, {:.0} m, exit {}",
+                    "planner: {} stops, ~{}k value, {:.0} m / {:.1} min, exit {}",
                     p.stops.len(),
                     p.total_value / 1000,
                     p.total_dist,
+                    p.total_time / 60.0,
                     p.extract
                 );
                 plan.stops = p.stops;
                 plan.total_value = p.total_value;
                 plan.total_dist = p.total_dist;
+                plan.total_time = p.total_time;
                 plan.extract = p.extract.clone();
                 plan.status = PlanStatus::Ok;
                 route_result.options = vec![RouteOption {
@@ -474,6 +501,7 @@ fn poll_plan(
                     dist: p.total_dist,
                 }];
                 route_result.dest_label = Some(format!("Loot run \u{2192} {}", p.extract));
+                route_result.stop_count = plan.stops.len() + 1;
                 route_result.status = RouteStatus::Ok;
                 route_result.select(0);
             }

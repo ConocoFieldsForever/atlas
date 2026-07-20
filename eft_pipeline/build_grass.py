@@ -352,10 +352,14 @@ def main():
     if alb is None:
         alb = _fallback_albedo(TL)
         print(f"[grass] no grass albedo in {TL}, using cross-map fallback {alb}")
-    # sidecar path contract (redistribution PR3): an albedo already INSIDE the pack (assemble
-    # --self-contained copied terrain_layers in) is written PACK-RELATIVE — the viewer resolves
-    # relative sidecar paths against the pack dir. --self-contained copies an outside albedo
-    # into the pack as grass_albedo.png. Otherwise the legacy absolute path is kept verbatim.
+    # Sidecar albedo path: packs MUST be self-contained + portable, so the sidecar ALWAYS gets a
+    # pack-relative path — NEVER an absolute one. An absolute build-tree path breaks on redistribution
+    # (the dir is gone on the user's machine), leaks a personal path, AND the cross-map fallback may
+    # reference ANOTHER map's texture (this was the "pink grass all over customs" bug: customs's
+    # sidecar pointed at .../eft_assets/interchange_v2/.../grass_Grass3_D.png). So: an albedo already
+    # inside the pack stays relative; an outside albedo is ALWAYS copied in as grass_albedo.png (no
+    # --self-contained gate); a truly-missing albedo emits an EMPTY path so the viewer skips grass
+    # (no magenta placeholder) instead of a dangling absolute.
     pack_abs = os.path.abspath(pack)
     alb_abs = os.path.abspath(alb)
     try:
@@ -365,15 +369,14 @@ def main():
     if rel is not None and rel.split(os.sep)[0] != ".." and not os.path.isabs(rel):
         alb_out = rel.replace("\\", "/")
         print(f"[grass] albedo inside pack -> pack-relative {alb_out}")
-    elif a.self_contained and os.path.exists(alb_abs):
+    elif os.path.exists(alb_abs):
         shutil.copy2(alb_abs, os.path.join(pack_abs, "grass_albedo.png"))
         alb_out = "grass_albedo.png"
-        print(f"[grass] self-contained: copied {alb_abs} -> {alb_out}")
+        print(f"[grass] copied {alb_abs} -> {alb_out} (self-contained; portable)")
     else:
-        if a.self_contained:
-            print(f"[grass] WARNING: --self-contained but albedo {alb_abs} does not exist - "
-                  f"keeping the legacy absolute path")
-        alb_out = alb_abs.replace("\\", "/")
+        print(f"[grass] WARNING: no grass albedo found ({alb_abs} missing) — emitting empty albedo "
+              f"so the viewer skips grass rather than showing the magenta placeholder")
+        alb_out = ""
     tint = [0.7, 0.75, 0.55]
     try:
         gj = mani["sidecars"]["grassJson"]

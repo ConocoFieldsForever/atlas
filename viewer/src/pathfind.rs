@@ -56,6 +56,8 @@ pub struct RouteOption {
 pub struct RouteResult {
     pub points: Vec<Vec3>,
     pub dist: f32,
+    /// Number of requested destinations, not the number of simplified polyline vertices.
+    pub stop_count: usize,
     pub status: RouteStatus,
     /// Display label of the destination this route ends at (from `RouteRequest::labels`), so the
     /// UI can say WHERE the route goes and highlight the matching row. None = unlabeled request.
@@ -68,6 +70,7 @@ impl Default for RouteResult {
         Self {
             points: Vec::new(),
             dist: 0.0,
+            stop_count: 0,
             status: RouteStatus::Idle,
             dest_label: None,
             options: Vec::new(),
@@ -87,6 +90,7 @@ impl RouteResult {
     pub fn clear(&mut self) {
         self.points.clear();
         self.dist = 0.0;
+        self.stop_count = 0;
         self.dest_label = None;
         self.options.clear();
         self.selected = 0;
@@ -384,6 +388,7 @@ fn dispatch_route(
     // multi-stop tour and adds cost to every leg.
     let visualize = opts.visualize && dests.len() == 1 && nearest_of == false && !optimize;
     result.status = RouteStatus::Pending;
+    result.stop_count = if nearest_of { 1 } else { dests.len() };
     // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
     let t = AsyncComputeTaskPool::get().spawn(async move {
         let mut s = Scratch::new(grid.nodes());

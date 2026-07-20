@@ -66,6 +66,14 @@ pub struct TaskDef {
     pub min_level: u32,
     pub kappa: bool,
     pub lk: bool,
+    pub xp: i64,
+    pub image: Option<String>,
+    pub faction: Option<String>,
+    pub restartable: bool,
+    pub delay_min: i64,
+    pub delay_max: i64,
+    pub trader_reqs: Vec<TraderRequirement>,
+    pub rewards: TaskRewards,
     /// Prerequisite task NAMES (shown so the planner can see ordering).
     pub requires: Vec<String>,
     pub objectives: Vec<ObjectiveDef>,
@@ -74,6 +82,7 @@ pub struct TaskDef {
 /// One objective. Fields are all optional in the schema and default to empty/false here.
 #[cfg_attr(not(feature = "egui"), allow(dead_code))]
 pub struct ObjectiveDef {
+    pub id: String,
     /// Objective TYPE: visit / giveItem / findItem / shoot / mark / plantItem / extract /
     /// findQuestItem / giveQuestItem / buildWeapon / skill / ... — drives the tag + colour.
     pub kind: String,
@@ -97,6 +106,82 @@ pub struct ObjectiveDef {
     pub zones: Vec<ObjZone>,
     /// Quest-item find spots (bridged points), for objectives without an explicit zone.
     pub item_locations: Vec<ObjLoc>,
+    pub required_keys: Vec<Vec<ItemRef>>,
+    pub weapons: Vec<String>,
+    pub weapon_mods: Vec<String>,
+    pub wearing: Vec<String>,
+    pub not_wearing: Vec<String>,
+    pub use_any: Vec<String>,
+    pub distance: Option<CompareValue>,
+    pub body_parts: Vec<String>,
+    pub shot_type: Option<String>,
+    pub time_window: Option<[f32; 2]>,
+    pub min_durability: Option<f32>,
+    pub max_durability: Option<f32>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ItemRef {
+    #[serde(rename = "n")]
+    pub name: String,
+    #[serde(rename = "s")]
+    pub short: Option<String>,
+    #[serde(rename = "pr")]
+    pub price: Option<i64>,
+    pub count: Option<i64>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CompareValue {
+    #[serde(rename = "compareMethod")]
+    pub compare: Option<String>,
+    pub value: f32,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TraderRequirement {
+    pub trader: String,
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub compare: Option<String>,
+    pub value: f32,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct StandingReward {
+    pub trader: String,
+    pub value: Option<f32>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct OfferReward {
+    pub trader: String,
+    pub level: Option<i64>,
+    pub item: Option<String>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SkillReward {
+    pub name: Option<String>,
+    pub level: Option<f32>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct TaskRewards {
+    pub items: Vec<ItemRef>,
+    pub standing: Vec<StandingReward>,
+    pub offers: Vec<OfferReward>,
+    pub skills: Vec<SkillReward>,
+    pub traders: Vec<String>,
+    pub achievements: Vec<String>,
+    pub customization: Vec<String>,
 }
 
 /// A single objective zone bridged to viewer space.
@@ -144,12 +229,30 @@ struct RawTask {
     #[serde(default)]
     lk: bool,
     #[serde(default)]
+    xp: i64,
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    faction: Option<String>,
+    #[serde(default)]
+    restartable: bool,
+    #[serde(default, rename = "delayMin")]
+    delay_min: i64,
+    #[serde(default, rename = "delayMax")]
+    delay_max: i64,
+    #[serde(default, rename = "traderReqs")]
+    trader_reqs: Vec<TraderRequirement>,
+    #[serde(default)]
+    rewards: TaskRewards,
+    #[serde(default)]
     requires: Vec<String>,
     #[serde(default)]
     objectives: Vec<RawObj>,
 }
 #[derive(Deserialize)]
 struct RawObj {
+    #[serde(default)]
+    id: String,
     #[serde(default, rename = "type")]
     kind: String,
     #[serde(default)]
@@ -174,6 +277,30 @@ struct RawObj {
     zones: Vec<RawZone>,
     #[serde(default, rename = "itemLocations")]
     item_locations: Vec<RawLoc>,
+    #[serde(default, rename = "requiredKeys")]
+    required_keys: Vec<Vec<ItemRef>>,
+    #[serde(default)]
+    weapons: Vec<String>,
+    #[serde(default, rename = "weaponMods")]
+    weapon_mods: Vec<String>,
+    #[serde(default)]
+    wearing: Vec<String>,
+    #[serde(default, rename = "notWearing")]
+    not_wearing: Vec<String>,
+    #[serde(default, rename = "useAny")]
+    use_any: Vec<String>,
+    #[serde(default)]
+    distance: Option<CompareValue>,
+    #[serde(default, rename = "bodyParts")]
+    body_parts: Vec<String>,
+    #[serde(default, rename = "shotType")]
+    shot_type: Option<String>,
+    #[serde(default, rename = "timeWindow")]
+    time_window: Option<[f32; 2]>,
+    #[serde(default, rename = "minDurability")]
+    min_durability: Option<f32>,
+    #[serde(default, rename = "maxDurability")]
+    max_durability: Option<f32>,
 }
 #[derive(Deserialize)]
 struct RawZone {
@@ -197,6 +324,7 @@ fn convert_task(t: RawTask) -> TaskDef {
         .objectives
         .into_iter()
         .map(|o| ObjectiveDef {
+            id: o.id,
             kind: o.kind,
             desc: o.desc,
             optional: o.optional,
@@ -224,6 +352,18 @@ fn convert_task(t: RawTask) -> TaskDef {
                     pts: l.pts.into_iter().map(Vec3::from).collect(),
                 })
                 .collect(),
+            required_keys: o.required_keys,
+            weapons: o.weapons,
+            weapon_mods: o.weapon_mods,
+            wearing: o.wearing,
+            not_wearing: o.not_wearing,
+            use_any: o.use_any,
+            distance: o.distance,
+            body_parts: o.body_parts,
+            shot_type: o.shot_type,
+            time_window: o.time_window,
+            min_durability: o.min_durability,
+            max_durability: o.max_durability,
         })
         .collect();
     TaskDef {
@@ -235,6 +375,14 @@ fn convert_task(t: RawTask) -> TaskDef {
         min_level: t.min_level,
         kappa: t.kappa,
         lk: t.lk,
+        xp: t.xp,
+        image: t.image.filter(|s| !s.is_empty()),
+        faction: t.faction.filter(|s| !s.is_empty()),
+        restartable: t.restartable,
+        delay_min: t.delay_min,
+        delay_max: t.delay_max,
+        trader_reqs: t.trader_reqs,
+        rewards: t.rewards,
         requires: t.requires,
         objectives,
     }
@@ -355,6 +503,7 @@ impl Plugin for TasksPanelPlugin {
 #[derive(Resource, Default)]
 pub struct TaskIconCache {
     tex: std::collections::HashMap<String, Option<bevy_egui::egui::TextureHandle>>,
+    task_art: std::collections::HashMap<String, Option<bevy_egui::egui::TextureHandle>>,
 }
 
 #[cfg(feature = "egui")]
@@ -382,6 +531,35 @@ impl TaskIconCache {
         self.tex.insert(slug.to_string(), loaded.clone());
         loaded
     }
+
+    fn get_task(
+        &mut self,
+        ctx: &bevy_egui::egui::Context,
+        task_dir: Option<&Path>,
+        task_id: &str,
+    ) -> Option<bevy_egui::egui::TextureHandle> {
+        use bevy_egui::egui;
+        if let Some(hit) = self.task_art.get(task_id) {
+            return hit.clone();
+        }
+        let loaded = task_dir
+            .and_then(|dir| image::open(dir.join(format!("{task_id}.png"))).ok())
+            .map(|img| {
+                let rgba = img.into_rgba8();
+                let (w, h) = rgba.dimensions();
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                ctx.load_texture(
+                    format!("taskart:{task_id}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+        self.task_art.insert(task_id.to_string(), loaded.clone());
+        loaded
+    }
 }
 
 // ============================================================================================
@@ -395,8 +573,6 @@ pub struct TasksUiState {
     search: String,
     /// Requirement 2 default: show only the current map's tasks. Toggle off for all maps.
     this_map_only: bool,
-    /// Client-side "checked off" objective ids — a session-only progress feel (no game state).
-    done: std::collections::HashSet<String>,
 }
 #[cfg(feature = "egui")]
 impl Default for TasksUiState {
@@ -405,7 +581,6 @@ impl Default for TasksUiState {
             // EFT_TASK_SEARCH seeds the search box (screenshots / power users), mirroring EFT_TAB.
             search: std::env::var("EFT_TASK_SEARCH").unwrap_or_default(),
             this_map_only: true,
-            done: std::collections::HashSet::new(),
         }
     }
 }
@@ -438,6 +613,7 @@ pub struct TasksPanelParams<'w, 's> {
     pub route_result: Res<'w, crate::pathfind::RouteResult>,
     /// Pathfind server state — the route buttons gate on it running.
     pub server: Res<'w, crate::pathfind::PathfindServer>,
+    pub progress: ResMut<'w, crate::progress::PlayerProgress>,
 }
 
 // ============================================================================================
@@ -464,6 +640,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
         route,
         route_result,
         server,
+        progress,
     } = p;
 
     // ---- Palette: all from the single source of truth (ui_theme); thin local aliases keep the
@@ -481,17 +658,23 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
 
     // Local copies for the clone-edit-compare write-back (see module doc).
     let mut tr = (**tracker).clone();
+    tr.active = progress.tracked.clone();
+    let mut done = progress.done.clone();
+    let mut owned_keys = progress.owned_keys.clone();
     let mut quests_on = toggles.quests;
 
     // Current map key + icon dirs, resolved once from the pack.
-    let (cur_map, icon_root, icon_shared): (Option<String>, Option<PathBuf>, Option<PathBuf>) =
+    let (cur_map, icon_root, icon_shared, task_art_dir):
+        (Option<String>, Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) =
         match pack {
             Some(lp) => {
                 let root = lp.0.root.clone();
-                let shared = root.parent().map(|pp| pp.join("shared").join("icons"));
-                (Some(map_key(&lp.0.manifest)), Some(root.join("icons")), shared)
+                let shared_root = root.parent().map(|pp| pp.join("shared"));
+                let shared = shared_root.as_ref().map(|p| p.join("icons"));
+                let task_art = shared_root.as_ref().map(|p| p.join("task_images"));
+                (Some(map_key(&lp.0.manifest)), Some(root.join("icons")), shared, task_art)
             }
-            None => (None, None, None),
+            None => (None, None, None, Some(crate::paths::shared_dir().join("task_images"))),
         };
 
     ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
@@ -568,6 +751,8 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             o.items.iter().any(|i| i.to_lowercase().contains(&q))
                 || o.quest_item.as_deref().is_some_and(|i| i.to_lowercase().contains(&q))
                 || o.marker_item.as_deref().is_some_and(|i| i.to_lowercase().contains(&q))
+                || o.required_keys.iter().flatten().any(|k| k.name.to_lowercase().contains(&q))
+                || o.weapons.iter().chain(&o.weapon_mods).chain(&o.wearing).any(|i| i.to_lowercase().contains(&q))
         })
     };
     let mut groups: std::collections::BTreeMap<String, Vec<&TaskDef>> = std::collections::BTreeMap::new();
@@ -615,7 +800,10 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             let mut dests: Vec<Vec3> = Vec::new();
             if let Some(m) = cur {
                 for t in catalog.tasks.iter().filter(|t| tr.active.contains(&t.id)) {
-                    for o in &t.objectives {
+                    for (i, o) in t.objectives.iter().enumerate() {
+                        if done.contains(&obj_key(&t.id, o, i)) {
+                            continue;
+                        }
                         if let Some(pos) = obj_location(o, m) {
                             dests.push(pos);
                         }
@@ -639,7 +827,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                 RichText::new(format!(
                     "Route  {:.0} m  ({} stops)",
                     route_result.dist,
-                    route_result.points.len()
+                    route_result.stop_count
                 ))
                 .size(11.0)
                 .color(Color32::from_gray(210)),
@@ -703,7 +891,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                             .objectives
                             .iter()
                             .enumerate()
-                            .filter(|(i, _)| ui_state.done.contains(&obj_key(&t.id, *i)))
+                            .filter(|(i, o)| done.contains(&obj_key(&t.id, o, *i)))
                             .count();
                         let all_done = total > 0 && done_n == total;
                         // Task block: a flush RAIL title bar (no padding around it) sits directly on a
@@ -713,6 +901,9 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                         let title_resp = egui::Frame::new().fill(theme::RAIL).inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
+                                if let Some(tex) = icons.get_task(ui.ctx(), task_art_dir.as_deref(), &t.id) {
+                                    ui.add(egui::Image::new(&tex).fit_to_exact_size(egui::vec2(42.0, 30.0)));
+                                }
                                 // Track button on the RIGHT first (right_to_left); the name fills the space
                                 // to its left and truncates, so a long name never pushes the button off.
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -761,6 +952,12 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                 if t.min_level > 0 {
                                     bits.push(format!("Lvl {}", t.min_level));
                                 }
+                                if t.xp > 0 {
+                                    bits.push(format!("{} XP", crate::inspect::money(t.xp)));
+                                }
+                                if let Some(faction) = &t.faction {
+                                    bits.push(faction.clone());
+                                }
                                 if total > 0 {
                                     bits.push(format!("{done_n}/{total} done"));
                                 }
@@ -794,6 +991,26 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                             if !note.is_empty() {
                                 ui.label(RichText::new(note.join("   \u{00B7}   ")).size(9.0).italics().color(MUTED));
                             }
+                            let mut conditions: Vec<String> = t.trader_reqs.iter().map(|r| {
+                                format!("{} {} {}", r.trader, r.kind.as_deref().unwrap_or("requirement"), trim_num(r.value))
+                            }).collect();
+                            if t.restartable { conditions.push("restartable".into()); }
+                            if t.delay_max > 0 {
+                                conditions.push(format!("available after {}-{} min", t.delay_min / 60, t.delay_max / 60));
+                            }
+                            if !conditions.is_empty() {
+                                ui.label(RichText::new(conditions.join("   \u{00B7}   ")).size(9.0).color(MUTED));
+                            }
+                            let reward = reward_summary(&t.rewards);
+                            if !reward.is_empty() {
+                                CollapsingHeader::new(RichText::new(format!("Rewards  {reward}")).size(10.0).color(FIR))
+                                    .id_salt(format!("rewards_{}", t.id))
+                                    .show(ui, |ui| {
+                                        for line in reward_lines(&t.rewards) {
+                                            ui.label(RichText::new(line).size(9.5).color(BONE));
+                                        }
+                                    });
+                            }
 
                             // ===== SUBTASK TABLE: fixed left icon/glyph gutter + click-to-toggle rows =====
                             // Every row shares a fixed-width left gutter so the art lines up in ONE
@@ -808,8 +1025,8 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                             ui.spacing_mut().item_spacing.y = 4.0; // snug rows around the divider lines
                             for (i, o) in t.objectives.iter().enumerate() {
                                 ui.separator(); // separating line between subtasks
-                                let key = obj_key(&t.id, i);
-                                let is_done = ui_state.done.contains(&key);
+                                let key = obj_key(&t.id, o, i);
+                                let is_done = done.contains(&key);
                                 let (tag, dot) = obj_tag(&o.kind);
                                 let here = cur.and_then(|m| obj_location(o, m));
                                 // item names for this objective (handover/find + quest + mark tool)
@@ -959,10 +1176,32 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                                 }
                                             });
                                         }
+                                        let restrictions = objective_restrictions(o);
+                                        if !restrictions.is_empty() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                for r in restrictions {
+                                                    theme::chip(ui, &r, ACCENT);
+                                                }
+                                            });
+                                        }
+                                        if !o.required_keys.is_empty() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.label(RichText::new("KEYS").size(9.0).strong().color(ACCENT));
+                                                for key_group in &o.required_keys {
+                                                    for item in key_group {
+                                                        let mut have = owned_keys.contains(&item.name);
+                                                        if ui.checkbox(&mut have, RichText::new(&item.name).size(9.5)).changed() {
+                                                            if have { owned_keys.insert(item.name.clone()); }
+                                                            else { owned_keys.remove(&item.name); }
+                                                        }
+                                                    }
+                                                }
+                                            });
+                                        }
                                     });
                                 });
                                 if toggle {
-                                    if is_done { ui_state.done.remove(&key); } else { ui_state.done.insert(key.clone()); }
+                                    if is_done { done.remove(&key); } else { done.insert(key.clone()); }
                                 }
                             }
                         });
@@ -992,6 +1231,15 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
     // ---- WRITE-BACK (only on a real delta, so poi's is_changed() gates stay meaningful) ----
     if tr != **tracker {
         **tracker = tr;
+    }
+    if progress.tracked != tracker.active {
+        progress.tracked = tracker.active.clone();
+    }
+    if progress.done != done {
+        progress.done = done;
+    }
+    if progress.owned_keys != owned_keys {
+        progress.owned_keys = owned_keys;
     }
     if quests_on != toggles.quests {
         toggles.quests = quests_on;
@@ -1029,8 +1277,67 @@ fn obj_location(o: &ObjectiveDef, map_key: &str) -> Option<Vec3> {
 /// A stable id for an objective's checked-off state (task id + index; objective ids aren't always
 /// present/unique across the schema, so the index keys it locally).
 #[cfg(feature = "egui")]
-fn obj_key(task_id: &str, i: usize) -> String {
-    format!("{task_id}#{i}")
+fn obj_key(task_id: &str, objective: &ObjectiveDef, i: usize) -> String {
+    if objective.id.is_empty() {
+        format!("{task_id}#{i}")
+    } else {
+        format!("{task_id}:{}", objective.id)
+    }
+}
+
+#[cfg(feature = "egui")]
+fn trim_num(value: f32) -> String {
+    if value.fract().abs() < 0.001 { format!("{value:.0}") } else { format!("{value:.2}") }
+}
+
+#[cfg(feature = "egui")]
+fn objective_restrictions(o: &ObjectiveDef) -> Vec<String> {
+    let mut out = Vec::new();
+    if !o.weapons.is_empty() { out.push(format!("weapon: {}", o.weapons.join(" / "))); }
+    if !o.weapon_mods.is_empty() { out.push(format!("mods: {}", o.weapon_mods.join(" / "))); }
+    if !o.wearing.is_empty() { out.push(format!("wear: {}", o.wearing.join(" / "))); }
+    if !o.not_wearing.is_empty() { out.push(format!("without: {}", o.not_wearing.join(" / "))); }
+    if !o.use_any.is_empty() { out.push(format!("use: {}", o.use_any.join(" / "))); }
+    if let Some(d) = &o.distance {
+        out.push(format!("distance {} {} m", d.compare.as_deref().unwrap_or("at"), trim_num(d.value)));
+    }
+    if !o.body_parts.is_empty() { out.push(format!("hit: {}", o.body_parts.join(" / "))); }
+    if let Some(shot) = &o.shot_type { out.push(format!("shot: {shot}")); }
+    if let Some([from, until]) = o.time_window { out.push(format!("time {}:00-{}:00", trim_num(from), trim_num(until))); }
+    if o.min_durability.is_some() || o.max_durability.is_some() {
+        out.push(format!(
+            "durability {}-{}%",
+            o.min_durability.map(trim_num).unwrap_or_else(|| "0".into()),
+            o.max_durability.map(trim_num).unwrap_or_else(|| "100".into())
+        ));
+    }
+    out
+}
+
+#[cfg(feature = "egui")]
+fn reward_summary(r: &TaskRewards) -> String {
+    let mut bits = Vec::new();
+    if !r.items.is_empty() { bits.push(format!("{} item{}", r.items.len(), if r.items.len() == 1 { "" } else { "s" })); }
+    if !r.standing.is_empty() { bits.push(format!("{} rep", r.standing.len())); }
+    if !r.offers.is_empty() { bits.push(format!("{} unlock{}", r.offers.len(), if r.offers.len() == 1 { "" } else { "s" })); }
+    bits.join("  \u{00B7}  ")
+}
+
+#[cfg(feature = "egui")]
+fn reward_lines(r: &TaskRewards) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in &r.items {
+        let count = item.count.filter(|n| *n > 1).map(|n| format!(" x{n}")).unwrap_or_default();
+        let price = item.price.filter(|v| *v > 0).map(|v| format!(" (~{} R)", crate::inspect::money(v))).unwrap_or_default();
+        out.push(format!("{}{}{}", item.name, count, price));
+    }
+    for s in &r.standing { out.push(format!("{} reputation {:+}", s.trader, s.value.unwrap_or(0.0))); }
+    for o in &r.offers { out.push(format!("Unlock: {}{} at {}", o.item.as_deref().unwrap_or("offer"), o.level.map(|v| format!(" LL{v}")).unwrap_or_default(), o.trader)); }
+    for s in &r.skills { out.push(format!("Skill: {} +{}", s.name.as_deref().unwrap_or("skill"), trim_num(s.level.unwrap_or(0.0)))); }
+    for t in &r.traders { out.push(format!("Unlock trader: {t}")); }
+    for a in &r.achievements { out.push(format!("Achievement: {a}")); }
+    for c in &r.customization { out.push(format!("Customization: {c}")); }
+    out
 }
 
 /// (short ASCII tag, dot colour) per objective TYPE — the map key from `obj_tag` reads at a glance.

@@ -19,16 +19,19 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 VIEWER = os.path.dirname(HERE)
-TK = os.environ.get("EFT_TARKMAP_ROOT", r"C:\Users\user\beamng_blender_pipeline\tarkmap")
+TK = os.environ.get("EFT_TARKMAP_ROOT")
 PY = sys.executable or "python"
 SHARED = os.path.join(VIEWER, "packs", "shared")
+BUILD_OUT = os.path.join(TK, "out") if TK else SHARED
 
 
 def run(stage, total, name, cmd, optional=False):
     print(f"[STAGE {stage}/{total}] {name}", flush=True)
     t0 = time.time()
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="ascii:replace")
-    env.setdefault("EFT_TARKMAP_ROOT", TK)
+    env["EFT_INTEL_OUT_DIR"] = BUILD_OUT
+    if TK:
+        env.setdefault("EFT_TARKMAP_ROOT", TK)
     p = subprocess.Popen(cmd, cwd=VIEWER, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, encoding="ascii", errors="replace")
     for line in p.stdout:
@@ -58,13 +61,15 @@ def main():
     run(2, total, "task catalog (tarkov.dev)",
         [PY, os.path.join(VIEWER, "extraction", "intel", "build_tasks.py")])
 
-    # 3: ship into packs/shared (the builders write <TK>/out; every pack resolves shared/)
+    # 3: ship into packs/shared. With no legacy tarkmap tree, builders already wrote here.
     print(f"[STAGE 3/{total}] ship to packs/shared", flush=True)
     shipped = 0
     for f in ("loot.json", "tasks.json"):
-        src = os.path.join(TK, "out", f)
+        src = os.path.join(BUILD_OUT, f)
         if os.path.isfile(src):
-            shutil.copyfile(src, os.path.join(SHARED, f))
+            dst = os.path.join(SHARED, f)
+            if os.path.normcase(os.path.abspath(src)) != os.path.normcase(os.path.abspath(dst)):
+                shutil.copyfile(src, dst)
             print(f"  {f} -> packs/shared ({os.path.getsize(src)/1e6:.1f} MB)", flush=True)
             shipped += 1
         else:

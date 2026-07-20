@@ -26,6 +26,7 @@ mod paths;
 mod pick;
 mod planner;
 mod poi;
+mod progress;
 mod render;
 mod tasks_panel;
 mod ui;
@@ -481,7 +482,7 @@ fn apply_gfx_camera(
             Tonemapping::TonyMcMapface,
             ColorGrading {
                 global: ColorGradingGlobal {
-                    exposure: 0.4,
+                    exposure: 0.0,
                     temperature: -0.02,
                     tint: -0.005,
                     post_saturation: 0.95,
@@ -516,7 +517,10 @@ fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Trans
     };
     let cam_pos = target + Vec3::new(6.0, 11.0, 18.0); // pulled back + up for context
     let dir = (target - cam_pos).normalize_or_zero();
-    cam.yaw = dir.x.atan2(-dir.z); // same convention as `setup` (main.rs) / flycam_look
+    // Invert `Ry(yaw)·Rx(pitch)` (which builds forward = (-cos p·sin yaw, sin p, -cos p·cos yaw)):
+    // yaw = atan2(-dir.x, -dir.z). The old atan2(dir.x, -dir.z) was the negated yaw, so `fly_to`
+    // looked at the X-mirror of the target. Now it faces the target (and matches EFT_POSE/pos_hud).
+    cam.yaw = (-dir.x).atan2(-dir.z);
     cam.pitch = dir.y.asin();
     tf.translation = cam_pos;
     tf.rotation = Quat::from_axis_angle(Vec3::Y, cam.yaw) * Quat::from_axis_angle(Vec3::X, cam.pitch);
@@ -771,6 +775,7 @@ fn main() {
         .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
         .add_plugins(inspect::InspectPlugin) // left-click a marker -> floating info card (\u{2715} to close)
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
+        .add_plugins(progress::ProgressPlugin) // persistent tracked tasks, objectives, and owned keys
         .add_plugins(tasks_panel::TasksPanelPlugin) // revamped Tasks tab: catalog + icon cache (router calls tasks_panel_ui)
         .add_plugins(pathfind::PathfindPlugin) // in-process CPU routing over the baked nav grid (nav.rs)
         .add_plugins(planner::PlannerPlugin) // loot-run orienteering planner (Navigation tab)
@@ -1073,7 +1078,7 @@ fn setup(
             Tonemapping::TonyMcMapface,
             ColorGrading {
                 global: ColorGradingGlobal {
-                    exposure: 0.4,
+                    exposure: 0.0,
                     temperature: -0.02,
                     tint: -0.005,
                     post_saturation: 0.95, // EFT palette is DEsaturated

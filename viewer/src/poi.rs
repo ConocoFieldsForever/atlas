@@ -58,6 +58,18 @@ pub struct ExtractFaction(#[allow(dead_code)] pub String);
 #[derive(Component)]
 pub struct MarkerValue(pub i64);
 
+/// Dense, point-like intel marker eligible for distance-aware de-cluttering.
+#[derive(Component)]
+pub struct DenseMarker;
+
+/// Possible high-value loose spawn; its price is useful upside, not guaranteed EV.
+#[derive(Component)]
+pub struct LootJackpot;
+
+/// Keys that gate a marker. The planner skips nearby loot until one is marked owned.
+#[derive(Component, Clone, Default)]
+pub struct LockKeys(pub Vec<String>);
+
 /// Tag on markers whose gamedata.json record is INACTIVE in the game scene (`active: false` —
 /// disabled exfils like factory's Gate 2, low-power minefields, off sniper zones, disabled
 /// doors/loot points). The panel's global "hide inactive" filter
@@ -196,6 +208,18 @@ pub struct KeyUse {
     pub lock_positions: Vec<Vec3>,
 }
 
+#[derive(Resource, Default)]
+pub struct MapIntelMeta {
+    pub name: String,
+    pub description: String,
+    pub enemies: Vec<String>,
+    pub raid_minutes: Option<i64>,
+    pub players: Option<String>,
+}
+
+#[derive(Resource, Default)]
+pub struct OperationLinks(pub Vec<(Vec3, Vec3)>);
+
 /// Startup-built zone outlines from `gamedata.json` (TYPED game-file data —
 /// extract_gamedata.py). `live` flips the UI footer to credit the game files and marks that the
 /// typed exfils replaced the tarkov.dev `extracts_dev` layer. Outline verts are already viewer
@@ -224,6 +248,8 @@ impl Plugin for PoiPlugin {
         app.init_resource::<QuestData>()
             .init_resource::<KeyCatalog>()
             .init_resource::<GameDataZones>()
+            .init_resource::<MapIntelMeta>()
+            .init_resource::<OperationLinks>()
             // Build ALL per-map POI markers + zone walls (and the QuestData/KeyCatalog/GameDataZones
             // resources) on each MapEpoch — the initial epoch-0 insert included — despawning the old
             // map's first. (Command ordering: teardown's despawns are queued before spawn's inserts.)
@@ -231,14 +257,21 @@ impl Plugin for PoiPlugin {
                 Update,
                 (teardown_pois, spawn_pois)
                     .chain()
-                    .run_if(resource_changed::<crate::render::MapEpoch>),
+                    .run_if(pois_need_rebuild),
             )
             // Quest markers get their own visibility pass (toggle AND tracker selection); the other
             // POI layers stay on the plain toggle-driven `apply_poi_visibility`. Ordered AFTER
             // spawn_pois so the auto-inserted sync point makes the fresh markers visible on a swap.
             .add_systems(Update, (apply_poi_visibility, apply_quest_visibility).after(spawn_pois))
-            .add_systems(Update, (draw_quest_outlines, draw_gamedata_outlines));
+            .add_systems(Update, (draw_quest_outlines, draw_gamedata_outlines, draw_operation_links));
     }
+}
+
+fn pois_need_rebuild(
+    epoch: Res<crate::render::MapEpoch>,
+    pack: Option<Res<LoadedPack>>,
+) -> bool {
+    epoch.is_changed() || pack.is_some_and(|p| p.is_added())
 }
 
 /// (colour, marker radius m, y-lift m). Colours match the panel swatches.
@@ -289,6 +322,30 @@ struct MapNodes {
     extracts_dev: Vec<ExtractDev>,
     #[serde(default)]
     loose: Vec<Loose>,
+    #[serde(default)]
+    btr: Vec<BtrStop>,
+    #[serde(default)]
+    artillery: Vec<ApiZone>,
+    #[serde(default)]
+    meta: MapMeta,
+}
+
+#[derive(Deserialize, Default)]
+struct MapMeta {
+    #[serde(default)] name: String,
+    #[serde(default)] description: String,
+    #[serde(default)] enemies: Vec<String>,
+    #[serde(default)] raid_minutes: Option<i64>,
+    #[serde(default)] players: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BtrStop { pos: [f32; 3], #[serde(default)] name: String }
+
+#[derive(Deserialize)]
+struct ApiZone {
+    pos: [f32; 3],
+    #[serde(default)] outline: Vec<[f32; 3]>,
 }
 #[derive(Deserialize)]
 struct Node {
@@ -367,16 +424,29 @@ struct Key {
     /// Roubles, or null.
     #[serde(default)]
     pr: Option<i64>,
+    #[serde(default)] low: Option<i64>,
+    #[serde(default)] high: Option<i64>,
+    #[serde(default)] trend: Option<f32>,
 }
 /// A power/lever switch.
 #[derive(Deserialize)]
 struct Switch {
+    #[serde(default)] id: Option<String>,
     pos: [f32; 3],
     #[serde(default)]
     name: String,
     /// Switch state / type label (e.g. "Close").
     #[serde(default)]
     st: String,
+    #[serde(default)] activated_by: Option<String>,
+    #[serde(default)] activates: Vec<Operation>,
+}
+
+#[derive(Deserialize)]
+struct Operation {
+    #[serde(default)] op: String,
+    #[serde(default)] id: Option<String>,
+    #[serde(default)] name: Option<String>,
 }
 /// A transit exit to another map.
 #[derive(Deserialize)]
@@ -410,12 +480,23 @@ struct Stationary {
 /// A clean, faction-tagged extract (supersedes the semantics extracts when present).
 #[derive(Deserialize)]
 struct ExtractDev {
+    #[serde(default)] id: Option<String>,
     pos: [f32; 3],
     #[serde(default)]
     name: String,
     /// Faction: "pmc" / "scav" / "shared".
     #[serde(default)]
     fac: String,
+    #[serde(default)] outline: Vec<[f32; 3]>,
+    #[serde(default)] switches: Vec<String>,
+    #[serde(default)] transfer: Option<TransferItem>,
+}
+
+#[derive(Deserialize)]
+struct TransferItem {
+    #[serde(default, rename = "n")] name: String,
+    #[serde(default)] count: Option<i64>,
+    #[serde(default, rename = "pr")] price: Option<i64>,
 }
 /// A single valuable loose-loot point (already price-filtered upstream).
 #[derive(Deserialize)]
@@ -430,6 +511,13 @@ struct Loose {
     /// Its price in roubles, or null.
     #[serde(default)]
     pr: Option<i64>,
+    #[serde(default)] low: Option<i64>,
+    #[serde(default)] high: Option<i64>,
+    #[serde(default)] trend: Option<f32>,
+    #[serde(default)] vendor: Option<String>,
+    #[serde(default)] sell: Option<i64>,
+    #[serde(default)] t: Option<f32>,
+    #[serde(default)] jackpot: i64,
 }
 
 #[derive(Deserialize)]
@@ -530,6 +618,12 @@ struct GameDataFile {
     /// Transit outlines already ship inside `transit_points`.
     #[serde(default)]
     transit_points: Vec<GdZone>,
+    #[serde(default)]
+    buffer_switches: Vec<GdZone>,
+    #[serde(default)]
+    buffer_zones: Vec<GdZone>,
+    #[serde(default)]
+    loot_groups: Vec<GdZone>,
 }
 fn default_true() -> bool {
     true
@@ -650,7 +744,16 @@ fn outline_extent(outline: &[[f32; 3]]) -> Option<String> {
 /// becomes the display name, with the raw scene id kept as a detail line.
 fn gd_exfil_info(e: &GdExfil, friendly: Option<&str>) -> MarkerInfo {
     let display = friendly.unwrap_or(e.name.as_str());
-    let mut info = extract_dev_info(display, &e.faction);
+    let base = ExtractDev {
+        id: None,
+        pos: e.pos,
+        name: display.to_string(),
+        fac: e.faction.clone(),
+        outline: Vec::new(),
+        switches: Vec::new(),
+        transfer: None,
+    };
+    let mut info = extract_dev_info(&base, &e.faction);
     if friendly.is_some_and(|f| f != e.name) && !e.name.is_empty() {
         info.detail.push(format!("Scene id: {}", e.name));
     }
@@ -978,8 +1081,9 @@ fn extract_faction_color(fac: &str) -> Color {
 
 /// Card for a clean faction-tagged extract (loot.json `extracts_dev`). `fac` may be a merged
 /// "pmc+scav" (one physical extract listed once per faction by tarkov.dev).
-fn extract_dev_info(name: &str, fac: &str) -> MarkerInfo {
+fn extract_dev_info(ex: &ExtractDev, fac: &str) -> MarkerInfo {
     let accent = extract_faction_color(fac);
+    let name = ex.name.as_str();
     let name = if name.is_empty() { "Extract" } else { name };
     // Faction in the title (e.g. "Armored Train  [All]") so search hits "pmc"/"scav".
     let title = if fac.is_empty() {
@@ -993,10 +1097,20 @@ fn extract_dev_info(name: &str, fac: &str) -> MarkerInfo {
     } else {
         faction_label(fac)
     };
+    let mut detail = vec![format!("Faction: {fac_line}")];
+    if !ex.switches.is_empty() {
+        detail.push(format!("Requires switch: {}", ex.switches.join(", ")));
+    }
+    if let Some(item) = &ex.transfer {
+        let mut req = format!("Requires {}", item.name);
+        if let Some(count) = item.count.filter(|v| *v > 1) { req.push_str(&format!(" x{count}")); }
+        if let Some(price) = item.price.filter(|v| *v > 0) { req.push_str(&format!(" (~{} R)", money(price))); }
+        detail.push(req);
+    }
     MarkerInfo {
         title,
         subtitle: "Extract".into(),
-        detail: vec![format!("Faction: {fac_line}")],
+        detail,
         accent,
     }
 }
@@ -1028,6 +1142,14 @@ fn lock_info(lk: &Lock) -> MarkerInfo {
                     d.push(format!("Value  {}", money(pr)));
                 }
             }
+            if k.low.is_some() || k.high.is_some() {
+                d.push(format!(
+                    "24h range  {}-{}",
+                    k.low.map(money).unwrap_or_else(|| "?".into()),
+                    k.high.map(money).unwrap_or_else(|| "?".into())
+                ));
+            }
+            if let Some(trend) = k.trend { d.push(format!("48h trend  {trend:+.1}%")); }
         }
         if lk.pw == 1 {
             d.push("Power required".into());
@@ -1054,6 +1176,14 @@ fn switch_info(sw: &Switch) -> MarkerInfo {
     let mut detail = Vec::new();
     if !sw.st.is_empty() {
         detail.push(format!("Type: {}", sw.st));
+    }
+    if let Some(by) = &sw.activated_by { detail.push(format!("Activated by: {by}")); }
+    for op in &sw.activates {
+        detail.push(format!(
+            "{}: {}",
+            if op.op.is_empty() { "Activates" } else { op.op.as_str() },
+            op.name.as_deref().or(op.id.as_deref()).unwrap_or("target")
+        ));
     }
     MarkerInfo {
         title: sw.name.clone(),
@@ -1175,8 +1305,19 @@ fn loose_info(lo: &Loose) -> MarkerInfo {
     let mut detail = Vec::new();
     if let Some(pr) = lo.pr {
         if pr > 0 {
-            detail.push(format!("Value  {}", money(pr)));
+            detail.push(format!("Possible jackpot  {}", money(pr)));
         }
+    }
+    if lo.low.is_some() || lo.high.is_some() {
+        detail.push(format!(
+            "24h range  {}-{}",
+            lo.low.map(money).unwrap_or_else(|| "?".into()),
+            lo.high.map(money).unwrap_or_else(|| "?".into())
+        ));
+    }
+    if let Some(trend) = lo.trend { detail.push(format!("48h trend  {trend:+.1}%")); }
+    if let Some(sell) = lo.sell.filter(|v| *v > 0) {
+        detail.push(format!("{}  {}", lo.vendor.as_deref().unwrap_or("Vendor"), money(sell)));
     }
     MarkerInfo {
         title,
@@ -1408,6 +1549,8 @@ fn spawn_pois(
     // Exfil", "Emercom Checkpoint"). The typed gamedata exfils carry raw scene ids ("NW Exfil",
     // "SE Exfil"), so each is renamed to the nearest dev extract within 60 m (XZ) below.
     let mut dev_extract_names: Vec<(String, Vec3)> = Vec::new();
+    let mut intel_meta = MapIntelMeta::default();
+    let mut operation_links: Vec<(Vec3, Vec3)> = Vec::new();
     let key = map_key(&lp.0.manifest);
     // ONE loot.json resolver for the whole app (loot.rs: env > pack > pack-parent shared >
     // shared_dir > cwd) - poi.rs used to re-implement a subset (audit A6).
@@ -1417,11 +1560,20 @@ fn spawn_pois(
         .and_then(|s| serde_json::from_str::<LootFile>(&s).ok())
         .and_then(|mut f| f.maps.remove(&key))
     {
+        intel_meta = MapIntelMeta {
+            name: mn.meta.name.clone(),
+            description: mn.meta.description.clone(),
+            enemies: mn.meta.enemies.clone(),
+            raid_minutes: mn.meta.raid_minutes,
+            players: mn.meta.players.clone(),
+        };
         for nd in &mn.pmc_nodes {
-            spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd), None);
+            let e = spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd), None);
+            commands.entity(e).insert(DenseMarker);
         }
         for nd in &mn.scav_nodes {
-            spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd), None);
+            let e = spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd), None);
+            commands.entity(e).insert(DenseMarker);
         }
         for nd in &mn.boss_nodes {
             spawn(&mut commands, PoiLayer::Boss, nd.pos, node_info(PoiLayer::Boss, nd), None);
@@ -1442,6 +1594,9 @@ fn spawn_pois(
             if let Some(k) = lk.keys.iter().find(|k| !k.n.is_empty()) {
                 commands.entity(e).insert(MarkerIcon(icon_slug(&k.n)));
             }
+            commands.entity(e).insert(LockKeys(
+                lk.keys.iter().filter(|k| !k.n.is_empty()).map(|k| k.n.clone()).collect()
+            ));
             // Fold EVERY key into the catalog, grouped by key name (today each lock ships
             // exactly one key, but an alternate key must not vanish from the list).
             if let Some(k) = lk.keys.iter().find(|k| !k.n.is_empty()) {
@@ -1463,6 +1618,15 @@ fn spawn_pois(
         }
         for sw in &mn.switches {
             spawn(&mut commands, PoiLayer::Switch, sw.pos, switch_info(sw), None);
+            let from = Vec3::from(sw.pos);
+            for op in &sw.activates {
+                if let Some(ex) = mn.extracts_dev.iter().find(|ex| {
+                    op.id.as_ref().is_some_and(|id| ex.id.as_ref() == Some(id))
+                        || op.name.as_ref().is_some_and(|name| ex.name.eq_ignore_ascii_case(name))
+                }) {
+                    operation_links.push((from, Vec3::from(ex.pos)));
+                }
+            }
         }
         for tr in &mn.transits {
             spawn(&mut commands, PoiLayer::Transit, tr.pos, transit_info(tr), None);
@@ -1476,7 +1640,8 @@ fn spawn_pois(
                 pruned_dev_hazards += 1;
                 continue;
             }
-            spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz), None);
+            let e = spawn(&mut commands, PoiLayer::Hazard, hz.pos, hazard_info(hz), None);
+            commands.entity(e).insert(DenseMarker);
         }
         if pruned_dev_hazards > 0 {
             info!(
@@ -1497,11 +1662,37 @@ fn spawn_pois(
             }
             // Tagged with the item price so the panel's min-value filter applies (0 = unpriced).
             let e = spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, loose_info(lo), None);
-            commands.entity(e).insert(MarkerValue(lo.pr.unwrap_or(0)));
+            commands.entity(e).insert((
+                MarkerValue(lo.pr.unwrap_or(0)),
+                crate::loot::LootTime(lo.t.unwrap_or(2.0).max(0.0)),
+                DenseMarker,
+            ));
+            if lo.jackpot != 0 { commands.entity(e).insert(LootJackpot); }
             // Item icon (cached per map by fetch_icons.py; missing file = no icon).
             if !lo.n.is_empty() {
                 commands.entity(e).insert(MarkerIcon(icon_slug(&lo.n)));
             }
+        }
+        for stop in &mn.btr {
+            let name = if stop.name.is_empty() { "BTR stop".into() } else { stop.name.clone() };
+            let e = spawn(&mut commands, PoiLayer::Transit, stop.pos, MarkerInfo {
+                title: name,
+                subtitle: "BTR stop".into(),
+                detail: vec!["tarkov.dev route stop".into()],
+                accent: poi_look(PoiLayer::Transit).0,
+            }, None);
+            commands.entity(e).insert(DenseMarker);
+        }
+        for zone in &mn.artillery {
+            let info = MarkerInfo {
+                title: "Artillery zone".into(),
+                subtitle: "Hazard".into(),
+                detail: vec!["Dynamic artillery danger area".into(), "tarkov.dev".into()],
+                accent: poi_look(PoiLayer::Hazard).0,
+            };
+            spawn(&mut commands, PoiLayer::Hazard, zone.pos, info, None);
+            let points: Vec<Vec3> = zone.outline.iter().copied().map(Vec3::from).collect();
+            wall(&mut commands, &mut meshes, PoiLayer::Hazard, &points, poi_look(PoiLayer::Hazard).0, true);
         }
         // Community extract names for the typed-exfil rename (kept whether or not the dev
         // markers themselves spawn — the names matter either way).
@@ -1549,10 +1740,17 @@ fn spawn_pois(
                     &mut commands,
                     PoiLayer::Extract,
                     ex.pos,
-                    extract_dev_info(&ex.name, fac),
+                    extract_dev_info(ex, fac),
                     mat,
                 );
                 commands.entity(e).insert(ExtractFaction(fac.clone()));
+                let points: Vec<Vec3> = ex.outline.iter().copied().map(Vec3::from).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Extract, &points, extract_faction_color(fac), true);
+                for switch_name in &ex.switches {
+                    if let Some(sw) = mn.switches.iter().find(|sw| sw.name.eq_ignore_ascii_case(switch_name)) {
+                        operation_links.push((Vec3::from(sw.pos), Vec3::from(ex.pos)));
+                    }
+                }
             }
         }
     }
@@ -1645,6 +1843,40 @@ fn spawn_pois(
                 gd_zones.hazard_zones.push((pts, z.active));
             }
         }
+        for z in &gd.buffer_switches {
+            let ent = spawn(&mut commands, PoiLayer::Switch, z.pos, MarkerInfo {
+                title: z.name.as_deref().map(prettify).unwrap_or_else(|| "Buffer gate switch".into()),
+                subtitle: "Buffer gate switch \u{00B7} game files".into(),
+                detail: vec![z.kind.clone().unwrap_or_else(|| "BufferGateSwitcher".into())],
+                accent: poi_look(PoiLayer::Switch).0,
+            }, None);
+            if !z.active { commands.entity(ent).insert(SceneInactive); }
+        }
+        for z in &gd.buffer_zones {
+            let kind = z.kind.as_deref().unwrap_or("restricted");
+            let ent = spawn(&mut commands, PoiLayer::Hazard, z.pos, MarkerInfo {
+                title: z.name.as_deref().map(prettify).unwrap_or_else(|| "Restricted zone".into()),
+                subtitle: "Restricted / buffer zone \u{00B7} game files".into(),
+                detail: vec![titlecase(&kind.replace('_', " "))],
+                accent: poi_look(PoiLayer::Hazard).0,
+            }, None);
+            if !z.active { commands.entity(ent).insert(SceneInactive); }
+            if z.outline.len() >= 3 {
+                let pts: Vec<Vec3> = z.outline.iter().copied().map(Vec3::from).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Hazard, &pts, poi_look(PoiLayer::Hazard).0, z.active);
+                gd_zones.hazard_zones.push((pts, z.active));
+            }
+        }
+        for z in &gd.loot_groups {
+            let ent = spawn(&mut commands, PoiLayer::LooseLoot, z.pos, MarkerInfo {
+                title: z.name.as_deref().map(prettify).unwrap_or_else(|| "Loot group".into()),
+                subtitle: "LootPointsGroup \u{00B7} game files".into(),
+                detail: vec!["Grouped loose-loot spawn area".into()],
+                accent: poi_look(PoiLayer::LooseLoot).0,
+            }, None);
+            commands.entity(ent).insert((DenseMarker, crate::loot::LootTime(5.0)));
+            if !z.active { commands.entity(ent).insert(SceneInactive); }
+        }
         // Quest TRIGGER markers only. The zone FOOTPRINTS (walls + outlines) are intentionally NOT
         // built here: gamedata triggers carry no task id, so they can't be limited to the currently
         // tracked quest. Tracked-quest zones come from the tasks.json path below (`QuestMarkerTask`
@@ -1671,6 +1903,7 @@ fn spawn_pois(
         // them — an unknown pool is not "low value". Real best items also get their icon.
         for lo in &gd.loose_points {
             let ent = spawn(&mut commands, PoiLayer::LooseLoot, lo.pos, gd_loose_info(lo), None);
+            commands.entity(ent).insert((DenseMarker, crate::loot::LootTime(3.0)));
             let best = lo.items.first();
             if let Some(pr) = best.and_then(|b| b.pr).filter(|&p| p > 0) {
                 commands.entity(ent).insert(MarkerValue(pr));
@@ -1715,7 +1948,7 @@ fn spawn_pois(
             // The key ITEM's icon on keyed-door cards, keyed by the tarkov.dev name the card
             // shows (fetch_icons.py also caches these by the door's raw key_id template).
             if let Some(n) = dev_key {
-                commands.entity(ent).insert(MarkerIcon(icon_slug(n)));
+                commands.entity(ent).insert((MarkerIcon(icon_slug(n)), LockKeys(vec![n.to_string()])));
             }
             if !d.active {
                 commands.entity(ent).insert(SceneInactive);
@@ -1871,6 +2104,10 @@ fn spawn_pois(
     // Most expensive keys first — the panel renders the catalog in this order.
     key_uses.sort_by_key(|k| std::cmp::Reverse(k.price.unwrap_or(0)));
     commands.insert_resource(KeyCatalog { keys: key_uses });
+    commands.insert_resource(intel_meta);
+    operation_links.sort_by(|a, b| a.0.x.total_cmp(&b.0.x).then_with(|| a.1.x.total_cmp(&b.1.x)));
+    operation_links.dedup_by(|a, b| a.0.distance_squared(b.0) < 0.25 && a.1.distance_squared(b.1) < 0.25);
+    commands.insert_resource(OperationLinks(operation_links));
     commands.insert_resource(QuestData { tasks: quest_tasks });
     if quest_count > 0 {
         info!("poi: {quest_count} tasks tracked on this map");
@@ -1948,17 +2185,27 @@ fn teardown_pois(mut commands: Commands, q: Query<Entity, With<PoiLayer>>) {
 fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
+    cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     mut q: Query<
-        (&PoiLayer, Option<&MarkerValue>, Option<&SceneInactive>, &mut Visibility),
+        (
+            &PoiLayer,
+            Option<&MarkerValue>,
+            Option<&SceneInactive>,
+            &GlobalTransform,
+            Option<&DenseMarker>,
+            &mut Visibility,
+        ),
         Without<QuestMarkerTask>,
     >,
 ) {
     // Re-apply on a toggle change OR a map swap (fresh markers spawn Hidden; the swap didn't touch
     // the toggles, so without the epoch trigger they'd stay invisible).
-    if !toggles.is_changed() && !epoch.is_changed() {
+    if !toggles.cluster_dense && !toggles.is_changed() && !epoch.is_changed() {
         return;
     }
-    for (l, val, inactive, mut vis) in &mut q {
+    let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    let mut occupied = std::collections::HashSet::new();
+    for (l, val, inactive, gt, dense, mut vis) in &mut q {
         let show = match l {
             PoiLayer::PmcSpawn => toggles.pmc_spawns,
             PoiLayer::ScavSpawn => toggles.scav_spawns,
@@ -1979,14 +2226,36 @@ fn apply_poi_visibility(
         // Value-tagged markers (loose loot) additionally pass the panel's min-value filter,
         // and scene-inactive markers the global "hide inactive" filter — both COMPOSE with
         // the layer toggle rather than replacing it.
-        let show = show
+        let mut show = show
             && value_passes(toggles.min_value, val)
             && !(toggles.hide_inactive && inactive.is_some());
+        if show && toggles.cluster_dense && dense.is_some() {
+            let p = gt.translation();
+            let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
+            let cell = if distance > 320.0 { 40.0 } else if distance > 140.0 { 18.0 } else { 0.0 };
+            if cell > 0.0 {
+                show = occupied.insert((*l as u8, (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
+            }
+        }
         *vis = if show {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+    }
+}
+
+fn draw_operation_links(
+    mut gizmos: Gizmos,
+    links: Res<OperationLinks>,
+    toggles: Res<LayerToggles>,
+) {
+    if !toggles.switches || links.0.is_empty() {
+        return;
+    }
+    let color = Color::srgba(0.25, 0.9, 1.0, 0.75);
+    for (from, to) in &links.0 {
+        gizmos.line(*from + Vec3::Y, *to + Vec3::Y, color);
     }
 }
 

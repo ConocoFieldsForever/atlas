@@ -1454,7 +1454,12 @@ pub fn menu_ui(
         state.deps_ok = deps_ready().unwrap_or(true);
         let ok = worker.last_outcome().map(|(_, ok)| ok).unwrap_or(false);
         if worker.last_is_sync() {
-            state.sync_note = Some(if ok {
+            // "refreshed" only if the sync exited 0 AND fresh intel is actually VISIBLE where we scan
+            // (state.intel was just re-read above). A green "refreshed" next to "synced never" means
+            // the script wrote loot.json somewhere shared_dir() can't see — report that instead of
+            // lying. (After the packs_root content-check fix both point at the same dir.)
+            let intel_present = state.intel.0.is_some() || state.intel.1.is_some();
+            state.sync_note = Some(if ok && intel_present {
                 (t(lg, K::IntelRefreshed).to_string(), true)
             } else {
                 (t(lg, K::SyncFailed).to_string(), false)

@@ -22,6 +22,12 @@ pub mod instancing;
 pub mod ssao;
 pub mod standard;
 
+/// Pre-LUT exposure calibrated for the native renderer's SH radiance scale.  Keep this in one
+/// place: both the startup LUT resource and the live graphics settings must begin at the same value.
+/// 1.7 clipped too much of Lighthouse's pale road/rock range; 1.35 is roughly one third stop lower
+/// while retaining the game's extracted LUT rather than replacing it with a hand grade.
+pub const DEFAULT_GRADE_EXPOSURE: f32 = 1.35;
+
 pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin, GpuLoadSignal};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
@@ -41,7 +47,7 @@ pub struct GfxSettings {
     pub sky_refl: f32,
     /// Emissive strength scale (monitors / signs / lamps).
     pub emissive: f32,
-    /// Experimental real-time sun shadows (needs a valid sun_dir; marginal on baked-SH scenes).
+    /// Real-time sun shadows (default ON; needs a valid sun_dir). EFT_SHADOWS=0 force-disables.
     pub shadows: bool,
     /// Whether the pack has a usable sun_dir at all (set at startup; greys the toggle out).
     pub shadows_available: bool,
@@ -51,7 +57,7 @@ pub struct GfxSettings {
     /// The game grade LUT (off = TonyMcMapface + hand-grade fallback).
     pub grade: bool,
     pub grade_available: bool,
-    /// Pre-LUT exposure (web viewer default 0.18).
+    /// Pre-LUT exposure (native renderer default [`DEFAULT_GRADE_EXPOSURE`]).
     pub grade_exposure: f32,
     /// PRISM vignette on/off.
     pub vignette: bool,
@@ -86,7 +92,13 @@ impl Default for GfxSettings {
                 .unwrap_or(1.0),
             sky_refl: 1.0,
             emissive: 1.0,
-            shadows: std::env::var("EFT_SHADOWS").map(|v| v.trim() == "1").unwrap_or(false),
+            // Sun shadows default ON for every map with a sun_dir; EFT_SHADOWS=0 (or =false) opts OUT.
+            shadows: std::env::var("EFT_SHADOWS")
+                .map(|v| {
+                    let t = v.trim();
+                    t != "0" && !t.eq_ignore_ascii_case("false")
+                })
+                .unwrap_or(true),
             shadows_available: false, // set at startup when sun_dir resolves
             // EFT_BLOOM=0 disables (debug A/B: bloom's downsample grid can checker bright haze).
             bloom: !std::env::var("EFT_BLOOM").map(|v| v.trim() == "0").unwrap_or(false),
@@ -96,8 +108,7 @@ impl Default for GfxSettings {
             grade_exposure: std::env::var("EFT_GRADE_EXPOSURE")
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(1.7), // recalibrated: 0.18 was the web viewer's scale (and was tuned
-                                 // while the LUT pass was silently dead — see render/grade.rs)
+                .unwrap_or(DEFAULT_GRADE_EXPOSURE),
             vignette: !std::env::var("EFT_VIGNETTE").map(|v| v.trim() == "0").unwrap_or(false),
             grass: true,
             cull_px,
