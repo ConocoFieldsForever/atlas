@@ -19,6 +19,24 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=ATLAS_GIT_SHA={sha}");
+
+    // --- 1b. git commit date -> ATLAS_BUILD_TIME (ISO 8601, UTC) --------------------------------
+    // The update check compares this against the newest release's `published_at`, so a build that is
+    // AHEAD of every published release (a local dev build) is NOT nagged to "update" to an OLDER
+    // release. Forced UTC + a fixed format so the string sorts LEXICOGRAPHICALLY == chronologically
+    // (matches GitHub's "...Z" timestamps; no date parsing at runtime). "unknown" when git can't tell
+    // us — same fallback as the SHA, and the check treats "unknown" build time as "don't recency-gate".
+    let build_time = Command::new("git")
+        .args(["show", "-s", "--date=format-local:%Y-%m-%dT%H:%M:%SZ", "--format=%cd", "HEAD"])
+        .env("TZ", "UTC")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=ATLAS_BUILD_TIME={build_time}");
     // Rebuild when HEAD moves so the embedded SHA stays current. `--git-path` resolves the real
     // HEAD path relative to this crate dir (handles worktrees + the .git living at the repo root,
     // one level up from viewer/). Best-effort: skip the directive if git can't tell us.
