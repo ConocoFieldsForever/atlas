@@ -577,7 +577,13 @@ impl Pack {
     }
 
     pub fn load(dir: impl AsRef<Path>) -> Result<Pack> {
-        let root = dir.as_ref().to_path_buf();
+        // Keep the pack root absolute from the moment it enters the loader.  Several rendering
+        // sidecars are resolved in more than one stage (main world -> render world); a relative
+        // root made an already-resolved path still look relative and produced paths such as
+        // `packs/lighthouse.eftpack/packs/lighthouse.eftpack/terrain_layers/...`.
+        let requested_root = dir.as_ref();
+        let root = std::fs::canonicalize(requested_root)
+            .unwrap_or_else(|_| requested_root.to_path_buf());
         if !root.is_dir() {
             return Err(anyhow!("pack dir does not exist: {}", root.display()));
         }

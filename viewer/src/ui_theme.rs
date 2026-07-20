@@ -25,7 +25,6 @@
 //! egui 0.32 via bevy_egui 0.37. Everything is square-cornered (EFT UI is all hard corners).
 //! ASCII + the whitelisted glyphs only (x -> `\u{00D7}`, dot `\u{25CF}`, etc).
 
-#![cfg(feature = "egui")]
 // A design-system module deliberately exposes a COMPLETE, coherent token vocabulary (the full type
 // and spacing scale, every state color, the widget helpers) so panels reach for the right token
 // instead of a literal. Not every token is consumed on day one; that is by design, not dead weight.

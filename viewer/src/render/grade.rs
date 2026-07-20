@@ -16,8 +16,8 @@
 //!
 //! LUT resolution order: EFT_GRADE_LUT env → <pack>/grade_lut.bin → tarkmap/out default.
 //! EFT_GRADE=0 disables the pass entirely (camera falls back to TonyMcMapface + hand grade).
-//! EFT_GRADE_EXPOSURE overrides the pre-LUT exposure (default 1.7 — recalibrated for this
-//! renderer's radiance scale; the web viewer's 0.18 was tuned for a different pipeline).
+//! EFT_GRADE_EXPOSURE overrides the pre-LUT exposure (the default is shared with
+//! `GfxSettings`; the web viewer's 0.18 was tuned for a different radiance scale).
 //! EFT_VIGNETTE=0 zeroes the PRISM vignette strength.
 
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
@@ -49,7 +49,7 @@ pub struct GradeLutCpu {
     /// 64³ texels, Rgba16Float LE bytes, x=R fastest → y=G → z=B (texture_3d upload order).
     /// Texels are LINEAR (display encode inverted at load — see module docs).
     pub texels: Vec<u8>,
-    /// Pre-LUT exposure multiplier (web default 0.18).
+    /// Pre-LUT exposure multiplier.
     pub exposure: f32,
     /// PRISM vignette strength (0 = off).
     pub vignette: f32,
@@ -113,7 +113,7 @@ pub fn load_grade_lut(pack_root: Option<&std::path::Path>) -> Option<GradeLutCpu
     let exposure = std::env::var("EFT_GRADE_EXPOSURE")
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(1.7f32); // matches GfxSettings::default — see recalibration note there
+        .unwrap_or(super::DEFAULT_GRADE_EXPOSURE);
     let vignette = if std::env::var("EFT_VIGNETTE").map(|v| v.trim() == "0").unwrap_or(false) {
         0.0
     } else {

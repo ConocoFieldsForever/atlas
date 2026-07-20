@@ -35,7 +35,7 @@ pub struct NavUiState {
     pending: Option<Entity>,
     plan_min_value: i64,
     plan_stops: usize,
-    plan_budget: f32,
+    plan_budget_min: f32,
     /// Last MapEpoch we reacted to — on a swap, `pending` (an extract Entity from the OLD map) is
     /// cleared so it can't highlight a wrong row / recycled id on the new map.
     last_epoch: u64,
@@ -46,7 +46,7 @@ impl Default for NavUiState {
             pending: None,
             plan_min_value: 100_000,
             plan_stops: 10,
-            plan_budget: 1500.0,
+            plan_budget_min: 25.0,
             last_epoch: 0,
         }
     }
@@ -314,7 +314,7 @@ pub fn navigate_tab(
                     });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("budget").size(theme::SIZE_SMALL).color(theme::MUTED));
-                        ui.add(egui::Slider::new(&mut ui_state.plan_budget, 500.0..=3000.0).suffix(" m").step_by(50.0));
+                        ui.add(egui::Slider::new(&mut ui_state.plan_budget_min, 5.0..=50.0).suffix(" min").step_by(1.0));
                     });
                     let full = egui::vec2(ui.available_width(), 26.0);
                     if ui
@@ -328,7 +328,7 @@ pub fn navigate_tab(
                         plan_req.write(PlanRequest {
                             min_value: ui_state.plan_min_value,
                             max_stops: ui_state.plan_stops,
-                            budget_m: ui_state.plan_budget,
+                            budget_s: ui_state.plan_budget_min * 60.0,
                         });
                     }
                     match &plan.status {
@@ -343,8 +343,9 @@ pub fn navigate_tab(
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!(
-                                        "\u{2248}{}k \u{20BD}  \u{00B7}  {:.0} m  \u{00B7}  exits {}",
+                                        "\u{2248}{}k \u{20BD}  \u{00B7}  {:.1} min / {:.0} m  \u{00B7}  exits {}",
                                         plan.total_value / 1000,
+                                        plan.total_time / 60.0,
                                         plan.total_dist,
                                         plan.extract
                                     ))
@@ -353,7 +354,7 @@ pub fn navigate_tab(
                                 );
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button(RichText::new("clear").size(10.0)).clicked() {
-                                        plan_req.write(PlanRequest { min_value: 0, max_stops: 0, budget_m: 0.0 });
+                                        plan_req.write(PlanRequest { min_value: 0, max_stops: 0, budget_s: 0.0 });
                                         route.write(RouteRequest::default());
                                     }
                                 });
@@ -368,7 +369,7 @@ pub fn navigate_tab(
                                         );
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                             ui.label(
-                                                RichText::new(format!("+{:.0} m", st.leg))
+                                                RichText::new(format!("+{:.0} m / {:.0}s", st.leg, st.loot_s))
                                                     .size(theme::SIZE_TINY)
                                                     .color(theme::FAINT),
                                             );

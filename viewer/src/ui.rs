@@ -21,6 +21,8 @@ const LOOT_CLASSES: &[&str] = &[
 #[derive(Resource, Clone, PartialEq)]
 pub struct LayerToggles {
     pub loot: bool,
+    /// Collapse dense point layers into camera-distance grid cells.
+    pub cluster_dense: bool,
     /// class -> shown. Missing class defaults to shown.
     pub loot_classes: BTreeMap<String, bool>,
     /// Min ruble value for VALUE-TAGGED markers (`poi::MarkerValue`: container `ev` estimates +
@@ -67,6 +69,7 @@ impl Default for LayerToggles {
         let has = |k: &str| on.contains(k);
         Self {
             loot: !has("noloot"),
+            cluster_dense: !has("nocluster"),
             loot_classes: LOOT_CLASSES.iter().map(|c| (c.to_string(), true)).collect(),
             min_value: 0,
             hide_inactive: !has("showinactive"),
@@ -461,9 +464,8 @@ fn load_bookmarks(
 /// markers (recycled ids would silently resolve to wrong new markers) and the quest tracker set
 /// (the new map's task ids differ). Filter/view PREFERENCES are kept. `Bookmarks` reload is handled
 /// by `load_bookmarks` (epoch-tracked); loot/POI/quest marker visibility by their epoch guards.
-fn teardown_ui(mut plan: ResMut<PlanList>, mut tracker: ResMut<QuestTracker>) {
+fn teardown_ui(mut plan: ResMut<PlanList>) {
     plan.pins.clear();
-    tracker.active.clear();
 }
 
 /// Show/hide loot markers by the master toggle AND the per-class filter AND the min-value
@@ -472,15 +474,33 @@ fn teardown_ui(mut plan: ResMut<PlanList>, mut tracker: ResMut<QuestTracker>) {
 fn apply_loot_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
-    mut q: Query<(&LootClass, Option<&crate::poi::MarkerValue>, &mut Visibility)>,
+    cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
+    mut q: Query<(
+        &LootClass,
+        Option<&crate::poi::MarkerValue>,
+        &GlobalTransform,
+        Option<&crate::poi::DenseMarker>,
+        &mut Visibility,
+    )>,
 ) {
     // Re-apply on a toggle change OR a map swap (fresh markers spawn Hidden and the swap didn't
     // touch the toggles).
-    if !toggles.is_changed() && !epoch.is_changed() {
+    if !toggles.cluster_dense && !toggles.is_changed() && !epoch.is_changed() {
         return;
     }
-    for (cls, val, mut vis) in &mut q {
-        *vis = vis_for(&toggles, &cls.0, val);
+    let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    let mut occupied = std::collections::HashSet::new();
+    for (cls, val, gt, dense, mut vis) in &mut q {
+        let mut shown = vis_for(&toggles, &cls.0, val) == Visibility::Visible;
+        if shown && toggles.cluster_dense && dense.is_some() {
+            let p = gt.translation();
+            let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
+            let cell = if distance > 320.0 { 35.0 } else if distance > 140.0 { 14.0 } else { 0.0 };
+            if cell > 0.0 {
+                shown = occupied.insert((cls.0.clone(), (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
+            }
+        }
+        *vis = if shown { Visibility::Visible } else { Visibility::Hidden };
     }
 }
 
@@ -559,6 +579,8 @@ struct GfxUiParams<'w, 's> {
     cam: Query<'w, 's, &'static Transform, With<crate::render::CullCamera>>,
     /// Typed gamedata.json zone state — the footer credits the game files when it's live.
     gamedata: Res<'w, crate::poi::GameDataZones>,
+    map_meta: Res<'w, crate::poi::MapIntelMeta>,
+    progress: ResMut<'w, crate::progress::PlayerProgress>,
     /// Scene-inactive markers, counted next to the "hide inactive" filter checkbox (walls
     /// excluded — a zone would otherwise count twice: marker + wall).
     inactive: Query<
@@ -887,6 +909,24 @@ fn layers_panel(
                 .id_salt("panel_body")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    if !gfx_ui.map_meta.name.is_empty() {
+                        CollapsingHeader::new(RichText::new("Map overview").size(12.0).strong())
+                            .id_salt("sec_map_overview")
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(&gfx_ui.map_meta.name).size(13.0).strong().color(ACCENT));
+                                let mut raid = Vec::new();
+                                if let Some(mins) = gfx_ui.map_meta.raid_minutes { raid.push(format!("{mins} min raid")); }
+                                if let Some(players) = &gfx_ui.map_meta.players { raid.push(format!("{players} players")); }
+                                if !raid.is_empty() { ui.label(RichText::new(raid.join("  \u{00B7}  ")).size(10.0).color(MUTED)); }
+                                if !gfx_ui.map_meta.enemies.is_empty() {
+                                    ui.label(RichText::new(format!("Enemies: {}", gfx_ui.map_meta.enemies.join(", "))).size(9.5).color(MUTED));
+                                }
+                                if !gfx_ui.map_meta.description.is_empty() {
+                                    ui.label(RichText::new(&gfx_ui.map_meta.description).size(9.5).italics().color(MUTED));
+                                }
+                            });
+                    }
                     // ===== RAID PLAN (markers pinned from their inspect cards) =====
                     // Self-prune pins whose marker entity despawned; write back only when
                     // something was actually dropped so change detection stays quiet.
@@ -1006,6 +1046,8 @@ fn layers_panel(
                                 &mut toggles.loot,
                                 RichText::new("Raw loot").size(14.0).strong(),
                             );
+                            ui.checkbox(&mut toggles.cluster_dense, "adaptive marker clustering")
+                                .on_hover_text("at long range, show one representative per grid cell to reduce clutter");
                             let loot_on = toggles.loot;
                             for (cls, on) in toggles.loot_classes.iter_mut() {
                                 let n = loot_counts.get(cls).copied().unwrap_or(0);
@@ -1129,12 +1171,17 @@ fn layers_panel(
                                     } else {
                                         RichText::new(row).size(12.0)
                                     };
-                                    if ui.selectable_label(false, text).clicked() {
-                                        toggles.locks = true;
-                                        if let Some(p) = k.lock_positions.first() {
-                                            cam_cmd.fly_to = Some(*p);
+                                    ui.horizontal(|ui| {
+                                        let mut owned = gfx_ui.progress.owns_key(&k.name);
+                                        if ui.checkbox(&mut owned, "").on_hover_text("mark key owned for route planning").changed() {
+                                            if owned { gfx_ui.progress.owned_keys.insert(k.name.clone()); }
+                                            else { gfx_ui.progress.owned_keys.retain(|x| !x.eq_ignore_ascii_case(&k.name)); }
                                         }
-                                    }
+                                        if ui.selectable_label(false, text).clicked() {
+                                            toggles.locks = true;
+                                            if let Some(p) = k.lock_positions.first() { cam_cmd.fly_to = Some(*p); }
+                                        }
+                                    });
                                 }
                             }
                         });
@@ -1352,10 +1399,13 @@ fn pos_hud(
         return;
     };
     let p = tf.translation;
-    // Camera ANGLE from the transform forward (same convention as FlyCam yaw/pitch and
-    // apply_camera_command): yaw = atan2(fwd.x, -fwd.z), pitch = asin(fwd.y). Degrees for reading.
+    // Camera ANGLE from the transform forward, in the EXACT convention `EFT_POSE`/`setup` REBUILD the
+    // rotation with: `Ry(yaw)·Rx(pitch)` gives forward = (-cos p·sin yaw, sin p, -cos p·cos yaw). To
+    // reproduce THIS forward we invert that: yaw = atan2(-fwd.x, -fwd.z), pitch = asin(fwd.y). (The old
+    // atan2(fwd.x, -fwd.z) yielded the NEGATED yaw, so a copied pose fed back to EFT_POSE mirrored the
+    // view across X — the reproducibility bug.)
     let fwd = *tf.forward();
-    let yaw_deg = fwd.x.atan2(-fwd.z).to_degrees();
+    let yaw_deg = (-fwd.x).atan2(-fwd.z).to_degrees();
     let pitch_deg = fwd.y.clamp(-1.0, 1.0).asin().to_degrees();
     let dim = crate::ui_theme::SECTION;
     let bright = crate::ui_theme::TEXT_BRIGHT;
@@ -1363,7 +1413,7 @@ fn pos_hud(
     let ang_s = format!("{:.1} {:.1}", yaw_deg, pitch_deg);
     // One-line capture of the FULL camera pose (position + look angle) for reproducing a view.
     let capture = format!(
-        "pos={:.2},{:.2},{:.2} yaw={:.2} pitch={:.2} fwd={:.3},{:.3},{:.3}",
+        "pos={:.4},{:.4},{:.4} yaw={:.5} pitch={:.5} fwd={:.6},{:.6},{:.6}",
         p.x, p.y, p.z, yaw_deg, pitch_deg, fwd.x, fwd.y, fwd.z
     );
     egui::Area::new(egui::Id::new("pos_hud"))

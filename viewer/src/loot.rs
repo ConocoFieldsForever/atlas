@@ -33,9 +33,16 @@ impl Plugin for LootPlugin {
             Update,
             (teardown_loot, spawn_loot)
                 .chain()
-                .run_if(resource_changed::<crate::render::MapEpoch>),
+                .run_if(loot_needs_rebuild),
         );
     }
+}
+
+fn loot_needs_rebuild(
+    epoch: Res<crate::render::MapEpoch>,
+    pack: Option<Res<LoadedPack>>,
+) -> bool {
+    epoch.is_changed() || pack.is_some_and(|p| p.is_added())
 }
 
 /// In-place map swap: despawn every loot marker so `spawn_loot` rebuilds for the new pack (freeing
@@ -68,7 +75,14 @@ struct Container {
     /// Spawn probability 0..1.
     #[serde(default)]
     spawn: f32,
+    /// Estimated seconds spent opening/searching this container.
+    #[serde(default)]
+    t: Option<f32>,
 }
+
+/// Estimated seconds spent at a loot stop. Shared with the raid-time planner.
+#[derive(Component, Clone, Copy)]
+pub struct LootTime(pub f32);
 
 /// Container class -> (base color, half-extents in metres). Weapon boxes are dark
 /// (the "black weapon crate") but never pure black, and every class gets an emissive
@@ -225,6 +239,8 @@ pub(crate) fn spawn_loot(
         if c.spawn > 0.0 {
             detail.push(format!("Spawn {:.0}%", c.spawn * 100.0));
         }
+        let search_s = c.t.unwrap_or(7.0).max(0.0);
+        detail.push(format!("Search ~{search_s:.0}s"));
         // Bounding sphere of the scaled cube (half-diagonal of the full extent),
         // clamped up so small markers stay easy to click.
         let pick_r = ((half * 2.0).length() * 0.5).max(0.9);
@@ -238,6 +254,8 @@ pub(crate) fn spawn_loot(
             // The ev estimate feeds the panel's min-value filter (0 = no estimate, hides under
             // an active filter).
             MarkerValue(c.ev),
+            LootTime(search_s),
+            crate::poi::DenseMarker,
             PickRadius(pick_r),
             MarkerInfo {
                 title,

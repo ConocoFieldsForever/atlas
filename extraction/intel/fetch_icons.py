@@ -73,6 +73,7 @@ def main():
     if not os.path.isdir(PACK):
         raise SystemExit(f"[icons] no pack dir {PACK}")
     names, ids = set(), set()
+    task_images = {}
 
     gd = jload(os.path.join(PACK, "gamedata.json"))
     if gd:
@@ -114,18 +115,34 @@ def main():
         for t in tj.get("tasks") or []:
             if not tasks_all and not (t.get("map") == MAP or MAP in (t.get("maps") or [])):
                 continue
+            if t.get("id") and t.get("image"):
+                task_images[t["id"]] = t["image"]
             for o in t.get("objectives") or []:
                 for it in o.get("items") or []:
                     names.add(it); n_task += 1
                 for key in ("questItem", "markerItem"):
                     if o.get(key):
                         names.add(o[key]); n_task += 1
+                for key in ("weapons", "weaponMods", "wearing", "notWearing", "useAny"):
+                    for item_name in o.get(key) or []:
+                        names.add(item_name); n_task += 1
+                for group in o.get("requiredKeys") or []:
+                    for item in group or []:
+                        if item.get("n"):
+                            names.add(item["n"]); n_task += 1
+            for reward in (t.get("rewards") or {}).get("items") or []:
+                if reward.get("n"):
+                    names.add(reward["n"]); n_task += 1
+            for offer in (t.get("rewards") or {}).get("offers") or []:
+                if offer.get("item"):
+                    names.add(offer["item"]); n_task += 1
         print(f"[icons] {MAP}: +{n_task} task item refs ({'all maps' if tasks_all else 'this map'})")
 
-    if not names and not ids:
+    if not names and not ids and not task_images:
         print(f"[icons] {MAP}: no items referenced — nothing to do")
         return
-    print(f"[icons] {MAP}: {len(names)} item names + {len(ids)} template ids referenced")
+    print(f"[icons] {MAP}: {len(names)} item names + {len(ids)} template ids + "
+          f"{len(task_images)} task images referenced")
 
     items = {}
     Q = "{ items(%s: [%s]) { id name iconLink gridImageLink } }"
@@ -176,6 +193,27 @@ def main():
     n_missing = len(names - set(items.keys()))
     print(f"[icons] {MAP}: {len(items)} resolved, {n_new} fetched, {n_have} cached, "
           f"{n_fail} failed, {n_missing} names unresolved -> {out_dir}")
+
+    # Task artwork is keyed by immutable task id (unlike item cards, no slug lookup is needed).
+    task_dir = os.path.join(os.path.dirname(PACK), "shared", "task_images")
+    os.makedirs(task_dir, exist_ok=True)
+    ti_new = ti_have = ti_fail = 0
+    for task_id, url in sorted(task_images.items()):
+        dst = os.path.join(task_dir, task_id + ".png")
+        if os.path.exists(dst):
+            ti_have += 1
+            continue
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "eft-native-viewer-icons/1.0"})
+            img = Image.open(BytesIO(urllib.request.urlopen(req, timeout=60).read())).convert("RGBA")
+            if max(img.size) > 320:
+                img.thumbnail((320, 320), Image.LANCZOS)
+            img.save(dst, "PNG")
+            ti_new += 1
+        except Exception as ex:
+            print(f"[icons]   FAIL task {task_id}: {type(ex).__name__}: {ex}")
+            ti_fail += 1
+    print(f"[icons] {MAP}: task images {ti_new} fetched, {ti_have} cached, {ti_fail} failed -> {task_dir}")
 
 
 if __name__ == "__main__":
