@@ -99,6 +99,7 @@ pub enum K {
     UsingDefault,
     FirstRunBanner,
     FirstBuildHint,
+    PlayNeedsSync,
     LanguageTip,
     ProcessInBackground,
     ProcessInBackgroundTip,
@@ -238,6 +239,10 @@ fn pair(k: K) -> [&'static str; 2] {
         FirstBuildHint => [
             "First BUILD of a map runs a one-time ~1-6 GB extraction - close the game first.",
             "Первая СБОРКА карты запускает однократную распаковку ~1-6 ГБ - сначала закройте игру.",
+        ],
+        PlayNeedsSync => [
+            "Sync tarkov.dev before playing (SYNC NOW, top) - loot/spawns/intel come from it.",
+            "Синхронизируйте tarkov.dev перед игрой (SYNC NOW, сверху) - оттуда лут/спавны/данные.",
         ],
         LanguageTip => ["Language / Язык (override auto-detect)", "Язык / Language (переопределить)"],
         ProcessInBackground => ["Process in background", "Обрабатывать в фоне"],

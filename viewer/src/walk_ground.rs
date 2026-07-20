@@ -31,7 +31,9 @@ pub const EYE_HEIGHT: f32 = 1.7;
 /// Total body height feet→head for the collision capsule (m).
 pub const PLAYER_HEIGHT: f32 = 1.8;
 /// Max height the feet may rise to select a surface (mount stairs/curbs, not tabletops) (m).
-pub const STEP_UP: f32 = 0.45;
+/// 0.5 clears the taller EFT stair treads / low ledges that 0.45 stopped short of, while staying
+/// well under a real wall so you still can't climb waist-high geometry.
+pub const STEP_UP: f32 = 0.5;
 /// Snappy game-feel gravity (not real 9.8) (m/s²).
 pub const GRAVITY: f32 = 20.0;
 /// Jump apex height per unit walk-speed (m per m/s) — apex = JUMP_K·walk_speed, so one scroll
@@ -50,6 +52,10 @@ const WALL_MIN_AREA: f32 = 0.04;
 pub const PLAYER_RADIUS: f32 = 0.32;
 /// If the camera falls this far below the last known ground, treat as fell-through-world.
 pub const KILL_DROP: f32 = 60.0;
+/// Head-bob: peak vertical eye offset (m) and phase advance (rad per metre walked). Deliberately
+/// subtle — a faint footstep cadence, not a seasick lurch.
+pub const BOB_AMP: f32 = 0.03;
+pub const BOB_RATE: f32 = 6.5;
 
 /// Per-camera walk locomotion state (lives on the CullCamera+FlyCam entity).
 #[derive(Component, Default)]
@@ -62,6 +68,11 @@ pub struct WalkState {
     pub last_ground_y: f32,
     /// Whether last_ground_y is valid yet.
     pub has_ground: bool,
+    /// Head-bob phase (radians), advanced by distance walked while grounded.
+    pub bob_phase: f32,
+    /// The cosmetic head-bob Y offset applied last frame — removed at the start of the next frame so
+    /// the bob never feeds back into the ground/step physics (which run on the un-bobbed eye height).
+    pub last_bob: f32,
 }
 
 /// One XZ-bucketed triangle grid. `tris` stores each world triangle ONCE (36 B); `cells` holds only
