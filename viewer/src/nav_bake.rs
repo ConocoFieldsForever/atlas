@@ -107,6 +107,9 @@ pub(crate) struct Tri {
     pub(crate) ny: f32,
     /// Belongs to a DOOR-tagged mesh/root → transparent to the cast + stamps the door footprint.
     pub(crate) door: bool,
+    /// SubMesh.material_id of the face — the `sh_bake` diffuse bounce reads it to look up per-material
+    /// albedo/emissive. `nav_bake` never reads it (it just travels with the tri through the BVH).
+    pub(crate) mat: u32,
 }
 
 /// A surface hit collected along one downward column ray.
@@ -270,6 +273,18 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
             lmin = lmin.min(v);
             lmax = lmax.max(v);
         }
+        // Per-face material id (for the sh_bake bounce). Submeshes are consecutive index runs within
+        // this mesh's index array, so face f (indices 3f..3f+3) belongs to the submesh whose
+        // [idx_start, idx_start+idx_count) contains 3f. Same for every instance of this mesh.
+        let n_faces = geom.indices.len() / 3;
+        let mut face_mat = vec![0u32; n_faces];
+        for sub in &mesh.submeshes {
+            let f0 = (sub.idx_start as usize) / 3;
+            let f1 = (((sub.idx_start + sub.idx_count) as usize) / 3).min(n_faces);
+            if f0 < f1 {
+                face_mat[f0..f1].fill(sub.material_id);
+            }
+        }
         for &iid in inst_ids {
             let inst = &pack.instances[iid as usize];
             let root_is_door = pack
@@ -284,7 +299,8 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
             // Footprint cap: a door tag only opens a hole (transparent + door-cell stamp, and drops
             // its faces from `walls`) when the instance is door-panel sized. A big gate still blocks.
             let door = door_tagged && instance_small_footprint(&aff, lmin, lmax);
-            for tri in geom.indices.chunks_exact(3) {
+            for (fi, tri) in geom.indices.chunks_exact(3).enumerate() {
+                let mat = face_mat[fi];
                 let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
                 // Defensive: a bad index just skips the face (release is panic=abort).
                 if i0 >= geom.positions.len() || i1 >= geom.positions.len() || i2 >= geom.positions.len() {
@@ -307,7 +323,7 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
                 // WALL: near-vertical + big enough, and NOT a (small) door panel. `|ny|` so the
                 // mirror flip is immaterial. area = 0.5·|e1×e2| = 0.5·nlen.
                 if !door && ny.abs() < WALL_MAX_NY && 0.5 * nlen >= WALL_MIN_AREA {
-                    walls.push(Tri { a, b, c, ny, door: false });
+                    walls.push(Tri { a, b, c, ny, door: false, mat });
                 }
                 // Column BVH input — UNCHANGED: drop only the vertical faces (XZ projection ~ a
                 // line, a vertical ray can't register them); keep floors AND ceilings for headroom.
@@ -320,7 +336,7 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
                 if door {
                     door_tris += 1;
                 }
-                tris.push(Tri { a, b, c, ny, door });
+                tris.push(Tri { a, b, c, ny, door, mat });
             }
         }
     }
