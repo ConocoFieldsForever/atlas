@@ -1051,7 +1051,15 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         //   reflection gated to the INTERIOR (coverage>0.5); edges only wet-darken.
         let mask_ch = select(tex.a, dot(tex.rgb, vec3<f32>(0.299, 0.587, 0.114)),
                              (m.flags & MAT_FLAG_PUDDLE_LUMA) != 0u);
-        let coverage = clamp((mask_ch + o.color.a) * 1.52, 0.0, 1.0);
+        // The game's DXBC is `saturate((mask + COLOR_0.a) * _FadeStrength=1.52)`. EFT's puddle DECAL
+        // meshes carry NO vertex-color channel (0/38 water meshes on lighthouse have one), so their
+        // COLOR_0 is the shader default — and for these deferred decals the game renders SOFT,
+        // mask-driven puddles, which is only consistent with a default COLOR_0.a of 0 (a default of
+        // 1.0 would saturate every puddle to a hard opaque slab). Our assembler wrongly writes
+        // opaque-white COLOR_0 for non-vp meshes, so `o.color.a` = 1.0 here and (mask + 1.0)*1.52
+        // hard-slabbed the puddle. Force COLOR_0.a = 0 -> the game's exact mask-driven coverage.
+        let color0_a = 0.0; // puddle decals have no painted COLOR_0; Unity's decal default is 0, not 1
+        let coverage = clamp((mask_ch + color0_a) * 1.52, 0.0, 1.0);
         let ndv = max(NdotV, 1e-3);
         let fr = pow(1.0 - ndv * 0.354, 2.0);              // game _Fresnel
         let refl = max(sh_env, sky_env) * (fr * 0.88);     // _ReflectionStrength, sharp sky mirror
