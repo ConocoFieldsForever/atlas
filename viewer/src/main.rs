@@ -19,6 +19,7 @@ mod menu;
 mod menu_fx;
 mod nav;
 mod nav_bake;
+mod sh_bake;
 mod navigate_panel;
 mod pathfind;
 mod paths;
@@ -529,6 +530,12 @@ fn main() {
         let argv: Vec<String> = std::env::args().collect();
         if argv.get(1).map(String::as_str) == Some("bake-nav") {
             std::process::exit(nav_bake::run_cli(&argv[2..]));
+        }
+        // Headless PORTABLE lighting bake (CPU rayon, any GPU / none) — `atlas bake-sh <pack_dir>`
+        // bakes the SH irradiance volume without CUDA/warp, so AMD/Intel builds get real baked
+        // lighting instead of the flat realtime fallback. Replaces bake_volume2.py in the pipeline.
+        if argv.get(1).map(String::as_str) == Some("bake-sh") {
+            std::process::exit(sh_bake::run_cli(&argv[2..]));
         }
     }
     // --version/--help fast path BEFORE any Bevy/GPU init: CI runners have no usable GPU, so

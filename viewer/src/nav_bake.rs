@@ -96,16 +96,17 @@ const CAP_H: [f32; 3] = [STEP_UP_NAV + 0.1, 1.0, PLAYER_HEIGHT_NAV - 0.15];
 /// 8-neighbour offsets — MUST match `nav.rs` NB order (block-mask bit d = the edge to NB_BAKE[d]).
 const NB_BAKE: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
 
-/// One world-space triangle that a vertical ray can hit (walls pre-filtered out).
+/// One world-space triangle. Shared with `sh_bake` (the wgpu lighting bake reuses the same
+/// world-triangle assembly + BVH), hence `pub(crate)`.
 #[derive(Clone, Copy)]
-struct Tri {
-    a: Vec3,
-    b: Vec3,
-    c: Vec3,
+pub(crate) struct Tri {
+    pub(crate) a: Vec3,
+    pub(crate) b: Vec3,
+    pub(crate) c: Vec3,
     /// Normalised world-space normal Y (sign-corrected for mirror instances).
-    ny: f32,
+    pub(crate) ny: f32,
     /// Belongs to a DOOR-tagged mesh/root → transparent to the cast + stamps the door footprint.
-    door: bool,
+    pub(crate) door: bool,
 }
 
 /// A surface hit collected along one downward column ray.
@@ -237,7 +238,7 @@ fn instance_small_footprint(aff: &glam::Affine3A, lmin: Vec3, lmax: Vec3) -> boo
 ///     faces (XZ projection ~ a line) are still skipped here.
 ///   * `wall_tris` — the NEW near-vertical WALL faces (|ny| < WALL_MAX_NY, area >= WALL_MIN_AREA)
 ///     for the horizontal-segment wall BVH, EXCLUDING door panels (small door-tagged instances).
-fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
+pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
     let by_mesh = pack.instances_by_mesh();
     let mut tris: Vec<Tri> = Vec::new();
     let mut walls: Vec<Tri> = Vec::new();
@@ -333,21 +334,21 @@ fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
 // ---- BVH (median-split over XZ, for vertical-ray queries) -------------------------------------
 
 #[derive(Clone, Copy)]
-struct BvhNode {
-    min: Vec3,
-    max: Vec3,
+pub(crate) struct BvhNode {
+    pub(crate) min: Vec3,
+    pub(crate) max: Vec3,
     /// Leaf (count>0): tris[start..start+count]. Internal (count==0): children at start, start+1.
-    start: u32,
-    count: u32,
+    pub(crate) start: u32,
+    pub(crate) count: u32,
 }
 
-struct Bvh {
-    nodes: Vec<BvhNode>,
-    tris: Vec<Tri>,
+pub(crate) struct Bvh {
+    pub(crate) nodes: Vec<BvhNode>,
+    pub(crate) tris: Vec<Tri>,
 }
 
 impl Bvh {
-    fn build(tris: Vec<Tri>) -> Bvh {
+    pub(crate) fn build(tris: Vec<Tri>) -> Bvh {
         let n = tris.len();
         if n == 0 {
             return Bvh {
