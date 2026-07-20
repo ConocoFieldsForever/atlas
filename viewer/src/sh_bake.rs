@@ -16,7 +16,11 @@
 //!      with a smooth range window + spot cones, each SHADOW-TESTED against the same BVH, projected
 //!      as delta lights into the SH. Fills interiors that see no sky. Mirrors bake_volume2.py's direct
 //!      pass exactly (LIGHT_SCALE=6, MIN_D2=0.25), so a portable bake matches the author-side CUDA one.
-//!   M3 (next) — one diffuse bounce + emissive-surface gather.
+//!   M3 DIFFUSE BOUNCE — a second pass re-casts a Fibonacci sphere; at each NEAREST surface hit it
+//!      gathers irradiance E(hit,n) from the pass-A grid (trilinear + cosine convolution) and
+//!      re-emits albedo/pi * E + emissive. Albedo/emissive = the per-material MEAN of the pack's own
+//!      source PNGs (colored bounce -> a red container bounces red = Warp parity). Nearest-hit uses
+//!      front-to-back BVH traversal; toggle the whole pass with EFT_SH_BOUNCE=0.
 //! The OUTPUT FORMAT is already final (volume.json + volume.bin, the exact layout the viewer's
 //! `load_sh_volume` reads) so each milestone just improves the numbers, never the plumbing.
 //!
@@ -62,6 +66,8 @@ struct Baked {
     /// nx*ny*nz*12 f16 halfs (as u16), probe-major.
     halfs: Vec<u16>,
     inside_solid: usize,
+    /// diffuse bounces baked in (0 = direct only, 1 = one bounce).
+    bounces: usize,
 }
 
 // ---- Fibonacci sphere + SH basis --------------------------------------------------------------
@@ -135,29 +141,94 @@ fn ray_occluded(bvh: &Bvh, o: Vec3, d: Vec3, t_max: f32, stack: &mut Vec<u32>) -
     false
 }
 
-/// Möller–Trumbore: does the ray `o + t*d` cross triangle `t` at some t in (RAY_EPS, t_max)?
+/// Möller–Trumbore: the ray `o + t*d` crosses triangle `t` at some t in (RAY_EPS, t_max) -> Some(t).
 #[inline]
-fn ray_tri(o: Vec3, d: Vec3, t: &Tri, t_max: f32) -> bool {
+fn ray_tri_t(o: Vec3, d: Vec3, t: &Tri, t_max: f32) -> Option<f32> {
     let e1 = t.b - t.a;
     let e2 = t.c - t.a;
     let p = d.cross(e2);
     let det = e1.dot(p);
     if det.abs() < 1.0e-8 {
-        return false; // parallel
+        return None; // parallel
     }
     let inv = 1.0 / det;
     let tv = o - t.a;
     let u = tv.dot(p) * inv;
     if u < 0.0 || u > 1.0 {
-        return false;
+        return None;
     }
     let q = tv.cross(e1);
     let v = d.dot(q) * inv;
     if v < 0.0 || u + v > 1.0 {
-        return false;
+        return None;
     }
     let tt = e2.dot(q) * inv;
-    tt > RAY_EPS && tt < t_max
+    if tt > RAY_EPS && tt < t_max {
+        Some(tt)
+    } else {
+        None
+    }
+}
+
+/// Any-hit boolean form (the occlusion / shadow test).
+#[inline]
+fn ray_tri(o: Vec3, d: Vec3, t: &Tri, t_max: f32) -> bool {
+    ray_tri_t(o, d, t, t_max).is_some()
+}
+
+/// NEAREST hit of the ray `o + t*d` (t in (RAY_EPS, t_max)) against the BVH -> (t, tri_index into
+/// `bvh.tris`). Used by the M3 diffuse-bounce pass, which needs the closest surface (to read its
+/// normal + gather irradiance there). Unlike `ray_occluded` there is NO early-out; instead the
+/// current nearest `best_t` prunes any box whose entry is already farther, so it stays fast.
+fn ray_hit(bvh: &Bvh, o: Vec3, d: Vec3, t_max: f32, stack: &mut Vec<u32>) -> Option<(f32, usize)> {
+    if bvh.tris.is_empty() {
+        return None;
+    }
+    let inv = Vec3::new(1.0 / d.x, 1.0 / d.y, 1.0 / d.z);
+    let mut best_t = t_max;
+    let mut best_face: Option<usize> = None;
+    stack.clear();
+    stack.push(0);
+    while let Some(ni) = stack.pop() {
+        let node = bvh.nodes[ni as usize];
+        let t0 = (node.min - o) * inv;
+        let t1 = (node.max - o) * inv;
+        let tmin = t0.min(t1);
+        let tmax = t0.max(t1);
+        let enter = tmin.x.max(tmin.y).max(tmin.z).max(RAY_EPS);
+        let exit = tmax.x.min(tmax.y).min(tmax.z);
+        if enter > exit || enter > best_t {
+            continue; // miss, or the whole box is farther than the nearest hit so far
+        }
+        if node.count > 0 {
+            let s = node.start as usize;
+            for fi in s..s + node.count as usize {
+                if let Some(t) = ray_tri_t(o, d, &bvh.tris[fi], best_t) {
+                    if t < best_t {
+                        best_t = t;
+                        best_face = Some(fi);
+                    }
+                }
+            }
+        } else {
+            // front-to-back: process the child the ray ENTERS sooner first, so `best_t` tightens fast
+            // and the farther subtree is pruned by the `enter > best_t` test above. Ordering only
+            // affects speed, never which hit is nearest.
+            let (a, b) = (node.start, node.start + 1);
+            let na = bvh.nodes[a as usize];
+            let nb = bvh.nodes[b as usize];
+            let ea = ((na.min - o) * inv).min((na.max - o) * inv).max_element();
+            let eb = ((nb.min - o) * inv).min((nb.max - o) * inv).max_element();
+            if ea <= eb {
+                stack.push(b); // far pushed first -> near (a) popped first
+                stack.push(a);
+            } else {
+                stack.push(a);
+                stack.push(b);
+            }
+        }
+    }
+    best_face.map(|f| (best_t, f))
 }
 
 // ---- grid + bake ------------------------------------------------------------------------------
@@ -170,6 +241,131 @@ fn percentile(v: &mut [f32], q: f32) -> f32 {
     let idx = (((q / 100.0) * (v.len() - 1) as f32).round() as usize).min(v.len() - 1);
     v.select_nth_unstable_by(idx, |a, b| a.total_cmp(b));
     v[idx]
+}
+
+/// World-space origin of probe `pi` in the probe-major grid (idx = ((z*ny)+y)*nx + x).
+#[inline]
+fn probe_o(pi: usize, nx: usize, ny: usize, gmin: Vec3, spacing: [f32; 3]) -> Vec3 {
+    let x = pi % nx;
+    let y = (pi / nx) % ny;
+    let z = pi / (nx * ny);
+    Vec3::new(
+        gmin.x + x as f32 * spacing[0],
+        gmin.y + y as f32 * spacing[1],
+        gmin.z + z as f32 * spacing[2],
+    )
+}
+
+/// Trilinear irradiance E(p, n) from the direct radiance-SH grid `sh` (pass-A f32 coeffs), via cosine
+/// convolution (A0=pi, A1=2pi/3) — the SAME reconstruction the viewer's `load_sh_volume` and
+/// bake_volume2.py's `irr_at` use. `inv_sp` = 1/spacing. Clamped to >= 0 per channel.
+#[inline]
+fn irr_at(sh: &[[Vec3; 4]], gmin: Vec3, inv_sp: Vec3, dims: [usize; 3], p: Vec3, n: Vec3) -> Vec3 {
+    let [nx, ny, nz] = dims;
+    let gx = ((p.x - gmin.x) * inv_sp.x).clamp(0.0, (nx - 1) as f32);
+    let gy = ((p.y - gmin.y) * inv_sp.y).clamp(0.0, (ny - 1) as f32);
+    let gz = ((p.z - gmin.z) * inv_sp.z).clamp(0.0, (nz - 1) as f32);
+    let (x0, y0, z0) = (gx.floor() as usize, gy.floor() as usize, gz.floor() as usize);
+    let (x1, y1, z1) = ((x0 + 1).min(nx - 1), (y0 + 1).min(ny - 1), (z0 + 1).min(nz - 1));
+    let (fx, fy, fz) = (gx - x0 as f32, gy - y0 as f32, gz - z0 as f32);
+    let mut a = [Vec3::ZERO; 4];
+    for k in 0..8 {
+        let (xi, wx) = if k & 1 != 0 { (x1, fx) } else { (x0, 1.0 - fx) };
+        let (yi, wy) = if k & 2 != 0 { (y1, fy) } else { (y0, 1.0 - fy) };
+        let (zi, wz) = if k & 4 != 0 { (z1, fz) } else { (z0, 1.0 - fz) };
+        let w = wx * wy * wz;
+        let s = &sh[(zi * ny + yi) * nx + xi];
+        for c in 0..4 {
+            a[c] += s[c] * w;
+        }
+    }
+    // E(n) = pi*Y00*c0 + (2pi/3)*Y1*(c1*n.y + c2*n.z + c3*n.x)
+    let e = a[0] * 0.886_226_9 + (a[1] * n.y + a[2] * n.z + a[3] * n.x) * 1.023_326_7;
+    Vec3::new(e.x.max(0.0), e.y.max(0.0), e.z.max(0.0))
+}
+
+// ---- M3b: per-material albedo/emissive LUTs (mean of the pack's own source PNGs) --------------
+
+/// sRGB(u8) -> linear(f32) LUT (gamma 2.2, matching bake_volume2.py's `_srgb_lut`).
+fn srgb_lin_lut() -> [f32; 256] {
+    let mut l = [0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        l[i] = ((i as f32) / 255.0).powf(2.2);
+        i += 1;
+    }
+    l
+}
+
+/// Mean LINEAR rgb of a texture PNG (whole image), or None if it can't be decoded.
+fn tex_mean_linear(path: &Path, lut: &[f32; 256]) -> Option<Vec3> {
+    let img = image::open(path).ok()?.to_rgb8();
+    let raw = img.as_raw();
+    if raw.len() < 3 {
+        return None;
+    }
+    let (mut sr, mut sg, mut sb) = (0f64, 0f64, 0f64);
+    for px in raw.chunks_exact(3) {
+        sr += lut[px[0] as usize] as f64;
+        sg += lut[px[1] as usize] as f64;
+        sb += lut[px[2] as usize] as f64;
+    }
+    let n = (raw.len() / 3) as f64;
+    Some(Vec3::new((sr / n) as f32, (sg / n) as f32, (sb / n) as f32))
+}
+
+/// Per-material albedo + emissive radiance LUTs (indexed by material id) for the diffuse bounce.
+/// albedo = mean(source albedo PNG, LINEAR) * tint  (or tint*0.5 when untextured — bake_volume2's
+/// untextured fallback); emissive = factor*hdr * mean(emissive PNG) (or *1 if no map), clamped to a
+/// sane ceiling. Every UNIQUE texture is decoded ONCE, in parallel (the pack ships its own tex/).
+fn build_material_luts(pack: &Pack) -> (Vec<Vec3>, Vec<Vec3>) {
+    let lut = srgb_lin_lut();
+    let max_id = pack.materials.iter().map(|m| m.id).max().unwrap_or(0) as usize;
+    let mut albedo = vec![Vec3::splat(0.3); max_id + 1]; // neutral grey for id gaps
+    let mut emissive = vec![Vec3::ZERO; max_id + 1];
+
+    // unique texture paths (albedo + emissive maps) referenced by any material
+    let mut want: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &pack.materials {
+        if let Some(a) = &m.albedo {
+            want.insert(a.clone());
+        }
+        if let Some(e) = &m.emissive {
+            if let Some(t) = &e.texture {
+                want.insert(t.clone());
+            }
+        }
+    }
+    let paths: Vec<String> = want.into_iter().collect();
+    let t_tex = Instant::now();
+    let means: std::collections::HashMap<String, Vec3> = paths
+        .par_iter()
+        .filter_map(|rel| tex_mean_linear(&pack.root.join(rel), &lut).map(|v| (rel.clone(), v)))
+        .collect();
+    eprintln!(
+        "  sh-bake: decoded {}/{} unique bounce textures (mean albedo) in {:.2}s",
+        means.len(),
+        paths.len(),
+        t_tex.elapsed().as_secs_f32()
+    );
+
+    for m in &pack.materials {
+        let i = m.id as usize;
+        let tint = Vec3::new(m.tint[0], m.tint[1], m.tint[2]);
+        albedo[i] = match m.albedo.as_ref().and_then(|a| means.get(a)) {
+            Some(mean) => *mean * tint,
+            None => tint * 0.5,
+        }
+        // energy bound: a diffuse albedo is physically <= 1 (reference clamps too). No-op on LDR
+        // base-color packs, but guards against a future HDR tint over-brightening the bounce.
+        .clamp(Vec3::ZERO, Vec3::ONE);
+        if let Some(e) = &m.emissive {
+            let f = Vec3::new(e.factor[0], e.factor[1], e.factor[2]) * e.hdr;
+            let cov = e.texture.as_ref().and_then(|t| means.get(t)).copied().unwrap_or(Vec3::ONE);
+            emissive[i] = (f * cov).min(Vec3::splat(8.0)); // clamp HDR emissive (bake_volume2 EMIS_MAX)
+        }
+    }
+    (albedo, emissive)
 }
 
 fn bake(pack: &Pack) -> Result<Baked> {
@@ -252,94 +448,153 @@ fn bake(pack: &Pack) -> Result<Baked> {
         lights.len()
     );
 
-    // --- per-probe sky-visibility SH, parallel over Z-rows ---
-    let t_bake = Instant::now();
-    let inside = std::sync::atomic::AtomicUsize::new(0);
-    let mut halfs = vec![0u16; n_probe * 12];
-    // Precompute the ray directions + their SH bases once (shared across all probes).
+    // Precompute the sky-ray directions + their SH bases once (shared across all probes).
     let dirs: Vec<(Vec3, [f32; 4])> = (0..n_dir).map(|i| { let d = fib_dir(i, n_dir); (d, sh_basis(d)) }).collect();
     let norm = 4.0 * std::f32::consts::PI / n_dir as f32;
-    // Parallelize over probes directly (each probe independent). Per-thread BVH stack via for_each_init.
-    halfs
-        .par_chunks_mut(12)
-        .enumerate()
-        .for_each_init(
+
+    // ================= PASS A — direct: sky-visibility (M1) + shadow-tested practicals (M2) =========
+    // Kept in f32 (NOT packed yet) so the M3 diffuse bounce can trilinearly gather irradiance from it.
+    let t_bake = Instant::now();
+    let inside = std::sync::atomic::AtomicUsize::new(0);
+    let mut sh_a: Vec<[Vec3; 4]> = vec![[Vec3::ZERO; 4]; n_probe];
+    sh_a.par_iter_mut().enumerate().for_each_init(
+        || Vec::<u32>::with_capacity(64),
+        |stack, (pi, out)| {
+            let o = probe_o(pi, nx, ny, gmin, spacing);
+            // --- M1: sky-visibility (each escaping Fibonacci ray sees a neutral sky gradient) ---
+            let mut sh = [Vec3::ZERO; 4];
+            let mut n_sky = 0u32;
+            for (d, basis) in &dirs {
+                if ray_occluded(&bvh, o, *d, f32::INFINITY, stack) {
+                    continue; // occluded -> sees no sky
+                }
+                n_sky += 1;
+                let l = sky(*d, sky_scale);
+                for c in 0..4 {
+                    sh[c] += l * basis[c];
+                }
+            }
+            for c in 0..4 {
+                sh[c] *= norm; // sky is a hemisphere integral -> weight by the ray solid angle dw
+            }
+            if n_sky == 0 {
+                inside.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // --- M2: live practicals (delta lights; added AFTER the sky*norm scale, NOT weighted by
+            //     norm — a point light is a single direction, not a solid-angle sample). ---
+            for lgt in lights {
+                let tol = lgt.pos - o;
+                let dist = tol.length();
+                let r = lgt.range.max(LIGHT_RANGE_FLOOR); // floor to match the CUDA reference
+                if dist <= 0.05 || dist >= r {
+                    continue; // on the bulb, or out of range
+                }
+                let dl = tol / dist;
+                let spot = if lgt.cos_outer > -1.5 {
+                    // spot cone smoothstep; point lights (sentinel cos_outer=-2.0) stay factor 1
+                    let cosang = -dl.dot(lgt.dir);
+                    ((cosang - lgt.cos_outer) / (lgt.cos_inner - lgt.cos_outer + 1.0e-4)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if spot <= 0.0 {
+                    continue; // outside the cone
+                }
+                let x = dist / r;
+                let win = (1.0 - x * x * x * x).clamp(0.0, 1.0);
+                let at = win * win / (dist * dist).max(MIN_D2);
+                if ray_occluded(&bvh, o, dl, dist - 0.1, stack) {
+                    continue; // occluder between probe and bulb -> shadowed
+                }
+                let rad = lgt.color * (at * spot * light_scale);
+                let basis = sh_basis(dl);
+                for c in 0..4 {
+                    sh[c] += rad * basis[c];
+                }
+            }
+            *out = sh;
+        },
+    );
+    let inside_solid = inside.into_inner();
+    eprintln!(
+        "  sh-bake: pass A (direct) {n_probe} probes in {:.2}s ({} fully-occluded/inside-solid)",
+        t_bake.elapsed().as_secs_f32(),
+        inside_solid
+    );
+
+    // ================= PASS B — one diffuse bounce (M3) =============================================
+    // Re-cast a Fibonacci sphere; at each NEAREST surface hit, gather irradiance E(hit,n) from the
+    // pass-A grid (trilinear + cosine convolution) and re-emit albedo/pi * E + emissive back into the
+    // SH. Albedo/emissive = the per-material mean of the pack's own source PNGs (colored bounce = Warp
+    // parity). Toggle with EFT_SH_BOUNCE=0 (then the pack is byte-identical to the M2 direct bake).
+    // The bounce is low-frequency, so half the sky-ray count is plenty and ~halves the (costly)
+    // nearest-hit pass. Override with EFT_SH_BOUNCE_RAYS.
+    let bounce_rays = env_usize("EFT_SH_BOUNCE_RAYS", 128).clamp(1, 4096);
+    let albedo_boost = env_f32("EFT_SH_ALBEDO_BOOST", 1.0); // global multiplier on per-material albedo
+    let emis_gain = env_f32("EFT_SH_EMIS_GAIN", 1.0); // global multiplier on emissive-surface gather
+    let do_bounce = env_usize("EFT_SH_BOUNCE", 1) > 0 && !bvh.tris.is_empty();
+    let mut halfs = vec![0u16; n_probe * 12];
+    let bounces = if do_bounce {
+        let t_b = Instant::now();
+        // per-material albedo/emissive (mean of the pack's source PNGs) — colored bounce = Warp parity
+        let (albedo_lut, emis_lut) = build_material_luts(pack);
+        let bdirs: Vec<(Vec3, [f32; 4])> =
+            (0..bounce_rays).map(|i| { let d = fib_dir(i, bounce_rays); (d, sh_basis(d)) }).collect();
+        let bnorm = 4.0 * std::f32::consts::PI / bounce_rays as f32;
+        let inv_sp = Vec3::new(1.0 / spacing[0], 1.0 / spacing[1], 1.0 / spacing[2]);
+        // full mesh diagonal (BVH root AABB) — a bounce ray may hit geometry well outside the probe band
+        let root = bvh.nodes[0];
+        let max_dist = (root.max - root.min).length() * 1.2;
+        let inv_pi_boost = std::f32::consts::FRAC_1_PI * albedo_boost; // albedo/pi * boost
+        halfs.par_chunks_mut(12).enumerate().for_each_init(
             || Vec::<u32>::with_capacity(64),
             |stack, (pi, out)| {
-                let x = pi % nx;
-                let y = (pi / nx) % ny;
-                let z = pi / (nx * ny);
-                let o = Vec3::new(
-                    gmin.x + x as f32 * spacing[0],
-                    gmin.y + y as f32 * spacing[1],
-                    gmin.z + z as f32 * spacing[2],
-                );
-                // --- M1: sky-visibility (each escaping Fibonacci ray sees a neutral sky gradient) ---
-                let mut sh = [Vec3::ZERO; 4];
-                let mut n_sky = 0u32;
-                for (d, basis) in &dirs {
-                    if ray_occluded(&bvh, o, *d, f32::INFINITY, stack) {
-                        continue; // occluded -> sees no sky (hits contribute nothing at M1/M2)
-                    }
-                    n_sky += 1;
-                    let l = sky(*d, sky_scale);
-                    for c in 0..4 {
-                        sh[c] += l * basis[c];
-                    }
-                }
-                if n_sky == 0 {
-                    inside.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                // --- M2: live practicals. Physical 1/d^2 * smooth range window, spot cone, SHADOW-TESTED
-                //     against the same BVH. A delta light projects into the SH directly and is NOT
-                //     weighted by the ray solid angle `norm`, so it accumulates in a separate `sh_lit`
-                //     that is added AFTER the sky term is scaled (identical to bake_volume2's kernel). ---
-                let mut sh_lit = [Vec3::ZERO; 4];
-                for lgt in lights {
-                    let tol = lgt.pos - o;
-                    let dist = tol.length();
-                    let r = lgt.range.max(LIGHT_RANGE_FLOOR); // floor to match the CUDA reference
-                    if dist <= 0.05 || dist >= r {
-                        continue; // on the bulb, or out of range
-                    }
-                    let dl = tol / dist;
-                    let spot = if lgt.cos_outer > -1.5 {
-                        // spot cone smoothstep; point lights (sentinel cos_outer=-2.0) stay factor 1
-                        let cosang = -dl.dot(lgt.dir);
-                        ((cosang - lgt.cos_outer) / (lgt.cos_inner - lgt.cos_outer + 1.0e-4))
-                            .clamp(0.0, 1.0)
-                    } else {
-                        1.0
-                    };
-                    if spot <= 0.0 {
-                        continue; // outside the cone
-                    }
-                    let x = dist / r;
-                    let win = (1.0 - x * x * x * x).clamp(0.0, 1.0);
-                    let at = win * win / (dist * dist).max(MIN_D2);
-                    if ray_occluded(&bvh, o, dl, dist - 0.1, stack) {
-                        continue; // occluder between probe and bulb -> shadowed
-                    }
-                    let rad = lgt.color * (at * spot * light_scale);
-                    let basis = sh_basis(dl);
-                    for c in 0..4 {
-                        sh_lit[c] += rad * basis[c];
+                let o = probe_o(pi, nx, ny, gmin, spacing);
+                let mut sh_b = [Vec3::ZERO; 4];
+                for (d, basis) in &bdirs {
+                    if let Some((t, face)) = ray_hit(&bvh, o, *d, max_dist, stack) {
+                        let tri = &bvh.tris[face];
+                        let mut n = (tri.b - tri.a).cross(tri.c - tri.a).normalize_or_zero();
+                        if n.dot(*d) > 0.0 {
+                            n = -n; // orient the surface toward the incoming ray
+                        }
+                        let h = o + *d * t + n * 0.05; // hit point, nudged off the surface
+                        let e = irr_at(&sh_a, gmin, inv_sp, [nx, ny, nz], h, n);
+                        let mat = tri.mat as usize;
+                        let alb = albedo_lut.get(mat).copied().unwrap_or(Vec3::splat(0.3));
+                        let emi = emis_lut.get(mat).copied().unwrap_or(Vec3::ZERO);
+                        let rad = e * alb * inv_pi_boost + emi * emis_gain; // albedo/pi * E + emissive
+                        for c in 0..4 {
+                            sh_b[c] += rad * basis[c];
+                        }
                     }
                 }
+                let a = &sh_a[pi];
                 for c in 0..4 {
-                    let v = sh[c] * norm + sh_lit[c];
+                    let v = a[c] + sh_b[c] * bnorm; // direct + (bounce hemisphere integral)
                     out[c * 3] = f16_bits(v.x);
                     out[c * 3 + 1] = f16_bits(v.y);
                     out[c * 3 + 2] = f16_bits(v.z);
                 }
             },
         );
-    let inside_solid = inside.into_inner();
-    eprintln!(
-        "  sh-bake: baked {n_probe} probes in {:.2}s ({} fully-occluded/inside-solid)",
-        t_bake.elapsed().as_secs_f32(),
-        inside_solid
-    );
+        eprintln!(
+            "  sh-bake: pass B (1 diffuse bounce, per-material colored albedo, {bounce_rays} rays) in {:.2}s",
+            t_b.elapsed().as_secs_f32()
+        );
+        1
+    } else {
+        // bounce off -> pack pass A directly (identical to the M2 direct bake)
+        halfs.par_chunks_mut(12).enumerate().for_each(|(pi, out)| {
+            let a = &sh_a[pi];
+            for c in 0..4 {
+                out[c * 3] = f16_bits(a[c].x);
+                out[c * 3 + 1] = f16_bits(a[c].y);
+                out[c * 3 + 2] = f16_bits(a[c].z);
+            }
+        });
+        0
+    };
 
     Ok(Baked {
         min: [gmin.x, gmin.y, gmin.z],
@@ -349,6 +604,7 @@ fn bake(pack: &Pack) -> Result<Baked> {
         sun_dir,
         halfs,
         inside_solid,
+        bounces,
     })
 }
 
@@ -397,8 +653,8 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
         "coeffs": 4, "channels": 3,
         "layout": "float16 LE, probe-major; probe index = ((z*ny)+y)*nx + x; within each probe 12 halfs ordered coeff0.r,coeff0.g,coeff0.b, coeff1.r,coeff1.g,coeff1.b, coeff2.r,coeff2.g,coeff2.b, coeff3.r,coeff3.g,coeff3.b. Coeffs are RADIANCE SH (L1 real basis): 0=Y00(0.282095), 1=Y1-1(0.488603*y), 2=Y10(0.488603*z), 3=Y11(0.488603*x). Viewer reconstructs IRRADIANCE via cosine convolution A0=pi, A1=2pi/3.",
         "sun_dir": b.sun_dir,
-        "bounces": 0,
-        "baker": "atlas-cpu-sh (sh_bake.rs, M2 sky-visibility + shadow-tested practicals)",
+        "bounces": b.bounces,
+        "baker": "atlas-cpu-sh (sh_bake.rs, M3: sky-visibility + shadow-tested practicals + diffuse bounce)",
     });
     std::fs::write(dir.join("volume.json"), serde_json::to_string_pretty(&meta)?)
         .with_context(|| format!("writing {}", dir.join("volume.json").display()))?;
