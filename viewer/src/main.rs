@@ -1247,6 +1247,9 @@ fn walk_move(
     let dt = time.delta_secs().min(0.05); // clamp big frame gaps so jumps don't over-integrate
     let typing = ui_kb.0;
     for (mut tf, cam, mut ws) in &mut q {
+        // Undo last frame's cosmetic head-bob so every physics query below runs on the TRUE eye
+        // height (the bob must never feed back into ground/step selection).
+        tf.translation.y -= ws.last_bob;
         // Horizontal: yaw-only (looking up/down must not change ground speed). Forward/right from
         // the FlyCam yaw, flattened onto XZ (matches Quat::from_axis_angle(Y, yaw)).
         let (s, c) = cam.yaw.sin_cos();
@@ -1259,11 +1262,13 @@ fn walk_move(
             if keys.pressed(KeyCode::KeyD) { h += right; }
             if keys.pressed(KeyCode::KeyA) { h -= right; }
         }
+        let mut moved = 0.0f32; // horizontal distance walked this frame (drives the head-bob)
         if h != Vec3::ZERO {
             let mut spd = settings.walk_speed;
             if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
                 spd *= 1.8; // sprint
             }
+            moved = spd * dt;
             tf.translation += h.normalize() * spd * dt;
             // Player-sized collision: push the body capsule back out of any wall it entered so you
             // can't run through walls/fences. Purely horizontal (feet height is unchanged here).
@@ -1293,7 +1298,7 @@ fn walk_move(
                 if ws.vy <= 0.0 && new_y <= target {
                     // Land / stand: settle exactly, and while grounded exp-smooth toward the
                     // surface so stepping up curbs/treads glides instead of snapping.
-                    let follow = 1.0 - (-15.0 * dt).exp();
+                    let follow = 1.0 - (-20.0 * dt).exp();
                     new_y = tf.translation.y + (target - tf.translation.y) * follow;
                     // Snap the last little bit to avoid perpetual approach.
                     if (new_y - target).abs() < 0.01 {
@@ -1316,6 +1321,18 @@ fn walk_move(
             }
         }
         tf.translation.y = new_y;
+
+        // Head bob: a subtle vertical sine advanced by distance walked while grounded; eases back to
+        // zero when you stop. Applied ON TOP of the settled eye height and removed at the top of the
+        // next frame, so it never perturbs the ground/step physics.
+        let new_bob = if ws.grounded && moved > 0.0 {
+            ws.bob_phase += moved * walk_ground::BOB_RATE;
+            walk_ground::BOB_AMP * ws.bob_phase.sin()
+        } else {
+            ws.last_bob * (-8.0 * dt).exp()
+        };
+        tf.translation.y += new_bob;
+        ws.last_bob = new_bob;
     }
 }
 

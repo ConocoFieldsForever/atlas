@@ -1905,6 +1905,11 @@ pub fn menu_ui(
             // and UPDATE must both stay disabled instead of spawn-erroring. UPDATE used to bypass
             // this entirely — it now shares `can_build`.
             let can_build = state.build_kit_available && state.deps_ok && state.game_fp.is_some();
+            // PLAY is gated on a tarkov.dev sync having happened at least once (loot/spawns/intel come
+            // from it — playing before a sync gives an empty map). `intel` is (loot age, tasks age,
+            // icons); a present loot age means the sync ran. Copied to a local so it reaches the PLAY
+            // button inside the card loop without borrowing `state`.
+            let intel_synced = state.intel.0.is_some();
             // The map LIST fills whatever height the header + the pinned bottom panels (build +
             // footer) leave: a plain ScrollArea::vertical() caps itself to that and scrolls the rows.
             // (The old fixed `reserve` estimate is gone — the footer + build panel are their own
@@ -1923,6 +1928,22 @@ pub fn menu_ui(
                     .show(ui, |ui| {
                         ui.label(
                             RichText::new(format!("\u{26A0} {}", t(lg, K::BuildNeedsSetup)))
+                                .color(WARN)
+                                .size(12.0),
+                        );
+                    });
+                ui.add_space(8.0);
+            }
+            if !intel_synced {
+                // Global reason PLAY is disabled on every row until a tarkov.dev sync runs (SYNC NOW,
+                // top) — inline, not just a hover, so a non-technical user knows what to do.
+                egui::Frame::new()
+                    .fill(theme::INSET)
+                    .stroke(egui::Stroke::new(1.0, WARN))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(format!("\u{26A0} {}", t(lg, K::PlayNeedsSync)))
                                 .color(WARN)
                                 .size(12.0),
                         );
@@ -1995,9 +2016,20 @@ pub fn menu_ui(
                                             // so PLAY can never open a blank window; DELETE stays
                                             // available below either way.
                                             if e.valid {
+                                                // Force a tarkov.dev sync before playing: PLAY is
+                                                // disabled until intel has been synced at least once.
                                                 let play = theme::primary_button(t(lg, K::Play));
-                                                if ui.add_sized([84.0, 30.0], play).clicked() {
-                                                    switch.0 = e.pack_dir.clone();
+                                                let resp = ui
+                                                    .add_enabled_ui(intel_synced, |ui| {
+                                                        ui.add_sized([84.0, 30.0], play)
+                                                    })
+                                                    .inner;
+                                                if intel_synced {
+                                                    if resp.clicked() {
+                                                        switch.0 = e.pack_dir.clone();
+                                                    }
+                                                } else {
+                                                    resp.on_disabled_hover_text(t(lg, K::PlayNeedsSync));
                                                 }
                                             } else {
                                                 let reb = theme::warn_button(if this_building {
