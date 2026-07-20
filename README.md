@@ -1,11 +1,26 @@
 # Atlas
 
+![Atlas rendering the Lighthouse map in its native 3D viewer](docs/img/lighthouse.jpg)
+
 A fast, native **map viewer and raid planner for Escape from Tarkov**. It renders
 each map in 3D and overlays the things you actually plan around — extracts, loot,
 keys, hazards, quest objectives — with search and point-to-point routing on top.
 
 It's a normal desktop app: double-click and go. No browser, no account, no
 internet required to use it.
+
+## ⬇️ Download & run
+
+**[Download the latest Atlas release for Windows (portable `.zip`)](https://github.com/ConocoFieldsForever/atlas/releases/latest)**
+
+Unzip it anywhere (your Desktop is fine) and **double-click `atlas.exe`** — that's
+it. No installer, no account, and no internet needed to view maps. On first launch
+the map manager opens; build a map once from your own game files, then hit **Play**.
+(Full walkthrough in [Getting started](#getting-started-2-minutes) below.)
+
+![The Atlas map manager — build each map once from your own game files, then play](docs/img/map-manager.png)
+
+![The 3D map with the raid-planner overlays — loot, spawns, quests, keys and map intel](docs/img/viewer-ui.jpg)
 
 > **Legal, in one line:** Atlas only shows maps built from *your own* copy of
 > Escape from Tarkov, on your own PC. Map data is never bundled with the app. See
