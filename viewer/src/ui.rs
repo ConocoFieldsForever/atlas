@@ -30,8 +30,10 @@ pub struct LayerToggles {
     /// GLOBAL "hide inactive" filter: hides every marker tagged `poi::SceneInactive` (gamedata
     /// records serialized `active: false` — disabled exfils, low-power minefields, off sniper
     /// zones, disabled doors/loot points) and their zone outlines. COMPOSES with the layer
-    /// toggles like `min_value`; untagged markers never filter. Off by default: inactive intel
-    /// still matters when planning (a disabled exfil can be event-enabled mid-wipe).
+    /// toggles like `min_value`; untagged markers never filter. ON by default (inactive hidden) so a
+    /// fresh map isn't cluttered with disabled markers; `EFT_LAYERS=showinactive` starts it off, and
+    /// it's a one-click toggle in the panel — inactive intel still matters when planning (a disabled
+    /// exfil can be event-enabled mid-wipe).
     pub hide_inactive: bool,
     pub pmc_spawns: bool,
     pub scav_spawns: bool,
@@ -67,7 +69,7 @@ impl Default for LayerToggles {
             loot: !has("noloot"),
             loot_classes: LOOT_CLASSES.iter().map(|c| (c.to_string(), true)).collect(),
             min_value: 0,
-            hide_inactive: has("hideinactive"),
+            hide_inactive: !has("showinactive"),
             pmc_spawns: has("pmc"),
             scav_spawns: has("scav"),
             bosses: has("boss"),
