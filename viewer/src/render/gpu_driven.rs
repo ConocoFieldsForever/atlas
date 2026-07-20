@@ -271,6 +271,11 @@ pub const MAT_FLAG_VP: u32 = 1 << 7;
 /// Decal samples `.r`); without this the puddle feathers on a constant-1 alpha and the whole quad
 /// renders as a solid slab. Detected at load by `puddle_alpha_is_constant`.
 pub const MAT_FLAG_PUDDLE_LUMA: u32 = 1 << 8;
+/// `GpuMaterial::flags` bit: a STRETCHED floor water-decal — the `Water Deferred Decal` shader also
+/// serves large wet-ground / tire-mark trails whose texture is mapped at tens-to-hundreds of meters
+/// per repeat (vs a puddle's few). Those are matte, NOT reflective puddles, so the shader drops the
+/// mirror + sun glint for them. Set at load from the per-material world-meters-per-uv-repeat.
+pub const MAT_FLAG_WATER_MATTE: u32 = 1 << 9;
 /// `GpuMaterial::detail_flags` bit0: this material has a detail ALBEDO texture.
 pub const DETAIL_FLAG_ALBEDO: u32 = 1 << 0;
 /// `GpuMaterial::detail_flags` bit1: this material has a detail NORMAL texture.
@@ -1261,6 +1266,65 @@ fn build_cpu_data(
     let mut vp_table: Vec<VpGpu> = Vec::new();
     // Pack-wide green-flip convention (DirectX Y-down): OR'd with each material's own flag.
     let conv_green_flip = pack.manifest.conventions.normal_map_green_flip;
+
+    // Pre-pass: which TEXTURED-water materials are STRETCHED floor decals (matte wet-ground / tire
+    // marks) vs real reflective puddles. The `Water Deferred Decal` shader serves both; the ONLY
+    // discriminator is world-meters-per-texture-repeat — a puddle maps its texture at a few m/repeat,
+    // a facility-floor / wet-asphalt / tire-trail decal at tens-to-hundreds. Measured once from the
+    // geometry (submesh local vertex-span / uv-span), map-agnostically. `MAT_FLAG_WATER_MATTE` on the
+    // stretched ones tells the shader to drop the mirror + sun glint.
+    const WATER_MATTE_MPR: f32 = 40.0; // meters/texture-repeat; puddles <=~22, floor decals >=~60 on lighthouse
+    let max_mat_id = pack.materials.iter().map(|m| m.id).max().map_or(0usize, |m| m as usize);
+    let mut water_tex = vec![false; max_mat_id + 1];
+    for m in &pack.materials {
+        if m.role == "water" && m.albedo.is_some() {
+            water_tex[m.id as usize] = true;
+        }
+    }
+    let mut stretched_water = vec![false; max_mat_id + 1];
+    if water_tex.iter().any(|&b| b) {
+        for me in &pack.manifest.meshes {
+            if !me.submeshes.iter().any(|sm| water_tex.get(sm.material_id as usize).copied().unwrap_or(false)) {
+                continue;
+            }
+            let geom = match pack.mesh_geom(me) {
+                Ok(g) => g,
+                Err(_) => continue,
+            };
+            for sm in &me.submeshes {
+                if !water_tex.get(sm.material_id as usize).copied().unwrap_or(false) {
+                    continue;
+                }
+                let (mut pmin, mut pmax) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                let (mut umin, mut umax) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+                let s0 = sm.idx_start as usize;
+                let s1 = (s0 + sm.idx_count as usize).min(geom.indices.len());
+                for &vi in &geom.indices[s0..s1] {
+                    let vi = vi as usize;
+                    if let Some(p) = geom.positions.get(vi) {
+                        let v = Vec3::from(*p);
+                        pmin = pmin.min(v);
+                        pmax = pmax.max(v);
+                    }
+                    if let Some(uv) = geom.uvs.get(vi) {
+                        umin[0] = umin[0].min(uv[0]);
+                        umin[1] = umin[1].min(uv[1]);
+                        umax[0] = umax[0].max(uv[0]);
+                        umax[1] = umax[1].max(uv[1]);
+                    }
+                }
+                if !pmin.is_finite() {
+                    continue;
+                }
+                let span = (pmax - pmin).length();
+                let uv_rep = (umax[0] - umin[0]).max(umax[1] - umin[1]).max(1.0e-3);
+                if span / uv_rep > WATER_MATTE_MPR {
+                    stretched_water[sm.material_id as usize] = true;
+                }
+            }
+        }
+    }
+
     for mat in &pack.materials {
         let albedo_index = match mat.albedo.as_deref() {
             Some(p) if !p.is_empty() => *path_to_index.entry(p.to_string()).or_insert_with(|| {
@@ -1425,6 +1489,10 @@ fn build_cpu_data(
                 // Route the puddle shape mask to luma when its alpha is constant (atlas puddles).
                 if mat.albedo.as_deref().is_some_and(puddle_alpha_is_constant) {
                     flags |= MAT_FLAG_PUDDLE_LUMA;
+                }
+                // Stretched floor decal (tire marks / wet-ground) -> matte, no mirror (pre-pass above).
+                if stretched_water.get(mat.id as usize).copied().unwrap_or(false) {
+                    flags |= MAT_FLAG_WATER_MATTE;
                 }
             }
         }

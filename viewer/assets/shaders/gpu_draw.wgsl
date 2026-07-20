@@ -153,6 +153,7 @@ const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary alb
 const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW tex.a (smoothness-in-alpha)
 const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpGpu at _pad2)
 const MAT_FLAG_PUDDLE_LUMA: u32 = 256u;   // bit8: puddle shape mask in luma(rgb), not alpha (atlas)
+const MAT_FLAG_WATER_MATTE: u32 = 512u;   // bit9: STRETCHED floor water-decal (tire marks / wet-ground) -> matte, no mirror
 const DETAIL_HAS_ALBEDO: u32 = 1u;        // detail_flags bit0: has detail albedo texture
 const DETAIL_HAS_NORMAL: u32 = 2u;        // detail_flags bit1: has detail normal texture
 const DETAIL_UNITY_GAIN: f32 = 4.5948;    // Unity Standard detail ×2 expressed in linear space
@@ -1060,12 +1061,16 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         // hard-slabbed the puddle. Force COLOR_0.a = 0 -> the game's exact mask-driven coverage.
         let color0_a = 0.0; // puddle decals have no painted COLOR_0; Unity's decal default is 0, not 1
         let coverage = clamp((mask_ch + color0_a) * 1.52, 0.0, 1.0);
+        // A large STRETCHED floor decal (texture mapped at tens-to-hundreds of meters per repeat,
+        // flagged per-material at load) is matte wet-ground / tire marks, NOT a reflective puddle —
+        // kill the sky mirror + sun glint so it reads as a dark decal. Real puddles keep both.
+        let matte = (m.flags & MAT_FLAG_WATER_MATTE) != 0u;
         let ndv = max(NdotV, 1e-3);
         let fr = pow(1.0 - ndv * 0.354, 2.0);              // game _Fresnel
         let refl = max(sh_env, sky_env) * (fr * 0.88);     // _ReflectionStrength, sharp sky mirror
-        let refl_mix = clamp(ndv * ndv * 2.0 * max(coverage - 0.5, 0.0), 0.0, 1.0) * fr;
+        let refl_mix = select(clamp(ndv * ndv * 2.0 * max(coverage - 0.5, 0.0), 0.0, 1.0) * fr, 0.0, matte);
         let wet = m.tint.rgb * gi;                          // dark wet asphalt (grey _Color), GI-lit
-        let col = mix(wet, refl, refl_mix) + spec_rgb;
+        let col = mix(wet, refl, refl_mix) + select(spec_rgb, vec3<f32>(0.0), matte);
         let a = coverage * m.tint.a;                        // _Color.a = overall puddle strength
         // PREMULTIPLIED output: rgb = col*a preserves the puddle's intended lerp(road, col, a) —
         // the reflection is DELIBERATELY weighted by coverage here (it wets the road), unlike glass.
