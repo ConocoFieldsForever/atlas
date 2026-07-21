@@ -3415,7 +3415,7 @@ fn prepare_gpu_buffers(
         tex_count
     );
     info!(
-        "gpu-driven Phase2b: {} normal-map textures uploaded (LINEAR Rgba8Unorm), normal_tex @group(2) binding(3)",
+        "gpu-driven Phase2b: {} normal-map textures uploaded (LINEAR BC5 Rg where BC is supported, else raw Rgba8Unorm), normal_tex @group(2) binding(3)",
         normal_count
     );
     info!(
@@ -3488,7 +3488,7 @@ fn load_albedo_texture(
             // Content-hash first: a shared-cache hit skips PNG decode AND BC encode entirely.
             let hash = fnv64(&bytes);
             if bc_enabled(device) {
-                if let Some((w, h, mips, payload)) = texcache_read(hash) {
+                if let Some((w, h, mips, payload)) = texcache_read(hash, "bc3c") {
                     return upload_bc3(device, queue, w, h, mips, &payload, true, "eft_albedo");
                 }
             }
@@ -3501,7 +3501,7 @@ fn load_albedo_texture(
             if bc_wanted(device, w, h) {
                 let (mips, chain) = build_mip_chain(w, h, &rgba);
                 let payload = bc3_compress_chain(w, h, mips, &chain);
-                texcache_write(hash, w, h, mips, &payload);
+                texcache_write(hash, "bc3c", w, h, mips, &payload);
                 return upload_bc3(device, queue, w, h, mips, &payload, true, "eft_albedo");
             }
             upload_rgba8_srgb(device, queue, w.max(1), h.max(1), &rgba, "eft_albedo")
@@ -3529,27 +3529,39 @@ fn load_normal_texture(
     queue: &RenderQueue,
     path: &str,
 ) -> (Texture, TextureView) {
-    // Normal maps are uploaded UNCOMPRESSED as Rgba8Unorm (LINEAR) — NEVER block-compressed.
-    // BC3 stores XYZ in a BC1-quality RGB565 block, so the small tangent-space X/Y variation
-    // (which IS the surface relief; Z/blue is near-constant ~0.96) is quantized to almost nothing
-    // and every normal-mapped surface reads flat. Raw RGBA8 keeps all channels, so the shader's
-    // base-normal decode (reads .rgb, keeps the real z from blue) works unchanged. The pack
-    // convention is "BC5 (normal, linear)"; raw RGBA8 is the lowest-risk equivalent (no new dep).
-    // ~540 unique normals uncompressed is a modest, acceptable VRAM cost. NOTE: the shared texcache
-    // stores BC3 payloads, so normals must NOT consult it (a hit would re-introduce the BC3 crush).
+    // Normal maps compress to BC5 (Rg, LINEAR): tangent XY in two dedicated interpolated channels
+    // (Z reconstructed in the shader). Unlike BC3 — whose BC1-quality RGB565 block crushes the small
+    // X/Y relief to flat — BC5 preserves the relief, at 8 bpp (4x smaller than the raw Rgba8 normals
+    // used to upload as: ~6.3 GB -> ~1.6 GB on lighthouse). Cached under .bc5c (the .bc3c albedo cache
+    // stores a DIFFERENT format, so the extensions must not be shared). Sync mirror of prepare_tex_cpu.
+    let flat = |d: &RenderDevice, q: &RenderQueue| {
+        upload_rgba8_linear(d, q, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing")
+    };
     match std::fs::read(path) {
         Ok(bytes) => {
+            let hash = fnv64(&bytes);
+            if bc_enabled(device) {
+                if let Some((w, h, mips, payload)) = texcache_read(hash, "bc5c") {
+                    return upload_bc5(device, queue, w, h, mips, &payload, "eft_normal");
+                }
+            }
             let Ok(img) = image::load_from_memory(&bytes) else {
                 warn!("gpu-driven Phase2b: normal '{path}' failed to decode; flat placeholder");
-                return upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing");
+                return flat(device, queue);
             };
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
+            if bc_wanted(device, w, h) {
+                let (mips, chain) = build_mip_chain(w, h, &rgba);
+                let payload = bc5_compress_chain(w, h, mips, &chain);
+                texcache_write(hash, "bc5c", w, h, mips, &payload);
+                return upload_bc5(device, queue, w, h, mips, &payload, "eft_normal");
+            }
             upload_rgba8_linear(device, queue, w.max(1), h.max(1), &rgba, "eft_normal")
         }
         Err(e) => {
             warn!("gpu-driven Phase2b: normal '{path}' failed to load ({e}); using flat placeholder");
-            upload_rgba8_linear(device, queue, 1, 1, &[128u8, 128, 255, 255], "eft_normal_missing")
+            flat(device, queue)
         }
     }
 }
@@ -3630,14 +3642,85 @@ fn bc3_compress_chain(width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u
     out
 }
 
+/// Encode one 4x4 block of a single 8-bit channel to a BC4 (8-byte) block: endpoints = block
+/// max/min (r0 >= r1 -> the 8-value interpolation mode), each texel gets the nearest 3-bit index.
+/// Pure Rust (no ISPC/C dep) — quality is ample for smooth tangent-space normals.
+fn bc4_block(vals: &[u8; 16]) -> [u8; 8] {
+    let (mut lo, mut hi) = (255u8, 0u8);
+    for &v in vals {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let (r0, r1) = (hi, lo); // r0 >= r1 -> code0=r0, code1=r1, code2..7 = interpolated
+    let mut refv = [r0; 8];
+    refv[1] = r1;
+    if r0 > r1 {
+        // code k (k in 2..=7) = ((8-k)*r0 + (k-1)*r1)/7, rounded.
+        for k in 2..8u32 {
+            refv[k as usize] = (((8 - k) * r0 as u32 + (k - 1) * r1 as u32 + 3) / 7) as u8;
+        }
+    }
+    let mut bits: u64 = 0;
+    for (i, &v) in vals.iter().enumerate() {
+        let mut best = 0u64;
+        let mut bestd = i32::MAX;
+        for (k, &rk) in refv.iter().enumerate() {
+            let d = (v as i32 - rk as i32).abs();
+            if d < bestd {
+                bestd = d;
+                best = k as u64;
+            }
+        }
+        bits |= best << (3 * i);
+    }
+    let mut out = [0u8; 8];
+    out[0] = r0;
+    out[1] = r1;
+    for (b, o) in out[2..8].iter_mut().enumerate() {
+        *o = ((bits >> (8 * b)) & 0xFF) as u8;
+    }
+    out
+}
+
+/// BC5-compress an RGBA8 mip chain (tangent-space NORMAL maps): per 4x4 block, BC4(R) then BC4(G) =
+/// 16 bytes (RG = tangent XY; the shader reconstructs Z). Same 16-byte-per-block layout as BC3, so
+/// `create_texture_with_data` / `bc3_payload_len` accept it unchanged. 4x smaller than raw Rgba8 and,
+/// unlike BC3, does NOT crush the small X/Y relief (each channel gets its own interpolated endpoints).
+fn bc5_compress_chain(width: u32, height: u32, mips: u32, chain: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for l in 0..mips {
+        let (mw, mh) = ((width >> l).max(1) as usize, (height >> l).max(1) as usize);
+        let (bw, bh) = (mw.div_ceil(4), mh.div_ceil(4));
+        for by in 0..bh {
+            for bx in 0..bw {
+                let (mut rr, mut gg) = ([0u8; 16], [0u8; 16]);
+                for ty in 0..4 {
+                    for tx in 0..4 {
+                        let px = (bx * 4 + tx).min(mw - 1);
+                        let py = (by * 4 + ty).min(mh - 1);
+                        let idx = off + (py * mw + px) * 4;
+                        rr[ty * 4 + tx] = chain[idx];
+                        gg[ty * 4 + tx] = chain[idx + 1];
+                    }
+                }
+                out.extend_from_slice(&bc4_block(&rr));
+                out.extend_from_slice(&bc4_block(&gg));
+            }
+        }
+        off += mw * mh * 4;
+    }
+    out
+}
+
 /// Cross-map BC3 texture cache, keyed by CONTENT HASH of the source PNG bytes — the same game
 /// texture extracted into several map datasets (different filenames, identical bytes) encodes
 /// ONCE and every map reuses it. Lives in packs/shared/texcache/<fnv64>.bc3c =
 /// [w,h,mips: u32 LE] + concatenated BC3 mips. Content addressing self-invalidates.
-fn texcache_path(hash: u64) -> std::path::PathBuf {
+fn texcache_path(hash: u64, ext: &str) -> std::path::PathBuf {
     crate::paths::shared_dir()
         .join("texcache")
-        .join(format!("{hash:016x}.bc3c"))
+        .join(format!("{hash:016x}.{ext}"))
 }
 
 fn fnv64(bytes: &[u8]) -> u64 {
@@ -3659,8 +3742,8 @@ fn bc3_payload_len(width: u32, height: u32, mips: u32) -> usize {
         .sum()
 }
 
-fn texcache_read(hash: u64) -> Option<(u32, u32, u32, Vec<u8>)> {
-    let bytes = std::fs::read(texcache_path(hash)).ok()?;
+fn texcache_read(hash: u64, ext: &str) -> Option<(u32, u32, u32, Vec<u8>)> {
+    let bytes = std::fs::read(texcache_path(hash, ext)).ok()?;
     if bytes.len() <= 12 {
         return None;
     }
@@ -3679,8 +3762,8 @@ fn texcache_read(hash: u64) -> Option<(u32, u32, u32, Vec<u8>)> {
     Some((w, h, m, payload.to_vec()))
 }
 
-fn texcache_write(hash: u64, width: u32, height: u32, mips: u32, payload: &[u8]) {
-    let p = texcache_path(hash);
+fn texcache_write(hash: u64, ext: &str, width: u32, height: u32, mips: u32, payload: &[u8]) {
+    let p = texcache_path(hash, ext);
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -3749,6 +3832,40 @@ fn upload_bc3(
             } else {
                 TextureFormat::Bc3RgbaUnorm
             },
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::default(),
+        payload,
+    );
+    let view = tex.create_view(&TextureViewDescriptor::default());
+    (tex, view)
+}
+
+/// Upload a pre-built BC5 (Rg) mip payload as a LINEAR normal-map texture — tangent XY (Z is
+/// reconstructed in the shader). 8 bpp = 4x smaller than the raw Rgba8 the normals used to upload as.
+fn upload_bc5(
+    device: &RenderDevice,
+    queue: &RenderQueue,
+    width: u32,
+    height: u32,
+    mips: u32,
+    payload: &[u8],
+    label: &'static str,
+) -> (Texture, TextureView) {
+    let tex = device.create_texture_with_data(
+        queue,
+        &TextureDescriptor {
+            label: Some(label),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Bc5RgUnorm, // LINEAR two-channel; normals are vectors, not color
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         },
@@ -3842,6 +3959,8 @@ fn upload_rgba8_linear(
 enum TexCpu {
     /// A finished BC3 mip payload (`upload_bc3`); `srgb` is decided per-array at upload time.
     Bc3 { w: u32, h: u32, mips: u32, payload: Vec<u8> },
+    /// A finished BC5 (Rg) mip payload for tangent-space NORMAL maps (`upload_bc5`, always LINEAR).
+    Bc5 { w: u32, h: u32, mips: u32, payload: Vec<u8> },
     /// A finished RGBA8 mip chain (small textures / data maps / decode failures): uploaded sRGB or
     /// linear per-array. The mip chain is built OFF-THREAD here (not in `upload_*`) so the render
     /// thread only does the GPU copy — otherwise a large data map's mip build stalls a frame.
@@ -3854,14 +3973,13 @@ enum TexCpu {
 /// uploads. NO `RenderDevice`/`RenderQueue`, so N of these run in parallel on the task pool.
 /// `bc` = BC compression enabled on this device (captured before spawn, folds in the feature + env
 /// gate). `data_linear` = terrain control/data map (raw RGBA, NEVER BC — BC's palette warps blend
-/// weights). `is_normal` = tangent-space normal map (raw RGBA8 LINEAR, NEVER BC — BC3 crushes the
-/// small X/Y relief to flat; the shared texcache stores BC3 so normals must skip it too).
-/// `placeholder` = the 1x1 fill on any load/decode failure (magenta for albedo, flat normal for
-/// normals) so the bindless array index stays aligned with materials.json.
+/// weights). `is_normal` = tangent-space normal map -> BC5 (Rg, tangent XY; Z reconstructed in the
+/// shader): 4x smaller than raw Rgba8, and unlike BC3 no X/Y-relief crush. `placeholder` = the 1x1
+/// fill on any load/decode failure (magenta for albedo, flat normal for normals) so the bindless
+/// array index stays aligned with materials.json.
 fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, is_normal: bool, placeholder: [u8; 4]) -> TexCpu {
-    // Force the raw (uncompressed) path for normals: no texcache read (it stores BC3) and no BC
-    // encode, so the tangent-space detail survives. Mirrors the sync `load_normal_texture`.
-    let bc = bc && !is_normal;
+    // Cache is keyed by format extension so BC5 (normal) and BC3 (albedo) entries never collide.
+    let cache_ext = if is_normal { "bc5c" } else { "bc3c" };
     // Build the RGBA8 mip chain OFF-THREAD (the render thread just copies it) — mirrors what
     // `upload_rgba8_srgb/linear` did inline, moved here so a big data map can't stall a frame.
     let raw = |w: u32, h: u32, rgba: &[u8]| {
@@ -3887,8 +4005,12 @@ fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, is_normal: bool, p
             // Content-hash first: a shared-cache hit skips PNG decode AND BC encode entirely.
             let hash = fnv64(&bytes);
             if bc {
-                if let Some((w, h, mips, payload)) = texcache_read(hash) {
-                    return TexCpu::Bc3 { w, h, mips, payload };
+                if let Some((w, h, mips, payload)) = texcache_read(hash, cache_ext) {
+                    return if is_normal {
+                        TexCpu::Bc5 { w, h, mips, payload }
+                    } else {
+                        TexCpu::Bc3 { w, h, mips, payload }
+                    };
                 }
             }
             let Ok(img) = image::load_from_memory(&bytes) else {
@@ -3900,8 +4022,13 @@ fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, is_normal: bool, p
             // Same threshold as `bc_wanted` (feature already folded into `bc`): >= 64px each axis.
             if bc && w >= 64 && h >= 64 {
                 let (mips, chain) = build_mip_chain(w, h, &rgba);
+                if is_normal {
+                    let payload = bc5_compress_chain(w, h, mips, &chain);
+                    texcache_write(hash, cache_ext, w, h, mips, &payload);
+                    return TexCpu::Bc5 { w, h, mips, payload };
+                }
                 let payload = bc3_compress_chain(w, h, mips, &chain);
-                texcache_write(hash, w, h, mips, &payload);
+                texcache_write(hash, cache_ext, w, h, mips, &payload);
                 return TexCpu::Bc3 { w, h, mips, payload };
             }
             raw(w, h, &rgba)
@@ -3926,6 +4053,9 @@ fn upload_prepared(
     match tex {
         TexCpu::Bc3 { w, h, mips, payload } => {
             upload_bc3(device, queue, *w, *h, *mips, payload, srgb, label)
+        }
+        TexCpu::Bc5 { w, h, mips, payload } => {
+            upload_bc5(device, queue, *w, *h, *mips, payload, label) // normals: always LINEAR
         }
         TexCpu::Raw { w, h, mips, chain } => {
             // Mip chain already built off-thread — the render thread only does the GPU copy.
