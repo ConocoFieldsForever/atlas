@@ -151,6 +151,11 @@ def main():
         # Rebuild the task catalog from the json.tarkov.dev static CDN dumps so the sync survives the outage.
         print(f"  tarkov.dev API error: {e}")
         print("  [fallback] GraphQL API unavailable -> json.tarkov.dev static dumps", flush=True)
+        # The bundled embeddable Python pins sys.path via python311._pth and does NOT add the
+        # running script's directory, so the sibling module needs an explicit path entry.
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
         import tarkov_static
         data = tarkov_static.load_static_tasks()
         source = 'tarkov.dev/static'
