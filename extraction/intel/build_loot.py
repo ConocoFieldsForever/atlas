@@ -175,7 +175,18 @@ def cluster(pts, radius):
 
 def main():
     print("[tarkov.dev] fetching loot + spawns + intel ...")
-    data = gql(QUERY)
+    try:
+        data = gql(QUERY)
+        source = 'tarkov.dev'
+    except SystemExit as e:
+        # api.tarkov.dev/graphql is down (503 / GraphQL 'server unavailable'). Rebuild the same data
+        # from the json.tarkov.dev static CDN dumps so the sync survives the outage -- and downstream,
+        # so the menu's PLAY button (gated on loot.json existing) never bricks on a tarkov.dev incident.
+        print(f"  {e}")
+        print("  [fallback] GraphQL API unavailable -> json.tarkov.dev static dumps", flush=True)
+        import tarkov_static
+        data = tarkov_static.load_static_maps()
+        source = 'tarkov.dev/static'
     out = {}
     for m in data['maps']:
         mid = DEV_TO_ID.get(m['normalizedName'])
@@ -342,7 +353,9 @@ def main():
 
         # ---- valuable LOOSE loot points (filtered to GPU/LEDX/keycard-tier so the layer isn't clutter) ----
         loose = []
-        for ll in fetch_loose(m.get('name') or m['normalizedName']):
+        # Static-fallback maps carry lootLoose inline (already price-resolved); only the live GraphQL
+        # path (no lootLoose in the main QUERY) needs the per-map LOOSE_QUERY round-trip.
+        for ll in (m['lootLoose'] if m.get('lootLoose') is not None else fetch_loose(m.get('name') or m['normalizedName'])):
             best = None
             for it in (ll.get('items') or []):
                 if best is None or (it.get('avg24hPrice') or 0) > (best.get('avg24hPrice') or 0):
@@ -378,7 +391,7 @@ def main():
               + (f"  [unmapped: {dict(list(unknown.items())[:5])}]" if unknown else ""))
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    json.dump({'version': 3, 'source': 'tarkov.dev', 'built': int(time.time()),
+    json.dump({'version': 3, 'source': source, 'built': int(time.time()),
                'coord_bridge': 'viewer = diag(-1,1,1) * unity',
                'value_model': {'pmc_kill_ev': PMC_KILL_EV, 'boss_fight_t': BOSS_FIGHT_T, 'loose_min_ev': LOOSE_MIN_EV,
                                'note': 'container ev = type-average filled value; effective value = ev*spawn (fill rate). '
