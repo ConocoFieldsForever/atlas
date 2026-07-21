@@ -108,6 +108,9 @@ pub enum K {
     DepsMissing,
     InstallDeps,
     BuildNeedsSetup,
+    BuildKitMissing,
+    DepsFirst,
+    SetGameFirst,
     Installing,
     // Build / loading panel
     InstallingDeps,
@@ -260,6 +263,18 @@ fn pair(k: K) -> [&'static str; 2] {
         BuildNeedsSetup => [
             "Install the build deps and set GAME INSTALL (below) first",
             "Сначала установите зависимости и укажите GAME INSTALL (ниже)",
+        ],
+        BuildKitMissing => [
+            "This viewer-only bundle has no build kit - use the full bundle to build maps",
+            "В этой сборке нет комплекта для сборки карт — используйте полную версию",
+        ],
+        DepsFirst => [
+            "Install the build deps (below) first",
+            "Сначала установите зависимости (ниже)",
+        ],
+        SetGameFirst => [
+            "Set GAME INSTALL to your Escape from Tarkov folder (below) first",
+            "Сначала укажите папку установки Escape from Tarkov (GAME INSTALL, ниже)",
         ],
         Installing => ["installing\u{2026}", "установка\u{2026}"],
         InstallingDeps => ["INSTALLING DEPENDENCIES", "УСТАНОВКА ЗАВИСИМОСТЕЙ"],

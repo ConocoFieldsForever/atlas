@@ -51,5 +51,14 @@ if ($LASTEXITCODE -ne 0) { throw "get-pip failed (rc=$LASTEXITCODE)" }
 # Sanity: python + pip run.
 & (Join-Path $Dest "python.exe") -m pip --version
 if ($LASTEXITCODE -ne 0) { throw "pip not runnable after bootstrap" }
+
+# Strip __pycache__: the .pyc files pip just compiled embed the BUILD MACHINE's absolute paths
+# (a username leak in a shipped zip — found by a binary-aware scan; text-only scans miss .pyc).
+# Python regenerates them on first import, so dropping them costs one-time startup only.
+Get-ChildItem -Recurse $Dest -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
+# Strip Scripts\*.exe: pip's console-script launchers hardcode this machine's absolute python.exe
+# path (same leak, AND broken after relocation). Everything here uses `python -m pip` instead.
+$scripts = Join-Path $Dest "Scripts"
+if (Test-Path $scripts) { Get-ChildItem $scripts -Filter "*.exe" | Remove-Item -Force }
 $mb = [math]::Round((Get-ChildItem -Recurse $Dest | Measure-Object Length -Sum).Sum / 1MB, 1)
 Write-Host "[bundle-python] ready at $Dest ($mb MB, Python $Version + pip; deps install on first INSTALL DEPS)"
