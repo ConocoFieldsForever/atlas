@@ -143,7 +143,17 @@ def conv_rewards(r):
 
 def main():
     print("[tarkov.dev] fetching tasks...")
-    data = gql(QUERY)
+    try:
+        data = gql(QUERY)
+        source = 'tarkov.dev'
+    except (SystemExit, urllib.error.URLError) as e:
+        # api.tarkov.dev/graphql down (503 -> HTTPError, or a GraphQL 'server unavailable' -> SystemExit).
+        # Rebuild the task catalog from the json.tarkov.dev static CDN dumps so the sync survives the outage.
+        print(f"  tarkov.dev API error: {e}")
+        print("  [fallback] GraphQL API unavailable -> json.tarkov.dev static dumps", flush=True)
+        import tarkov_static
+        data = tarkov_static.load_static_tasks()
+        source = 'tarkov.dev/static'
     tasks_in = data['tasks']
     out_tasks = []
     map_task_count = {}
@@ -233,7 +243,7 @@ def main():
         print(f"[tasks] zone patch: {applied} supplemental zone(s) applied")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    doc = {'version': 2, 'source': 'tarkov.dev', 'built': int(time.time()),
+    doc = {'version': 2, 'source': source, 'built': int(time.time()),
            'coord_bridge': 'viewer = diag(-1,1,1) * unity', 'count': len(out_tasks),
            'map_task_count': map_task_count, 'tasks': out_tasks}
     json.dump(doc, open(OUT, 'w'), separators=(',', ':'))
