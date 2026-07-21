@@ -1275,9 +1275,9 @@ fn obj_location(o: &ObjectiveDef, map_key: &str) -> Option<Vec3> {
 }
 
 /// A stable id for an objective's checked-off state (task id + index; objective ids aren't always
-/// present/unique across the schema, so the index keys it locally).
-#[cfg(feature = "egui")]
-fn obj_key(task_id: &str, objective: &ObjectiveDef, i: usize) -> String {
+/// present/unique across the schema, so the index keys it locally). Ungated: the game link
+/// (game_watch.rs) writes the same keys when a task finishes in-game.
+pub(crate) fn obj_key(task_id: &str, objective: &ObjectiveDef, i: usize) -> String {
     if objective.id.is_empty() {
         format!("{task_id}#{i}")
     } else {

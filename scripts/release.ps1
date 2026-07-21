@@ -130,7 +130,10 @@ New-Item -ItemType File -Force "$dist\packs\shared\.keep" | Out-Null
 $bad = Get-ChildItem -Recurse "$dist" -File -ErrorAction SilentlyContinue | Where-Object {
     $_.Name -match '\.eftpack$|\.bc[0-9]|lut_amidgen|eft_grade_lut\.bin$' -or
     $_.FullName -match '\\texcache\\' -or
-    $_.Name -in @('loot.json','tasks.json')
+    $_.Name -in @('loot.json','tasks.json') -or
+    # compiled-python bytecode embeds the build machine's absolute paths (username leak);
+    # bundle-python.ps1 strips its own __pycache__, this fails closed on any stray .pyc
+    $_.Name -match '\.pyc$'
 }
 if ($bad) { throw "game-derived data leaked into dist: $($bad.FullName -join ', ')" }
 

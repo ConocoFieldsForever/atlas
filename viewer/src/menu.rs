@@ -1970,6 +1970,16 @@ pub fn menu_ui(
             // vignette (Background layer, behind every opaque panel) only ever darkens the blue
             // background between/around them, never the UI text.
             let card_bg = CARD;
+            // Name the ONE condition that's actually failing (the old combined "install deps AND
+            // set game install" text told a user with deps ready + no install button to install
+            // deps they already had).
+            let setup_key = if !state.build_kit_available {
+                K::BuildKitMissing
+            } else if !state.deps_ok {
+                K::DepsFirst
+            } else {
+                K::SetGameFirst
+            };
             if !can_build {
                 // Persistent INLINE reason (not just the disabled-button hover tooltip) so a
                 // non-technical user actually sees WHY every BUILD is greyed out and what to do.
@@ -1979,7 +1989,7 @@ pub fn menu_ui(
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("\u{26A0} {}", t(lg, K::BuildNeedsSetup)))
+                            RichText::new(format!("\u{26A0} {}", t(lg, setup_key)))
                                 .color(WARN)
                                 .size(12.0),
                         );
@@ -2095,7 +2105,7 @@ pub fn menu_ui(
                                                     })
                                                     .inner;
                                                 let resp = if !can_build {
-                                                    resp.on_disabled_hover_text(t(lg, K::BuildNeedsSetup))
+                                                    resp.on_disabled_hover_text(t(lg, setup_key))
                                                 } else {
                                                     resp
                                                 };
@@ -2122,7 +2132,7 @@ pub fn menu_ui(
                                                     })
                                                     .inner;
                                                 let resp = if !can_build {
-                                                    resp.on_disabled_hover_text(t(lg, K::BuildNeedsSetup))
+                                                    resp.on_disabled_hover_text(t(lg, setup_key))
                                                 } else {
                                                     resp
                                                 };
@@ -2157,7 +2167,7 @@ pub fn menu_ui(
                                             let b = egui::Button::new(RichText::new(build_label));
                                             let resp = ui.add_enabled(!any_building && can_build, b);
                                             let resp = if !can_build {
-                                                resp.on_disabled_hover_text(t(lg, K::BuildNeedsSetup))
+                                                resp.on_disabled_hover_text(t(lg, setup_key))
                                             } else {
                                                 resp
                                             };
