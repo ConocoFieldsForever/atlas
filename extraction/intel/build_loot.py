@@ -184,6 +184,11 @@ def main():
         # so the menu's PLAY button (gated on loot.json existing) never bricks on a tarkov.dev incident.
         print(f"  {e}")
         print("  [fallback] GraphQL API unavailable -> json.tarkov.dev static dumps", flush=True)
+        # The bundled embeddable Python pins sys.path via python311._pth and does NOT add the
+        # running script's directory, so the sibling module needs an explicit path entry.
+        import sys
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
         import tarkov_static
         data = tarkov_static.load_static_maps()
         source = 'tarkov.dev/static'
