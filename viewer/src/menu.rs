@@ -681,6 +681,10 @@ pub struct MenuState {
     pub show_rebuild: Option<usize>,
     /// Build panel: raw log tail visible? Collapsed by default; auto-expands on failure.
     pub show_log: bool,
+    /// INTEL/sync strip: raw sync-log tail visible? The sync streams into the worker log like a
+    /// build, but `build_view` ignores sync jobs (no map row), so the build panel never surfaces it
+    /// — this drives an inline Show log / Copy log under the sync row instead. Auto-opens on failure.
+    pub show_sync_log: bool,
     /// Footer editor buffer for the game-install path.
     pub game_dir_edit: String,
     /// Where extracted datasets live (EFT_ASSETS_ROOT) + its footer editor buffer, and whether the
@@ -1252,6 +1256,7 @@ pub fn build_state() -> MenuState {
         confirm_delete: None,
         show_rebuild: None,
         show_log: false,
+        show_sync_log: false,
         intel: intel_status(),
         sync_note: None,
         seen_completed: 0,
@@ -1459,11 +1464,17 @@ pub fn menu_ui(
             // the script wrote loot.json somewhere shared_dir() can't see — report that instead of
             // lying. (After the packs_root content-check fix both point at the same dir.)
             let intel_present = state.intel.0.is_some() || state.intel.1.is_some();
-            state.sync_note = Some(if ok && intel_present {
+            let refreshed = ok && intel_present;
+            state.sync_note = Some(if refreshed {
                 (t(lg, K::IntelRefreshed).to_string(), true)
             } else {
                 (t(lg, K::SyncFailed).to_string(), false)
             });
+            if !refreshed {
+                // Surface the failing stage (or the exit-0-but-not-visible packs_root divergence)
+                // without a click — same reflex as a failed build (see below).
+                state.show_sync_log = true;
+            }
         } else if worker.last_is_build() && !ok {
             state.show_log = true; // surface the failing stage without a click
         } else if worker.last_is_build() && ok {
@@ -1547,6 +1558,9 @@ pub fn menu_ui(
             // ---- INTEL strip: tarkov.dev data freshness + one-click refresh. Overlays (loot
             // values, tasks, icons) are only as good as their last sync — surface it. ----
             ui.add_space(4.0);
+            // Whether a sync has run this session (current or last job) — gates the inline log
+            // toggle below. The sync writes no <packs>/logs file, so this is its only log surface.
+            let sync_has_log = worker.current_is_sync() || worker.last_is_sync();
             ui.horizontal(|ui| {
                 ui.label(RichText::new(t(lg, K::Intel)).color(BEIGE).size(11.0).strong());
                 let (loot_d, tasks_d, icons) = state.intel;
@@ -1611,7 +1625,40 @@ pub fn menu_ui(
                         ui.label(RichText::new(err.as_str()).color(theme::DANGER_TEXT).size(11.0));
                     }
                 }
+                // Show/Copy the sync's streamed log. build_view() skips sync jobs so the build panel
+                // never carries these buttons for a sync, and no <packs>/logs file is written — this
+                // inline toggle is the only way to read/share a failed sync's [SYNC FAILED] stage.
+                if sync_has_log {
+                    if ui
+                        .small_button(RichText::new(
+                            t(lg, if state.show_sync_log { K::HideLog } else { K::ShowLog }),
+                        ).size(10.0))
+                        .clicked()
+                    {
+                        state.show_sync_log = !state.show_sync_log;
+                    }
+                    if ui.small_button(RichText::new(t(lg, K::CopyLog)).size(10.0)).clicked() {
+                        let job = if worker.current_is_sync() { worker.current_job() } else { worker.last_job() };
+                        if let Some(job) = job {
+                            ui.ctx().copy_text(job.full_log());
+                        }
+                    }
+                }
             });
+            // Sync log tail, inline under the INTEL row (capped ScrollArea like the build panel so a
+            // long log scrolls INSIDE instead of shoving the map list up). Auto-opens on failure.
+            if state.show_sync_log && sync_has_log {
+                let job = if worker.current_is_sync() { worker.current_job() } else { worker.last_job() };
+                if let Some(job) = job {
+                    let (_, tail, _, _) = job.snapshot(200);
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                        for line in &tail {
+                            ui.label(RichText::new(line).color(DIM).size(11.0).monospace());
+                        }
+                    });
+                }
+            }
         });
 
     // With the real 3D prop active the CentralPanel goes TRANSPARENT: the 3D world behind
