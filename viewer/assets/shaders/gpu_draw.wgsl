@@ -403,6 +403,18 @@ fn eval_realtime_lights(world_pos: vec3<f32>, N: vec3<f32>, V: vec3<f32>, rough:
         let a2 = a * a;
         let sk = (rough + 1.0) * (rough + 1.0) / 8.0; // Smith k (direct lighting)
         let scale = lgrid.params.x;
+        // SH-directional occlusion for the realtime lights (cross-platform, ~free — reuses the baked
+        // INDIRECT SH). After the direct/indirect split the SH carries sky + bounce ONLY (practicals
+        // are realtime), and it is occlusion-aware, so a direction blocked by a wall reads DARK. Gating
+        // each light by radiance(toward-light)/ambient softly attenuates lights that leak from behind
+        // geometry, with NO per-light shadow map. amb~0 (no volume / fully-black probe) -> disabled.
+        let occ_uvw = clamp((world_pos - sh.vol_min.xyz) * sh.vol_inv_extent.xyz,
+                            vec3<f32>(0.0), vec3<f32>(1.0));
+        let occ_cr = textureSampleLevel(sh_r, sh_samp, occ_uvw, 0.0);
+        let occ_cg = textureSampleLevel(sh_g, sh_samp, occ_uvw, 0.0);
+        let occ_cb = textureSampleLevel(sh_b, sh_samp, occ_uvw, 0.0);
+        let OCC_LUMA = vec3<f32>(0.299, 0.587, 0.114);
+        let occ_amb = 0.282095 * dot(vec3<f32>(occ_cr.x, occ_cg.x, occ_cb.x), OCC_LUMA);
         for (var k = s; k < e; k = k + 1u) {
             let li = light_grid[k];
             let L0 = lights[li * 3u];
@@ -422,7 +434,17 @@ fn eval_realtime_lights(world_pos: vec3<f32>, N: vec3<f32>, V: vec3<f32>, rough:
             let spot = smoothstep(cos_outer, cos_inner, cosang); // point: cos_outer=-2,cos_inner=-1 => 1
             let ndl = max(dot(N, l), 0.0);
             if (ndl <= 0.0 || spot <= 0.0) { continue; }
-            let radiance = lcol * (scale * atten * spot);
+            // Directional occlusion from the indirect SH: reconstruct radiance TOWARD the light (`l`)
+            // and compare to the isotropic ambient. Ratio ~1 in an open/uniform direction, <1 toward a
+            // walled-off one -> the light dims. Folded into `radiance` so it gates diffuse AND spec.
+            let occ_rl = 0.282095 * vec3<f32>(occ_cr.x, occ_cg.x, occ_cb.x)
+                + 0.488603 * (vec3<f32>(occ_cr.y, occ_cg.y, occ_cb.y) * l.y
+                            + vec3<f32>(occ_cr.z, occ_cg.z, occ_cb.z) * l.z
+                            + vec3<f32>(occ_cr.w, occ_cg.w, occ_cb.w) * l.x);
+            let occ = select(1.0,
+                smoothstep(0.12, 0.85, dot(max(occ_rl, vec3<f32>(0.0)), OCC_LUMA) / (occ_amb + 1e-4)),
+                occ_amb > 1.0e-3);
+            let radiance = lcol * (scale * atten * spot * occ);
             acc_d = acc_d + radiance * ndl;
             // GGX/Cook-Torrance specular — identical BRDF to the SH-dominant lobe (dielectric F0=0.04).
             let H = normalize(V + l);

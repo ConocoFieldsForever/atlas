@@ -2193,22 +2193,36 @@ fn build_cpu_data(
     // Phase 1 SH-GI: load + repack the baked irradiance volume (volume.bin + volume.json).
     let sh_volume = load_sh_volume(pack);
 
-    // REALTIME lights: auto-select against the baked SH volume to avoid DOUBLE-COUNTING. A real
-    // SH volume already integrates the practical lights (baked WITH them) -> realtime OFF; a pack
-    // with no volume (the no-CUDA case) renders FLAT under SH alone -> realtime ON. `EFT_LIGHTS`
-    // overrides: `auto` (default rule), `rt` (force on, for A/B on a volume pack), `sh` (force off).
+    // REALTIME lights: auto-select against the baked SH volume to avoid DOUBLE-COUNTING. Three cases:
+    //  * no volume (no-CUDA fallback) -> FLAT under SH alone -> realtime ON.
+    //  * legacy FULL volume (practicals baked in) -> realtime OFF (they'd double-count).
+    //  * INDIRECT-only volume (bake-sh --indirect-only; volume.json "direct": false) -> practicals
+    //    were EXCLUDED from the bake, so realtime ON supplies the crisp direct lighting (the
+    //    direct/indirect split — baked soft indirect GI + real-time direct practicals).
+    // `EFT_LIGHTS` overrides: `auto` (rule above), `rt` (force on), `sh` (force off).
     let has_real_volume = sh_volume.is_some();
+    let indirect_volume = pack
+        .manifest
+        .sidecars
+        .volume_meta
+        .as_deref()
+        .map(|m| pack.resolve_path(m))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("direct").and_then(|d| d.as_bool()))
+        .map(|direct| !direct) // "direct": false -> indirect-only
+        .unwrap_or(false); // absent/true -> legacy full bake
     let rt_mode = std::env::var("EFT_LIGHTS")
         .map(|v| v.trim().to_ascii_lowercase())
         .unwrap_or_else(|_| "auto".to_string());
     let rt_enabled = match rt_mode.as_str() {
         "rt" | "on" | "1" => true,
         "sh" | "off" | "0" => false,
-        _ => !has_real_volume, // auto
+        _ => !has_real_volume || indirect_volume, // auto
     };
     info!(
         "gpu-driven realtime lights: EFT_LIGHTS={rt_mode} real_volume={has_real_volume} \
-         -> realtime {}",
+         indirect={indirect_volume} -> realtime {}",
         if rt_enabled { "ON" } else { "OFF" }
     );
     let light_grid = build_light_grid(&pack.lights, &pack.manifest.bounds, rt_enabled);

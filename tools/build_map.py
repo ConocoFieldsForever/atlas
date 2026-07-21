@@ -365,14 +365,32 @@ def main():
     if bake_mode != "warp" or not os.path.isfile(os.path.join(pack, "volume.bin")):
         atlas_exe = find_atlas_exe()
         if atlas_exe:
-            run(3, total, "bake lighting (portable CPU SH)",
-                [atlas_exe, "bake-sh", pack], VIEWER, optional=True)
+            run(3, total, "bake lighting (portable CPU SH, direct/indirect split)",
+                [atlas_exe, "bake-sh", pack, "--indirect-only"], VIEWER, optional=True)
         else:
             print(f"[STAGE 3/{total}] lighting: skipped - viewer exe not found. Build it "
                   f"(`cargo build --release`) or set EFT_ATLAS_EXE, then rebuild to bake lighting.",
                   flush=True)
     if os.path.isfile(os.path.join(pack, "volume.bin")):
         print("  lighting: SH irradiance volume baked into pack", flush=True)
+        # The portable CPU bake writes volume.bin/json into the pack AFTER assemble_bevy wrote the
+        # manifest, whose volume sidecars came out NULL (assemble derives them from a legacy
+        # tarkmap/out/<map> path that doesn't exist for the in-pack bake). Point the sidecars at the
+        # pack-relative files so the viewer's load_sh_volume actually finds the volume -- otherwise
+        # real_volume=false and the map renders with NO baked GI (flat + realtime-only).
+        try:
+            import json as _json
+            _mp = os.path.join(pack, "manifest.json")
+            _m = _json.load(open(_mp, encoding="utf-8"))
+            _sc = _m.setdefault("sidecars", {})
+            _sc["volume"] = "volume.bin"
+            _sc["volumeMeta"] = "volume.json"
+            if os.path.isfile(os.path.join(pack, "volume.vis.bin")):
+                _sc["volumeVis"] = "volume.vis.bin"
+            _json.dump(_m, open(_mp, "w", encoding="utf-8"))
+            print("  lighting: manifest volume sidecars -> volume.bin / volume.json (in-pack)", flush=True)
+        except Exception as _e:
+            print(f"  lighting: WARNING manifest volume-sidecar patch failed ({_e})", flush=True)
     else:
         print("  lighting: none (flat realtime fallback until the baker runs)", flush=True)
 
