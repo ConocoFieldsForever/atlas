@@ -68,6 +68,9 @@ struct Baked {
     inside_solid: usize,
     /// diffuse bounces baked in (0 = direct only, 1 = one bounce).
     bounces: usize,
+    /// false = INDIRECT-ONLY bake (practicals NOT baked; rendered real-time instead — direct/indirect
+    /// split). true = the legacy full bake (sky + practicals + bounce all in the SH).
+    direct: bool,
 }
 
 // ---- Fibonacci sphere + SH basis --------------------------------------------------------------
@@ -452,6 +455,15 @@ fn bake(pack: &Pack) -> Result<Baked> {
     let dirs: Vec<(Vec3, [f32; 4])> = (0..n_dir).map(|i| { let d = fib_dir(i, n_dir); (d, sh_basis(d)) }).collect();
     let norm = 4.0 * std::f32::consts::PI / n_dir as f32;
 
+    // Direct/indirect split: with EFT_SH_INDIRECT=1 (`bake-sh --indirect-only`) the M2 practicals are
+    // NOT baked into the SH — they render as real-time direct lights instead. The volume then carries
+    // only INDIRECT lighting (sky M1 + bounce M3) and volume.json is marked "direct": false, which the
+    // viewer reads to auto-enable the realtime light grid (crisp per-light interiors, no double-count).
+    let indirect_only = std::env::var("EFT_SH_INDIRECT").map(|v| v.trim() == "1").unwrap_or(false);
+    if indirect_only {
+        eprintln!("  sh-bake: INDIRECT-ONLY — practicals skipped (baked = sky + bounce; direct=false)");
+    }
+
     // ================= PASS A — direct: sky-visibility (M1) + shadow-tested practicals (M2) =========
     // Kept in f32 (NOT packed yet) so the M3 diffuse bounce can trilinearly gather irradiance from it.
     let t_bake = Instant::now();
@@ -481,7 +493,9 @@ fn bake(pack: &Pack) -> Result<Baked> {
                 inside.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             // --- M2: live practicals (delta lights; added AFTER the sky*norm scale, NOT weighted by
-            //     norm — a point light is a single direction, not a solid-angle sample). ---
+            //     norm — a point light is a single direction, not a solid-angle sample). SKIPPED under
+            //     --indirect-only (they render as real-time direct lights instead). ---
+            if !indirect_only {
             for lgt in lights {
                 let tol = lgt.pos - o;
                 let dist = tol.length();
@@ -512,6 +526,7 @@ fn bake(pack: &Pack) -> Result<Baked> {
                     sh[c] += rad * basis[c];
                 }
             }
+            } // end if !indirect_only (M2 practicals)
             *out = sh;
         },
     );
@@ -605,6 +620,7 @@ fn bake(pack: &Pack) -> Result<Baked> {
         halfs,
         inside_solid,
         bounces,
+        direct: !indirect_only,
     })
 }
 
@@ -654,6 +670,9 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
         "layout": "float16 LE, probe-major; probe index = ((z*ny)+y)*nx + x; within each probe 12 halfs ordered coeff0.r,coeff0.g,coeff0.b, coeff1.r,coeff1.g,coeff1.b, coeff2.r,coeff2.g,coeff2.b, coeff3.r,coeff3.g,coeff3.b. Coeffs are RADIANCE SH (L1 real basis): 0=Y00(0.282095), 1=Y1-1(0.488603*y), 2=Y10(0.488603*z), 3=Y11(0.488603*x). Viewer reconstructs IRRADIANCE via cosine convolution A0=pi, A1=2pi/3.",
         "sun_dir": b.sun_dir,
         "bounces": b.bounces,
+        // false = INDIRECT-ONLY (practicals excluded; the viewer renders them real-time). The viewer
+        // auto-enables the realtime light grid when this is present and false (direct/indirect split).
+        "direct": b.direct,
         "baker": "atlas-cpu-sh (sh_bake.rs, M3: sky-visibility + shadow-tested practicals + diffuse bounce)",
     });
     std::fs::write(dir.join("volume.json"), serde_json::to_string_pretty(&meta)?)
@@ -679,6 +698,9 @@ pub fn run_cli(args: &[String]) -> i32 {
                     }
                 }
             }
+            // Direct/indirect split: bake only INDIRECT (sky + bounce); the practicals become
+            // real-time direct lights in the viewer. Marks volume.json "direct": false.
+            "--indirect-only" | "--indirect" => std::env::set_var("EFT_SH_INDIRECT", "1"),
             s if s.starts_with('-') => {
                 eprintln!("bake-sh: unknown flag '{s}'");
                 return 2;
