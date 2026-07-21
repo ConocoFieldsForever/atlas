@@ -755,10 +755,13 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let Ng = N;
     let has_normal = m.normal_index != MAT_NORMAL_NONE;
     let nidx = select(0u, m.normal_index, has_normal); // untextured -> slot 0, result discarded
-    let nt = textureSample(normal_tex[nidx], albedo_samp, o.uv).rgb;
-    var base_ts = nt * 2.0 - vec3<f32>(1.0);
-    if ((m.normal_flags & 1u) != 0u) { base_ts.y = -base_ts.y; } // DirectX green-flip (no derivative op)
-    base_ts = vec3<f32>(base_ts.xy * m.normal_scale, max(base_ts.z, 1e-3));
+    // Read only XY (tangent) and RECONSTRUCT Z. Normal maps are stored BC5 (Rg two-channel, Z is
+    // redundant); reading .z would give 0. This is also correct for the legacy raw-RGB normals
+    // (Z = sqrt(1 - x² - y²) regardless), so it is a drop-in. Matches the detail-normal decode below.
+    var base_xy = textureSample(normal_tex[nidx], albedo_samp, o.uv).xy * 2.0 - vec2<f32>(1.0);
+    if ((m.normal_flags & 1u) != 0u) { base_xy.y = -base_xy.y; } // DirectX green-flip (no derivative op)
+    base_xy = base_xy * m.normal_scale;
+    var base_ts = vec3<f32>(base_xy, sqrt(max(1.0 - dot(base_xy, base_xy), 1.0e-4)));
     // Flat (0,0,1) when the material has no base normal map, so a detail-only material still has a
     // valid base to RNM-blend against (blend_rnm(flat, detail) == detail).
     base_ts = select(vec3<f32>(0.0, 0.0, 1.0), base_ts, has_normal);
