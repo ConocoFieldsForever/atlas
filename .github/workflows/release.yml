@@ -15,7 +15,9 @@ on:
       prerelease:
         description: "Mark the GitHub Release as a pre-release"
         type: boolean
-        default: true
+        # Stable by default so /releases/latest works and existing installs can reliably discover
+        # urgent fixes. Callers can still opt into a prerelease for experimental builds.
+        default: false
 
 permissions:
   contents: write # create the Release + tag
