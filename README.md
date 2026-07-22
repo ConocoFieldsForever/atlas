@@ -11,7 +11,7 @@ internet required to use it.
 
 ## ⬇️ Download & run
 
-**[Download the latest Atlas release for Windows (portable `.zip`)](https://github.com/ConocoFieldsForever/atlas/releases/latest)**
+**[Download Atlas for Windows (portable `.zip`)](https://github.com/ConocoFieldsForever/atlas/releases)**
 
 Unzip it anywhere (your Desktop is fine) and **double-click `atlas.exe`** — that's
 it. No installer, no account, and no internet needed to view maps. On first launch

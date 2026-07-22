@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Build the TASK catalog for the tarkmap task-tracker (out/tasks.json).
 
-Pulls the full quest/task list from the public tarkov.dev GraphQL API (needs a User-Agent header or it 403s), keeps the
+Pulls the full quest/task list from tarkov.dev's pre-generated JSON API, keeps the
 fields the tracker needs (name/trader/map/level/kappa/prereqs + every objective with its description and, where it has a
 map location, its zone position + outline), and COORDINATE-BRIDGES every position/outline into viewer-world space with the
 SAME G3 = diag(-1,1,1) conjugation the geometry pipeline uses (viewer = (-x, y, z)). So a task zone drops straight onto the
@@ -9,7 +9,7 @@ tacmap. Tasks span all maps, so this is ONE global catalog the viewer filters by
 
   python extraction/intel/build_tasks.py                 -> <EFT_TARKMAP_ROOT>/out/tasks.json  (all tasks, all maps)
 Re-run per wipe (task data changes per wipe, not per session). No game files needed (tarkov.dev only)."""
-import os, json, urllib.request, time
+import os, json, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -21,7 +21,6 @@ _OUT_DIR = os.environ.get("EFT_INTEL_OUT_DIR") or (
     os.path.join(_TK, "out") if _TK else os.path.join(REPO, "packs", "shared")
 )
 OUT = os.path.join(_OUT_DIR, 'tasks.json')
-API = "https://api.tarkov.dev/graphql"
 # tarkov.dev map normalizedName -> our map id (matches tarkmap/maps/<id>). Extend as maps are added.
 DEV_TO_ID = {
     'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
@@ -36,51 +35,6 @@ G3 = (-1.0, 1.0, 1.0)   # Unity world -> viewer world (X-flip), read logically f
 
 def bridge(p):
     return None if p is None else [round(G3[0] * p['x'], 2), round(G3[1] * p['y'], 2), round(G3[2] * p['z'], 2)]
-
-QUERY = """
-{ tasks {
-    id name normalizedName kappaRequired lightkeeperRequired experience wikiLink taskImageLink
-    minPlayerLevel factionName restartable availableDelaySecondsMin availableDelaySecondsMax
-    trader { name } map { normalizedName }
-    taskRequirements { task { name } status }
-    traderRequirements { trader { name } requirementType compareMethod value }
-    finishRewards {
-      traderStanding { trader { name } standing }
-      items { item { name shortName avg24hPrice } count quantity }
-      offerUnlock { trader { name } level item { name shortName } }
-      skillLevelReward { name level }
-      traderUnlock { name }
-      achievement { name rarity }
-      customization { name customizationTypeName }
-    }
-    objectives {
-      id type description optional maps { normalizedName }
-      ... on TaskObjectiveBasic { requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveExtract { exitStatus exitName zoneNames count requiredKeys { name shortName avg24hPrice } }
-      ... on TaskObjectiveItem { items { name } count foundInRaid minDurability maxDurability requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveMark { markerItem { name } requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveQuestItem { questItem { name } count requiredKeys { name shortName avg24hPrice } possibleLocations { map { normalizedName } positions { x y z } } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveShoot { targetNames count shotType bodyParts usingWeapon { name } usingWeaponMods { name } wearing { name } notWearing { name } distance { compareMethod value } timeFromHour timeUntilHour requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveUseItem { count zoneNames useAny { name } requiredKeys { name shortName avg24hPrice } zones { map { normalizedName } position { x y z } outline { x y z } top bottom } }
-      ... on TaskObjectiveBuildItem { item { name } }
-      ... on TaskObjectivePlayerLevel { playerLevel }
-      ... on TaskObjectiveTraderLevel { trader { name } level }
-      ... on TaskObjectiveTraderStanding { trader { name } value }
-      ... on TaskObjectiveSkill { skillLevel { name level } }
-      ... on TaskObjectiveTaskStatus { task { name } status }
-      ... on TaskObjectiveExperience { count }
-    }
-} }
-"""
-
-
-def gql(q):
-    req = urllib.request.Request(API, data=json.dumps({"query": q}).encode(),
-                                 headers={"Content-Type": "application/json", "User-Agent": "tarkmap/1.0"})
-    r = json.load(urllib.request.urlopen(req, timeout=90))
-    if 'errors' in r: raise SystemExit("tarkov.dev errors: " + json.dumps(r['errors'][:3]))
-    return r['data']
-
 
 def map_id(nn):
     return DEV_TO_ID.get(nn, nn)
@@ -142,23 +96,14 @@ def conv_rewards(r):
 
 
 def main():
-    print("[tarkov.dev] fetching tasks...")
-    try:
-        data = gql(QUERY)
-        source = 'tarkov.dev'
-    except (SystemExit, urllib.error.URLError) as e:
-        # api.tarkov.dev/graphql down (503 -> HTTPError, or a GraphQL 'server unavailable' -> SystemExit).
-        # Rebuild the task catalog from the json.tarkov.dev static CDN dumps so the sync survives the outage.
-        print(f"  tarkov.dev API error: {e}")
-        print("  [fallback] GraphQL API unavailable -> json.tarkov.dev static dumps", flush=True)
-        # The bundled embeddable Python pins sys.path via python311._pth and does NOT add the
-        # running script's directory, so the sibling module needs an explicit path entry.
-        import sys
-        if HERE not in sys.path:
-            sys.path.insert(0, HERE)
-        import tarkov_static
-        data = tarkov_static.load_static_tasks()
-        source = 'tarkov.dev/static'
+    print("[tarkov.dev/json] building tasks...")
+    # The bundled embeddable Python pins sys.path via python311._pth and does not add this directory.
+    import sys
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import tarkov_static
+    data = tarkov_static.load_static_tasks()
+    source = 'tarkov.dev/json'
     tasks_in = data['tasks']
     out_tasks = []
     map_task_count = {}
@@ -183,7 +128,7 @@ def main():
             if o.get('foundInRaid'): oo['fir'] = True
             if o.get('exitName'): oo['exit'] = o['exitName']
             if o.get('requiredKeys'):
-                # GraphQL currently returns a flat list, but tolerate nested alternative-key groups.
+                # Upstream currently returns a flat list, but tolerate nested alternative-key groups.
                 raw_keys = o['requiredKeys']
                 if raw_keys and isinstance(raw_keys[0], list):
                     oo['requiredKeys'] = [[item_ref(k) for k in flat_items(group)] for group in raw_keys]

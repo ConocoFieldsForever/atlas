@@ -1,41 +1,45 @@
 #!/usr/bin/env python
-"""Cache tarkov.dev item ICONS for one map's cards -> packs/<map>.eftpack/icons/<slug>.png.
+"""Cache tarkov.dev item/task images for one or more built map packs.
 
-The client ships NO inventory-icon sprites: item bundles are 3D mesh/texture assets and the
-game RENDERS grid icons at runtime into a local cache keyed by opaque numeric hashes
-(%TEMP%/Battlestate Games/EscapeFromTarkov/Icon Cache/live/<n>.png — no usable template-id
-index). So icons come from the tarkov.dev asset CDN at BUILD time and the viewer stays
-offline: only items actually referenced by THIS map's cards are fetched — gamedata.json
-loose_points item pools + keyed doors (key_id template ids) and loot.json lock keys + loose
-"jackpot" items. webp -> PNG via PIL, capped at 128 px. Existing files are kept (re-run is
-incremental); a fetch failure skips that icon (the viewer renders the card without it).
+Only items referenced by the supplied packs are resolved. All packs are handled in one process so
+shared references are deduplicated and the cached items catalog is parsed once. Existing PNGs are
+kept; only missing images hit the asset CDN.
 
-  python extraction/intel/fetch_icons.py <map> [--pack DIR]
+  python extraction/intel/fetch_icons.py <map> [<map> ...] [--pack DIR] [--tasks-all]
 
-The <slug>.png name contract (shared with viewer/src/inspect.rs `icon_slug`): lowercase the
-item's display name; ASCII alphanumerics pass through; every other run of chars becomes one
-'-'; leading/trailing '-' stripped.
+The <slug>.png contract is shared with viewer/src/inspect.rs `icon_slug`: lowercase ASCII
+alphanumerics pass through and every other run becomes one dash.
 """
-import os, sys, json, time, functools, urllib.request
+import argparse
+import functools
+import json
+import os
+import sys
+import urllib.request
 from io import BytesIO
 
 print = functools.partial(print, flush=True)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-API = "https://api.tarkov.dev/graphql"
-
-args = [a for a in sys.argv[1:] if not a.startswith("--")]
-MAP = args[0] if args else "lighthouse"
-PACK = os.path.join(REPO, "packs", f"{MAP}.eftpack")
-for a in sys.argv[1:]:
-    if a.startswith("--pack="):
-        PACK = a.split("=", 1)[1]
 
 
-def slug(s):
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("maps", nargs="*", default=["lighthouse"])
+    parser.add_argument("--pack", help="explicit pack dir (valid with exactly one map)")
+    parser.add_argument("--tasks-all", action="store_true")
+    args = parser.parse_args()
+    if not args.maps:
+        args.maps = ["lighthouse"]
+    if args.pack and len(args.maps) != 1:
+        parser.error("--pack requires exactly one map")
+    return args
+
+
+def slug(value):
     out, dash = [], False
-    for ch in s.lower():
+    for ch in value.lower():
         if ch.isascii() and ch.isalnum():
             out.append(ch)
             dash = False
@@ -45,157 +49,154 @@ def slug(s):
     return "".join(out).strip("-")
 
 
-def gql(q, tries=3):
-    req = urllib.request.Request(API, data=json.dumps({"query": q}).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "User-Agent": "eft-native-viewer-icons/1.0"})
-    last = None
-    for i in range(tries):
-        try:
-            r = json.load(urllib.request.urlopen(req, timeout=60))
-            if "errors" in r:
-                raise RuntimeError(json.dumps(r["errors"][:2])[:300])
-            return r["data"]
-        except Exception as ex:
-            last = ex
-            time.sleep(1.5 * (i + 1))
-    raise SystemExit(f"[icons] tarkov.dev unreachable: {last}")
-
-
-def jload(p):
+def jload(path):
     try:
-        return json.load(open(p, encoding="utf-8"))
-    except Exception:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
         return None
 
 
-def main():
-    if not os.path.isdir(PACK):
-        raise SystemExit(f"[icons] no pack dir {PACK}")
-    names, ids = set(), set()
-    task_images = {}
+def collect_refs(map_name, pack, tasks_all):
+    names, ids, task_images = set(), set(), {}
 
-    gd = jload(os.path.join(PACK, "gamedata.json"))
+    gd = jload(os.path.join(pack, "gamedata.json"))
     if gd:
-        for r in gd.get("loose_points") or []:
-            for it in r.get("items") or []:
-                if it.get("cat"):
-                    continue                      # category pool slots have no icon
-                if it.get("n"):
-                    names.add(it["n"])
-                elif it.get("tpl"):
-                    ids.add(it["tpl"])            # unresolved pool entry — resolve by id
-        for d in gd.get("doors") or []:
-            k = d.get("key_id")
-            if k:
-                ids.add(k)                        # key template id -> key item icon
+        for ref in gd.get("loose_points") or []:
+            for item in ref.get("items") or []:
+                if item.get("cat"):
+                    continue
+                if item.get("n"):
+                    names.add(item["n"])
+                elif item.get("tpl"):
+                    ids.add(item["tpl"])
+        for door in gd.get("doors") or []:
+            if door.get("key_id"):
+                ids.add(door["key_id"])
 
-    lj = jload(os.path.join(PACK, "loot.json")) or jload(
-        os.path.join(os.path.dirname(PACK), "shared", "loot.json"))
-    mkey = MAP
-    if lj:
-        maps = lj.get("maps") or {}
-        mm = maps.get(mkey) or (list(maps.values())[0] if len(maps) == 1 else None) or {}
-        for lk in mm.get("locks") or []:
-            for k in lk.get("keys") or []:
-                if k.get("n"):
-                    names.add(k["n"])
-        for lo in mm.get("loose") or []:
-            if lo.get("n"):
-                names.add(lo["n"])
+    loot = jload(os.path.join(pack, "loot.json")) or jload(
+        os.path.join(os.path.dirname(pack), "shared", "loot.json"))
+    if loot:
+        maps = loot.get("maps") or {}
+        current = maps.get(map_name) or (list(maps.values())[0] if len(maps) == 1 else None) or {}
+        for lock in current.get("locks") or []:
+            for key in lock.get("keys") or []:
+                if key.get("n"):
+                    names.add(key["n"])
+        for loose in current.get("loose") or []:
+            if loose.get("n"):
+                names.add(loose["n"])
 
-    # TASK-REQUIRED ITEMS (tasks.json, build_tasks.py) — the Tasks tab shows hand-in / find / mark /
-    # quest items with icons via this same shared store. By default only tasks that TOUCH this map
-    # are fetched (keeps the per-map run small); --tasks-all pulls every task item across all maps.
-    tasks_all = any(a == "--tasks-all" for a in sys.argv[1:])
-    tj = jload(os.path.join(PACK, "tasks.json")) or jload(
-        os.path.join(os.path.dirname(PACK), "shared", "tasks.json"))
-    if tj:
-        n_task = 0
-        for t in tj.get("tasks") or []:
-            if not tasks_all and not (t.get("map") == MAP or MAP in (t.get("maps") or [])):
+    tasks = jload(os.path.join(pack, "tasks.json")) or jload(
+        os.path.join(os.path.dirname(pack), "shared", "tasks.json"))
+    n_task = 0
+    if tasks:
+        for task in tasks.get("tasks") or []:
+            if not tasks_all and not (task.get("map") == map_name or map_name in (task.get("maps") or [])):
                 continue
-            if t.get("id") and t.get("image"):
-                task_images[t["id"]] = t["image"]
-            for o in t.get("objectives") or []:
-                for it in o.get("items") or []:
-                    names.add(it); n_task += 1
+            if task.get("id") and task.get("image"):
+                task_images[task["id"]] = task["image"]
+            for objective in task.get("objectives") or []:
+                for item in objective.get("items") or []:
+                    names.add(item)
+                    n_task += 1
                 for key in ("questItem", "markerItem"):
-                    if o.get(key):
-                        names.add(o[key]); n_task += 1
+                    if objective.get(key):
+                        names.add(objective[key])
+                        n_task += 1
                 for key in ("weapons", "weaponMods", "wearing", "notWearing", "useAny"):
-                    for item_name in o.get(key) or []:
-                        names.add(item_name); n_task += 1
-                for group in o.get("requiredKeys") or []:
+                    for item_name in objective.get(key) or []:
+                        names.add(item_name)
+                        n_task += 1
+                for group in objective.get("requiredKeys") or []:
                     for item in group or []:
                         if item.get("n"):
-                            names.add(item["n"]); n_task += 1
-            for reward in (t.get("rewards") or {}).get("items") or []:
+                            names.add(item["n"])
+                            n_task += 1
+            for reward in (task.get("rewards") or {}).get("items") or []:
                 if reward.get("n"):
-                    names.add(reward["n"]); n_task += 1
-            for offer in (t.get("rewards") or {}).get("offers") or []:
+                    names.add(reward["n"])
+                    n_task += 1
+            for offer in (task.get("rewards") or {}).get("offers") or []:
                 if offer.get("item"):
-                    names.add(offer["item"]); n_task += 1
-        print(f"[icons] {MAP}: +{n_task} task item refs ({'all maps' if tasks_all else 'this map'})")
+                    names.add(offer["item"])
+                    n_task += 1
+    print(f"[icons] {map_name}: {n_task} task item refs; {len(names)} names, "
+          f"{len(ids)} template ids, {len(task_images)} task images")
+    return names, ids, task_images
+
+
+def main():
+    args = parse_args()
+    packs = [(name, args.pack or os.path.join(REPO, "packs", f"{name}.eftpack"))
+             for name in args.maps]
+    for _, pack in packs:
+        if not os.path.isdir(pack):
+            raise SystemExit(f"[icons] no pack dir {pack}")
+    roots = {os.path.normcase(os.path.abspath(os.path.dirname(pack))) for _, pack in packs}
+    if len(roots) != 1:
+        raise SystemExit("[icons] all pack dirs must share one parent")
+
+    names, ids, task_images = set(), set(), {}
+    for map_name, pack in packs:
+        map_names, map_ids, map_task_images = collect_refs(map_name, pack, args.tasks_all)
+        names.update(map_names)
+        ids.update(map_ids)
+        task_images.update(map_task_images)
+    label = args.maps[0] if len(args.maps) == 1 else f"{len(args.maps)} maps"
 
     if not names and not ids and not task_images:
-        print(f"[icons] {MAP}: no items referenced — nothing to do")
+        print(f"[icons] {label}: no referenced images - nothing to do")
         return
-    print(f"[icons] {MAP}: {len(names)} item names + {len(ids)} template ids + "
-          f"{len(task_images)} task images referenced")
 
+    # Pillow is an extraction dependency, not part of the bare embeddable Python. Loot/task sync is
+    # still required, so this optional image stage exits immediately when Pillow is unavailable.
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[icons] Pillow not installed - optional icon refresh skipped (INSTALL DEPS enables it)")
+        return
+
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import tarkov_static
     items = {}
-    Q = "{ items(%s: [%s]) { id name iconLink gridImageLink } }"
-    if names:
-        # Chunk the names query — task-item runs (esp. --tasks-all) can reference thousands of
-        # names, which would blow the request size in one shot.
-        names_sorted = sorted(names)
-        for i in range(0, len(names_sorted), 400):
-            chunk = names_sorted[i:i + 400]
-            lst = ",".join(json.dumps(n) for n in chunk)
-            for it in gql(Q % ("names", lst)).get("items") or []:
-                # items(names:) can match loosely — keep ONLY exact referenced names so the pack
-                # never carries icons no card shows (our names round-trip from tarkov.dev data).
-                if it["name"] in names:
-                    items[it["name"]] = it
-    if ids:
-        lst = ",".join(json.dumps(i) for i in sorted(ids))
-        for it in gql(Q % ("ids", lst)).get("items") or []:
-            items.setdefault(it["name"], it)
-    from PIL import Image
-    # Icons are ITEM-keyed, not map-keyed: cache into the cross-map shared store.
-    out_dir = os.path.join(os.path.dirname(PACK), "shared", "icons")
+    for item in tarkov_static.load_static_items(names, ids).get("items") or []:
+        if item.get("name"):
+            items[item["name"]] = item
+
+    packs_parent = os.path.dirname(packs[0][1])
+    out_dir = os.path.join(packs_parent, "shared", "icons")
     os.makedirs(out_dir, exist_ok=True)
     n_new = n_have = n_fail = 0
-    for name, it in sorted(items.items()):
-        sl = slug(name)
-        if not sl:
+    for name, item in sorted(items.items()):
+        item_slug = slug(name)
+        if not item_slug:
             continue
-        dst = os.path.join(out_dir, sl + ".png")
+        dst = os.path.join(out_dir, item_slug + ".png")
         if os.path.exists(dst):
             n_have += 1
             continue
-        url = it.get("iconLink") or it.get("gridImageLink")
+        url = item.get("iconLink") or item.get("gridImageLink")
         if not url:
             n_fail += 1
             continue
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "eft-native-viewer-icons/1.0"})
             raw = urllib.request.urlopen(req, timeout=60).read()
-            img = Image.open(BytesIO(raw)).convert("RGBA")
-            if max(img.size) > 128:
-                img.thumbnail((128, 128), Image.LANCZOS)
-            img.save(dst, "PNG")
+            image = Image.open(BytesIO(raw)).convert("RGBA")
+            if max(image.size) > 128:
+                image.thumbnail((128, 128), Image.LANCZOS)
+            image.save(dst, "PNG")
             n_new += 1
         except Exception as ex:
             print(f"[icons]   FAIL {name}: {type(ex).__name__}: {ex}")
             n_fail += 1
-    n_missing = len(names - set(items.keys()))
-    print(f"[icons] {MAP}: {len(items)} resolved, {n_new} fetched, {n_have} cached, "
+    n_missing = len(names - set(items))
+    print(f"[icons] {label}: {len(items)} resolved, {n_new} fetched, {n_have} cached, "
           f"{n_fail} failed, {n_missing} names unresolved -> {out_dir}")
 
-    # Task artwork is keyed by immutable task id (unlike item cards, no slug lookup is needed).
-    task_dir = os.path.join(os.path.dirname(PACK), "shared", "task_images")
+    task_dir = os.path.join(packs_parent, "shared", "task_images")
     os.makedirs(task_dir, exist_ok=True)
     ti_new = ti_have = ti_fail = 0
     for task_id, url in sorted(task_images.items()):
@@ -205,15 +206,16 @@ def main():
             continue
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "eft-native-viewer-icons/1.0"})
-            img = Image.open(BytesIO(urllib.request.urlopen(req, timeout=60).read())).convert("RGBA")
-            if max(img.size) > 320:
-                img.thumbnail((320, 320), Image.LANCZOS)
-            img.save(dst, "PNG")
+            image = Image.open(BytesIO(urllib.request.urlopen(req, timeout=60).read())).convert("RGBA")
+            if max(image.size) > 320:
+                image.thumbnail((320, 320), Image.LANCZOS)
+            image.save(dst, "PNG")
             ti_new += 1
         except Exception as ex:
             print(f"[icons]   FAIL task {task_id}: {type(ex).__name__}: {ex}")
             ti_fail += 1
-    print(f"[icons] {MAP}: task images {ti_new} fetched, {ti_have} cached, {ti_fail} failed -> {task_dir}")
+    print(f"[icons] {label}: task images {ti_new} fetched, {ti_have} cached, "
+          f"{ti_fail} failed -> {task_dir}")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,10 @@
 #!/usr/bin/env python
-"""Static-dump FALLBACK for the tarkov.dev intel sync.
+"""Adapter for tarkov.dev's supported JSON API (https://json.tarkov.dev/endpoints).
 
-tarkov.dev serves two independent things:
-  - api.tarkov.dev/graphql : the live GraphQL API (dynamic; goes 503 when their backend/DB is down).
-  - json.tarkov.dev/regular/* : pre-generated static JSON snapshots on a CDN (what tarkov.dev's own
-    site loads). These stay UP during API outages because there is no live backend behind them.
-
-build_loot.py / build_tasks.py prefer the GraphQL API (freshest, fully name-resolved). When it is
-unreachable this module rebuilds the SAME data from the static dumps so a tarkov.dev API incident
-never bricks the sync (and, downstream, never greys out the menu's PLAY button, which gates on
-loot.json existing). It returns objects shaped EXACTLY like the GraphQL query responses, so the
-builders' main() logic is unchanged.
+tarkov.dev's own applications consume the pre-generated ``json.tarkov.dev/regular/*`` catalogs.
+Atlas does the same.  This module resolves their compact/id-referenced schema into the shapes the
+existing loot/task builders consume, and maintains a persistent conditional-HTTP cache so a manual
+SYNC does not download unchanged multi-megabyte catalogs again.
 
 The static schema differs from GraphQL in three ways this adapter bridges:
   1. wrapping: each file is { "data": {...}, "translations": [...] }.
@@ -21,25 +15,124 @@ The static schema differs from GraphQL in three ways this adapter bridges:
      string lives in the SEPARATE `<name>_en` dump, a flat { "<id> Name": "English" } dict. So we
      fetch maps_en / items_en purely as name lookups. Numeric fields (prices, chances) are real.
 """
-import json, time, urllib.request, urllib.error
+import gzip, json, os, time, urllib.request, urllib.error
 
 BASE = "https://json.tarkov.dev/regular/"
-UA = "tarkmap-static/1.0"
+UA = "atlas-json-sync/1.0"
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+DEFAULT_CACHE = os.path.join(REPO, "packs", "shared", ".tarkov-json-cache")
 
 
-def _get(name, tries=4):
-    """GET json.tarkov.dev/regular/<name> with the same back-off discipline as the gql() path."""
-    url = BASE + name
-    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": UA})
+def _cache_dir():
+    return (os.environ.get("EFT_TARKOV_JSON_CACHE")
+            or os.environ.get("EFT_TARKOV_STATIC_CACHE")  # compatibility with the first fallback build
+            or DEFAULT_CACHE)
+
+
+def _read_json(path):
+    try:
+        with open(path, "rb") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _atomic_write(path, raw):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + f".{os.getpid()}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _fetch(name, tries=3):
+    """Return (document, changed, downloaded_bytes) using ETag/Last-Modified revalidation."""
+    cache_dir = _cache_dir()
+    data_path = os.path.join(cache_dir, name + ".json")
+    meta_path = os.path.join(cache_dir, name + ".http.json")
+    cached_raw = None
+    try:
+        with open(data_path, "rb") as f:
+            cached_raw = f.read()
+        cached = json.loads(cached_raw)
+    except (OSError, ValueError):
+        cached = None
+        cached_raw = None
+
+    # sync_intel.py prefetches every required dataset once, then marks the cache ready for its child
+    # builders/icon pass. Those children must do zero duplicate HTTP requests.
+    if cached is not None and os.environ.get("EFT_TARKOV_JSON_CACHE_READY") == "1":
+        return cached, False, 0
+
+    meta = _read_json(meta_path) or {}
+    headers = {"Accept": "application/json", "Accept-Encoding": "gzip", "User-Agent": UA}
+    if cached is not None:
+        if meta.get("etag"):
+            headers["If-None-Match"] = meta["etag"]
+        if meta.get("last_modified"):
+            headers["If-Modified-Since"] = meta["last_modified"]
+    req = urllib.request.Request(BASE + name, headers=headers)
     last = None
     for i in range(tries):
         try:
-            return json.load(urllib.request.urlopen(req, timeout=120))
-        except urllib.error.URLError as e:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                wire = resp.read()
+                raw = gzip.decompress(wire) if resp.headers.get("Content-Encoding") == "gzip" else wire
+                doc = json.loads(raw)
+                new_meta = {
+                    "etag": resp.headers.get("ETag"),
+                    "last_modified": resp.headers.get("Last-Modified"),
+                    "checked": int(time.time()),
+                }
+            content_changed = cached_raw != raw
+            if content_changed:
+                _atomic_write(data_path, raw)
+            _atomic_write(meta_path, json.dumps(new_meta, separators=(",", ":")).encode("ascii"))
+            status = "updated" if content_changed else "content unchanged"
+            print(f"  [json] {name}: {status} ({len(wire) / 1e6:.2f} MB downloaded)", flush=True)
+            return doc, content_changed, len(wire)
+        except urllib.error.HTTPError as e:
+            if e.code == 304 and cached is not None:
+                meta["checked"] = int(time.time())
+                _atomic_write(meta_path, json.dumps(meta, separators=(",", ":")).encode("ascii"))
+                print(f"  [json] {name}: unchanged (304)", flush=True)
+                return cached, False, 0
             last = e
-            print(f"  [static] {name}: {getattr(e, 'code', e)} - retry {i + 1}/{tries}", flush=True)
+        except (urllib.error.URLError, TimeoutError, ValueError, OSError) as e:
+            last = e
+        if i + 1 < tries:
+            print(f"  [json] {name}: {getattr(last, 'code', last)} - retry {i + 1}/{tries}", flush=True)
             time.sleep(2 * (i + 1))
-    raise SystemExit(f"json.tarkov.dev/{name} unreachable after {tries} tries: {last}")
+
+    # An existing validated snapshot is more useful than failing an otherwise-offline viewer. Do
+    # not call it fresh: the unchanged output mtimes/state still expose its real age in the menu.
+    if cached is not None:
+        print(f"  [json] {name}: network unavailable - using cached snapshot ({last})", flush=True)
+        return cached, False, 0
+    raise SystemExit(f"json.tarkov.dev/{name} unreachable and no cache exists: {last}")
+
+
+def _get(name):
+    return _fetch(name)[0]
+
+
+def prefetch(names):
+    """Revalidate exactly the named catalogs once; return (changed_names, downloaded_bytes)."""
+    changed, downloaded = set(), 0
+    for name in names:
+        _, did_change, nbytes = _fetch(name)
+        if did_change:
+            changed.add(name)
+        downloaded += nbytes
+    return changed, downloaded
 
 
 def _list(x):
@@ -47,13 +140,39 @@ def _list(x):
     return x if isinstance(x, list) else list(x.values())
 
 
+def load_static_items(names=(), ids=()):
+    """Resolve item display names/template IDs for fetch_icons.py without GraphQL.
+
+    The static item dump already carries the asset-CDN URLs; only its display-name fields are
+    translation keys, resolved through items_en.  Return the same small item shape as the GraphQL
+    query so the icon downloader stays source-agnostic.
+    """
+    wanted_names = {str(x) for x in names if x}
+    wanted_ids = {str(x) for x in ids if x}
+    I = _get("items")["data"]
+    ien = _get("items_en").get("data", {})
+    out = []
+    for it in _list(I["items"]):
+        iid = str(it.get("id") or "")
+        name = ien.get(it.get("name")) or it.get("normalizedName")
+        if iid not in wanted_ids and name not in wanted_names:
+            continue
+        out.append({
+            "id": iid,
+            "name": name,
+            "iconLink": it.get("iconLink"),
+            "gridImageLink": it.get("gridImageLink"),
+        })
+    return {"items": out}
+
+
 def load_static_maps():
     """Rebuild the build_loot.py QUERY response ({'maps': [...]}) from the static dumps.
 
     Includes lootLoose INLINE per map (the base maps dump already carries it), so the caller does not
-    need the per-map LOOSE_QUERY round-trips in fallback mode.
+    need any per-map round-trips.
     """
-    print("  [static] fetching maps + items catalogs from json.tarkov.dev ...", flush=True)
+    print("  [json] resolving maps + items catalogs ...", flush=True)
     D = _get("maps")["data"]
     I = _get("items")["data"]
     men = _get("maps_en").get("data", {})   # { "<id> Name": "English", "bossTagilla": "Tagilla", ... }
@@ -156,7 +275,7 @@ def load_static_maps():
                            "items": [io for io in (item_obj(i) for i in (p.get("items") or [])) if io]}
                           for p in (m.get("lootLoose") or [])],
         })
-    print(f"  [static] rebuilt {len(out)} maps from CDN dumps", flush=True)
+    print(f"  [json] resolved {len(out)} maps", flush=True)
     return {"maps": out}
 
 
@@ -167,7 +286,7 @@ def load_static_tasks():
     union wrapper) and id-referenced (item / questItem / trader / task / map ids + a translation-key
     description). This resolves all of them back to the inlined GraphQL shape main() reads.
     """
-    print("  [static] fetching tasks + traders + items catalogs from json.tarkov.dev ...", flush=True)
+    print("  [json] resolving tasks + traders + items catalogs ...", flush=True)
     T = _get("tasks")["data"]
     I = _get("items")["data"]
     TRD = _get("traders")["data"]
@@ -270,5 +389,5 @@ def load_static_tasks():
             "finishRewards": conv_rewards(t.get("finishRewards")),
             "objectives": [conv_obj(o) for o in (t.get("objectives") or [])],
         })
-    print(f"  [static] rebuilt {len(out)} tasks from CDN dumps", flush=True)
+    print(f"  [json] resolved {len(out)} tasks", flush=True)
     return {"tasks": out}

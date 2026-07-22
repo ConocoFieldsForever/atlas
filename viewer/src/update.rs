@@ -24,10 +24,11 @@ pub const APP_TAG: &str = concat!("v", env!("CARGO_PKG_VERSION"), "-", env!("ATL
 /// build with no git (then the gate is skipped and the plain tag-inequality decides, as before).
 pub const APP_BUILD_TIME: &str = env!("ATLAS_BUILD_TIME");
 
-/// The newest release, per GitHub. NOT `/releases/latest` — every atlas release is a pre-release,
-/// which that endpoint hides; the plain list (newest first) surfaces pre-releases too.
+/// Recent releases, including prereleases. GitHub's list order is not reliable here (it currently
+/// returns an older release ahead of several later-published ones), so `classify` sorts by the
+/// timestamps in the response instead of trusting element zero.
 const RELEASES_URL: &str =
-    "https://api.github.com/repos/ConocoFieldsForever/atlas/releases?per_page=1";
+    "https://api.github.com/repos/ConocoFieldsForever/atlas/releases?per_page=20";
 
 /// Result of the update check. Read by the menu UI; default `Unknown`.
 #[derive(Resource, Clone, Debug, Default, PartialEq, Eq)]
@@ -114,20 +115,35 @@ fn check_latest() -> UpdateStatus {
 }
 
 /// Pure compare: given the raw releases-list JSON body, this build's tag, and this build's commit
-/// time, decide the status. GitHub returns the list newest-first, so `first` is the newest release.
-/// Same tag => up to date. Different tag => an update EXISTS, but we only prompt if the release is
-/// actually newer than this build: if this build's commit time is later than the release's
-/// `published_at`, we're a dev build AHEAD of every release and stay quiet (that's the "always shows
-/// the modal on a locally-built binary" fix). ISO-8601 UTC timestamps sort lexicographically ==
-/// chronologically, so a plain string compare is exact — no date parsing. Unit-testable, no network.
+/// time, decide the status. Select the greatest `published_at` (`created_at` fallback) ourselves:
+/// GitHub has returned this repository's prereleases out of chronological order, and trusting the
+/// first element stranded users on a pre-fallback sync build. Same tag => up to date. Different tag
+/// => an update EXISTS, but we only prompt if the release is actually newer than this build: if this
+/// build's commit time is later than the release's publish time, we're a dev build AHEAD of every
+/// release and stay quiet. ISO-8601 UTC timestamps sort lexicographically == chronologically, so a
+/// plain string compare is exact — no date parsing. Unit-testable, no network.
 fn classify(body: &str, app_tag: &str, build_time: &str) -> UpdateStatus {
     let val: serde_json::Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(_) => return UpdateStatus::Unknown,
     };
-    let first = match val.as_array().and_then(|a| a.first()) {
+    let releases = match val.as_array() {
+        Some(a) => a,
+        None => return UpdateStatus::Unknown,
+    };
+    fn release_time(r: &serde_json::Value) -> &str {
+        r.get("published_at")
+            .and_then(|v| v.as_str())
+            .or_else(|| r.get("created_at").and_then(|v| v.as_str()))
+            .unwrap_or("")
+    }
+    let first = match releases
+        .iter()
+        .filter(|r| r.get("tag_name").and_then(|v| v.as_str()).is_some())
+        .max_by(|a, b| release_time(a).cmp(release_time(b)))
+    {
         Some(f) => f,
-        None => return UpdateStatus::Unknown, // no releases yet
+        None => return UpdateStatus::Unknown, // no releases with a tag
     };
     let tag = match first.get("tag_name").and_then(|v| v.as_str()) {
         Some(t) => t,
@@ -239,6 +255,26 @@ mod tests {
         let body = r#"[{"tag_name":"v0.2.0-abc","published_at":"2026-08-01T00:00:00Z","html_url":"https://example.com/r"}]"#;
         match classify(body, "v0.1.0-new5678", "2026-07-20T09:00:00Z") {
             UpdateStatus::Available { tag, .. } => assert_eq!(tag, "v0.2.0-abc"),
+            other => panic!("expected Available, got {other:?}"),
+        }
+    }
+
+    // GitHub's releases endpoint has returned this project's prereleases out of publish order. An
+    // old updater using `per_page=1` therefore called the pre-fallback build current. Always select
+    // the greatest published_at from the whole page, irrespective of array order.
+    #[test]
+    fn out_of_order_list_uses_latest_published_release() {
+        let body = r#"[
+            {"tag_name":"v0.1.0-85261a8","published_at":"2026-07-21T14:43:53Z"},
+            {"tag_name":"v0.1.0-307ae0b","published_at":"2026-07-21T16:53:37Z",
+             "html_url":"https://example.com/307"},
+            {"tag_name":"v0.1.0-7aff751","published_at":"2026-07-21T15:48:50Z"}
+        ]"#;
+        match classify(body, "v0.1.0-85261a8", "2026-07-21T14:39:27Z") {
+            UpdateStatus::Available { tag, url } => {
+                assert_eq!(tag, "v0.1.0-307ae0b");
+                assert_eq!(url, "https://example.com/307");
+            }
             other => panic!("expected Available, got {other:?}"),
         }
     }

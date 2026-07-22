@@ -16,7 +16,7 @@ the time-limited raid as an ORIENTEERING problem. Everything here is data-driven
 
   python extraction/intel/build_loot.py            -> <EFT_TARKMAP_ROOT>/out/loot.json
 Re-run per wipe (prices/containers shift). No game files needed (tarkov.dev only)."""
-import os, json, urllib.request, time
+import os, json, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -25,7 +25,6 @@ _OUT_DIR = os.environ.get("EFT_INTEL_OUT_DIR") or (
     os.path.join(_TK, "out") if _TK else os.path.join(REPO, "packs", "shared")
 )
 OUT = os.path.join(_OUT_DIR, 'loot.json')
-API = "https://api.tarkov.dev/graphql"
 DEV_TO_ID = {
     'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
     # The shipped roster's "Factory" is the 1.0 rework (id factory_rework). tarkov.dev still calls
@@ -106,61 +105,6 @@ def bridge(p):
 # only points whose best possible item clears this bar. Tunable.
 LOOSE_MIN_EV = 120000
 
-QUERY = """{ maps {
-  normalizedName name wiki description enemies raidDuration players minPlayerLevel maxPlayerLevel
-  spawns { zoneName sides categories position { x y z } }
-  bosses { boss { name normalizedName } spawnChance spawnTime spawnTrigger
-           escorts { boss { normalizedName } amount { count chance } }
-           spawnLocations { name chance } }
-  lootContainers { lootContainer { name normalizedName } position { x y z } }
-  locks { lockType needsPower key { name shortName avg24hPrice low24hPrice high24hPrice changeLast48hPercent category { name } } position { x y z } }
-  switches { id name switchType position { x y z } activatedBy { id name }
-             activates { operation target { ... on MapSwitch { id name } ... on MapExtract { id name } } } }
-  transits { description conditions map { normalizedName } position { x y z } }
-  hazards { hazardType name position { x y z } }
-  stationaryWeapons { stationaryWeapon { name } position { x y z } }
-  extracts { id name faction position { x y z } outline { x y z } top bottom switches { id name }
-             transferItem { item { name shortName avg24hPrice } count quantity } }
-  accessKeys { name shortName avg24hPrice }
-  btrStops { name x y z }
-  artillery { zones { position { x y z } outline { x y z } top bottom } }
-} }"""
-
-# lootLoose is ~6.4k points across all maps — folding it into the big query (or even one all-maps
-# loose query) 503s / drops the 4 MB reply, so it's fetched PER MAP (small, robust) by display name.
-LOOSE_QUERY = '''{ maps(name:"%s"){ lootLoose { position { x y z } items {
-  shortName name avg24hPrice low24hPrice high24hPrice changeLast48hPercent
-  sellFor { priceRUB vendor { name } }
-} } } }'''
-
-
-def fetch_loose(display_name):
-    """Per-map loose-loot points; returns [] on any failure so the pipeline never dies on it."""
-    try:
-        ms = gql(LOOSE_QUERY % display_name.replace('"', ''))['maps']
-        return (ms[0].get('lootLoose') or []) if ms else []
-    except SystemExit:
-        print(f"  [loose] {display_name}: fetch failed — skipping loose layer")
-        return []
-
-
-def gql(q, tries=4):
-    req = urllib.request.Request(API, data=json.dumps({"query": q}).encode(),
-                                 headers={"Content-Type": "application/json", "User-Agent": "tarkmap-loot/1.0"})
-    last = None
-    for i in range(tries):
-        try:
-            r = json.load(urllib.request.urlopen(req, timeout=120))
-            if 'errors' in r:
-                raise SystemExit("tarkov.dev errors: " + json.dumps(r['errors'][:3]))
-            return r['data']
-        except urllib.error.URLError as e:  # 503/429/transient — back off and retry
-            last = e
-            print(f"  [gql] {getattr(e, 'code', e)} — retry {i + 1}/{tries}")
-            time.sleep(2 * (i + 1))
-    raise SystemExit(f"tarkov.dev unreachable after {tries} tries: {last}")
-
-
 def cluster(pts, radius):
     """greedy-merge nearby [x,y,z] points -> list of (centroid, count)."""
     out = []
@@ -174,24 +118,14 @@ def cluster(pts, radius):
 
 
 def main():
-    print("[tarkov.dev] fetching loot + spawns + intel ...")
-    try:
-        data = gql(QUERY)
-        source = 'tarkov.dev'
-    except SystemExit as e:
-        # api.tarkov.dev/graphql is down (503 / GraphQL 'server unavailable'). Rebuild the same data
-        # from the json.tarkov.dev static CDN dumps so the sync survives the outage -- and downstream,
-        # so the menu's PLAY button (gated on loot.json existing) never bricks on a tarkov.dev incident.
-        print(f"  {e}")
-        print("  [fallback] GraphQL API unavailable -> json.tarkov.dev static dumps", flush=True)
-        # The bundled embeddable Python pins sys.path via python311._pth and does NOT add the
-        # running script's directory, so the sibling module needs an explicit path entry.
-        import sys
-        if HERE not in sys.path:
-            sys.path.insert(0, HERE)
-        import tarkov_static
-        data = tarkov_static.load_static_maps()
-        source = 'tarkov.dev/static'
+    print("[tarkov.dev/json] building loot + spawns + intel ...")
+    # The bundled embeddable Python pins sys.path via python311._pth and does not add this directory.
+    import sys
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import tarkov_static
+    data = tarkov_static.load_static_maps()
+    source = 'tarkov.dev/json'
     out = {}
     for m in data['maps']:
         mid = DEV_TO_ID.get(m['normalizedName'])
@@ -358,9 +292,7 @@ def main():
 
         # ---- valuable LOOSE loot points (filtered to GPU/LEDX/keycard-tier so the layer isn't clutter) ----
         loose = []
-        # Static-fallback maps carry lootLoose inline (already price-resolved); only the live GraphQL
-        # path (no lootLoose in the main QUERY) needs the per-map LOOSE_QUERY round-trip.
-        for ll in (m['lootLoose'] if m.get('lootLoose') is not None else fetch_loose(m.get('name') or m['normalizedName'])):
+        for ll in (m.get('lootLoose') or []):
             best = None
             for it in (ll.get('items') or []):
                 if best is None or (it.get('avg24hPrice') or 0) > (best.get('avg24hPrice') or 0):
