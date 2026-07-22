@@ -72,21 +72,38 @@ pub fn shared_dir() -> PathBuf {
     packs_root().join("shared")
 }
 
-/// `%APPDATA%\atlas\atlas.config.json` — the WRITABLE per-user config location (survives a
-/// read-only / Program Files install dir, where a config beside the exe would silently fail to
-/// save; finding 12). None when APPDATA is unset (non-Windows dev / stripped env).
+/// The writable per-user app-data root: `%APPDATA%\atlas` on Windows, `$XDG_DATA_HOME/atlas`
+/// (falling back to `~/.local/share/atlas`, the XDG default) on Linux/macOS. None only when even
+/// HOME can't be resolved (stripped env) — callers fall back to `exe_dir()` in that case.
+fn user_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("atlas"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(x) = std::env::var_os("XDG_DATA_HOME") {
+            return Some(PathBuf::from(x).join("atlas"));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share/atlas"))
+    }
+}
+
+/// `%APPDATA%\atlas\atlas.config.json` (`$XDG_DATA_HOME/atlas/atlas.config.json` on Linux/macOS)
+/// — the WRITABLE per-user config location (survives a read-only / Program Files install dir,
+/// where a config beside the exe would silently fail to save; finding 12). None when the
+/// user-data root can't be resolved (non-Windows dev / stripped env).
 pub fn appdata_config() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("atlas").join("atlas.config.json"))
+    user_data_dir().map(|d| d.join("atlas.config.json"))
 }
 
 /// Writable, per-user task/key progress. Kept outside packs so changing maps or replacing a pack
 /// never loses the user's checklist.
 pub fn progress_path() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| exe_dir().to_path_buf())
-        .join("atlas")
-        .join("progress.json")
+    // NOTE: the exe_dir() fallback does NOT add an "atlas" subdir (unlike user_data_dir()) — the
+    // exe is already atlas-specific, and on Linux the exe is literally named `atlas`, so a sibling
+    // dir of the same name would collide with the binary itself.
+    user_data_dir().unwrap_or_else(|| exe_dir().to_path_buf()).join("progress.json")
 }
 
 /// Resolved config path. READ order prefers an EXISTING file so pre-portability installs (config
@@ -140,13 +157,26 @@ pub fn python_exe(root: &Path) -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    let bundled = root.join("python").join("python.exe");
-    if bundled.is_file() {
-        return bundled;
+    #[cfg(windows)]
+    {
+        let bundled = root.join("python").join("python.exe");
+        if bundled.is_file() {
+            return bundled;
+        }
+        let venv = root.join("venv").join("Scripts").join("python.exe");
+        if venv.is_file() {
+            return venv;
+        }
+        PathBuf::from("python")
     }
-    let venv = root.join("venv").join("Scripts").join("python.exe");
-    if venv.is_file() {
-        return venv;
+    #[cfg(not(windows))]
+    {
+        // No bundled embeddable Python on Linux/macOS (that distribution is Windows-only) — just
+        // a venv (created by tools/setup_deps.py, `python3 -m venv` layout: venv/bin/…) or PATH.
+        let venv = root.join("venv").join("bin").join("python3");
+        if venv.is_file() {
+            return venv;
+        }
+        PathBuf::from("python3")
     }
-    PathBuf::from("python")
 }
