@@ -41,7 +41,7 @@ lights_*.json) INTO the pack, and write pack-RELATIVE paths everywhere. The Rust
 dir; absolute (legacy dev) paths pass through untouched, so default builds are unchanged.
 manifest.datasetPath stays ABSOLUTE for provenance; "selfContained": true marks the mode.
 """
-import sys, os, time, json, glob, shutil, functools
+import sys, os, time, json, glob, shutil, functools, math
 import numpy as np
 
 print = functools.partial(print, flush=True)
@@ -859,8 +859,24 @@ def main():
         # datasetPath above stays ABSOLUTE deliberately (build provenance only): the loader
         # never resolves textures/sidecars through it -- every consumer path is pack-relative.
         manifest["selfContained"] = True
-    # allow_nan=False: a NaN/Infinity (e.g. bounds never updated) must fail THE BUILD here, not
-    # brick the pack at load time (serde_json rejects non-finite numbers).
+    # Non-finite floats (the game data itself ships some - e.g. a Reserve LODGroup with
+    # fadeTransitionWidth=NaN) must not kill a 20-minute build at the very last step: sanitize to
+    # 0.0 and REPORT each path loudly so a real data bug stays visible. allow_nan=False stays as
+    # the final backstop (serde_json rejects non-finite numbers, so a miss would brick the pack).
+    _nonfinite = []
+    def _sane(v, path):
+        if isinstance(v, float) and not math.isfinite(v):
+            _nonfinite.append(path)
+            return 0.0
+        if isinstance(v, dict):
+            return {k: _sane(x, f"{path}.{k}") for k, x in v.items()}
+        if isinstance(v, list):
+            return [_sane(x, f"{path}[{i}]") for i, x in enumerate(v)]
+        return v
+    manifest = _sane(manifest, "manifest")
+    if _nonfinite:
+        print(f"[bevy] WARNING: sanitized {len(_nonfinite)} non-finite float(s) in the manifest -> 0.0: "
+              + ", ".join(_nonfinite[:8]) + (" ..." if len(_nonfinite) > 8 else ""), flush=True)
     json.dump(manifest, open(os.path.join(OUT, 'manifest.json'), 'w'), indent=1, allow_nan=False)
 
     # ---- GLOBAL sidecars: the all-maps catalogs (tarkov.dev loot/tasks) + the game grade LUT are

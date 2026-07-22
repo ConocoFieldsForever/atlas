@@ -394,21 +394,45 @@ def bake_terrain_albedo(td, res_out=4096, ss=2):
         except Exception:
             dimg, repX, repZ = None, 1.0, 1.0
         LD.append((tex_i, li % 4, dimg, max(repX, 1e-6), max(repZ, 1e-6)))
+    # PERF (the 961s Reserve tail): two changes, same output class.
+    #  1. Control-map weights are sampled ONCE at pixel centers instead of once per supersample
+    #     pass: the control maps are low-res and smooth, so the ss-jitter changed them by ~nothing
+    #     — the jitter exists to anti-alias the FINE-TILED diffuse gather, which stays jittered.
+    #     Also prunes globally-empty layers out of every pass, not per-pass.
+    #  2. The ss*ss passes are independent accumulations of pure numpy work (all UnityPy reads
+    #     happened above) -> run them on a small thread pool (numpy releases the GIL on big ops).
+    ci = ((np.arange(R) + 0.5) / R)[:, None] * np.ones((1, R), np.float32)
+    cj = np.ones((R, 1), np.float32) * ((np.arange(R) + 0.5) / R)[None, :]
+    W0 = {}
+    for tex_i, ch, _dimg, _rx, _rz in LD:
+        if (tex_i, ch) in W0:
+            continue
+        # L19: bilinearly sample the control map (was nearest-neighbour -> blocky layer transitions).
+        w = _bilinear(ctrl[tex_i][..., ch], ci, cj, wrap=False)
+        W0[(tex_i, ch)] = w if w.max() > 0.001 else None
+    LD = [e for e in LD if W0[(e[0], e[1])] is not None]
+
+    def _pass(a, b):
+        alb = np.zeros((R, R, 3), np.float32); ws = np.zeros((R, R), np.float32)
+        ii = (((np.arange(R) + (b + 0.5) / ss) / R)[:, None] * np.ones((1, R)))   # normalized v (0..1) down terrain
+        jj = (np.ones((R, 1)) * ((np.arange(R) + (a + 0.5) / ss) / R)[None, :])   # normalized u (0..1) across terrain
+        for tex_i, ch, dimg, repX, repZ in LD:
+            w = W0[(tex_i, ch)]
+            if dimg is None:
+                alb += w[..., None] * np.array([0.4, 0.4, 0.4], np.float32); ws += w; continue
+            # H5: tile in normalized terrain-UV space; per-axis rep => correct V tiling at any aspect ratio.
+            u = np.mod(jj * repX, 1.0); v = np.mod(ii * repZ, 1.0)
+            alb += w[..., None] * _bilinear(dimg, v, u, wrap=True); ws += w
+        return alb, ws
+
     albedo = np.zeros((R, R, 3), np.float32); wsum = np.zeros((R, R), np.float32)
-    # ss x ss jittered supersample -> clean mip0 despite the fine real tiling
-    for a in range(ss):
-        for b in range(ss):
-            ii = (((np.arange(R) + (b + 0.5) / ss) / R)[:, None] * np.ones((1, R)))   # normalized v (0..1) down terrain
-            jj = (np.ones((R, 1)) * ((np.arange(R) + (a + 0.5) / ss) / R)[None, :])   # normalized u (0..1) across terrain
-            for tex_i, ch, dimg, repX, repZ in LD:
-                # L19: bilinearly sample the control map (was nearest-neighbour -> blocky layer transitions).
-                cm = ctrl[tex_i]; w = _bilinear(cm[..., ch], ii, jj, wrap=False)
-                if w.max() <= 0.001: continue
-                if dimg is None:
-                    albedo += w[..., None] * np.array([0.4, 0.4, 0.4], np.float32); wsum += w; continue
-                # H5: tile in normalized terrain-UV space; per-axis rep => correct V tiling at any aspect ratio.
-                u = np.mod(jj * repX, 1.0); v = np.mod(ii * repZ, 1.0)
-                albedo += w[..., None] * _bilinear(dimg, v, u, wrap=True); wsum += w
+    passes = [(a, b) for a in range(ss) for b in range(ss)]
+    if len(passes) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(passes))) as ex:
+            for alb, ws in ex.map(lambda p: _pass(*p), passes):
+                albedo += alb; wsum += ws
+    else:
+        albedo, wsum = _pass(*passes[0])
     # M7: a per-LAYER `w.max()<=0.001 continue` only skipped layers that are globally empty; texels where ALL
     # layers' weight ~0 (no control coverage) still divided ~0/~0 -> BLACK ground. Mask those uncovered texels
     # and fill with a neutral terrain colour (the covered-area mean, fallback 0.4 grey) instead of black.
@@ -996,11 +1020,19 @@ def main():
                 rpl = np.array([rp.get("x", 0.0), rp.get("y", 0.0), rp.get("z", 0.0)], np.float64)
                 center = (M3 @ rpl + T3).tolist()
                 last_bb = bool(d.get("m_LastLODIsBillboard", False))
-                srh = [round(float(L.get("screenRelativeHeight", 0.0) or 0.0), 5) for L in mlods]
-                ftw = [round(float(L.get("fadeTransitionWidth", 0.0) or 0.0), 5) for L in mlods]
+                # `x or 0.0` does NOT catch NaN (NaN is truthy): Reserve ships a LODGroup with
+                # fadeTransitionWidth=NaN, which later poisoned the pack manifest (allow_nan=False).
+                def _fin(x, d=0.0):
+                    try:
+                        v = float(x if x is not None else d)
+                    except (TypeError, ValueError):
+                        return d
+                    return v if np.isfinite(v) else d
+                srh = [round(_fin(L.get("screenRelativeHeight")), 5) for L in mlods]
+                ftw = [round(_fin(L.get("fadeTransitionWidth")), 5) for L in mlods]
                 gidx = len(lodgroups)
-                grp = {"size": round(float(d.get("m_Size", 1.0) or 1.0) * (wscale or 1.0), 4),
-                       "center": [round(c, 4) for c in center], "fadeMode": int(d.get("m_FadeMode", 0) or 0),
+                grp = {"size": round(_fin(float(d.get("m_Size", 1.0) or 1.0) * (wscale or 1.0), 1.0), 4),
+                       "center": [round(_fin(c), 4) for c in center], "fadeMode": int(d.get("m_FadeMode", 0) or 0),
                        "lastIsBillboard": last_bb, "srh": srh, "ftw": ftw, "n": len(mlods)}
                 if last_bb: grp["cullH"] = srh[-1]
                 lodgroups.append(grp)
