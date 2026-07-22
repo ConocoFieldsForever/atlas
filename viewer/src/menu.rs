@@ -76,6 +76,32 @@ pub struct BuildJob {
     max_frac: std::sync::atomic::AtomicU32,
 }
 
+/// Best-effort per-platform spawn tweaks applied before `.spawn()`.
+///
+/// Windows: suppress the console window (CREATE_NO_WINDOW) always; for `detached` builds also
+/// fully detach (DETACHED_PROCESS) so the child survives an Atlas close.
+///
+/// Unix: a child already survives its parent exiting (no console to suppress), so there's
+/// nothing to do for that part. Instead, put it in its OWN process group (`setpgid(0, 0)`) —
+/// `cancel()` below signals the whole group (negative pid) so grandchildren (eft_extract_v2,
+/// the GPU bake, pip) die too, not just the direct python child. Done for every spawn, not just
+/// `detached`, since the pipe path can be cancelled too.
+fn prep_child(cmd: &mut std::process::Command, detached: bool) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(if detached { DETACHED_PROCESS | CREATE_NO_WINDOW } else { CREATE_NO_WINDOW });
+    }
+    #[cfg(unix)]
+    {
+        let _ = detached;
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+}
+
 impl BuildJob {
     pub fn spawn(key: &str, game_dir: &str, force: bool, background: bool) -> std::io::Result<Self> {
         // GUI builds are ALWAYS --self-contained: the pack copies its textures/sidecars in and
@@ -114,12 +140,6 @@ impl BuildJob {
         background: bool,
     ) -> std::io::Result<Self> {
         use std::io::BufRead;
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000; // no console popping over the menu
-        // DETACHED_PROCESS: the child gets NO console and is NOT tied to Atlas's console/stdio, so it
-        // keeps running after Atlas exits (combined with file-redirected output below, nothing breaks
-        // when the parent's pipe would have closed).
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
         let root = crate::paths::repo_root().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -168,11 +188,11 @@ impl BuildJob {
                 .truncate(true)
                 .open(&log_path)?;
             let file2 = file.try_clone()?;
+            prep_child(&mut cmd, true);
             let child = cmd
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(file))
                 .stderr(std::process::Stdio::from(file2))
-                .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
                 .spawn()?;
             let pid = child.id();
             // Sidecar { pid, map, started, force } so a later launch can DETECT + reattach/clean this
@@ -215,10 +235,10 @@ impl BuildJob {
         // ---- Legacy inherited-pipe path (toggle OFF; intel/deps always). Streams stdout+stderr
         // through PIPEs read by reader threads. Dies with Atlas (the pipe closes) — acceptable for
         // the OFF toggle and the quick intel/deps jobs. ----
+        prep_child(&mut cmd, false);
         let mut child = cmd
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW)
             .spawn()?;
         for pipe in [
             child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
@@ -320,20 +340,31 @@ impl BuildJob {
 
     pub fn cancel(&self) {
         // Kill the WHOLE process tree. build_map.py / setup_deps.py spawn heavy child processes
-        // (eft_extract_v2, the GPU bake, pip). On Windows, killing only the direct child orphans
-        // them — the extraction would keep churning after CANCEL. `taskkill /T` walks the tree;
-        // the direct .kill() is a fallback if the PID has already been reaped. Works for a reattached
-        // (Detached) build too: its PID is still reachable by taskkill.
-        use std::os::windows::process::CommandExt;
+        // (eft_extract_v2, the GPU bake, pip). Killing only the direct child would orphan them —
+        // the extraction would keep churning after CANCEL. The direct .kill() below is a
+        // fallback if the PID has already been reaped. Works for a reattached (Detached) build
+        // too: its PID is still reachable by taskkill / the process-group signal.
         let pid = match &self.proc {
             ProcHandle::Owned(c) => c.lock().ok().map(|c| c.id()),
             ProcHandle::Detached(p) => Some(*p),
         };
         if let Some(pid) = pid.filter(|p| *p != 0) {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .creation_flags(0x0800_0000)
-                .output();
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .creation_flags(0x0800_0000)
+                    .output();
+            }
+            #[cfg(unix)]
+            {
+                // Every child is spawned in its own process group (see `prep_child`), so
+                // signalling the NEGATIVE pid hits the whole tree, not just the direct child.
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &format!("-{pid}")])
+                    .output();
+            }
         }
         if let ProcHandle::Owned(c) = &self.proc {
             if let Ok(mut c) = c.lock() {
@@ -416,6 +447,7 @@ fn push_capped(
 
 /// Is a process with this PID currently running? Uses `tasklist` (no extra crate / no winapi): the
 /// CSV row for a live PID contains the quoted id; the "no tasks" notice does not.
+#[cfg(windows)]
 fn pid_alive(pid: u32) -> bool {
     use std::os::windows::process::CommandExt;
     let out = std::process::Command::new("tasklist")
@@ -426,6 +458,17 @@ fn pid_alive(pid: u32) -> bool {
         Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")),
         Err(_) => false,
     }
+}
+
+/// Is a process with this PID currently running? `kill -0` sends no signal, just checks
+/// existence + permission — no extra crate needed for a Unix "does this PID exist" probe.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 /// A pack for `key` looks present on disk (its manifest exists). The rigorous validity check lives
@@ -1063,14 +1106,14 @@ pub fn lang_switch_area(
 /// probe under paths::python_exe. None when there's no kit/python to probe (shipped-lite / no build).
 pub fn deps_ready() -> Option<bool> {
     let root = crate::paths::repo_root()?;
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new(crate::paths::python_exe(root))
-        .current_dir(root)
-        .arg("-c")
-        .arg("import UnityPy, numpy, PIL")
-        .creation_flags(0x0800_0000)
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(crate::paths::python_exe(root));
+    cmd.current_dir(root).arg("-c").arg("import UnityPy, numpy, PIL");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok()?;
     Some(out.status.success())
 }
 
@@ -1109,7 +1152,9 @@ pub fn valid_game_dir(dir: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// BSG launcher registry entry -> "<InstallLocation>\EscapeFromTarkov_Data".
+/// BSG launcher registry entry -> "<InstallLocation>\EscapeFromTarkov_Data". Windows only — there
+/// is no Windows registry to query on Linux/macOS.
+#[cfg(windows)]
 fn registry_game_dir() -> Option<String> {
     use std::os::windows::process::CommandExt;
     let out = std::process::Command::new("reg")
@@ -1134,6 +1179,10 @@ fn registry_game_dir() -> Option<String> {
 }
 
 /// Autodetect priority: EFT_GAME_DATA env > saved config > launcher registry > drive probe.
+/// The registry lookup and drive-letter probe are Windows-only (EFT is a Windows game; there is
+/// no registry on Linux/macOS). On those platforms we still take a best-effort guess at common
+/// Wine/Lutris prefixes, but this is unverified — EFT has no official Linux/Proton support, so
+/// most Linux users will end up setting GAME INSTALL by hand via the folder picker.
 pub fn detect_game_dir() -> String {
     if let Ok(d) = std::env::var("EFT_GAME_DATA") {
         if !d.is_empty() {
@@ -1143,22 +1192,48 @@ pub fn detect_game_dir() -> String {
     if let Some(d) = config_game_dir().filter(|d| valid_game_dir(d)) {
         return d;
     }
-    if let Some(d) = registry_game_dir().filter(|d| valid_game_dir(d)) {
-        return d;
-    }
-    for drive in ["C", "D", "E", "F", "G"] {
-        for tail in [
-            r"\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data",
-            r"\Battlestate Games\EFT\EscapeFromTarkov_Data",
-            r"\Games\Escape from Tarkov\EscapeFromTarkov_Data",
-        ] {
-            let d = format!("{drive}:{tail}");
-            if valid_game_dir(&d) {
-                return d;
+    #[cfg(windows)]
+    {
+        if let Some(d) = registry_game_dir().filter(|d| valid_game_dir(d)) {
+            return d;
+        }
+        for drive in ["C", "D", "E", "F", "G"] {
+            for tail in [
+                r"\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data",
+                r"\Battlestate Games\EFT\EscapeFromTarkov_Data",
+                r"\Games\Escape from Tarkov\EscapeFromTarkov_Data",
+            ] {
+                let d = format!("{drive}:{tail}");
+                if valid_game_dir(&d) {
+                    return d;
+                }
             }
         }
+        r"C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data".to_string()
     }
-    r"C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data".to_string()
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::Path::new(&home);
+            for root in [
+                home.join(".wine/drive_c"),
+                home.join(".local/share/lutris/runners/wine"), // not a prefix root; harmless miss
+                home.join("Games/escape-from-tarkov/drive_c"), // common Lutris default prefix
+            ] {
+                for tail in [
+                    "Battlestate Games/Escape from Tarkov/EscapeFromTarkov_Data",
+                    "Battlestate Games/EFT/EscapeFromTarkov_Data",
+                ] {
+                    let d = root.join(tail);
+                    let s = d.to_string_lossy().into_owned();
+                    if valid_game_dir(&s) {
+                        return s;
+                    }
+                }
+            }
+        }
+        String::new()
+    }
 }
 
 /// One-time, menu-startup extraction of the real CCTV menu prop (menu_fx 3D decor):
@@ -1185,19 +1260,21 @@ fn ensure_menu_prop(game_dir: &str) {
     if !script.is_file() {
         return;
     }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     eprintln!("menu prop: extracting the real CCTV prop (one-time, local-only)...");
-    let child = std::process::Command::new(crate::paths::python_exe(root))
-        .current_dir(root)
+    let mut cmd = std::process::Command::new(crate::paths::python_exe(root));
+    cmd.current_dir(root)
         .env("EFT_GAME_DATA", game_dir)
         .arg("tools/extract_menu_prop.py")
         .arg("--out")
         .arg(&menu_dir)
-        .creation_flags(CREATE_NO_WINDOW)
         .stdout(std::process::Stdio::inherit()) // its ASCII [menu-prop] lines go to our console
-        .stderr(std::process::Stdio::inherit())
-        .spawn();
+        .stderr(std::process::Stdio::inherit());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = cmd.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
