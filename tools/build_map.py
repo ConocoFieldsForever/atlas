@@ -38,7 +38,16 @@ for _stream in (sys.stdout, sys.stderr):
 HERE = os.path.dirname(os.path.abspath(__file__))
 VIEWER = os.path.dirname(HERE)
 # EFT_TARKMAP_ROOT is the tarkmap dir ITSELF (holds maps/ + out/), NOT the parent workspace.
-TK = os.environ.get("EFT_TARKMAP_ROOT", r"C:\Users\user\beamng_blender_pipeline\tarkmap")
+# Default: a sibling `tarkmap` beside EFT_ASSETS_ROOT — the SAME derivation the menu uses — so a
+# bare CLI `build_map.py <map>` gets working stage-6 gamedata instead of silently pointing TK at
+# the dead legacy dev path (which made `extract_gamedata` exit 1 and packs ship without doors/
+# exfil/zone intel; the copy at stage 6 also reads <TK>/out/<map>/). Legacy path stays as the
+# last-resort fallback when neither env is set.
+TK = os.environ.get("EFT_TARKMAP_ROOT")
+if not TK:
+    _ar = os.environ.get("EFT_ASSETS_ROOT")
+    TK = (os.path.normpath(os.path.join(_ar, os.pardir, "tarkmap")) if _ar
+          else r"C:\Users\user\beamng_blender_pipeline\tarkmap")
 ASSETS = os.environ.get("EFT_ASSETS_ROOT") or os.path.normpath(
     os.path.join(TK, os.pardir, "eft_assets"))
 PY = sys.executable or "python"
