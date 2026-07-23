@@ -413,7 +413,11 @@ fn spawn_standard(
 
     // 3. Spawn one entity per (instance × submesh) with the instance's full affine.
     let mut n_entities = 0usize;
-    for inst in &pack.instances {
+    for (idx, inst) in pack.instances.iter().enumerate() {
+        // All-LOD pack: the standard-path entity spawn uses the default shell only.
+        if !pack.is_default_lod(idx) {
+            continue;
+        }
         let mid = inst.mesh_id as usize;
         if mid >= submesh_assets.len() {
             continue;
