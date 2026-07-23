@@ -630,7 +630,12 @@ fn detail_xform(base_st: vec4<f32>, det_st: vec4<f32>) -> vec4<f32> {
 
 @vertex
 fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
-    let real = visible[instance_index];
+    // B5: clamp both indirections (visible[] then instances[]). @builtin(instance_index) is bounded by
+    // the indirect draw args, and visible[] entries come from cs_cull, so both are in-bounds for
+    // well-formed packs (no-op); the clamp only prevents an OOB fetch (AMD garbage / NVIDIA 0) if a
+    // draw arg or compaction slot were ever corrupt.
+    let vi = min(instance_index, arrayLength(&visible) - 1u);
+    let real = min(visible[vi], arrayLength(&instances) - 1u);
     let inst = instances[real];
 
     // rebuild the linear 3x3 columns + translation from the ROW-MAJOR 3x4.
@@ -670,7 +675,10 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
 
 @fragment
 fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
-    let m = materials[o.material_index];
+    // B5: clamp the material index (per-vertex Uint32 from the pack) into the materials table. The
+    // global materialId equals the materials.json array index for a well-formed pack (in-bounds
+    // no-op); the clamp keeps an OOB id from reading garbage on AMD.
+    let m = materials[min(o.material_index, arrayLength(&materials) - 1u)];
 
     // #1 terrain: UV derivatives computed here in UNIFORM control flow, so the per-layer
     // textureSampleGrad calls inside the (non-uniform) terrain branch need no implicit

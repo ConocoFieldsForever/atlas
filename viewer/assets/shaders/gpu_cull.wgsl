@@ -141,12 +141,19 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (sphere.w < k * d) { return; }
     }
 
-    let mesh_id = inst.ids.x;
+    // B5: clamp the instance-supplied mesh id before it indexes mesh_meta / indirect / indirect_blend
+    // (all sized == mesh_count). Well-formed packs are always in-bounds (no-op); a malformed id must
+    // not read/write out of bounds — AMD returns garbage on OOB (NVIDIA returns 0), which would let a
+    // stray instance corrupt an unrelated mesh's draw args.
+    let mesh_id = min(inst.ids.x, arrayLength(&mesh_meta) - 1u);
     let base = mesh_meta[mesh_id].instance_base;
     // The OPAQUE buffer's counter is the CANONICAL slot allocator for visible[]; the blend
     // buffer's counter converges to the same total (same survivors), so both passes read the
     // identical visible[base .. base+count) range.
     let slot = atomicAdd(&indirect[mesh_id].instance_count, 1u);
     atomicAdd(&indirect_blend[mesh_id].instance_count, 1u);
-    visible[base + slot] = i;
+    // B5: clamp the compaction write index into visible[] (sized == instance_total). In-bounds for
+    // well-formed packs; the clamp only guards a corrupt base/slot from stomping foreign memory.
+    let vi = min(base + slot, arrayLength(&visible) - 1u);
+    visible[vi] = i;
 }
