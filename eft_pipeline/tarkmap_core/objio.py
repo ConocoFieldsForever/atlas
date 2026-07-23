@@ -68,18 +68,61 @@ def _parse_obj_fast(data):
     return Va, VTa, Fa
 
 
+# F5: parsed-mesh cache. OBJ text is immutable between rebuilds, yet every assemble re-parsed all
+# ~10-17k meshes (parse was ~69% of assemble pre-F3). First parse writes `<mesh>.obj.parsed.npz`
+# (V/VT/F + a (mtime_ns,size) stamp); later assembles mmap-load it and skip parsing entirely. The
+# cache is derived data — safe to delete anytime; a stale/corrupt entry falls through to a re-parse.
+# EFT_MESH_CACHE=0 disables both read and write.
+_MESH_CACHE = os.environ.get('EFT_MESH_CACHE', '1') != '0'
+
+
+def _parsed_cache_load(p):
+    """Return (V,VT,F) from `<p>.parsed.npz` iff its stamp matches the OBJ's (mtime_ns,size); else None."""
+    try:
+        st = os.stat(p)
+        with np.load(p + '.parsed.npz') as z:
+            meta = z['meta']
+            if int(meta[0]) == st.st_mtime_ns and int(meta[1]) == st.st_size:
+                return z['V'], z['VT'], z['F']
+    except Exception:
+        pass
+    return None
+
+
+def _parsed_cache_store(p, V, VT, F):
+    """Best-effort atomic cache write (tmp + os.replace) so concurrent assembles never see a torn file."""
+    tmp = p + f'.parsed.npz.{os.getpid()}.tmp'
+    try:
+        st = os.stat(p)
+        with open(tmp, 'wb') as fh:
+            np.savez(fh, meta=np.array([st.st_mtime_ns, st.st_size], np.int64), V=V, VT=VT, F=F)
+        os.replace(tmp, p + '.parsed.npz')
+    except Exception:
+        try:
+            if os.path.exists(tmp): os.remove(tmp)
+        except OSError:
+            pass
+
+
 def load_obj(ds, fn):
     """Parse a dataset OBJ -> (V[nv,3] f32, VT[nt,2] f32, F[nf,3,2] i32 of (vert,uv) index pairs), or None if missing."""
     p = os.path.join(ds, 'meshes', fn)
     if not os.path.exists(p): return None
+    if _MESH_CACHE:
+        hit = _parsed_cache_load(p)
+        if hit is not None: return hit
     if _OBJ_FASTPARSE:
         try:
             with open(p, 'rb') as fh:
                 fast = _parse_obj_fast(fh.read())
-            if fast is not None: return fast
+            if fast is not None:
+                if _MESH_CACHE: _parsed_cache_store(p, *fast)
+                return fast
         except Exception:
             pass                                        # any surprise -> exact original parser below
-    return _load_obj_slow(p)
+    out = _load_obj_slow(p)
+    if _MESH_CACHE: _parsed_cache_store(p, *out)
+    return out
 
 
 def load_vcol(ds, fn):
