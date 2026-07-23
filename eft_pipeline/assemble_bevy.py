@@ -353,6 +353,37 @@ class MaterialFactory:
 
 
 # =============================================================================================================
+# F4: vectorized per-submesh vertex dedup + smooth-normal accumulation. BYTE-IDENTICAL to the old
+# np.unique(axis=0) / np.add.at pair (proven on a full-map SHA diff); EFT_ASM_VEC=0 forces the legacy path.
+_ASM_VEC = os.environ.get('EFT_ASM_VEC', '1') != '0'
+
+
+def _unique_rows(key):
+    """First-occurrence indices idx0 and inverse map inv for the unique ROWS of `key` (N,C).
+    Byte-identical to np.unique(key, axis=0, return_index=True, return_inverse=True)[1:] (same lexsort,
+    same first-occurrence tie-break), but views the rows as a structured-void 1-D array so numpy runs
+    ONE lexsort over named f64 fields (== axis=0's own internal consolidation) instead of the axis=0 path."""
+    if not _ASM_VEC:
+        _, idx0, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
+        return idx0, inv.ravel()
+    kc = np.ascontiguousarray(key)
+    kv = kc.view([('', kc.dtype)] * kc.shape[1]).ravel()   # (N,) structured; per-field numeric compare == axis=0
+    _, idx0, inv = np.unique(kv, return_index=True, return_inverse=True)
+    return idx0, inv.ravel()
+
+
+def _accumulate_normals(inv, fnr, nv):
+    """Sum face-normal rows fnr (N,3) into per-unique-vertex bins `inv` -> (nv,3) f64. Byte-identical to
+    `nrm = np.zeros((nv,3)); np.add.at(nrm, inv, fnr)`: np.bincount accumulates in the SAME index order and
+    upcasts the same f32->f64 values, so every partial sum matches bit-for-bit (verified across random trials)."""
+    if not _ASM_VEC:
+        nrm = np.zeros((nv, 3)); np.add.at(nrm, inv, fnr); return nrm
+    nrm = np.empty((nv, 3), np.float64)
+    for c in range(3):
+        nrm[:, c] = np.bincount(inv, weights=fnr[:, c], minlength=nv)
+    return nrm
+
+
 def _M3T(mg):
     """3x3 (rows) of a row-major 3x4/4x4 flat list, and translation T."""
     M3 = np.array([[mg[0], mg[1], mg[2]], [mg[4], mg[5], mg[6]], [mg[8], mg[9], mg[10]]], np.float64)
@@ -656,9 +687,9 @@ def main():
             uvr[:, 1] = 1.0 - uvr[:, 1]
             fn = np.cross(pos[1::3] - pos[0::3], pos[2::3] - pos[0::3]); fnr = np.repeat(fn, 3, 0)
             key = np.concatenate([np.round(pos, 3), np.round(uvr, 3)], 1)
-            _, idx0, inv = np.unique(key, axis=0, return_index=True, return_inverse=True); inv = inv.ravel()
+            idx0, inv = _unique_rows(key)                      # F4: structured-void 1-D unique (== np.unique axis=0)
             nv = int(inv.max()) + 1
-            nrm = np.zeros((nv, 3)); np.add.at(nrm, inv, fnr)
+            nrm = _accumulate_normals(inv, fnr, nv)            # F4: bincount per-axis (== np.add.at, byte-identical)
             ln = np.linalg.norm(nrm, axis=1, keepdims=True); nrm = (nrm / np.where(ln > 0, ln, 1)).astype(np.float32)
             # COLOR_0 = vert-paint blend weights (do NOT collapse white/unpainted). Non-vp -> opaque white.
             if sb.get('vp'):
