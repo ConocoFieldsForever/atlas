@@ -1502,32 +1502,34 @@ fn toolbar_panel(
     theme::apply_global_style(ctx);
     let cur = *tab;
     egui::SidePanel::right("toolbar")
-        .exact_width(40.0)
+        .exact_width(46.0)
         .resizable(false)
-        .frame(egui::Frame::new().fill(theme::RAIL).inner_margin(egui::Margin::symmetric(4, 8)))
+        .frame(egui::Frame::new().fill(theme::RAIL).inner_margin(egui::Margin::symmetric(3, 8)))
         .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing.y = 6.0;
-            // Back to the start menu (map manager). Sits above the tab icons, separated — it's an
-            // action, not a tab, so it never shows the active-tab highlight.
-            if theme::rail_button(ui, false, 4, "Back to menu (map manager)") {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            // Top house = "Menu": back to the start menu (map manager). Sits above the tab icons,
+            // separated — it's an action, not a tab, so it never shows the active-tab highlight.
+            if theme::rail_button(ui, false, 4, "Menu", "Back to menu (map manager)") {
                 go_menu.0 = true;
             }
             ui.add_space(3.0);
             ui.separator();
             ui.add_space(3.0);
-            if theme::rail_button(ui, cur == RightPanelTab::Visibility, 0, "Visibility layers") {
+            if theme::rail_button(ui, cur == RightPanelTab::Visibility, 0, "Layers", "Visibility layers") {
                 *tab = RightPanelTab::Visibility;
             }
-            if theme::rail_button(ui, cur == RightPanelTab::Camera, 1, "Camera") {
+            if theme::rail_button(ui, cur == RightPanelTab::Camera, 1, "Camera", "Camera") {
                 *tab = RightPanelTab::Camera;
             }
-            if theme::rail_button(ui, cur == RightPanelTab::Tasks, 2, "Tasks") {
+            if theme::rail_button(ui, cur == RightPanelTab::Tasks, 2, "Tasks", "Tasks") {
                 *tab = RightPanelTab::Tasks;
             }
-            if theme::rail_button(ui, cur == RightPanelTab::Navigate, 3, "Navigation \u{00B7} routes") {
+            if theme::rail_button(ui, cur == RightPanelTab::Navigate, 3, "Nav", "Navigation \u{00B7} routes") {
                 *tab = RightPanelTab::Navigate;
             }
-            if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Level controls \u{00B7} power switches") {
+            // Bottom house = "Map": map-specific controls (level / power switches). The second of the
+            // two house icons — the caption is what tells it apart from the top "Menu" one.
+            if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Map", "Map \u{00B7} level & power controls") {
                 *tab = RightPanelTab::Level;
             }
         });
