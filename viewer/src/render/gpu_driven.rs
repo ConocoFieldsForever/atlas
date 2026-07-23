@@ -1167,10 +1167,14 @@ impl Plugin for EftGpuDrivenPlugin {
             // down the old pack's GPU state on a swap.
             ExtractResourcePlugin::<super::MapEpoch>::default(),
         ))
-        // build_cpu_data re-runs on every map epoch (the initial insert included) so an in-place
-        // .eftpack swap rebuilds the CPU staging blob; the render-world reset then rebuilds the GPU
-        // side. (Was `Startup`, which only ever ran for the first pack.)
-        .add_systems(Update, build_cpu_data.run_if(resource_changed::<super::MapEpoch>))
+        // The CPU staging build re-runs on every map epoch (the initial insert included) so an
+        // in-place .eftpack swap rebuilds the blob; the render-world reset then rebuilds the GPU
+        // side. Step 3: `kick_cpu_build` spawns the heavy build onto the AsyncComputeTaskPool (so
+        // the ~0.6–1.3 s work no longer freezes the main thread); `poll_cpu_build` applies the
+        // result when it lands, dropping any stale (superseded-epoch) blob. (Was one synchronous
+        // `build_cpu_data` system; was `Startup` before that, which only ran for the first pack.)
+        .add_systems(Update, kick_cpu_build.run_if(resource_changed::<super::MapEpoch>))
+        .add_systems(Update, poll_cpu_build.run_if(resource_exists::<PendingCpuBuild>))
         .add_systems(Update, free_cpu_staging);
 
         let render_app = app.sub_app_mut(RenderApp);
@@ -1280,39 +1284,22 @@ fn softcutout_params(vp: &Option<crate::eftpack::VertPaint>) -> Option<[f32; 4]>
     ])
 }
 
-fn build_cpu_data(
-    mut commands: Commands,
-    pack: Option<Res<LoadedPack>>,
-    epoch: Res<super::MapEpoch>,
-    tags: Query<(), With<GpuDrivenTag>>,
-    lod: Res<crate::ForcedLod>,
-    load_signal: Option<Res<GpuLoadSignal>>,
-) {
-    let Some(pack) = pack else {
-        return;
-    };
-    // A new map's GPU build starts NOW: latch the loading flag so the indicator stays up through
-    // the whole (multi-frame, off-thread) texture build, not just the file load. Cleared by
-    // `prepare_gpu_buffers` once the map is actually on-screen. Covers epoch bumps with no
-    // `PendingMapLoad` (the LOD selector), and closes the 1-frame gap after `poll_map_load` clears
-    // `PendingMapLoad` but before the render world starts building.
-    if let Some(s) = &load_signal {
-        s.set(true);
-    }
-    let pack = &pack.0;
-    let build_t0 = std::time::Instant::now(); // STALL INSTRUMENTATION (main-thread)
+/// Pure CPU staging build (NO ECS/Bevy access) so it can run on the `AsyncComputeTaskPool` off
+/// the main thread (Step 3). Parses the pack + selected LOD into the GPU-ready `CpuData` blob.
+/// Returns `None` when there is nothing to draw (empty pack, or a failed bounding-sphere pass);
+/// the caller (`poll_cpu_build`) clears the loading flag in that case. The heavy work here — the
+/// fused geometry encode, the material table, grass, SH/light-grid load — is exactly what used to
+/// stall the main thread for ~0.6–1.3 s per map load.
+fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
+    let build_t0 = std::time::Instant::now(); // STALL INSTRUMENTATION (off-thread now)
     // LOD selector (graphics panel): keep one LOD per group. No-op on lean LOD0-only packs.
-    let by_mesh = pack.instances_by_mesh_for_lod(lod.0);
+    let by_mesh = pack.instances_by_mesh_for_lod(lod);
     let t_bymesh = build_t0.elapsed(); // phase: instance-by-mesh grouping
     let local_spheres = match pack.bounding_spheres() {
         Ok(s) => s,
         Err(e) => {
             error!("gpu-driven: bounding_spheres failed: {e:#}");
-            // Clear the load flag we latched above, else the loading toast spins forever with no map.
-            if let Some(s) = &load_signal {
-                s.set(false);
-            }
-            return;
+            return None; // poll_cpu_build clears the loading flag on a None result
         }
     };
 
@@ -2356,11 +2343,7 @@ fn build_cpu_data(
     let instance_total = inst_cursor;
     if mesh_count == 0 || instance_total == 0 {
         warn!("gpu-driven: nothing to draw (0 meshes / 0 instances)");
-        // Clear the load flag we latched at the top, else the loading toast spins forever.
-        if let Some(s) = &load_signal {
-            s.set(false);
-        }
-        return;
+        return None; // poll_cpu_build clears the loading flag on a None result
     }
 
     info!(
@@ -2450,7 +2433,7 @@ fn build_cpu_data(
     let vbytes = std::mem::size_of_val(vertex_data.as_slice());
     let ibytes = std::mem::size_of_val(index_data.as_slice());
     eprintln!(
-        "[stall] build_cpu_data (main thread): {:.1} ms  ({} meshes, {} instances, {} albedo, {} normal)\n\
+        "[stall] build_cpu_data (off main thread unless EFT_SYNC_LOAD): {:.1} ms  ({} meshes, {} instances, {} albedo, {} normal)\n\
          [stall]   phases ms: bymesh={:.1} spheres+materials={:.1} geometry={:.1} grass={:.1} | \
          vtx_buf={:.1}MiB idx_buf={:.1}MiB",
         ms(build_t0.elapsed()),
@@ -2474,7 +2457,7 @@ fn build_cpu_data(
             index_data.len(),
         );
     }
-    commands.insert_resource(ExtractedCpuData(Arc::new(CpuData {
+    Some(CpuData {
         vertex_data,
         index_data,
         instances,
@@ -2491,13 +2474,116 @@ fn build_cpu_data(
         light_grid,
         instance_total,
         mesh_count,
-    }), epoch.0));
-    // one entity to hang the draw phase item on (ignored by the draw command). Idempotent: on an
-    // in-place map swap build_cpu_data re-runs, and a SECOND GpuDrivenTag would make queue_gpu_driven
-    // emit every phase item twice (the whole scene drawn 2×). The tag carries no per-map data, so
-    // keep the single existing one.
-    if tags.is_empty() {
-        commands.spawn((GpuDrivenTag, Name::new("eft_gpu_driven_draw")));
+    })
+}
+
+/// In-flight off-thread CPU build. Keyed by the `MapEpoch` it was kicked for so a stale result
+/// (an older map, superseded by a fast swap) is dropped instead of applied. Replacing this
+/// resource cancels any previous in-flight task (a superseded build is wasted work anyway).
+#[derive(Resource)]
+struct PendingCpuBuild {
+    task: bevy::tasks::Task<Option<CpuData>>,
+    epoch: u64,
+}
+
+/// KICK (main world, on every `MapEpoch` change incl. the initial insert + LOD swaps): latch the
+/// loading flag and spawn `compute_cpu_blob` onto the AsyncComputeTaskPool so the ~0.6–1.3 s build
+/// no longer freezes the main thread — the loading indicator keeps animating while it runs.
+/// `EFT_SYNC_LOAD=1` keeps the old in-one-frame behavior (build inline, apply immediately) as an
+/// escape hatch for deterministic capture.
+fn kick_cpu_build(
+    mut commands: Commands,
+    pack: Option<Res<LoadedPack>>,
+    epoch: Res<super::MapEpoch>,
+    tags: Query<(), With<GpuDrivenTag>>,
+    lod: Res<crate::ForcedLod>,
+    load_signal: Option<Res<GpuLoadSignal>>,
+) {
+    let Some(pack) = pack else {
+        return;
+    };
+    // A new map's GPU build starts NOW: latch the loading flag so the indicator stays up through
+    // the whole (off-thread) build + the (multi-frame) texture upload, not just the file load.
+    // Cleared by `prepare_gpu_buffers` once the map is on-screen, or by `poll_cpu_build` on a
+    // build that produced nothing.
+    if let Some(s) = &load_signal {
+        s.set(true);
+    }
+    let pack_arc = pack.0.clone(); // Arc clone (cheap); shares meshes.bin with the worker
+    let lod = lod.0;
+    let ep = epoch.0;
+
+    // Escape hatch: build synchronously in this frame and apply immediately (old behavior).
+    let sync_load = std::env::var("EFT_SYNC_LOAD")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if sync_load {
+        commands.remove_resource::<PendingCpuBuild>();
+        match compute_cpu_blob(&pack_arc, lod) {
+            Some(cpu) => {
+                commands.insert_resource(ExtractedCpuData(Arc::new(cpu), ep));
+                if tags.is_empty() {
+                    commands.spawn((GpuDrivenTag, Name::new("eft_gpu_driven_draw")));
+                }
+            }
+            None => {
+                if let Some(s) = &load_signal {
+                    s.set(false);
+                }
+            }
+        }
+        return;
+    }
+
+    let task = bevy::tasks::AsyncComputeTaskPool::get()
+        .spawn(async move { compute_cpu_blob(&pack_arc, lod) });
+    // Inserting replaces (and thus cancels) any previous in-flight build for a superseded epoch.
+    commands.insert_resource(PendingCpuBuild { task, epoch: ep });
+}
+
+/// POLL (main world, whenever a build is in flight): when the off-thread `compute_cpu_blob`
+/// finishes, apply its result IFF it still matches the current `MapEpoch` (a fast map swap bumps
+/// the epoch and re-kicks; the stale blob is dropped). Mirrors the drop-stale-results discipline
+/// of `PendingMapLoad`.
+fn poll_cpu_build(
+    mut commands: Commands,
+    pending: Option<ResMut<PendingCpuBuild>>,
+    epoch: Res<super::MapEpoch>,
+    tags: Query<(), With<GpuDrivenTag>>,
+    load_signal: Option<Res<GpuLoadSignal>>,
+) {
+    let Some(mut pending) = pending else {
+        return;
+    };
+    let Some(result) = bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(
+        &mut pending.task,
+    )) else {
+        return; // still building
+    };
+    let built_epoch = pending.epoch;
+    commands.remove_resource::<PendingCpuBuild>();
+
+    if built_epoch != epoch.0 {
+        // Superseded by a newer map/LOD; the newer kick's build is (or will be) in flight, and it
+        // owns the loading flag. Drop this blob silently.
+        return;
+    }
+    match result {
+        Some(cpu) => {
+            commands.insert_resource(ExtractedCpuData(Arc::new(cpu), built_epoch));
+            // one entity to hang the draw phase item on (ignored by the draw command). Idempotent:
+            // a SECOND GpuDrivenTag would make queue_gpu_driven emit every phase item twice (the
+            // whole scene drawn 2×). The tag carries no per-map data, so keep the single one.
+            if tags.is_empty() {
+                commands.spawn((GpuDrivenTag, Name::new("eft_gpu_driven_draw")));
+            }
+        }
+        None => {
+            // Nothing to draw / build failed: clear the flag so the loading toast doesn't spin.
+            if let Some(s) = &load_signal {
+                s.set(false);
+            }
+        }
     }
 }
 
