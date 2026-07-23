@@ -193,15 +193,17 @@ impl RenderPath {
 /// Backends Atlas permits. DX12 PANICS at pipeline creation on Bevy's own `downsample_depth.wgsl`
 /// (a scalar `push_constant`, wgpu#5683) — BEFORE any render path runs, so neither the GPU-driven
 /// guard nor the M0 fallback can rescue it (both share the device). Atlas also hard-requires
-/// Vulkan-class features regardless. So on Windows we restrict to Vulkan: a Vulkan-capable machine
-/// runs, and a Vulkan-less one is caught by `main`'s pre-flight with an actionable message instead
-/// of a confusing mid-pipeline wgpu panic. Non-Windows keeps wgpu's default (all) backends.
+/// Vulkan-class features regardless. So on **Windows and Linux** we restrict to Vulkan: a
+/// Vulkan-capable machine runs, and a Vulkan-less one is caught by `main`'s pre-flight with an
+/// actionable message instead of a confusing panic (or, on Linux, an unsupported GL fallback).
+/// Modern AMD/NVIDIA/Intel drivers ship Vulkan on both OSes; the GL path in `all()` can't drive the
+/// GPU-driven features anyway. macOS/other keep wgpu's default (all -> Metal) backends.
 pub fn allowed_backends() -> wgpu::Backends {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         wgpu::Backends::VULKAN
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         wgpu::Backends::all()
     }
