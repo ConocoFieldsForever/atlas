@@ -94,6 +94,14 @@ pub struct GfxSettings {
     /// every group off (mall dark at raid spawn). Flipped by the Level-controls UI + clicking a
     /// switch mesh; `update_light_power` re-uploads the light buffer when it changes.
     pub light_groups: u32,
+    /// Distance-based LOD on/off (default off = max detail = shipped look). Only meaningful on an
+    /// all-LOD pack; a lean pack has one shell per group so it's a no-op. A live cull-uniform
+    /// switch — no rebuild. See LOD_DISTANCE_PLAN.md.
+    pub lod_distance: bool,
+    /// LOD bias (>1 holds finer shells to a greater distance; <1 switches to coarse sooner).
+    pub lod_bias: f32,
+    /// Debug: force a single LOD shell index (>=0); -1 = off (respect `lod_distance`).
+    pub lod_force: i32,
 }
 
 impl Default for GfxSettings {
@@ -159,6 +167,10 @@ impl Default for GfxSettings {
             } else {
                 0
             },
+            // Distance-LOD default OFF (shipped look). EFT_LOD=1 spawns it on; EFT_LOD_BIAS tunes.
+            lod_distance: std::env::var("EFT_LOD").map(|v| v.trim() == "1").unwrap_or(false),
+            lod_bias: std::env::var("EFT_LOD_BIAS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1.0),
+            lod_force: std::env::var("EFT_LOD_FORCE").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(-1),
         }
     }
 }
