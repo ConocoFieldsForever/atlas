@@ -197,7 +197,7 @@ def dataset_levels(m):
     Falls back to (or UNIONS with) the config list if derivation is unavailable, so a config that
     intentionally adds an off-folder level still contributes and we never regress to fewer levels."""
     cfg = _config_levels(m)
-    folder = unity_location(m)
+    folder = _config_unity_location(m)
     derived = []
     if folder:
         try:
