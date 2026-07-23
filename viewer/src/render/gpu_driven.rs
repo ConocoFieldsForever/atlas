@@ -1728,6 +1728,14 @@ fn build_cpu_data(
             // The 12 layers are shared across slices (same MicroSplat material); capture once.
             if !layers_done {
                 if let Some(layers) = tile.get("layers").and_then(|v| v.as_array()) {
+                    // Layer albedos missing from the pack (pre-B8 extractor gated export on MEAN
+                    // coverage and silently dropped locally-dominant layers, e.g. Sand/Pebbles)
+                    // would bind the 1x1 MAGENTA load-failure placeholder -> magenta ground
+                    // blotches wherever that layer's control weight dominates. Fall back to the
+                    // first PRESENT layer instead: visually plausible ground + a loud warn telling
+                    // the pack builder to re-extract, never magenta terrain.
+                    let mut missing: Vec<(usize, String)> = Vec::new();
+                    let mut first_present: Option<u32> = None;
                     for l in layers {
                         let idx = l.get("idx").and_then(|v| v.as_u64()).unwrap_or(99) as usize;
                         if idx >= 12 {
@@ -1735,8 +1743,26 @@ fn build_cpu_data(
                         }
                         let name = l.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let rep = l.get("rep").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
-                        terrain.layer_albedo[idx] = add_tex(&format!("layer_{name}.png"));
+                        let fname = format!("layer_{name}.png");
+                        if dir.join(&fname).exists() {
+                            let ti = add_tex(&fname);
+                            terrain.layer_albedo[idx] = ti;
+                            first_present.get_or_insert(ti);
+                        } else {
+                            missing.push((idx, fname));
+                        }
                         terrain.layer_rep[idx] = rep;
+                    }
+                    if !missing.is_empty() {
+                        let fb = first_present.unwrap_or(0);
+                        for (idx, fname) in &missing {
+                            warn!(
+                                "gpu-driven terrain: layer albedo '{fname}' (idx {idx}) missing from \
+                                 the pack (pre-B8 export?) — substituting a present layer; re-extract \
+                                 this map's terrain to restore the real texture"
+                            );
+                            terrain.layer_albedo[*idx] = fb;
+                        }
                     }
                     layers_done = true;
                 }
@@ -2094,19 +2120,30 @@ fn build_cpu_data(
         // placeholder — that placeholder is the "pink grass all over customs" bug.
         let grass_albedo = {
             let raw = std::path::Path::new(&grass_albedo_raw);
-            let cand = if raw.is_absolute() && raw.is_file() {
-                raw.to_path_buf()
+            let base = raw.file_name().unwrap_or(raw.as_os_str());
+            // Candidate order matters: (1) an absolute path that really exists (trusted as-is);
+            // (2) the FULL pack-relative path — the CORRECT portable form, including subdirs
+            //     ("terrain_layers/grass_Grass3_D.png"; the old code jumped straight to basename
+            //     and silently skipped grass on every pack whose sidecar used a subdir);
+            // (3) basename at the pack root, then (4) basename under terrain_layers/ — recovery
+            //     for ABSOLUTE build-path leaks pointing at another machine/map tree.
+            let mut cands: Vec<std::path::PathBuf> = Vec::new();
+            if raw.is_absolute() {
+                cands.push(raw.to_path_buf());
             } else {
-                pack.root.join(raw.file_name().unwrap_or(raw.as_os_str()))
-            };
-            if cand.is_file() {
-                cand.to_string_lossy().into_owned()
-            } else {
-                warn!(
-                    "gpu-driven grass: albedo '{grass_albedo_raw}' not found in pack \
-                     (non-portable / wrong-map build) — skipping grass to avoid the magenta placeholder"
-                );
-                break 'grass;
+                cands.push(pack.root.join(raw));
+            }
+            cands.push(pack.root.join(base));
+            cands.push(pack.root.join("terrain_layers").join(base));
+            match cands.iter().find(|c| c.is_file()) {
+                Some(c) => c.to_string_lossy().into_owned(),
+                None => {
+                    warn!(
+                        "gpu-driven grass: albedo '{grass_albedo_raw}' not found in pack \
+                         (non-portable / wrong-map build) — skipping grass to avoid the magenta placeholder"
+                    );
+                    break 'grass;
+                }
             }
         };
         let grass_tint = side
