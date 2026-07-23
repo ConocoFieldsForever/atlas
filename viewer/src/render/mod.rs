@@ -187,13 +187,47 @@ impl RenderPath {
 /// GPU-driven and risking the empty-view guard. If the probe SUCCEEDS but the real Bevy device still
 /// lacks the features (hybrid-adapter mismatch), the render-world guard relaunches into M0 via
 /// `GpuFallback` — so there is no reachable blank-view path either way.
+/// Backends Atlas permits. DX12 PANICS at pipeline creation on Bevy's own `downsample_depth.wgsl`
+/// (a scalar `push_constant`, wgpu#5683) — BEFORE any render path runs, so neither the GPU-driven
+/// guard nor the M0 fallback can rescue it (both share the device). Atlas also hard-requires
+/// Vulkan-class features regardless. So on Windows we restrict to Vulkan: a Vulkan-capable machine
+/// runs, and a Vulkan-less one is caught by `main`'s pre-flight with an actionable message instead
+/// of a confusing mid-pipeline wgpu panic. Non-Windows keeps wgpu's default (all) backends.
+pub fn allowed_backends() -> wgpu::Backends {
+    #[cfg(target_os = "windows")]
+    {
+        wgpu::Backends::VULKAN
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        wgpu::Backends::all()
+    }
+}
+
+/// True if wgpu finds ANY adapter within [`allowed_backends`]. `main` pre-flights this: a false here
+/// means Bevy would otherwise panic deep in device init (no Vulkan adapter on a DX12-only machine),
+/// so we exit early with a clear message instead.
+pub fn has_usable_adapter() -> bool {
+    let instance =
+        wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: allowed_backends(), ..Default::default() });
+    bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        force_fallback_adapter: false,
+        compatible_surface: None,
+    }))
+    .is_ok()
+}
+
 fn gpu_driven_supported() -> bool {
     use bevy::render::settings::WgpuFeatures;
     let need = WgpuFeatures::MULTI_DRAW_INDIRECT
         | WgpuFeatures::INDIRECT_FIRST_INSTANCE
         | WgpuFeatures::TEXTURE_BINDING_ARRAY
         | WgpuFeatures::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING;
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    // Probe within the SAME backends Bevy will use (allowed_backends), so on a multi-backend box we
+    // inspect the very adapter Bevy picks — not a DX12 one it will never select.
+    let instance =
+        wgpu::Instance::new(&wgpu::InstanceDescriptor { backends: allowed_backends(), ..Default::default() });
     let adapter = bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,

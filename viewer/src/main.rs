@@ -636,9 +636,34 @@ fn main() {
         PresentMode::AutoVsync // capped to refresh — far less GPU when it IS in the foreground
     };
 
+    // Pre-flight (P0/B1): DX12 is disabled below (it panics at pipeline creation on Bevy's own
+    // downsample_depth.wgsl — a scalar push-constant, wgpu#5683 — BEFORE any render path runs, so
+    // neither the GPU-driven guard nor M0 can catch it). On a machine with no Vulkan adapter, Bevy
+    // would then panic deep in device init; detect it here and exit with an actionable message.
+    if !render::has_usable_adapter() {
+        eprintln!(
+            "Atlas: no Vulkan-capable GPU adapter found.\n\
+             Atlas renders through Vulkan (DirectX 12 is disabled due to an upstream driver bug,\n\
+             wgpu#5683). Update your GPU drivers to a version with Vulkan support, then relaunch."
+        );
+        std::process::exit(1);
+    }
+
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
+            .set(bevy::render::RenderPlugin {
+                // P0/B1: pin to Vulkan on Windows (see render::allowed_backends). DX12 never worked
+                // for EITHER the GPU-driven or M0 path (it crashes on a Bevy shader regardless of
+                // features), so restricting to Vulkan loses no working configuration and removes a
+                // confusing mid-pipeline panic on the AMD/Intel machines that would route to it.
+                render_creation: bevy::render::settings::WgpuSettings {
+                    backends: Some(render::allowed_backends()),
+                    ..default()
+                }
+                .into(),
+                ..default()
+            })
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "Atlas".into(),
