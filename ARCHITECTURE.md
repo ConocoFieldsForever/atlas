@@ -163,6 +163,15 @@ spheres at load (manifest `meshes[]` has none). Bindless textures + indirect mul
 few, large draws. Port `_lod.js` **screen-height LOD** (`H = size/(dist·2·tan(fovV/2))·bias`,
 first `srh` threshold; `clampCoarsest` on for a viewer) into the cull pass using `lodGroups`.
 
+> **Distance-LOD SHIPPED** (lod 1/3–3/3). Packs built `--alllod` carry every shell; the CPU bakes
+> each instance's screen-height distance window (`near'=size/2·srh[i-1]`, `far'=size/2·srh[i]`) as an
+> f16 pair in `ids.w`, and `cs_cull` selects one shell per group by camera distance — a **live
+> cull-uniform toggle** (`Graphics ▸ Distance LOD` + bias + force-shell), no rebuild. Default packs
+> resolve to the finest shell only (`ids.w==0` sentinel) → byte-identical to the pre-LOD path.
+> Producer→consumer contract verified end-to-end; correctness proven on a synthetic 3-shell inject
+> (force-0 ≡ max-detail byte-identical, distance grounds near / raises far). The real per-frame perf
+> delta awaits a decimated `--alllod` rebuild (coarse shells = fewer triangles).
+
 **M2 — Lighting / GI.**
 SH-L1 irradiance volume as a real `Rgba16Float` **3D texture** (probe order `((z·ny)+y)·nx+x`;
 axis map `c1←y, c2←z, c3←x`); full L1 reconstruction
