@@ -149,6 +149,7 @@ fn pick_system(
     mut place: ResMut<crate::pathfind::PlaceMode>,
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut readout: Query<&mut Text, With<PickReadout>>,
+    mut gfx: ResMut<crate::render::GfxSettings>,
 ) {
     // Esc cancels an armed place-position mode (checked before the click gate so it works without
     // any click) — unless a text field has focus, where Esc means "defocus the field".
@@ -362,6 +363,32 @@ fn pick_system(
             let line = format!(
                 "POSITION set  ({:.1}, {:.1}, {:.1})  \u{2014} routes begin here",
                 wp.x, wp.y, wp.z
+            );
+            info!("{line}");
+            set_text(&mut readout, line);
+            return;
+        }
+        // LEVEL CONTROLS: clicking on (or right next to) a power switch flips the light group it
+        // drives — the same toggle as the Level tab. Match by world position (robust vs instance
+        // ordering); the switch mesh's own hit point lands within a couple of metres of its origin.
+        if let Some((idx, sw)) = pack
+            .switches
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| (0..32).contains(&s.group_idx))
+            .map(|(i, s)| (i, s, s.world_pos.distance(wp)))
+            .filter(|(_, _, d)| *d < 2.5)
+            .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, s, _)| (i, s))
+        {
+            let bit = 1u32 << sw.group_idx;
+            gfx.light_groups ^= bit;
+            let on = gfx.light_groups & bit != 0;
+            let line = format!(
+                "POWER {}  ({} lights)  \u{2014}  {}",
+                idx + 1,
+                sw.count,
+                if on { "ON" } else { "OFF" }
             );
             info!("{line}");
             set_text(&mut readout, line);

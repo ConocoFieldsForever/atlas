@@ -90,6 +90,10 @@ pub struct GfxSettings {
     pub dof_fstop: f32,
     /// Chromatic aberration intensity (0 = off).
     pub chroma: f32,
+    /// Power-switch state: bit i = light group i is POWERED (its switch flipped on). Default 0 =
+    /// every group off (mall dark at raid spawn). Flipped by the Level-controls UI + clicking a
+    /// switch mesh; `update_light_power` re-uploads the light buffer when it changes.
+    pub light_groups: u32,
 }
 
 impl Default for GfxSettings {
@@ -148,6 +152,13 @@ impl Default for GfxSettings {
             dof_focal_m: 15.0,
             dof_fstop: 2.8,
             chroma: 0.0,
+            // All power groups OFF at spawn (mall dark until a switch is flipped). EFT_POWER=1
+            // spawns fully powered (every group on) for screenshots / a lit walkthrough.
+            light_groups: if std::env::var("EFT_POWER").map(|v| v.trim() == "1").unwrap_or(false) {
+                u32::MAX
+            } else {
+                0
+            },
         }
     }
 }

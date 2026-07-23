@@ -86,6 +86,42 @@ def main():
         try: go2tf[o.read().m_GameObject.path_id] = pid
         except Exception: pass
 
+    # --- POWER SWITCH / controllable lights (map-agnostic, TYPED - no name rules) --------------
+    # A map's power lever is an EFT.Interactive.Switch whose serialized PPtr[] resolves ENTIRELY to
+    # EFT.Interactive.LampController -- that array is the EXACT bank it powers (verified byte-
+    # identical on Reserve + Interchange). Those lamp fixtures own/parent the Unity Light components.
+    # We recover the switch + its controlled Lights via the shared decoder, then TAG each controlled
+    # Light with its switch group and FORCE-KEEP it even when it ships off (mall dark until powered).
+    # Component classes come from each MonoBehaviour's m_Script -> MonoScript.m_ClassName (readable
+    # though the IL2CPP payload is not); nothing keys on a GameObject/mesh NAME, so it is identical on
+    # every map. Switches usually live in the *_DesignMain scene, not the *_light scene, so this only
+    # fires on the levels that actually contain a power lever (empty elsewhere = no behavior change).
+    import eft_extract_switches as _sw
+    _script_class = {}
+    def _harvest_scripts(objects):
+        for o in objects:
+            if o.type.name == "MonoScript":
+                try:
+                    d = o.read_typetree(); ns = d.get("m_Namespace", "") or ""; cn = d.get("m_ClassName", "") or ""
+                    _script_class[o.path_id] = (f"{ns}.{cn}" if ns else cn)
+                except Exception:
+                    pass
+    _harvest_scripts(env.objects)
+    try:
+        import UnityPy as _UP
+        _harvest_scripts(_UP.load(os.path.join(EFTDATA, "globalgamemanagers.assets")).objects)
+    except Exception:
+        pass
+    _switches = _sw.find_power_switches(args.level, list(env.objects), tfm, gos_all, monos_all, _script_class)
+    light_group = {}                            # light-owner GO path_id -> "<level>:<switchGO>" group id
+    for s in _switches:
+        gid = f"{args.level}:{s['switch_go']}"
+        for lg in s["controlled_light_gos"]:
+            light_group.setdefault(lg, gid)
+    if _switches:
+        print(f"power-switch: {len(_switches)} power lever(s), {len(light_group)} controlled lights "
+              f"on level{args.level}", flush=True)
+
     _go_active = {}
     def go_active(go_ref):
         pid = getattr(go_ref, "path_id", 0)
@@ -119,6 +155,7 @@ def main():
         n_total += 1
         try:
             L = o.read(); intensity = float(g(L, "m_Intensity", default=0.0) or 0.0)
+            grp = light_group.get(L.m_GameObject.path_id)   # switch group id, or None if uncontrolled
             ctrl = None
             if intensity <= 0:
                 ctrl = controller_state(L.m_GameObject.path_id)
@@ -135,7 +172,10 @@ def main():
                 on = False
             if not on:
                 n_disabled += 1
-                if not args.all:
+                # Switch-controlled lights ship OFF (mall dark until powered) but MUST survive so the
+                # viewer can turn them on; force-keep them (tagged on:false + group). Ungrouped off
+                # lights still drop unless --all.
+                if grp is None and not args.all:
                     continue
             pos = W[:3, 3]
             if abs(pos[0]) < 0.01 and abs(pos[2]) < 0.01: continue   # pooled-at-origin
@@ -171,6 +211,7 @@ def main():
                 "innerSpotAngle": round(float(tt.get("m_InnerSpotAngle", 0.0) or 0.0), 2),
                 "shadowType": int((shv.get("m_Type", 0) if isinstance(shv, dict) else 0) or 0),
                 "on": on,
+                **({"group": grp} if grp else {}),   # switch-controlled: viewer power-toggle key
             })
         except Exception:
             continue

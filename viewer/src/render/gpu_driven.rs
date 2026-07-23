@@ -413,6 +413,10 @@ struct LightGridCpu {
     /// 3 vec4 per light: v0=(pos.xyz,range) v1=(color.rgb,cos_outer) v2=(dir.xyz,cos_inner).
     /// Always >= 1 element (a dummy light when the pack has none) so the storage binding is valid.
     lights: Vec<[f32; 4]>,
+    /// Per-light power-switch group index (-1 = always on), parallel to the LIGHTS (not the vec4s):
+    /// `light_group[i]` is the group of the light packed at `lights[3*i..3*i+3]`. Used by the live
+    /// power toggle to zero a group's colors without touching the CSR grid.
+    light_group: Vec<i32>,
     /// CSR: `[0..=nCells]` prefix-sum offsets (each already includes the base = nCells+1) then the
     /// concatenated per-cell light-index lists. cell i's lights = `grid[grid[i]..grid[i+1]]`.
     grid: Vec<u32>,
@@ -442,13 +446,16 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
 
     // Pack the light records (>=1 element so the storage buffer is never zero-sized).
     let mut lbuf: Vec<[f32; 4]> = Vec::with_capacity(lights.len().max(1) * 3);
+    let mut light_group: Vec<i32> = Vec::with_capacity(lights.len().max(1));
     for l in lights {
         lbuf.push([l.pos.x, l.pos.y, l.pos.z, l.range]);
         lbuf.push([l.color.x, l.color.y, l.color.z, l.cos_outer]);
         lbuf.push([l.dir.x, l.dir.y, l.dir.z, l.cos_inner]);
+        light_group.push(l.group_idx);
     }
     if lbuf.is_empty() {
         lbuf.extend_from_slice(&[[0.0; 4], [0.0; 4], [0.0; 4]]); // dummy light 0 (n_lights stays 0)
+        light_group.push(-1);
     }
 
     let min = Vec3::new(bounds[0], bounds[1], bounds[2]);
@@ -465,6 +472,7 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
                 params: [light_scale, ambient_scale, 0.0, sun_diffuse],
             },
             lights: lbuf,
+            light_group,
             grid: vec![2u32, 2u32],
         };
     }
@@ -566,6 +574,7 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
             params: [light_scale, ambient_scale, 1.0, sun_diffuse],
         },
         lights: lbuf,
+        light_group,
         grid,
     }
 }
@@ -1212,6 +1221,11 @@ impl Plugin for EftGpuDrivenPlugin {
                     // Live lighting sliders: base x GfxSettings multipliers into the LightGrid
                     // uniform (48 B/frame; byte-identical at the default multipliers).
                     update_light_uniform
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
+                    // Live POWER SWITCH toggle: re-upload the light buffer with unpowered groups
+                    // zeroed when GfxSettings.light_groups changes (no-op until a switch is flipped).
+                    update_light_power
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
                     queue_gpu_driven.in_set(RenderSystems::QueueMeshes),
@@ -2685,6 +2699,12 @@ struct EftShResources {
     /// `update_light_uniform` rewrites the GPU copy per frame as base x GfxSettings multipliers,
     /// so the UI lighting sliders are live with no rebuild (identical bytes at multiplier 1).
     light_base: LightGridUniform,
+    /// BASE packed light records (with real colors) + the per-light group index (parallel to the
+    /// lights, not the vec4s). `update_light_power` rewrites `lights_buf` from these whenever the
+    /// per-group power state (GfxSettings.light_groups bitmask) changes: a light whose group is
+    /// unpowered gets its color lane zeroed (contributes nothing) without touching positions/grid.
+    light_records_base: Vec<[f32; 4]>,
+    light_group: Vec<i32>,
 }
 
 #[derive(Resource)]
@@ -3660,9 +3680,14 @@ fn prepare_gpu_buffers(
         contents: bytemuck::bytes_of(&lg.uniform),
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     });
+    // Build the records in the DEFAULT power state (all groups OFF = mask 0): a switch-controlled
+    // light ships dark until its lever is flipped, so zero its color lane now. `update_light_power`
+    // rewrites this buffer when a switch toggles. Ungrouped lights are unchanged.
+    let mut light_records = lg.lights.clone();
+    apply_light_power_records(&mut light_records, &lg.light_group, 0);
     let lights_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_lights"),
-        contents: bytemuck::cast_slice(&lg.lights),
+        contents: bytemuck::cast_slice(&light_records),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
     let light_grid_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -3740,6 +3765,8 @@ fn prepare_gpu_buffers(
         lights_buf,
         light_grid_buf,
         light_base: lg.uniform,
+        light_records_base: lg.lights.clone(),
+        light_group: lg.light_group.clone(),
     });
     commands.insert_resource(EftShBindGroup(sh_bg));
     // #5 shadows: the runtime switch, the queued pipeline + cascade layout, and the GPU resources.
@@ -4563,6 +4590,44 @@ fn update_light_uniform(
     u.params[1] *= g.gi_intensity.max(0.0);
     u.params[3] *= g.sun_diffuse.max(0.0);
     render_queue.write_buffer(&res.light_uniform, 0, bytemuck::bytes_of(&u));
+}
+
+/// Zero the color lane of every light whose power-group bit is not set in `mask` (group -1 = always
+/// lit). records = 3 vec4/light: [3i]=(pos,range) [3i+1]=(color,cos_outer) [3i+2]=(dir,cos_inner).
+fn apply_light_power_records(records: &mut [[f32; 4]], group: &[i32], mask: u32) {
+    for (i, &grp) in group.iter().enumerate() {
+        let on = grp < 0 || (grp < 32 && (mask >> grp) & 1 == 1);
+        if !on {
+            if let Some(c) = records.get_mut(3 * i + 1) {
+                c[0] = 0.0;
+                c[1] = 0.0;
+                c[2] = 0.0; // keep cos_outer in .w
+            }
+        }
+    }
+}
+
+/// Live POWER SWITCH toggle: when the per-group power bitmask (`GfxSettings.light_groups`) changes,
+/// rewrite the packed light buffer from the base records with the unpowered groups' colors zeroed.
+/// The light buffer is small (a few hundred lights), the CSR grid + positions never change, and the
+/// default state (mask 0) matches the as-built buffer, so this is a no-op until a switch is flipped.
+fn update_light_power(
+    render_queue: Res<RenderQueue>,
+    res: Option<Res<EftShResources>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+    mut last_mask: Local<Option<u32>>,
+) {
+    let (Some(res), Some(g)) = (res, settings) else {
+        return;
+    };
+    let mask = g.light_groups;
+    if *last_mask == Some(mask) {
+        return; // unchanged since last frame — nothing to re-upload
+    }
+    *last_mask = Some(mask);
+    let mut records = res.light_records_base.clone();
+    apply_light_power_records(&mut records, &res.light_group, mask);
+    render_queue.write_buffer(&res.lights_buf, 0, bytemuck::cast_slice(&records));
 }
 
 fn prepare_shadow_uniforms(
