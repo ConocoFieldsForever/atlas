@@ -157,6 +157,8 @@ fn spawn_pack_entities(
 
         let data: Vec<InstanceData> = inst_ids
             .iter()
+            // All-LOD pack: the M0 fallback draws the default shell only (else all shells stack).
+            .filter(|&&i| pack.is_default_lod(i as usize))
             .map(|&i| {
                 let inst = &pack.instances[i as usize];
                 let a = &inst.affine;

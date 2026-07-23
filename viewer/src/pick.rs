@@ -235,6 +235,11 @@ fn pick_system(
     // matches the cull's radius scale).
     let mut candidates: Vec<(usize, f32)> = Vec::new();
     for (i, inst) in pack.instances.iter().enumerate() {
+        // On an all-LOD pack only the default (finest) shell participates — else a door/prop would
+        // return several overlapping hits and mesh-name-based tools would pick a coarse shell.
+        if !pack.is_default_lod(i) {
+            continue;
+        }
         let mid = inst.mesh_id as usize;
         if mid >= spheres.len() {
             continue;

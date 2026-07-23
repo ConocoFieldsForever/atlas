@@ -2140,7 +2140,12 @@ fn spawn_pois(
                     || s.contains("pulemet"))
         };
         let mut seen: Vec<Vec3> = Vec::new();
-        for inst in &pack.instances {
+        for (idx, inst) in pack.instances.iter().enumerate() {
+            // All-LOD pack: mine stationary weapons from the default shell only (the 3 m dedupe
+            // would mostly absorb duplicates, but filter to be exact + cheap).
+            if !pack.is_default_lod(idx) {
+                continue;
+            }
             let mid = inst.mesh_id as usize;
             let Some(m) = pack.manifest.meshes.get(mid) else {
                 continue;

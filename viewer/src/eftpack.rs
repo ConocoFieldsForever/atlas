@@ -48,6 +48,37 @@ pub mod flags {
 // ---------------------------------------------------------------------------
 // manifest.json
 // ---------------------------------------------------------------------------
+/// A Unity LODGroup's runtime screen-height transition data, carried in the manifest for GPU
+/// distance-LOD. `instance.lodGroup` indexes this table (emitted by assemble_bevy; centers already
+/// conjugated into viewer world). Present in every shipped pack but ignored by the viewer until the
+/// distance-LOD path reads it. See LOD_DISTANCE_PLAN.md.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LodGroupEntry {
+    /// World-scaled LODGroup size (Unity `m_Size` × lossy world scale) — numerator of the
+    /// screen-relative-height metric `H = size * proj11 / (2*dist)`.
+    #[serde(default)]
+    pub size: f32,
+    /// Viewer-world reference center (already G3-conjugated by the emitter).
+    #[serde(default)]
+    pub center: [f32; 3],
+    /// Per-level Unity `screenRelativeHeight` thresholds, DESCENDING; level i is active while the
+    /// metric lies in `(srh[i], srh[i-1]]` (srh[-1] = +inf).
+    #[serde(default)]
+    pub srh: Vec<f32>,
+    /// Per-level fade transition widths (unused by hard-switch LOD; NaN-sanitized upstream).
+    #[serde(default)]
+    pub ftw: Vec<f32>,
+    #[serde(rename = "fadeMode", default)]
+    pub fade_mode: i32,
+    #[serde(rename = "lastIsBillboard", default)]
+    pub last_is_billboard: bool,
+    /// Billboard cull threshold (the last level's srh) when `last_is_billboard`; else absent.
+    #[serde(rename = "cullH", default)]
+    pub cull_h: f32,
+    #[serde(default)]
+    pub n: i32,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub version: u32,
@@ -78,6 +109,10 @@ pub struct Manifest {
     pub conventions: Conventions,
     #[serde(default)]
     pub sidecars: Sidecars,
+    /// Per-LODGroup screen-height transition table (distance-LOD). `instance.lodGroup` indexes it.
+    /// `#[serde(default)]` so packs that predate the reader (or lack the field) load unchanged.
+    #[serde(rename = "lodGroups", default)]
+    pub lod_groups: Vec<LodGroupEntry>,
 }
 
 /// Emitter-declared conventions. Every flag here changes how a shader must treat
@@ -745,6 +780,9 @@ pub struct Pack {
     pub exfils: Vec<LevelExfil>,
     /// Swing doors (gamedata.json) the viewer can open on click.
     pub doors: Vec<LevelDoor>,
+    /// Per-instance "is this the default (finest-present) LOD shell?" mask (distance-LOD). All-true
+    /// on a lean pack. CPU consumers query it via `is_default_lod` to avoid double-counting shells.
+    pub default_lod_mask: Vec<bool>,
 }
 
 impl Pack {
@@ -826,6 +864,27 @@ impl Pack {
         }
         let (switches, exfils, doors) = load_intel(&root, &group_map);
         let light_group_count = group_map.len() as u32;
+        // Default-LOD mask: the finest-present shell per group (all-true on a lean pack). Built once
+        // so CPU consumers skip extra shells on an all-LOD pack (distance-LOD, LOD_DISTANCE_PLAN.md).
+        let default_lod_mask: Vec<bool> = {
+            let mut r: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+            for inst in &instances {
+                if inst.lod_group >= 0 {
+                    let e = r.entry(inst.lod_group).or_insert(inst.lod_index);
+                    if inst.lod_index < *e {
+                        *e = inst.lod_index;
+                    }
+                }
+            }
+            instances
+                .iter()
+                .map(|inst| inst.lod_group < 0 || inst.lod_index == *r.get(&inst.lod_group).unwrap_or(&0))
+                .collect()
+        };
+        let n_extra = default_lod_mask.iter().filter(|&&d| !d).count();
+        if n_extra > 0 {
+            eprintln!("  LOD: all-LOD pack ({n_extra} non-default-shell instances of {} total)", instances.len());
+        }
         if !switches.is_empty() {
             eprintln!(
                 "  power switches: {} ({} light group(s), {} controlled lights)",
@@ -856,6 +915,7 @@ impl Pack {
             light_group_count,
             exfils,
             doors,
+            default_lod_mask,
         };
         // Complete checked structural validation BEFORE the pack is exposed (finding 5): a malformed
         // manifest that parsed fine but whose offsets/ranges/ids are out of bounds would otherwise
@@ -1118,24 +1178,10 @@ impl Pack {
     /// instance at `lod_index == 0`, so any `forced_lod` yields the identical (full) set — the
     /// selector is a no-op there.
     pub fn instances_by_mesh_for_lod(&self, forced_lod: i32) -> Vec<Vec<u32>> {
-        let mut group_max: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
-        for inst in &self.instances {
-            if inst.lod_group >= 0 {
-                let e = group_max.entry(inst.lod_group).or_insert(0);
-                if inst.lod_index > *e {
-                    *e = inst.lod_index;
-                }
-            }
-        }
-        let want = forced_lod.max(0);
+        let range = self.group_lod_range();
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); self.manifest.meshes.len()];
         for (i, inst) in self.instances.iter().enumerate() {
-            let keep = if inst.lod_group < 0 {
-                true
-            } else {
-                inst.lod_index == want.min(*group_max.get(&inst.lod_group).unwrap_or(&0))
-            };
-            if keep {
+            if self.keep_lod(inst, forced_lod, &range) {
                 let mid = inst.mesh_id as usize;
                 if mid < out.len() {
                     out[mid].push(i as u32);
@@ -1143,6 +1189,45 @@ impl Pack {
             }
         }
         out
+    }
+
+    /// Per-lod_group `(min_present, max_present)` lod_index over the instances THIS pack actually
+    /// ships. On a lean pack every present group is `(0,0)`; reserve's 34 window groups are `(2,2)`.
+    fn group_lod_range(&self) -> std::collections::HashMap<i32, (i32, i32)> {
+        let mut r: std::collections::HashMap<i32, (i32, i32)> = std::collections::HashMap::new();
+        for inst in &self.instances {
+            if inst.lod_group >= 0 {
+                let e = r.entry(inst.lod_group).or_insert((inst.lod_index, inst.lod_index));
+                e.0 = e.0.min(inst.lod_index);
+                e.1 = e.1.max(inst.lod_index);
+            }
+        }
+        r
+    }
+
+    /// Keep an instance at the requested LOD, CLAMPED into the group's present range `[min,max]` so
+    /// (a) forcing a level a group lacks falls back to its coarsest, and (b) a group whose finest
+    /// shipped shell is > 0 (reserve's LOD2-only windows) is NOT invisible at forced 0 — the old
+    /// code assumed finest==0 and dropped them. Ungrouped (`lod_group < 0`) instances always kept.
+    fn keep_lod(
+        &self,
+        inst: &GpuInstance,
+        forced_lod: i32,
+        range: &std::collections::HashMap<i32, (i32, i32)>,
+    ) -> bool {
+        if inst.lod_group < 0 {
+            return true;
+        }
+        let (min, max) = range.get(&inst.lod_group).copied().unwrap_or((0, 0));
+        inst.lod_index == forced_lod.max(0).clamp(min, max)
+    }
+
+    /// True iff this instance is the one the DEFAULT (finest-present) LOD selector keeps — i.e. what
+    /// gets drawn at forced 0. Used by CPU consumers (pick / walk-ground / nav / M0 / bakes) to skip
+    /// the extra shells on an all-LOD pack so they don't double-count overlapping geometry. On a
+    /// lean pack this is every instance (mask all-true), so those call sites are unchanged.
+    pub fn is_default_lod(&self, idx: usize) -> bool {
+        self.default_lod_mask.get(idx).copied().unwrap_or(true)
     }
 
     /// Per-mesh LOCAL bounding spheres, indexed to match `manifest.meshes`.
