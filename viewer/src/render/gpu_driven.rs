@@ -134,7 +134,7 @@ pub struct DrawIndexedIndirectArgs {
 }
 
 /// Tiny per-frame cull uniform: 6 normalized inward frustum planes + counts + the screen-size
-/// cull anchor. 128 bytes.
+/// cull anchor + the distance-LOD params. 144 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct CullUniform {
@@ -147,9 +147,14 @@ pub struct CullUniform {
     /// radius subtends fewer than min_px pixels: sphere.w < k * distance(cam, sphere.center).
     /// Zeros = cull nothing (build-time seed before the first upload_frustum).
     pub cam_k: [f32; 4],
+    /// Distance-LOD (LOD_DISTANCE_PLAN.md): x = proj11 (1/tan(fovY/2)), y = lod_bias (>1 holds finer
+    /// shells longer), z = mode (0 = max detail / default shell only, 1 = distance-based, 2 = force
+    /// shell w), w = forced shell index (mode 2). Instances with ids.w == 0 (sentinel) ignore all of
+    /// this and always draw (lean packs, ungrouped, single-shell groups).
+    pub lod_params: [f32; 4],
 }
-// #6: LOCK the byte layout — matches `CullGlobals` in gpu_cull.wgsl (array<vec4,6> + 2×vec4 = 128).
-const _: () = assert!(std::mem::size_of::<CullUniform>() == 128);
+// #6: LOCK the byte layout — matches `CullGlobals` in gpu_cull.wgsl (array<vec4,6> + 3×vec4 = 144).
+const _: () = assert!(std::mem::size_of::<CullUniform>() == 144);
 
 /// Stride of one indirect draw record, in bytes.
 pub const DRAW_ARG_STRIDE: u64 = 20;
@@ -1317,9 +1322,60 @@ fn softcutout_params(vp: &Option<crate::eftpack::VertPaint>) -> Option<[f32; 4]>
 /// stall the main thread for ~0.6–1.3 s per map load.
 fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     let build_t0 = std::time::Instant::now(); // STALL INSTRUMENTATION (off-thread now)
-    // LOD selector (graphics panel): keep one LOD per group. No-op on lean LOD0-only packs.
-    let by_mesh = pack.instances_by_mesh_for_lod(lod);
+    // DISTANCE-LOD: a pack that ships more than one shell per group ("multi-LOD") packs EVERY shell
+    // and lets the GPU cull select per-frame (ids.w window + ids.z bits); a lean pack keeps the old
+    // single-shell CPU selection (byte-identical). See LOD_DISTANCE_PLAN.md.
+    let multi_lod = pack.default_lod_mask.iter().any(|&d| !d);
+    let by_mesh = if multi_lod {
+        pack.instances_by_mesh() // all shells; GPU selects
+    } else {
+        pack.instances_by_mesh_for_lod(lod) // lean: one shell per group (unchanged)
+    };
     let t_bymesh = build_t0.elapsed(); // phase: instance-by-mesh grouping
+    // Per-instance LOD encode (multi-LOD only): (ids.z extra bits, ids.w f16 window). `ids.z` bit8 =
+    // is-default-shell, bits9..12 = lod_index; `ids.w` = pack_f16(near', far') where the runtime
+    // distance window is [near'*proj11*bias, far'*proj11*bias) (0 = sentinel, always drawn).
+    let lod_range = if multi_lod { pack.group_lod_range() } else { std::collections::HashMap::new() };
+    let lod_encode = |i: u32| -> (u32, u32) {
+        let inst = &pack.instances[i as usize];
+        let idx = inst.lod_index.max(0);
+        let z = ((pack.is_default_lod(i as usize) as u32) << 8) | (((idx as u32) & 0xF) << 9);
+        if inst.lod_group < 0 {
+            return (z, 0); // ungrouped: always drawn
+        }
+        let (min, max) = lod_range.get(&inst.lod_group).copied().unwrap_or((0, 0));
+        if min == max {
+            return (z, 0); // single present shell: always drawn (reserve's LOD2 windows land here)
+        }
+        let Some(g) = pack.manifest.lod_groups.get(inst.lod_group as usize) else {
+            return (z, 0);
+        };
+        // far distance boundary of shell `lvl` (÷proj11): d beyond which the shell is too small.
+        let far = |lvl: i32| -> f32 {
+            let h = g.srh.get(lvl as usize).copied().unwrap_or(0.0);
+            if h > 1.0e-6 {
+                g.size / (2.0 * h)
+            } else {
+                f32::INFINITY
+            }
+        };
+        let near = if idx <= min { 0.0 } else { far(idx - 1) };
+        let far_b = if idx >= max {
+            if g.last_is_billboard && g.cull_h > 1.0e-6 {
+                g.size / (2.0 * g.cull_h) // billboard groups cull past their last threshold (no billboard geom ships)
+            } else {
+                f32::INFINITY
+            }
+        } else {
+            far(idx)
+        };
+        if !(near < far_b) || !near.is_finite() {
+            return (z, 0); // degenerate/inverted (bad srh) -> always draw
+        }
+        let a16 = half::f16::from_f32(near.max(0.0)).to_bits() as u32;
+        let b16 = half::f16::from_f32(far_b.min(65504.0)).to_bits() as u32; // f16 max ~= +inf at any real d
+        (z, (b16 << 16) | a16)
+    };
     let local_spheres = match pack.bounding_spheres() {
         Ok(s) => s,
         Err(e) => {
@@ -2151,11 +2207,13 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             let lin = Mat3::from(aff.matrix3);
             let center = aff.transform_point3(local_center);
             let radius = local_r * conservative_radius_scale(lin);
+            // Distance-LOD encode into ids.z/ids.w on multi-LOD packs; (0,0) on lean = unchanged.
+            let (lz, lw) = if multi_lod { lod_encode(i) } else { (0, 0) };
             instances.push(InstanceGpuRecord {
                 m0: [a[0], a[1], a[2], a[3]],
                 m1: [a[4], a[5], a[6], a[7]],
                 m2: [a[8], a[9], a[10], a[11]],
-                ids: [mesh_meta.len() as u32, inst.flags, 0, 0],
+                ids: [mesh_meta.len() as u32, inst.flags, lz, lw],
                 sphere: [center.x, center.y, center.z, radius],
             });
             if first_center.is_none() {
@@ -3260,6 +3318,7 @@ fn prepare_gpu_buffers(
         frustum: [[0.0; 4]; 6],
         counts: [cpu.instance_total, cpu.mesh_count, 0, 0],
         cam_k: [0.0; 4],
+        lod_params: [1.0, 1.0, 0.0, 0.0], // proj11=1, bias=1, mode=0 (max detail) until upload_frustum
     };
     let cull_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_cull_uniform"),
@@ -4615,6 +4674,23 @@ fn upload_frustum(
             0,
         ],
         cam_k: [cam_pos.x, cam_pos.y, cam_pos.z, px_gen / denom],
+        // distance-LOD: proj11 for the screen-height metric; mode/bias from the graphics panel
+        // (default mode 0 = max detail = today's look). Sentinel-window instances ignore it.
+        lod_params: {
+            let (mode, bias, forced) = settings
+                .as_ref()
+                .map(|g| {
+                    if g.lod_force >= 0 {
+                        (2.0, 1.0, g.lod_force as f32) // force shell N (debug)
+                    } else if g.lod_distance {
+                        (1.0, g.lod_bias.max(0.05), 0.0) // distance-based
+                    } else {
+                        (0.0, 1.0, 0.0) // max detail (default)
+                    }
+                })
+                .unwrap_or((0.0, 1.0, 0.0));
+            [proj11, bias, mode, forced]
+        },
     };
     render_queue.write_buffer(&buffers.cull_uniform, 0, bytemuck::bytes_of(&uniform));
 }
