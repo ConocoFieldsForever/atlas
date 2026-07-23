@@ -29,7 +29,7 @@ struct InstanceGpu {
     m0: vec4<f32>,      // ROW-MAJOR world 3x4 affine, row 0 (incl shear+mirror)
     m1: vec4<f32>,      // row 1
     m2: vec4<f32>,      // row 2
-    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class(1=grass)+lod bits(8=is_default,9..12=lod_index)  w=lod window (pack2x16float(near',far'); 0=sentinel/always-draw)
+    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class(1=grass)+lod bits(8=is_default,9..12=lod_index,13..31=lod_group id)  w=lod window (pack2x16float(near',far'); 0=sentinel/always-draw)
     sphere: vec4<f32>,  // xyz = world-space center, w = conservative world radius
 };
 
@@ -70,6 +70,7 @@ struct CullGlobals {
 @group(0) @binding(3) var<storage, read_write>  visible: array<u32>;
 @group(0) @binding(4) var<storage, read_write>  indirect: array<DrawArgs>;        // P1 opaque (+ shadow casters)
 @group(0) @binding(5) var<storage, read_write>  indirect_blend: array<DrawArgs>;  // P2 per-mesh blend draws
+@group(0) @binding(6) var<storage, read>        lod_centers: array<vec4<f32>>;    // B1 per-group ref center (indexed by ids.z>>13)
 
 @compute @workgroup_size(64)
 fn cs_reset(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -151,9 +152,13 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Max detail (default / today's look): draw only the default (finest-present) shell.
             if ((inst.ids.z & 256u) == 0u) { return; }
         } else if (mode == 1u) {
-            // Distance-based: draw shell i iff dist in [near'_i, far'_i) * proj11 * bias.
+            // Distance-based: draw shell i iff dist in (near'_i, far'_i] * proj11 * bias. B1: measure
+            // from the group's SHARED reference center (all shells/renderers of a group switch as a
+            // unit) — NOT this shell's own bounding-sphere centroid, which differs per LOD mesh and
+            // would leave a double-draw/hole seam at every boundary. Group id rides ids.z bits 13+.
             let ab = unpack2x16float(inst.ids.w);
-            let d = max(distance(G.cam_k.xyz, sphere.xyz), 1e-3);
+            let gid = min(inst.ids.z >> 13u, arrayLength(&lod_centers) - 1u);
+            let d = max(distance(G.cam_k.xyz, lod_centers[gid].xyz), 1e-3);
             let m = G.lod_params.x * G.lod_params.y;
             if (!(d > ab.x * m && d <= ab.y * m)) { return; }
         } else {

@@ -1020,6 +1020,12 @@ pub struct CpuData {
     /// Swing doors (gamedata) the viewer can open on click. Matched to their GPU instance +
     /// animated in `prepare_gpu_buffers` / `animate_doors`.
     doors: Vec<crate::eftpack::LevelDoor>,
+    /// B1 distance-LOD: per-lod_group reference center (already conjugated by the emitter), indexed
+    /// by `lod_group` (== manifest.lod_groups order). `cs_cull` mode 1 measures the shell-switch
+    /// distance from THIS shared point (via the group id packed in `ids.z` bits 13+), not each
+    /// shell's own bounding-sphere centroid, so every renderer/shell in a group switches together
+    /// (no per-boundary double-draw/hole from mismatched centroids). >=1 element (never zero-sized).
+    lod_centers: Vec<[f32; 4]>,
 }
 
 /// The repacked CPU geometry blob + the `MapEpoch` it was built for. `prepare_gpu_buffers` builds
@@ -1353,6 +1359,12 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         if inst.lod_group < 0 {
             return (z, 0); // ungrouped: always drawn
         }
+        // B1: the group id rides ids.z bits 13-31 (19 bits) so cs_cull can look up the group's
+        // shared reference center. A pack with >=2^19 groups can't encode it — fall back to the
+        // always-draw sentinel (never happens; interchange, the largest, has ~77k groups).
+        if (inst.lod_group as u32) >= (1u32 << 19) {
+            return (z, 0);
+        }
         let Some(present) = lod_present.get(&inst.lod_group) else {
             return (z, 0);
         };
@@ -1394,6 +1406,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         // B5: a genuine window must never quantize to the 0 sentinel (would make a real shell always
         // draw). Only possible if both halves underflow f16 (sub-nanometer geometry) — bump to the
         // smallest representable far so ids.w stays non-zero. No effect on any realistic pack.
+        // B1: OR the group id into ids.z bits 13+ so cs_cull mode-1 measures distance from the
+        // group's shared reference center (lod_centers[group]) instead of this shell's own centroid.
+        let z = z | ((inst.lod_group as u32) << 13);
         (z, if w == 0 { 1 } else { w })
     };
     let local_spheres = match pack.bounding_spheres() {
@@ -2578,6 +2593,18 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         instance_total,
         mesh_count,
         doors: pack.doors.clone(),
+        // B1: per-group reference center for the mode-1 distance metric, indexed by lod_group.
+        // Padded to >=1 so the storage buffer is never zero-sized (wgpu rejects that); on a lean
+        // pack it's bound but never read (every instance is a sentinel, mode-1 is skipped).
+        lod_centers: if pack.manifest.lod_groups.is_empty() {
+            vec![[0.0; 4]]
+        } else {
+            pack.manifest
+                .lod_groups
+                .iter()
+                .map(|g| [g.center[0], g.center[1], g.center[2], 0.0])
+                .collect()
+        },
     })
 }
 
@@ -2867,6 +2894,7 @@ fn init_gpu_pipelines(
                 storage_buffer_sized(false, None),           // 3: visible (rw)
                 storage_buffer_sized(false, None),           // 4: indirect OPAQUE (rw)
                 storage_buffer_sized(false, None),           // 5: indirect BLEND (rw)
+                storage_buffer_read_only_sized(false, None), // 6: lod_centers (B1 group-center metric)
             ),
         ),
     );
@@ -3346,6 +3374,13 @@ fn prepare_gpu_buffers(
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     });
 
+    // B1: per-group reference centers for the mode-1 distance metric (indexed by the group id in
+    // ids.z bits 13+). Read-only; never read on lean packs (mode-1 unreachable) but always bound.
+    let lod_centers = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_gpu_lod_centers"),
+        contents: bytemuck::cast_slice(&cpu.lod_centers),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
     let cull_bg = render_device.create_bind_group(
         "eft_cull_bg",
         &compute.cull_layout,
@@ -3356,6 +3391,7 @@ fn prepare_gpu_buffers(
             visible.as_entire_binding(),
             indirect.as_entire_binding(),
             indirect_blend.as_entire_binding(),
+            lod_centers.as_entire_binding(),
         )),
     );
     let draw_bg = render_device.create_bind_group(
