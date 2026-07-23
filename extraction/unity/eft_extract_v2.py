@@ -354,11 +354,13 @@ def _bilinear(arr, fy, fx, wrap=False):
     return top * (1 - wy) + bot * wy
 
 
-def bake_terrain_albedo(td, res_out=4096, ss=2):
-    """Composite a MicroSplat terrain's layers by its splat-alpha control maps into ONE albedo image.
-    Tiling comes FROM THE GAME (MicroSplat _UVScale x _PerTexProps), NOT the garbage TerrainLayer.m_TileSize that
-    was tiling grass every 137m ("massive grass"). Supersampled (ss x ss) so the now-fine real tiling (~1.8m grass)
-    doesn't alias in the fixed-res bake. (A live tiling splat is sharper at extreme zoom; this is the from-game bake.)"""
+def _terrain_bake_prepare(td, res_out=4096, ss=2):
+    """F1 phase 1 (MAIN THREAD): every UnityPy/PIL read for one terrain tile's albedo bake — control
+    maps, layer diffuse decodes, tiling params — plus the pass-invariant W0 center weights. Returns
+    the pure-numpy inputs for `_terrain_bake_composite`, or None exactly where the old single-pass
+    bake returned None. Split so composites can run CONCURRENTLY ACROSS TILES (F1) without touching
+    UnityPy off the main thread; the statements are verbatim from the old bake — same math, same
+    accumulation order, bit-identical output."""
     sdb = g(td, "m_SplatDatabase")
     if sdb is None: return None
     layers = g(sdb, "m_TerrainLayers", "m_Splats", "m_SplatPrototypes") or []
@@ -411,6 +413,14 @@ def bake_terrain_albedo(td, res_out=4096, ss=2):
         w = _bilinear(ctrl[tex_i][..., ch], ci, cj, wrap=False)
         W0[(tex_i, ch)] = w if w.max() > 0.001 else None
     LD = [e for e in LD if W0[(e[0], e[1])] is not None]
+    return {"R": R, "ss": ss, "LD": LD, "W0": W0}
+
+
+def _terrain_bake_composite(prep):
+    """F1 phase 2 (ANY THREAD): the pure-numpy supersampled composite. No UnityPy access — safe to
+    run several tiles concurrently. Per-tile accumulation order is fixed (ex.map yields in pass
+    order), so the output is bit-identical to the sequential bake regardless of concurrency."""
+    R, ss, LD, W0 = prep["R"], prep["ss"], prep["LD"], prep["W0"]
 
     def _pass(a, b):
         alb = np.zeros((R, R, 3), np.float32); ws = np.zeros((R, R), np.float32)
@@ -447,6 +457,16 @@ def bake_terrain_albedo(td, res_out=4096, ss=2):
     out = np.clip(out, 0, 1)
     from PIL import Image
     return Image.fromarray((out * 255).astype(np.uint8), "RGB")
+
+
+def bake_terrain_albedo(td, res_out=4096, ss=2):
+    """Composite a MicroSplat terrain's layers by its splat-alpha control maps into ONE albedo image.
+    Tiling comes FROM THE GAME (MicroSplat _UVScale x _PerTexProps), NOT the garbage TerrainLayer.m_TileSize that
+    was tiling grass every 137m ("massive grass"). Supersampled (ss x ss) so the now-fine real tiling (~1.8m grass)
+    doesn't alias in the fixed-res bake. (A live tiling splat is sharper at extreme zoom; this is the from-game bake.)
+    F1: thin wrapper over prepare (UnityPy reads) + composite (pure numpy) — see those for the split rationale."""
+    prep = _terrain_bake_prepare(td, res_out, ss)
+    return None if prep is None else _terrain_bake_composite(prep)
 
 
 def export_terrain_splat(td, tname, splat_root, manifest, layer_saved, thresh=0.005):
@@ -1120,7 +1140,14 @@ def main():
                     continue
 
         # ---- terrain ----
+        # F1 (the 961s Reserve tail): a level's terrain TILES used to bake strictly sequentially
+        # inside this loop while every other core idled. PASS 1 (main thread, UnityPy-safe) does the
+        # reads: OBJ export, splat export, instance record, and `_terrain_bake_prepare` for each tile
+        # whose albedo PNG is missing. PASS 2 runs the pure-numpy `_terrain_bake_composite` for those
+        # tiles CONCURRENTLY (each tile's internal math + accumulation order is unchanged, so every
+        # PNG is bit-identical to the sequential bake). EFT_TERRAIN_TILE_JOBS=1 forces sequential.
         tcnt = 0
+        _tile_jobs = []   # (tname, alb_path, prep) — composites deferred to pass 2
         for o in env.objects:
             if o.type.name != "Terrain": continue
             try:
@@ -1136,8 +1163,9 @@ def main():
                 # L18: re-bake if the PNG is missing OR a 0-byte stub from a truncated/failed prior run (mirrors the
                 # mesh-export size guard) so a pre-fix or partially-written albedo is never silently reused.
                 if (not os.path.exists(alb_path)) or os.path.getsize(alb_path) == 0:
-                    alb = bake_terrain_albedo(tdata)
-                    if alb is not None: _atomic_write(alb_path, lambda t: _save_png(t, alb))
+                    prep = _terrain_bake_prepare(tdata)
+                    if prep is not None:
+                        _tile_jobs.append((tname, alb_path, prep))
                     else:
                         alb_name = None
                         if os.path.exists(alb_path) and os.path.getsize(alb_path) == 0:
@@ -1155,6 +1183,28 @@ def main():
                 tcnt += 1
             except Exception as e:
                 print(f"  terrain err: {e}")
+        if _tile_jobs:
+            def _bake_tile(job):
+                tname, alb_path, prep = job
+                try:
+                    img = _terrain_bake_composite(prep)
+                    _atomic_write(alb_path, lambda tmp, _img=img: _save_png(tmp, _img))
+                    return None
+                except Exception as e:
+                    return f"  terrain bake err ({tname}): {e}"
+            _tj = os.environ.get("EFT_TERRAIN_TILE_JOBS", "").strip()
+            _tj = int(_tj) if _tj.isdigit() and int(_tj) > 0 else 4
+            n_jobs = min(_tj, len(_tile_jobs))
+            if n_jobs > 1:
+                with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+                    for err in ex.map(_bake_tile, _tile_jobs):
+                        if err: print(err)
+                print(f"  terrain: composited {len(_tile_jobs)} tile(s) across {n_jobs} threads")
+            else:
+                for job in _tile_jobs:
+                    err = _bake_tile(job)
+                    if err: print(err)
+            _tile_jobs.clear()
         print(f"level{lv}: +{cnt} mesh +{tcnt} terrain  total={len(instances)} meshes={len([v for v in exported.values() if v])} tex={len(tex_done)} ({time.time()-t0:.0f}s)", flush=True)
         del env, tfm, wcache, go2tf, _tf, _goc, mesh_intrinsic; gc.collect()
 
