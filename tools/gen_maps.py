@@ -114,8 +114,15 @@ _LEGACY_LIGHT_LEVELS = {
 # A scene is a SERVICE scene (no renderable geometry) if any underscore-token of its basename is here.
 # _Sound and _Design* are intentionally NOT excluded -- the hand-tuned configs keep them near-
 # universally and the extractor tolerates their low/zero mesh yield (keeps derived == config closer).
+# "light"/"lights" are NOT here: a `*_Light` scene is NOT pure light-source data -- it also holds real
+# GEOMETRY that only lives there (lamp fixtures, and VEHICLES whose headlights/lanterns are light
+# sources -- e.g. reserve's Kamaz_4310_cargo, which sat under the warehouse crates and was silently
+# dropped, so the crates floated). Excluding light scenes therefore drops that geometry on EVERY map.
+# The separate light-source extraction uses derive_light_scenes()'s own "light" token check, so keeping
+# light scenes in the GEOMETRY set does not affect light baking. Truly-mesh-less scenes (ai/scripts/
+# culling/navmesh/...) still yield ~nothing, so including them is harmless; excluding them just trims work.
 SERVICE_TOKENS = {
-    "ai", "scripts", "culling", "light", "quests", "portals", "stencil",
+    "ai", "scripts", "culling", "quests", "portals", "stencil",
     "develop", "levelborders", "navmesh", "cutscene", "cutscenes",
 }
 
