@@ -38,13 +38,21 @@ bevy_egui = { workspace = true }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 texpresso = "2.0.2"
 # Native folder picker for the first-run onboarding (choose where extracted datasets live).
-# default-features off = just the OS-native dialog, no Linux async/portal runtimes.
+# default-features off = just the OS-native dialog, no Linux async/portal runtimes. Windows/macOS
+# have a built-in native backend with no extra feature needed; Linux has none built in and rfd's
+# build.rs hard-errors unless one of gtk3/xdg-portal is picked explicitly (see the Linux-only
+# override below), so this bare line only takes effect on Windows/macOS.
 rfd = { version = "0.15", default-features = false }
 # System UI language detection for the EN/RU default (overridable in the menu).
 sys-locale = "0.3"
 # Data-parallel column casting in the portable CPU nav baker (nav_bake). Already in the tree as a
 # transitive dep (Bevy/wgpu), so this pins no new version — just makes it a direct dependency.
 rayon = "1"
+
+# Linux has no native folder-picker backend built into rfd; pick GTK3 (synchronous, no portal
+# daemon required, matches the libgtk-3-dev the project already needs for other things).
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 
 [features]
 # egui is structural (ui/menu/inspect are unconditional modules); the feature remains as a
