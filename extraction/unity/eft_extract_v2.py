@@ -1218,6 +1218,27 @@ def main():
         os.makedirs(splat_root, exist_ok=True)
         json.dump(terrain_manifest, open(os.path.join(splat_root, "manifest.json"), "w"), indent=1)
         print(f"terrain splat: {len(terrain_manifest['tiles'])} tiles, {len(_layer_saved)} layer textures -> {splat_root}")
+    # --terrain-only GUARD: this mode re-bakes/exports terrain for levels of an EXISTING dataset, but
+    # scene.json used to be rewritten unconditionally with only THIS run's instances — a 3s terrain
+    # touch-up nuked a 110k-instance scene graph (a 17-minute extraction) down to 4 terrain records.
+    # In terrain-only mode, MERGE instead: keep every non-terrain instance and all lodGroups from the
+    # existing scene.json, and replace only the terrain instances of the levels processed this run.
+    scene_path = os.path.join(out, "scene.json")
+    if args.terrain_only and os.path.exists(scene_path):
+        try:
+            old = json.load(open(scene_path))
+            run_lvs = {it["lv"] for it in instances}
+            kept = [it for it in (old.get("instances") or [])
+                    if not (it.get("kind") == "terrain" and it.get("lv") in run_lvs)]
+            merged = kept + instances
+            if len(old.get("instances") or []) > len(instances):
+                print(f"  terrain-only: merged {len(instances)} terrain instance(s) into existing "
+                      f"scene.json ({len(kept)} kept, {len(merged)} total)", flush=True)
+                instances = merged
+                lodgroups = old.get("lodGroups") or lodgroups
+                levels = sorted(set(old.get("levels") or []) | set(levels))
+        except Exception as e:
+            print(f"  terrain-only: scene merge failed ({e}) - writing this run's scene as-is", flush=True)
     json.dump({"instances": instances, "up": "unity", "levels": levels, "lodGroups": lodgroups, "lod_schema": 1,
                "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"},
               open(os.path.join(out, "scene.json"), "w"))
