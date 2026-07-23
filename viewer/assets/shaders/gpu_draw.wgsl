@@ -970,6 +970,7 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // times a far contact fade, times the PCF occlusion (1 - visibility). Fully gated off (0) when
     // the feature is disabled (sun_dir missing or not EFT_SHADOWS=1), so the render is identical to today.
     var shadow_event = 0.0;
+    var sun_diffuse = vec3<f32>(0.0); // B4-M: additive direct-sun diffuse (indirect-only bakes)
     if (sun.split_depths.w > 0.5) {
         let Lsun = sun.sun_dir_texel.xyz;
         let align = dot(dom.dir, Lsun);
@@ -982,6 +983,17 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let contact_fade = 1.0 - smoothstep(sun.combine.y, sun.combine.z, view_depth); // 65..80 m
         let shadow_vis = sun_shadow_visibility(o.world_pos, Ng, view_depth);
         shadow_event = sun_lit_gate * contact_fade * (1.0 - shadow_vis);
+        // B4-M: the SH carries sky + bounce ONLY (indirect-only bake), so there is no direct-sun
+        // Lambert term and sunlit exteriors read flat vs the game. Add a sun diffuse on surfaces
+        // FACING the sun that the shadow map says are lit. Gate on N·Lsun × shadow_vis ONLY — NOT
+        // `sun_lit_gate`, whose SH-directionality/align requirement is ~0 on an intentionally
+        // sky-dominant indirect SH and would cancel the very term we want. Tinted by dom.radiance
+        // (the map's daylight colour/level -> auto-scales, no blow-out, no new uniform). Only when
+        // realtime lighting is on. Strength = lgrid.params.w (EFT_SUN_DIFFUSE, set to 0 on a FULL
+        // bake so the already-integrated sun is never double-counted). Live-tunable, no rebuild.
+        if (lgrid.params.w > 0.0) {
+            sun_diffuse = dom.radiance * (lgrid.params.w * max(NdotSun, 0.0) * shadow_vis);
+        }
     }
 
     // Anti double-darkening combination: the SH volume ALREADY integrates the broad sun shadow, so
@@ -1035,7 +1047,7 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     let rt = eval_realtime_lights(o.world_pos, N, V, rough);
     // SH ambient (× gi_intensity × ambient_scale) + the realtime diffuse (which carries its own
     // light_scale, independent of gi_intensity), all modulated by albedo.
-    let lit = albedo.rgb * (gi_shadowed * sh.vol_min.w * lgrid.params.y + rt.diffuse);
+    let lit = albedo.rgb * (gi_shadowed * sh.vol_min.w * lgrid.params.y + rt.diffuse + sun_diffuse);
 
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {

@@ -400,7 +400,8 @@ struct LightGridUniform {
     grid_min: [f32; 4],
     /// xyz = grid dims, w = n_lights (0 => the shader skips the whole loop).
     grid_dims: [u32; 4],
-    /// x = light_scale, y = ambient_scale, z = rt_enabled (1/0), w unused.
+    /// x = light_scale, y = ambient_scale, z = rt_enabled (1/0), w = B4-M sun-diffuse strength
+    /// (EFT_SUN_DIFFUSE, 0 on a full/direct bake so it never double-counts the baked sun).
     params: [f32; 4],
 }
 const _: () = assert!(std::mem::size_of::<LightGridUniform>() == 48);
@@ -433,6 +434,11 @@ fn env_f32(name: &str, default: f32) -> f32 {
 fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enabled: bool) -> LightGridCpu {
     let light_scale = env_f32("EFT_LIGHT_SCALE", DEFAULT_LIGHT_SCALE);
     let ambient_scale = env_f32("EFT_AMBIENT_SCALE", 1.0);
+    // B4-M: additive direct-sun diffuse for indirect-only bakes (the SH carries sky+bounce only, so
+    // sunlit exteriors read flat). Strength lives in params.w; ONLY when rt_enabled (indirect-only /
+    // no-volume) so a FULL bake — which already integrates the sun — leaves it 0 and never
+    // double-counts. Live-tunable via EFT_SUN_DIFFUSE (0 = off).
+    let sun_diffuse = if rt_enabled { env_f32("EFT_SUN_DIFFUSE", 0.8) } else { 0.0 };
 
     // Pack the light records (>=1 element so the storage buffer is never zero-sized).
     let mut lbuf: Vec<[f32; 4]> = Vec::with_capacity(lights.len().max(1) * 3);
@@ -456,7 +462,7 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
             uniform: LightGridUniform {
                 grid_min: [min.x, min.y, min.z, 8.0],
                 grid_dims: [1, 1, 1, 0],
-                params: [light_scale, ambient_scale, 0.0, 0.0],
+                params: [light_scale, ambient_scale, 0.0, sun_diffuse],
             },
             lights: lbuf,
             grid: vec![2u32, 2u32],
@@ -557,7 +563,7 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
         uniform: LightGridUniform {
             grid_min: [min.x, min.y, min.z, cell],
             grid_dims: [nx, ny, nz, lights.len() as u32],
-            params: [light_scale, ambient_scale, 1.0, 0.0],
+            params: [light_scale, ambient_scale, 1.0, sun_diffuse],
         },
         lights: lbuf,
         grid,
