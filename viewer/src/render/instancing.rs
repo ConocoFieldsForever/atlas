@@ -59,8 +59,10 @@ use crate::eftpack::Pack;
 const SHADER_ASSET_PATH: &str = "shaders/instancing_m0.wgsl";
 
 /// Bevy resource wrapping the loaded pack (inserted by `main` before app build).
+/// Holds the pack behind an `Arc` so the off-thread `build_cpu_data` task can share it
+/// (cheap clone) without copying the ~hundreds-of-MiB `meshes.bin` blob.
 #[derive(Resource)]
-pub struct LoadedPack(pub Pack);
+pub struct LoadedPack(pub std::sync::Arc<Pack>);
 
 /// Plugin: builds the pack's meshes into entities and installs the custom
 /// instanced draw in the render app.
