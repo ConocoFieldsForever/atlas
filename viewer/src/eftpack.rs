@@ -119,7 +119,7 @@ pub struct VertexLayout {
 }
 
 impl VertexLayout {
-    fn attr(&self, name: &str) -> Option<&Attr> {
+    pub fn attr(&self, name: &str) -> Option<&Attr> {
         self.attrs.iter().find(|a| a.name == name)
     }
 }
@@ -1071,11 +1071,11 @@ fn parse_instances(layout: &InstanceLayout, bin: &[u8]) -> Result<Vec<GpuInstanc
 // little-endian primitive readers (alignment-safe)
 // ---------------------------------------------------------------------------
 #[inline]
-fn read_f32(b: &[u8], o: usize) -> f32 {
+pub(crate) fn read_f32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 #[inline]
-fn read_u32(b: &[u8], o: usize) -> u32 {
+pub(crate) fn read_u32(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 #[inline]
@@ -1083,7 +1083,7 @@ fn read_i32(b: &[u8], o: usize) -> i32 {
     i32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 #[inline]
-fn read_vec3(b: &[u8], o: usize) -> Vec3 {
+pub(crate) fn read_vec3(b: &[u8], o: usize) -> Vec3 {
     Vec3::new(read_f32(b, o), read_f32(b, o + 4), read_f32(b, o + 8))
 }
 

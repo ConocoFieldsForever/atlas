@@ -1898,25 +1898,83 @@ fn build_cpu_data(
     let mut idx_cursor: u32 = 0;
     let mut inst_cursor: u32 = 0;
 
+    // --- Fused raw->GPU geometry encoder (PERF: was pack.mesh_geom() per mesh = 5 temp Vecs +
+    // a UV clone + interleave-append; now reads the pack's interleaved bytes ONCE per vertex and
+    // writes final GPU records directly into pre-reserved buffers. Byte-identical output is gated
+    // by EFT_GEOM_SHA=1 against the old path.) The vertex layout is pack-wide (one manifest.vertex
+    // for every mesh), so hoist the attribute offsets out of the loop. ----
+    let vlayout = &pack.manifest.vertex;
+    let vstride = vlayout.stride as usize;
+    let pos_off = vlayout
+        .attr("position")
+        .map(|a| a.offset as usize)
+        .expect("vertex layout must define a 'position' attribute");
+    let nrm_off = vlayout.attr("normal").map(|a| a.offset as usize);
+    let uv_off = vlayout.attr("uv").map(|a| a.offset as usize);
+    let col_off = vlayout.attr("color").map(|a| a.offset as usize);
+    let mbin: &[u8] = &pack.meshes_bin;
+    let blen = mbin.len();
+    // Exact-size the destination buffers up front (over-reserves only for the rare mesh later
+    // skipped by an OOB/empty guard, which is harmless). 13 f32 per vertex; 1 u32 per index.
+    // The grass block later appends a fixed 12-vertex / 18-index cross-quad; include that headroom
+    // so a single trailing append can't force a full-buffer doubling realloc (~340ms on a 937MiB
+    // vertex buffer). instances/mesh_meta are sized to the non-grass counts (grass adds a small,
+    // cheap-to-grow tail).
+    {
+        let (mut tot_v, mut tot_i, mut tot_inst, mut tot_mesh) = (0usize, 0usize, 0usize, 0usize);
+        for (mi, m) in pack.manifest.meshes.iter().enumerate() {
+            if by_mesh[mi].is_empty() {
+                continue;
+            }
+            tot_v += m.vtx_count as usize;
+            tot_i += m.idx_count as usize;
+            tot_inst += by_mesh[mi].len();
+            tot_mesh += 1;
+        }
+        const GRASS_VERTS: usize = 12; // 3 cross-quads * 4 verts
+        const GRASS_IDX: usize = 18; // 3 quads * 6 indices
+        vertex_data.reserve(tot_v * 13 + GRASS_VERTS * 13);
+        index_data.reserve(tot_i + GRASS_IDX);
+        instances.reserve(tot_inst);
+        mesh_meta.reserve(tot_mesh + 1);
+    }
+    // Reused per-mesh scratch (cleared+resized each mesh; avoids the per-mesh Vec allocations).
+    let mut vert_mat: Vec<u32> = Vec::new();
+    let mut vert_uv: Vec<[f32; 2]> = Vec::new();
+
     for (mi, m) in pack.manifest.meshes.iter().enumerate() {
         let inst_ids = &by_mesh[mi];
         if inst_ids.is_empty() {
             continue; // orphan mesh â€” nothing references it
         }
-        let geom = match pack.mesh_geom(m) {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("gpu-driven: mesh {} '{}' skipped: {:#}", m.id, m.name, e);
-                continue;
-            }
-        };
-        if geom.positions.is_empty() || geom.indices.is_empty() {
+        // --- fused raw->GPU encode: slice this mesh's interleaved vertex + index bytes directly
+        // out of meshes.bin (== the old vertex_bytes(m)/index_bytes(m)) and validate the byte
+        // ranges, replicating mesh_geom()'s OOB guard (skip+warn) exactly. ---
+        let n = m.vtx_count as usize;
+        let ni = m.idx_count as usize;
+        let vtx_end = m.vtx_offset as usize + n * vstride;
+        let idx_end = m.idx_offset as usize + ni * 4;
+        if vtx_end > blen || idx_end > blen {
+            warn!(
+                "gpu-driven: mesh {} '{}' skipped: byte range out of bounds",
+                m.id, m.name
+            );
             continue;
         }
+        if n == 0 || ni == 0 {
+            continue;
+        }
+        let vb = &mbin[m.vtx_offset as usize..vtx_end];
+        let ib = &mbin[m.idx_offset as usize..idx_end];
 
         // --- geometry into the global vertex/index buffers (offsets we own) ---
         let base_vertex = vtx_cursor as i32;
-        let n = geom.positions.len();
+
+        // Append this mesh's (mesh-local) indices straight from bytes; borrow them back for the
+        // per-vertex material scatter + puddle detection (identical to reading geom.indices).
+        let idx_data_start = index_data.len();
+        index_data.extend((0..ni).map(|i| crate::eftpack::read_u32(ib, i * 4)));
+        let local_idx = &index_data[idx_data_start..];
 
         // M3: per-vertex material index. Each submesh is a contiguous index range into this
         // mesh's single vertex array; across ALL multi-submesh meshes in this pack the
@@ -1926,11 +1984,12 @@ fn build_cpu_data(
         // absent from the drawn index run), so the fallback material is irrelevant; we seed
         // it to the first submesh's id for safety.
         let default_mat = m.submeshes.first().map(|s| s.material_id).unwrap_or(0);
-        let mut vert_mat: Vec<u32> = vec![default_mat; n];
+        vert_mat.clear();
+        vert_mat.resize(n, default_mat);
         for sm in &m.submeshes {
             let start = sm.idx_start as usize;
             let end = start + sm.idx_count as usize;
-            for &vi in &geom.indices[start..end.min(geom.indices.len())] {
+            for &vi in &local_idx[start..end.min(local_idx.len())] {
                 if (vi as usize) < n {
                     vert_mat[vi as usize] = sm.material_id;
                 }
@@ -1957,9 +2016,15 @@ fn build_cpu_data(
         const PUDDLE_TARGET_M: f32 = 6.0; // one soft blob per ~6 m (decal_plane puddles are ~5 m)
         const PUDDLE_STRETCH_MIN: f32 = 15.0; // m-per-UV-tile above which a water decal is "stretched"
         const PUDDLE_MIN_WIDTH_M: f32 = 3.0; // 2nd-widest local axis must exceed this (else a 1D streak)
-        let mut vert_uv: Vec<[f32; 2]> = geom.uvs.clone();
-        if vert_uv.len() < n {
-            vert_uv.resize(n, [0.0, 0.0]);
+        // Base UVs straight from the interleaved bytes (== mesh_geom's geom.uvs: the raw uv attr,
+        // or [0,0] when the layout has no uv). Puddle re-UV may overwrite entries below.
+        vert_uv.clear();
+        match uv_off {
+            Some(uo) => vert_uv.extend((0..n).map(|k| {
+                let b = k * vstride + uo;
+                [crate::eftpack::read_f32(vb, b), crate::eftpack::read_f32(vb, b + 4)]
+            })),
+            None => vert_uv.resize(n, [0.0, 0.0]),
         }
         for sm in &m.submeshes {
             let mid = sm.material_id as usize;
@@ -1968,25 +2033,30 @@ fn build_cpu_data(
                 continue;
             }
             let s0 = sm.idx_start as usize;
-            let s1 = (s0 + sm.idx_count as usize).min(geom.indices.len());
+            let s1 = (s0 + sm.idx_count as usize).min(local_idx.len());
             if s1 <= s0 {
                 continue;
             }
-            let idx = &geom.indices[s0..s1];
+            let idx = &local_idx[s0..s1];
             // Local position bounds + baked-UV span (span only used to detect the stretch ratio).
+            // Positions/UVs read from bytes; guard vi<n replicates geom.positions.get(vi)==Some.
             let (mut pmin, mut pmax) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
             let (mut umin, mut umax) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
             for &vi in idx {
-                if let Some(p) = geom.positions.get(vi as usize) {
-                    let v = Vec3::from(*p);
+                let vi = vi as usize;
+                if vi < n {
+                    let v = crate::eftpack::read_vec3(vb, vi * vstride + pos_off);
                     pmin = pmin.min(v);
                     pmax = pmax.max(v);
-                }
-                if let Some(uv) = geom.uvs.get(vi as usize) {
-                    umin[0] = umin[0].min(uv[0]);
-                    umax[0] = umax[0].max(uv[0]);
-                    umin[1] = umin[1].min(uv[1]);
-                    umax[1] = umax[1].max(uv[1]);
+                    if let Some(uo) = uv_off {
+                        let b = vi * vstride + uo;
+                        let u0 = crate::eftpack::read_f32(vb, b);
+                        let u1 = crate::eftpack::read_f32(vb, b + 4);
+                        umin[0] = umin[0].min(u0);
+                        umax[0] = umax[0].max(u0);
+                        umin[1] = umin[1].min(u1);
+                        umax[1] = umax[1].max(u1);
+                    }
                 }
             }
             if !pmin.is_finite() {
@@ -2009,24 +2079,38 @@ fn build_cpu_data(
             for &vi in idx {
                 let vi = vi as usize;
                 if vi < n && vert_mat[vi] == sm.material_id {
-                    if let Some(p) = geom.positions.get(vi) {
-                        vert_uv[vi] = [
-                            (p[a_u] - cu) / PUDDLE_TARGET_M,
-                            (p[a_v] - cv) / PUDDLE_TARGET_M,
-                        ];
-                    }
+                    let p = crate::eftpack::read_vec3(vb, vi * vstride + pos_off).to_array();
+                    vert_uv[vi] = [
+                        (p[a_u] - cu) / PUDDLE_TARGET_M,
+                        (p[a_v] - cv) / PUDDLE_TARGET_M,
+                    ];
                 }
             }
         }
 
         for k in 0..n {
-            let p = geom.positions[k];
-            let nrm = *geom.normals.get(k).unwrap_or(&[0.0, 1.0, 0.0]);
+            let base = k * vstride;
+            let p = crate::eftpack::read_vec3(vb, base + pos_off).to_array();
+            let nrm = match nrm_off {
+                Some(o) => crate::eftpack::read_vec3(vb, base + o).to_array(),
+                None => [0.0, 1.0, 0.0],
+            };
             let uv = *vert_uv.get(k).unwrap_or(&[0.0, 0.0]);
             // M3b2: per-vertex COLOR_0 vert-paint weight. Every mesh in this pack carries a
             // color attr (unorm8x4 @32) so geom.colors is populated; default opaque-white for
             // any mesh that lacks it (color.a=1 -> SoftCutout coverage stays fully covered).
-            let col = *geom.colors.get(k).unwrap_or(&[1.0, 1.0, 1.0, 1.0]);
+            let col = match col_off {
+                Some(o) => {
+                    let b = base + o;
+                    [
+                        vb[b] as f32 / 255.0,
+                        vb[b + 1] as f32 / 255.0,
+                        vb[b + 2] as f32 / 255.0,
+                        vb[b + 3] as f32 / 255.0,
+                    ]
+                }
+                None => [1.0, 1.0, 1.0, 1.0],
+            };
             vertex_data.extend_from_slice(&[
                 p[0], p[1], p[2],
                 nrm[0], nrm[1], nrm[2],
@@ -2037,9 +2121,9 @@ fn build_cpu_data(
         }
         vtx_cursor += n as u32;
 
+        // indices were appended (from bytes) at the top of the loop; record the run.
         let first_index = idx_cursor;
-        index_data.extend_from_slice(&geom.indices); // indices are mesh-local
-        let index_count = geom.indices.len() as u32;
+        let index_count = ni as u32;
         idx_cursor += index_count;
 
         // --- instances (grouped-by-mesh, contiguous) with conservative world sphere ---
