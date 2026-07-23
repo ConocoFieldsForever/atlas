@@ -29,7 +29,7 @@ struct InstanceGpu {
     m0: vec4<f32>,      // ROW-MAJOR world 3x4 affine, row 0 (incl shear+mirror)
     m1: vec4<f32>,      // row 1
     m2: vec4<f32>,      // row 2
-    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class (1=grass -> bigger screen-size cull)  w=pad
+    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class(1=grass)+lod bits(8=is_default,9..12=lod_index)  w=lod window (pack2x16float(near',far'); 0=sentinel/always-draw)
     sphere: vec4<f32>,  // xyz = world-space center, w = conservative world radius
 };
 
@@ -60,6 +60,8 @@ struct CullGlobals {
     // k = min_px / (0.5 * viewport_h * proj11). Cull when sphere.w < k * distance(cam, center)
     // (the sphere subtends fewer than min_px pixels). Zeros = disabled (frame-0 seed).
     cam_k: vec4<f32>,
+    // Distance-LOD: x=proj11, y=lod_bias, z=mode (0=max detail, 1=distance, 2=force shell w), w=forced shell.
+    lod_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> G: CullGlobals;
@@ -139,6 +141,25 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (k > 0.0) {
         let d = max(distance(G.cam_k.xyz, sphere.xyz), 1e-3);
         if (sphere.w < k * d) { return; }
+    }
+
+    // Distance-LOD shell selection. ids.w == 0 is the sentinel (always draw): lean packs, ungrouped
+    // instances, and single-present-shell groups. Only multi-shell instances carry a window.
+    if (inst.ids.w != 0u) {
+        let mode = u32(G.lod_params.z);
+        if (mode == 0u) {
+            // Max detail (default / today's look): draw only the default (finest-present) shell.
+            if ((inst.ids.z & 256u) == 0u) { return; }
+        } else if (mode == 1u) {
+            // Distance-based: draw shell i iff dist in [near'_i, far'_i) * proj11 * bias.
+            let ab = unpack2x16float(inst.ids.w);
+            let d = max(distance(G.cam_k.xyz, sphere.xyz), 1e-3);
+            let m = G.lod_params.x * G.lod_params.y;
+            if (!(d > ab.x * m && d <= ab.y * m)) { return; }
+        } else {
+            // Force a single shell index (debug).
+            if (((inst.ids.z >> 9u) & 15u) != u32(G.lod_params.w)) { return; }
+        }
     }
 
     // B5: clamp the instance-supplied mesh id before it indexes mesh_meta / indirect / indirect_blend

@@ -1193,7 +1193,7 @@ impl Pack {
 
     /// Per-lod_group `(min_present, max_present)` lod_index over the instances THIS pack actually
     /// ships. On a lean pack every present group is `(0,0)`; reserve's 34 window groups are `(2,2)`.
-    fn group_lod_range(&self) -> std::collections::HashMap<i32, (i32, i32)> {
+    pub(crate) fn group_lod_range(&self) -> std::collections::HashMap<i32, (i32, i32)> {
         let mut r: std::collections::HashMap<i32, (i32, i32)> = std::collections::HashMap::new();
         for inst in &self.instances {
             if inst.lod_group >= 0 {

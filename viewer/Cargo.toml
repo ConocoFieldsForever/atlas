@@ -23,6 +23,7 @@ bevy = { workspace = true }
 wgpu = { version = "=26.0.1", default-features = false }
 bytemuck = { workspace = true }
 glam = { workspace = true }
+half = "2"                       # f16 packing for the per-instance distance-LOD window (ids.w)
 image = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
