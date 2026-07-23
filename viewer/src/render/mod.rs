@@ -85,11 +85,14 @@ impl Default for GfxSettings {
             })
             .unwrap_or((1.5, 4.0));
         Self {
-            // EFT_FOG=0 for haze-free debug screenshots (A/B comparisons against game captures).
+            // Distance fog default (B4-S): the old 1.0 added a warm-grey haze that flattened mid/far
+            // contrast and paled the sky — fog-off reads markedly more game-accurate (crisper, greener
+            // distance). 0.4 keeps a hint of atmospheric depth without the flattening. EFT_FOG overrides
+            // (0 = off for A/B captures against in-game shots).
             fog: std::env::var("EFT_FOG")
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
-                .unwrap_or(1.0),
+                .unwrap_or(0.4),
             sky_refl: 1.0,
             emissive: 1.0,
             // Sun shadows default ON for every map with a sun_dir; EFT_SHADOWS=0 (or =false) opts OUT.
