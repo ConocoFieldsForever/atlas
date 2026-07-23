@@ -113,6 +113,45 @@ def decode_lamp_array(raw, monos, sc):
     return best
 
 
+# Typed targets a Switch can gate BESIDES its light bank (Codex audit): the same Switch serializes
+# scalar PPtr refs to these. We surface them as evidence-carrying edges (e.g. the power lever also
+# enables an ExfiltrationPoint -> the viewer shows "requires power" on that extract). Name-free.
+SWITCH_TARGET_TYPES = {
+    "EFT.Interactive.ExfiltrationPoint",
+    "EFT.Interactive.ScavExfiltrationPoint",
+    "EFT.Interactive.SharedExfiltrationPoint",
+    "EFT.Interactive.SecretExfiltrations.SecretExfiltrationPoint",
+    "EFT.Interactive.Door",
+    "EFT.Interactive.KeycardDoor",
+    "EFT.Interactive.TransitPoint",
+}
+
+
+def decode_scalar_targets(raw, monos, sc, gos):
+    """Scan a Switch payload for aligned scalar PPtr{FileID=0(int32),PathID(int64)} refs whose target
+    resolves to a known interactive type (SWITCH_TARGET_TYPES). Returns [{type, target_go, offset}]
+    (deduped by target GO). Never infers from names; only a class-validated PPtr counts as an edge."""
+    if not raw:
+        return []
+    out = {}
+    n = len(raw)
+    off = 32
+    while off + 12 <= n:
+        fid, pid = struct.unpack_from("<iq", raw, off)
+        if fid == 0 and pid in monos:
+            cls = mono_class(monos[pid], sc)
+            if cls in SWITCH_TARGET_TYPES:
+                tgo = None
+                try:
+                    tgo = monos[pid].read(check_read=False).m_GameObject.path_id
+                except Exception:
+                    pass
+                if tgo is not None and tgo not in out:
+                    out[tgo] = {"type": cls, "target_go": tgo, "offset": off}
+        off += 4
+    return list(out.values())
+
+
 def world_pos(go_pid, gos, tfm):
     """World-space translation of a GameObject (walk the parent Transform chain)."""
     go2tf = {}
@@ -205,6 +244,21 @@ def find_power_switches(level, objs, tfm, gos, monos, sc):
             label = gos[sgo].read_typetree().get("m_Name", "switch")
         except Exception:
             label = "switch"
+        # Other typed things this switch gates (exfils, doors, transits) -- name-free class-validated
+        # PPtr edges. Resolve each target's GO name + world pos so the viewer can join to its marker.
+        targets = []
+        for t in decode_scalar_targets(raw, monos, sc, gos):
+            tgo = t["target_go"]
+            try:
+                tname = gos[tgo].read_typetree().get("m_Name", "")
+            except Exception:
+                tname = ""
+            targets.append({
+                "type": t["type"],
+                "target_go": tgo,
+                "name": tname,
+                "world_pos": world_pos(tgo, gos, tfm),
+            })
         switches.append({
             "id": f"unity:{level}:mb:{pid}",
             "level": level,
@@ -217,6 +271,7 @@ def find_power_switches(level, objs, tfm, gos, monos, sc):
             "count": len(lamp_pids),
             "controlled_lamp_gos": sorted(lamp_set),
             "controlled_light_gos": sorted(set(light_gos)),
+            "targets": targets,          # exfils/doors/transits this switch also enables
         })
     return switches
 
