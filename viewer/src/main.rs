@@ -363,7 +363,7 @@ fn poll_map_load(
                 None => commands.remove_resource::<GradeLutCpu>(),
             }
             commands.remove_resource::<walk_ground::GroundGrid>();
-            commands.insert_resource(LoadedPack(p));
+            commands.insert_resource(LoadedPack(std::sync::Arc::new(p)));
             commands.insert_resource(render::MapEpoch(epoch.0.wrapping_add(1)));
             load_err.0 = None; // a successful load clears any prior failure toast
         }
@@ -784,7 +784,7 @@ fn main() {
     app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<render::GfxSettings>::default());
 
     if let Some(p) = pack {
-        app.insert_resource(LoadedPack(p));
+        app.insert_resource(LoadedPack(std::sync::Arc::new(p)));
     }
     // In-place map-swap epoch: bumped by `load_map` on each .eftpack swap; extracted to the render
     // world and used as the run_if gate for every per-map (re)build system. Inserted always (menu
@@ -1059,12 +1059,12 @@ fn setup(
     grade: Option<Res<GradeLutCpu>>,
     mut gfx: ResMut<render::GfxSettings>,
 ) {
-    let (cam_pos, target, far, yaw, pitch) = frame_for_pack(pack.as_ref().map(|p| &p.0));
+    let (cam_pos, target, far, yaw, pitch) = frame_for_pack(pack.as_ref().map(|p| &*p.0));
 
     // Sky sun direction from the pack's volume sidecar (same one the SH/shadow path uses, so the
     // skybox sun disk, baked GI and reflected sun agree). The experimental shadow toggle needs a
     // real sun (matches the render side's sun_ok gate).
-    let (sun_dir, sun_ok) = pack_sun_dir(pack.as_ref().map(|p| &p.0));
+    let (sun_dir, sun_ok) = pack_sun_dir(pack.as_ref().map(|p| &*p.0));
     gfx.shadows_available = sun_ok;
     // Menu mode (no pack — same test main() uses): NO skybox — the menu's ClearColor
     // (#090909, set in main) must be the backdrop behind the transparent egui panel /
