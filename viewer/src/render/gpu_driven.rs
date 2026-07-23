@@ -4440,6 +4440,26 @@ fn queue_gpu_driven(
             },
         );
 
+        // B3 (behind EFT_OPAQUE_PREPASS, default OFF): draw the opaque multidraw twice — a depth-only
+        // prepass then an EQUAL-tested color pass — so each opaque pixel is shaded exactly once instead
+        // of once-per-overlapping-fragment. Image-invariant (same frontmost fragment wins); the win is
+        // killing the depth-complexity overdraw in main_transparent_pass_3d (6-11 ms on Reserve). A net
+        // LOSS on low-overdraw scenes (opaque geometry rasterizes twice), hence opt-in. Only the OPAQUE
+        // item changes — every blend/decal/overlay/water item below is byte-for-byte unchanged.
+        static OPAQUE_PREPASS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let opaque_prepass = *OPAQUE_PREPASS
+            .get_or_init(|| std::env::var("EFT_OPAQUE_PREPASS").is_ok_and(|v| v.trim() == "1"));
+        let opaque_depth_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey { samples: msaa.samples(), hdr: view.hdr, pass: DrawPass::OpaqueDepth },
+        );
+        let opaque_equal_pipeline = pipelines.specialize(
+            &pipeline_cache,
+            &draw_pipeline,
+            EftDrawKey { samples: msaa.samples(), hdr: view.hdr, pass: DrawPass::OpaqueEqual },
+        );
+
         let cam_pos = view.world_from_view.translation();
         for (entity, main_entity) in &markers {
             // Transparent3d sorts ASCENDING by distance (values increase toward the camera), so
@@ -4449,15 +4469,39 @@ fn queue_gpu_driven(
             // this replaced the whole-scene P2 re-raster AND gave transparency a stable order
             // (Codex review). Mixed-class meshes draw in both passes; the fragment class-discard
             // splits them.
-            phase.add(Transparent3d {
-                entity: (entity, *main_entity),
-                pipeline: opaque_pipeline,
-                draw_function: draw_fn,
-                distance: -1.0e30, // sort FIRST (writes depth)
-                batch_range: 0..1,
-                extra_index: PhaseItemExtraIndex::None,
-                indexed: true,
-            });
+            if opaque_prepass {
+                // B3: depth-only prepass FIRST (most negative), then the EQUAL-tested color pass.
+                // Both issue the SAME full opaque multidraw (extra_index None -> the `_ =>` arm in
+                // DrawGpuDrivenInner). Both sort before every blend/decal item (all at >= -2e6).
+                phase.add(Transparent3d {
+                    entity: (entity, *main_entity),
+                    pipeline: opaque_depth_pipeline,
+                    draw_function: draw_fn,
+                    distance: -1.0e30 - 1.0e27, // prepass writes depth FIRST
+                    batch_range: 0..1,
+                    extra_index: PhaseItemExtraIndex::None,
+                    indexed: true,
+                });
+                phase.add(Transparent3d {
+                    entity: (entity, *main_entity),
+                    pipeline: opaque_equal_pipeline,
+                    draw_function: draw_fn,
+                    distance: -1.0e30, // color pass, EQUAL against the prepass depth
+                    batch_range: 0..1,
+                    extra_index: PhaseItemExtraIndex::None,
+                    indexed: true,
+                });
+            } else {
+                phase.add(Transparent3d {
+                    entity: (entity, *main_entity),
+                    pipeline: opaque_pipeline,
+                    draw_function: draw_fn,
+                    distance: -1.0e30, // sort FIRST (writes depth)
+                    batch_range: 0..1,
+                    extra_index: PhaseItemExtraIndex::None,
+                    indexed: true,
+                });
+            }
             for (mesh_idx, center, pass_mask) in &_buffers.blend_meshes {
                 let d = (cam_pos - Vec3::from_array(*center)).length();
                 let item = |pipeline, distance| Transparent3d {
@@ -4515,6 +4559,15 @@ fn queue_gpu_driven(
 enum DrawPass {
     /// P1 OPAQUE: blend None, depth-write ON, no bias, A2C for cutout edges. Discards BLEND frags.
     Opaque,
+    /// B3 Z-prepass (behind EFT_OPAQUE_PREPASS): the SAME opaque multidraw as `Opaque`, same vertex
+    /// path + same fragment discards/A2C, but color-write masked OFF -> writes ONLY depth. Establishes
+    /// the frontmost per-pixel depth so the paired `OpaqueEqual` color pass shades each pixel once.
+    OpaqueDepth,
+    /// B3 opaque COLOR pass (behind EFT_OPAQUE_PREPASS): identical shading to `Opaque` but depth-write
+    /// OFF + depth_compare EQUAL against the `OpaqueDepth` prepass -> early-depth rejects every fragment
+    /// that is not the frontmost, killing opaque overdraw. Image-invariant vs `Opaque` (same frontmost
+    /// fragment survives), just far fewer fragment-shader invocations on depth-complex scenes.
+    OpaqueEqual,
     /// True transparency (currently glass): alpha blend, depth-write off, no coplanar bias.
     Blend,
     /// Plain decal and textured-water surface overlays: alpha blend, depth-write off, strong bias.
@@ -4573,9 +4626,10 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
         // perspective divide, exponent-INDEPENDENT, so the decal wins GreaterEqual at every
         // distance/angle. So these passes run with ZERO rasterizer bias; DecalDepth still writes
         // depth, so an open road over a void still occludes the underground (keeps 0d95be1).
-        let (blend, depth_write_enabled, bias, frag_defs, write_mask): (
+        let (blend, depth_write_enabled, depth_compare, bias, frag_defs, write_mask): (
             Option<BlendState>,
             bool,
+            CompareFunction,
             DepthBiasState,
             Vec<bevy::shader::ShaderDefVal>,
             ColorWrites,
@@ -4583,6 +4637,29 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             DrawPass::Opaque => (
                 None,
                 true,
+                CompareFunction::GreaterEqual,
+                DepthBiasState::default(),
+                vec![],
+                ColorWrites::ALL,
+            ),
+            // B3: depth-only prepass — SAME fragment defs as Opaque (identical BLEND-discard + cutout
+            // A2C so it writes EXACTLY the depth Opaque would), color-write masked off.
+            DrawPass::OpaqueDepth => (
+                None,
+                true,
+                CompareFunction::GreaterEqual,
+                DepthBiasState::default(),
+                vec![],
+                ColorWrites::empty(),
+            ),
+            // B3: opaque color — identical shading to Opaque, but depth-write OFF and EQUAL-tested
+            // against the prepass depth (bit-identical vertex math -> exact match) so only the
+            // frontmost fragment shades. Reverse-Z GreaterEqual would also work here, but EQUAL lets
+            // the driver early-reject non-frontmost frags before the fragment stage.
+            DrawPass::OpaqueEqual => (
+                None,
+                false,
+                CompareFunction::Equal,
                 DepthBiasState::default(),
                 vec![],
                 ColorWrites::ALL,
@@ -4595,6 +4672,7 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                 // of its sky reflection and read as a dark tinted slab (render-audit finding #18).
                 Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 false,
+                CompareFunction::GreaterEqual,
                 DepthBiasState::default(),
                 vec!["BLEND_PASS".into()],
                 ColorWrites::ALL,
@@ -4602,6 +4680,7 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             DrawPass::Overlay => (
                 Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 false,
+                CompareFunction::GreaterEqual,
                 DepthBiasState::default(),
                 vec!["BLEND_PASS".into(), "OVERLAY_PASS".into(), "DECAL_NDC_PUSH".into()],
                 ColorWrites::ALL,
@@ -4609,6 +4688,7 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             DrawPass::DecalDepth => (
                 None,
                 true,
+                CompareFunction::GreaterEqual,
                 DepthBiasState::default(),
                 // NO DECAL_NDC_PUSH: this prepass writes the road's RAW depth purely to occlude the
                 // underground over voids; pushing a depth-WRITER would peter-pan. The COLOR passes
@@ -4619,6 +4699,7 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             DrawPass::DecalColor => (
                 Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 false,
+                CompareFunction::GreaterEqual,
                 DepthBiasState::default(),
                 vec!["BLEND_PASS".into(), "DECAL_COLOR_PASS".into(), "DECAL_NDC_PUSH".into()],
                 ColorWrites::ALL,
@@ -4628,6 +4709,8 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
         RenderPipelineDescriptor {
             label: Some(match key.pass {
                 DrawPass::Opaque => "eft_gpu_draw_opaque".into(),
+                DrawPass::OpaqueDepth => "eft_gpu_draw_opaque_depth".into(),
+                DrawPass::OpaqueEqual => "eft_gpu_draw_opaque_equal".into(),
                 DrawPass::Blend => "eft_gpu_draw_blend".into(),
                 DrawPass::Overlay => "eft_gpu_draw_overlay".into(),
                 DrawPass::DecalDepth => "eft_gpu_draw_decal_depth".into(),
@@ -4689,9 +4772,10 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                 format: CORE_3D_DEPTH_FORMAT,
                 // P1 opaque writes depth; P2 blend reads it but does NOT write (see above).
                 depth_write_enabled,
-                // Bevy uses reverse-z; both passes compare GreaterEqual (blend still depth-TESTS
-                // against the depth P1 wrote â€” both ride the one transparent pass that LOADS depth).
-                depth_compare: CompareFunction::GreaterEqual,
+                // Bevy uses reverse-z; most passes compare GreaterEqual (blend still depth-TESTS
+                // against the depth P1 wrote — both ride the one transparent pass that LOADS depth).
+                // B3's OpaqueEqual is the exception (EQUAL against its depth-only prepass).
+                depth_compare,
                 stencil: StencilState::default(),
                 bias,
             }),
@@ -4699,9 +4783,13 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                 count: key.samples,
                 mask: !0,
                 // Only opaque cutouts and the coverage-only road depth pass use A2C. Every color
-                // overlay uses real alpha blending for a continuous, non-quantized edge.
-                alpha_to_coverage_enabled: matches!(key.pass, DrawPass::Opaque | DrawPass::DecalDepth)
-                    && key.samples > 1,
+                // overlay uses real alpha blending for a continuous, non-quantized edge. B3's opaque
+                // prepass/color pair MUST match Opaque's A2C so the prepass coverage == the color
+                // coverage (else EQUAL depth-test fails per-sample on cutout edges).
+                alpha_to_coverage_enabled: matches!(
+                    key.pass,
+                    DrawPass::Opaque | DrawPass::OpaqueDepth | DrawPass::OpaqueEqual | DrawPass::DecalDepth
+                ) && key.samples > 1,
             },
             fragment: Some(FragmentState {
                 shader: self.shader.clone(),
