@@ -46,6 +46,15 @@ def run(cmd):
     return p.wait()
 
 
+def has_pip(py):
+    try:
+        return subprocess.run(
+            [py, "-m", "pip", "--version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    except OSError:
+        return False
+
+
 def main():
     print("[SETUP] installing the Python packages the build pipeline needs (UnityPy, numpy, Pillow)",
           flush=True)
@@ -62,8 +71,27 @@ def main():
             if rc != 0 or not os.path.isfile(vpy()):
                 print(f"[BUILD FAILED] could not create venv at {VENV} (rc={rc})", flush=True)
                 sys.exit(2)
-        print(f"[STAGE 1/{TOTAL}] create virtual environment: done", flush=True)
         py = vpy()
+        if not has_pip(py):
+            # Debian/Ubuntu strip the bundled pip wheel out of ensurepip, so a "successful" venv
+            # (python -m venv exits 0, the python binary is there) can still come up with NO pip
+            # (python -m pip then fails with "No module named pip"). Recreate in place with
+            # --system-site-packages so it sees the distro's python3-pip instead of needing a
+            # bundled wheel; venv supports re-running on an existing dir without --clear.
+            print(
+                "  venv has no pip (Debian/Ubuntu strip the bundled wheel) -"
+                " retrying with --system-site-packages",
+                flush=True,
+            )
+            run([sys.executable, "-m", "venv", "--system-site-packages", VENV])
+            if not has_pip(py):
+                print(
+                    "[BUILD FAILED] this Python has no usable pip, even system-wide. Install it"
+                    " (e.g. `sudo apt install python3-pip`) and try INSTALL DEPS again.",
+                    flush=True,
+                )
+                sys.exit(2)
+        print(f"[STAGE 1/{TOTAL}] create virtual environment: done", flush=True)
 
     print(f"[STAGE 2/{TOTAL}] install packages (downloads from PyPI - needs internet)", flush=True)
     run([py, "-m", "pip", "install", "--upgrade", "pip"])

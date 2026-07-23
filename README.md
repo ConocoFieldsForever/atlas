@@ -180,6 +180,44 @@ cargo run --release -p atlas -- .\packs\interchange.eftpack   # open a pack dire
 Needs stable Rust 1.88+. A fuller list of environment toggles is in
 [README_DIST.md](README_DIST.md).
 
+### Linux (experimental)
+
+The viewer builds and runs natively on Linux (tested on Ubuntu 26.04 + an NVIDIA RTX 3090 via
+Vulkan). The extraction pipeline (Option B, building maps from your own game files) also works,
+including through a Wine/Proton/Lutris install of EFT — you just need to point **GAME INSTALL**
+at the right `EscapeFromTarkov_Data` folder by hand, since the auto-detect (Windows registry +
+drive-letter probing) is Windows-only.
+
+Install Rust and the system libraries Bevy needs to open a window and talk to the GPU:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+
+sudo apt update
+sudo apt install -y build-essential pkg-config \
+  libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev \
+  libwayland-dev \
+  libvulkan1 mesa-vulkan-drivers vulkan-tools \
+  libgtk-3-dev \
+  libasound2-dev libudev-dev
+```
+
+Then build and run exactly as above, just with forward slashes:
+
+```bash
+cargo run --release -p atlas
+cargo run --release -p atlas -- packs/interchange.eftpack
+```
+
+Notes:
+- `vulkaninfo --summary` should list at least one GPU before you launch — if it lists none, update
+  your GPU driver (the NVIDIA proprietary driver, or Mesa for AMD/Intel).
+- The Python build pipeline (INSTALL DEPS / BUILD in the menu) needs `python3`. On Debian/Ubuntu,
+  a freshly created venv can come up with no `pip` at all (the distro strips the bundled wheel out
+  of `ensurepip`) — `tools/setup_deps.py` detects this and retries with `--system-site-packages`
+  automatically; if that still fails, `sudo apt install python3-pip` first.
+
 ---
 
 ## Credits & data
