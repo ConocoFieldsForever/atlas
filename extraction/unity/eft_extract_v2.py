@@ -484,7 +484,12 @@ def export_terrain_splat(td, tname, splat_root, manifest, layer_saved, thresh=0.
             rep = uvscale * pertex[li]                                  # FROM-GAME (UV-space repeats, the real ~1.8m grass tiling)
         else:
             rep = sizeX / tx if (np.isfinite(tx) and tx > 0) else 1.0   # m_TileSize fallback (only if no MicroSplat material)
-        if nm not in layer_saved and dn is not None and cov >= thresh:
+        # B8: gate the export on MEAN or PEAK coverage. Mean-only pruning dropped layers that are
+        # locally dominant in small patches (reserve: Sand/Pebbles ~0.4% mean but ~100% inside their
+        # patches) while every tile's manifest still referenced them -> the viewer warned + rendered
+        # placeholder texels exactly where those layers ARE the ground.
+        cmax = float(arr[:, :, ch].max())
+        if nm not in layer_saved and dn is not None and (cov >= thresh or cmax >= 0.5):
             try:
                 dn.read().image.convert("RGB").save(os.path.join(splat_root, f"layer_{nm}.png")); layer_saved[nm] = 1
             except Exception:
