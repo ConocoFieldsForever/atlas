@@ -607,9 +607,13 @@ struct ShadowCascadeUniform {
     view_proj: [[f32; 4]; 4],
     /// xyz = Lsun (toward the sun), w = 1/SHADOW_MAP_SIZE (PCF texel).
     dir_texel: [f32; 4],
+    /// x = grass casts shadows (1/0). B2: the 109k grass cross-quads were ~the whole shadow-pass
+    /// fragment cost (alpha-tested albedo sample × 2 cascades) for micro-shadows that read as
+    /// noise at map scale — skipped by default; EFT_GRASS_SHADOWS=1 restores. yzw pad.
+    params: [f32; 4],
 }
-// #6: LOCK the byte layout — matches `ShadowCascadeUniform` in gpu_shadow.wgsl (mat4 + vec4 = 80).
-const _: () = assert!(std::mem::size_of::<ShadowCascadeUniform>() == 80);
+// #6: LOCK the byte layout — matches `ShadowCascadeUniform` in gpu_shadow.wgsl (mat4 + 2×vec4 = 96).
+const _: () = assert!(std::mem::size_of::<ShadowCascadeUniform>() == 96);
 
 /// group(3) binding(5) main sun-shadow uniform read by gpu_draw.wgsl. Byte-identical to the WGSL
 /// `SunShadowUniform` (208 bytes: 2×64 + 5×16).
@@ -4240,6 +4244,12 @@ fn prepare_shadow_uniforms(
         Vec3::Y
     };
 
+    // B2: grass shadow casters off by default (the 109k alpha-tested cross-quads dominated the
+    // shadow pass for micro-shadows invisible at map scale). EFT_GRASS_SHADOWS=1 restores.
+    static GRASS_CASTERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let grass_casters = *GRASS_CASTERS
+        .get_or_init(|| std::env::var("EFT_GRASS_SHADOWS").is_ok_and(|v| v.trim() == "1"));
+
     let mut main = SunShadowUniform {
         split_depths: [
             SHADOW_SPLITS[1],
@@ -4335,6 +4345,7 @@ fn prepare_shadow_uniforms(
         let cascade = ShadowCascadeUniform {
             view_proj: vp_cols,
             dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+            params: [if grass_casters { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         render_queue.write_buffer(
             &res.cascade_uniforms[c],
