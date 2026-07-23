@@ -1375,25 +1375,58 @@ fn walk_move(
     }
 }
 
-/// Reliable frame capture: with `EFT_SHOT=<path>` set, save ONE screenshot of the primary
-/// window ~90 Update-frames in (a beat after the heavy Startup finishes) via Bevy's own GPU
-/// screenshot — this bypasses the DWM/flip-model capture that makes external CopyFromScreen
-/// grab a blank white frame.
-fn auto_screenshot(mut commands: Commands, mut frames: Local<u32>) {
-    *frames += 1;
-    // EFT_SHOT_FRAME overrides the default frame-90 capture (later frames let a scripted in-place
-    // map swap settle before the shot — see debug_switch).
-    let target = std::env::var("EFT_SHOT_FRAME").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(90);
-    if *frames != target {
+/// Reliable frame capture: with `EFT_SHOT=<path>` set, save ONE screenshot of the primary window
+/// via Bevy's own GPU screenshot (bypasses the DWM/flip-model capture that grabs a blank white
+/// frame). By default it is LOAD-AWARE: it waits until the pack has loaded AND the GPU build has
+/// finished (the texcache/geometry stream across many frames after the file load), then settles a
+/// beat — so a bench screenshot is never a blank/loading frame, regardless of a slow first load.
+/// `EFT_SHOT_FRAME=<n>` forces the legacy ABSOLUTE-frame capture instead (for `EFT_SWITCH` soak
+/// tests that need a precise frame); `EFT_SHOT_SETTLE=<n>` tunes the post-load settle (default 30).
+fn auto_screenshot(
+    mut commands: Commands,
+    mut frames: Local<u32>,
+    mut settle: Local<i32>,
+    mut done: Local<bool>,
+    pending: Res<PendingMapLoad>,
+    gpu_load: Option<Res<render::GpuLoadSignal>>,
+    pack: Option<Res<LoadedPack>>,
+) {
+    if *done {
         return;
     }
-    if let Ok(path) = std::env::var("EFT_SHOT") {
-        use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-        commands
-            .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path.clone()));
-        info!("auto-screenshot -> {path}");
+    let Ok(path) = std::env::var("EFT_SHOT") else {
+        return;
+    };
+    *frames += 1;
+
+    if let Some(target) = std::env::var("EFT_SHOT_FRAME").ok().and_then(|s| s.trim().parse::<u32>().ok()) {
+        // Absolute-frame mode (unchanged): a scripted in-place swap settles by a fixed frame.
+        if *frames < target {
+            return;
+        }
+    } else {
+        // Load-aware mode (default): pack present, file load done, and the GPU build finished
+        // (GpuLoadSignal stays in_progress across the whole texcache+geometry build). Absent under
+        // the M0/std path -> fall back to "pack present + not loading".
+        let loaded = pack.is_some()
+            && pending.loading().is_none()
+            && gpu_load.as_ref().map(|s| !s.in_progress()).unwrap_or(true);
+        if !loaded {
+            *settle = 0;
+            return;
+        }
+        *settle += 1;
+        let settle_target: i32 =
+            std::env::var("EFT_SHOT_SETTLE").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(30);
+        if *settle < settle_target {
+            return;
+        }
     }
+
+    use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+    commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path.clone()));
+    info!("auto-screenshot -> {path} (frame {})", *frames);
+    *done = true;
 }
 
 /// Headless soak-test hook for the in-place map swap: `EFT_SWITCH="dir@frame;dir@frame;..."` fires
