@@ -85,7 +85,10 @@ fn vertex(
     @location(3) material_index: u32,
     @builtin(instance_index) ii: u32,
 ) -> ShadowVOut {
-    let inst = instances[visible[ii]];
+    // B5: clamp both indirections (visible[] then instances[]), same as gpu_draw's vertex. In-bounds
+    // for well-formed packs; guards an OOB fetch (AMD garbage / NVIDIA 0) on corrupt draw args.
+    let vi = min(ii, arrayLength(&visible) - 1u);
+    let inst = instances[min(visible[vi], arrayLength(&instances) - 1u)];
     let col0 = vec3<f32>(inst.m0.x, inst.m1.x, inst.m2.x);
     let col1 = vec3<f32>(inst.m0.y, inst.m1.y, inst.m2.y);
     let col2 = vec3<f32>(inst.m0.z, inst.m1.z, inst.m2.z);
@@ -105,7 +108,9 @@ fn vertex(
 // main shader's terrain branch.
 @fragment
 fn fragment(o: ShadowVOut) {
-    let m = materials[o.material_index];
+    // B5: clamp the material index into the materials table (in-bounds no-op for well-formed packs;
+    // guards an OOB read on AMD, which would alpha-test the caster against the wrong texture).
+    let m = materials[min(o.material_index, arrayLength(&materials) - 1u)];
 
     let duv_dx = dpdx(o.uv);
     let duv_dy = dpdy(o.uv);
