@@ -240,6 +240,16 @@ def main():
         print(json.dumps(select_light_levels(derive_light_scenes(scenes, folder), night=night)))
         return
 
+    # Sub-mode for build_map.dataset_levels: the AUTHORITATIVE geometry level list for a location
+    # folder, derived live from BuildSettings (every non-service scene in the folder). Replaces the
+    # hand-curated per-map config.source.levels, which drifts as the game adds scenes -- e.g. reserve
+    # was missing level116 (Reserve_Base_DesignStuff: vehicles/loot/props) so those objects never
+    # extracted and anything resting on them floated. JSON list on stdout.
+    if "--levels-for" in argv:
+        folder = argv[argv.index("--levels-for") + 1]
+        print(json.dumps(derive_levels(load_scenes(), folder)))
+        return
+
     write = "--check" not in argv
     scenes = load_scenes()
     print(f"[gen_maps] BuildSettings: {len(scenes)} scenes")
