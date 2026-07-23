@@ -938,6 +938,26 @@ fn conservative_radius_scale(l: Mat3) -> f32 {
     (c0.dot(c0) + c1.dot(c1) + c2.dot(c2)).sqrt()
 }
 
+/// FNV-1a 64-bit over a byte slice — the geometry byte-identity gate (EFT_GEOM_SHA=1). Not crypto;
+/// a mismatch between the old and the fused-encoder paths on the same pack is all we need to catch.
+#[inline]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// True when EFT_GEOM_SHA=1 — logs FNV hashes of the final vertex/index byte streams so an old-vs-new
+/// build on the same pack can be compared for byte-exactness. Cheap check, read once.
+#[inline]
+fn geom_hash_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("EFT_GEOM_SHA").map(|v| v.trim() == "1").unwrap_or(false))
+}
+
 // ===========================================================================
 // CPU-assembled blob, built once in the main world, shipped to the render world by
 // Arc (cheap per-frame extract), uploaded to the GPU exactly once.
@@ -1283,6 +1303,7 @@ fn build_cpu_data(
     let build_t0 = std::time::Instant::now(); // STALL INSTRUMENTATION (main-thread)
     // LOD selector (graphics panel): keep one LOD per group. No-op on lean LOD0-only packs.
     let by_mesh = pack.instances_by_mesh_for_lod(lod.0);
+    let t_bymesh = build_t0.elapsed(); // phase: instance-by-mesh grouping
     let local_spheres = match pack.bounding_spheres() {
         Ok(s) => s,
         Err(e) => {
@@ -1863,6 +1884,7 @@ fn build_cpu_data(
             .count(),
     );
 
+    let t_mats = build_t0.elapsed(); // phase mark: spheres + material/albedo/normal table done
     let mut vertex_data: Vec<f32> = Vec::new();
     let mut index_data: Vec<u32> = Vec::new();
     let mut instances: Vec<InstanceGpuRecord> = Vec::new();
@@ -2091,6 +2113,7 @@ fn build_cpu_data(
             _pad: [0, 0],
         });
     }
+    let t_geo = build_t0.elapsed(); // phase: the mesh geometry loop (parse + repack + append)
 
     // ---- #4 GRASS: append the density-placed grass clumps as a cross-quad mesh + N instances,
     //      rendered by the SAME cull + multidraw + alpha-cutout path. grass.bin = N×[x,y,z,rotY,
@@ -2265,6 +2288,7 @@ fn build_cpu_data(
     );
 
     // Phase 1 SH-GI: load + repack the baked irradiance volume (volume.bin + volume.json).
+    let t_grass = build_t0.elapsed(); // phase: grass append (done)
     let sh_volume = load_sh_volume(pack);
 
     // REALTIME lights: auto-select against the baked SH volume to avoid DOUBLE-COUNTING. Three cases:
@@ -2338,14 +2362,34 @@ fn build_cpu_data(
             }
         }
     }
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let vbytes = std::mem::size_of_val(vertex_data.as_slice());
+    let ibytes = std::mem::size_of_val(index_data.as_slice());
     eprintln!(
-        "[stall] build_cpu_data (main thread): {:.1} ms  ({} meshes, {} instances, {} albedo, {} normal)",
-        build_t0.elapsed().as_secs_f64() * 1000.0,
+        "[stall] build_cpu_data (main thread): {:.1} ms  ({} meshes, {} instances, {} albedo, {} normal)\n\
+         [stall]   phases ms: bymesh={:.1} spheres+materials={:.1} geometry={:.1} grass={:.1} | \
+         vtx_buf={:.1}MiB idx_buf={:.1}MiB",
+        ms(build_t0.elapsed()),
         mesh_count,
         instance_total,
         albedo_paths.len(),
         normal_paths.len(),
+        ms(t_bymesh),
+        ms(t_mats - t_bymesh),
+        ms(t_geo - t_mats),
+        ms(t_grass - t_geo),
+        vbytes as f64 / 1048576.0,
+        ibytes as f64 / 1048576.0,
     );
+    if geom_hash_enabled() {
+        eprintln!(
+            "[EFT_GEOM_SHA] vtx=0x{:016x} ({} f32)  idx=0x{:016x} ({} u32)",
+            fnv1a64(bytemuck::cast_slice(&vertex_data)),
+            vertex_data.len(),
+            fnv1a64(bytemuck::cast_slice(&index_data)),
+            index_data.len(),
+        );
+    }
     commands.insert_resource(ExtractedCpuData(Arc::new(CpuData {
         vertex_data,
         index_data,
@@ -3520,9 +3564,11 @@ fn prepare_gpu_buffers(
     }
     eprintln!(
         "[stall] prepare_gpu_buffers FINALIZE frame (render thread): {:.1} ms  \
-         [geo {:.1} | albedo {} tex {:.1} | normal {} tex {:.1} | SH+shadows {:.1}]{}",
+         [geo {:.1} ({:.0}MiB vtx + {:.0}MiB idx) | albedo {} tex {:.1} | normal {} tex {:.1} | SH+shadows {:.1}]{}",
         prep_t0.elapsed().as_secs_f64() * 1000.0,
         geo_ms,
+        std::mem::size_of_val(cpu.vertex_data.as_slice()) as f64 / 1048576.0,
+        std::mem::size_of_val(cpu.index_data.as_slice()) as f64 / 1048576.0,
         tex_count,
         albedo_ms,
         normal_count,
