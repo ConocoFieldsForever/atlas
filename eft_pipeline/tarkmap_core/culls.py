@@ -18,8 +18,14 @@ import re, os
 
 # Junk roots that carry no renderable map geometry. Validated against Factory (keeps 10,588 geometry roots,
 # drops 3,212: Decals/Day_light/Night_light/SpatialAudioSystem/BLOCKER...) and reproduces Interchange.
+# NOTE the light term is (day|night)_?light, NOT the old `.*light`: now that *_Light SCENES are extracted
+# as geometry (they hold the lamp fixtures + vehicles whose headlights are the light sources — reserve's
+# KamAZ under the warehouse crates), a bare `.*light` would re-cull those roots at assemble on any map
+# without a keep_root_prefix allowlist. Interchange's 'SBG_Shopping_Mall_Light' (Gazel van + Ford Focus)
+# already documented this over-match; reserve's 'SBG_Reserve_Base_Lights' only escaped by being plural.
+# Factory's validated junk (Day_light/Night_light sun/moon glow rigs) still matches.
 DEFAULT_DROP_ROOT_RE = (
-    r"(?i)^(decals?|.*_decals?|.*light|.*audio.*|trig?ger.*|blocker.*|justplane.*|"
+    r"(?i)^(decals?|.*_decals?|.*(?:day|night)_?light|.*audio.*|trig?ger.*|blocker.*|justplane.*|"
     r".*event.*|.*volume|reflectionprobe.*|lightprobe.*|skybox.*|spatialaudio.*)$"
 )
 
