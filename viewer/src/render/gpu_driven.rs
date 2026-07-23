@@ -1333,18 +1333,30 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     };
     let t_bymesh = build_t0.elapsed(); // phase: instance-by-mesh grouping
     // Per-instance LOD encode (multi-LOD only): (ids.z extra bits, ids.w f16 window). `ids.z` bit8 =
-    // is-default-shell, bits9..12 = lod_index; `ids.w` = pack_f16(near', far') where the runtime
-    // distance window is [near'*proj11*bias, far'*proj11*bias) (0 = sentinel, always drawn).
-    let lod_range = if multi_lod { pack.group_lod_range() } else { std::collections::HashMap::new() };
+    // is-default-shell, bits9..12 = lod_index (clamped 0..15); `ids.w` = pack_f16(near', far') where the
+    // runtime distance window is (near'*proj11*bias, far'*proj11*bias] (0 = sentinel, always drawn).
+    // `lod_present` = per-group SORTED present lod_index set: a shell's near boundary meets the
+    // *previous present* shell's far, so an internal gap (present {0,2}) can't leave a coverage hole.
+    let lod_present = if multi_lod {
+        pack.group_present_lods()
+    } else {
+        std::collections::HashMap::new()
+    };
     let lod_encode = |i: u32| -> (u32, u32) {
         let inst = &pack.instances[i as usize];
         let idx = inst.lod_index.max(0);
-        let z = ((pack.is_default_lod(i as usize) as u32) << 8) | (((idx as u32) & 0xF) << 9);
+        // B6: lod_index rides a 4-bit field; a group with >15 LODs would wrap (LOD16 -> shell 0).
+        // EFT LODGroups are ~4-8 levels so this never fires, but CLAMP (don't wrap) as a backstop and
+        // keep bits 13+ free for the group id (finding #1's lod_centers lookup).
+        debug_assert!(idx <= 15, "lod_index {idx} exceeds the 4-bit ids.z field");
+        let z = ((pack.is_default_lod(i as usize) as u32) << 8) | (((idx as u32).min(15)) << 9);
         if inst.lod_group < 0 {
             return (z, 0); // ungrouped: always drawn
         }
-        let (min, max) = lod_range.get(&inst.lod_group).copied().unwrap_or((0, 0));
-        if min == max {
+        let Some(present) = lod_present.get(&inst.lod_group) else {
+            return (z, 0);
+        };
+        if present.len() <= 1 {
             return (z, 0); // single present shell: always drawn (reserve's LOD2 windows land here)
         }
         let Some(g) = pack.manifest.lod_groups.get(inst.lod_group as usize) else {
@@ -1359,8 +1371,12 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                 f32::INFINITY
             }
         };
-        let near = if idx <= min { 0.0 } else { far(idx - 1) };
-        let far_b = if idx >= max {
+        // near = far of the previous PRESENT shell (not idx-1): with an internal gap the next present
+        // shell picks up exactly where the previous one ended, so no distance band is left undrawn.
+        let prev_present = present.iter().rev().find(|&&p| p < idx).copied();
+        let near = prev_present.map(far).unwrap_or(0.0);
+        let is_coarsest = idx >= *present.last().unwrap();
+        let far_b = if is_coarsest {
             if g.last_is_billboard && g.cull_h > 1.0e-6 {
                 g.size / (2.0 * g.cull_h) // billboard groups cull past their last threshold (no billboard geom ships)
             } else {
@@ -1374,7 +1390,11 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         }
         let a16 = half::f16::from_f32(near.max(0.0)).to_bits() as u32;
         let b16 = half::f16::from_f32(far_b.min(65504.0)).to_bits() as u32; // f16 max ~= +inf at any real d
-        (z, (b16 << 16) | a16)
+        let w = (b16 << 16) | a16;
+        // B5: a genuine window must never quantize to the 0 sentinel (would make a real shell always
+        // draw). Only possible if both halves underflow f16 (sub-nanometer geometry) — bump to the
+        // smallest representable far so ids.w stays non-zero. No effect on any realistic pack.
+        (z, if w == 0 { 1 } else { w })
     };
     let local_spheres = match pack.bounding_spheres() {
         Ok(s) => s,
@@ -4683,7 +4703,12 @@ fn upload_frustum(
                     if g.lod_force >= 0 {
                         (2.0, 1.0, g.lod_force as f32) // force shell N (debug)
                     } else if g.lod_distance {
-                        (1.0, g.lod_bias.max(0.05), 0.0) // distance-based
+                        // B7: sanitize the bias. The UI slider is 0.25..=4.0 but EFT_LOD_BIAS is raw
+                        // env input; an inf/NaN bias makes proj11*bias overflow and every window
+                        // comparison NaN out (total blackout). f32::clamp keeps NaN as NaN, so map
+                        // non-finite -> 1.0 first, then clamp the finite range.
+                        let bias = if g.lod_bias.is_finite() { g.lod_bias.clamp(0.05, 64.0) } else { 1.0 };
+                        (1.0, bias, 0.0) // distance-based
                     } else {
                         (0.0, 1.0, 0.0) // max detail (default)
                     }

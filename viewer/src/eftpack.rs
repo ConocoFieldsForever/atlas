@@ -1205,6 +1205,24 @@ impl Pack {
         r
     }
 
+    /// Per-lod_group SORTED-UNIQUE set of PRESENT lod_index values this pack ships. Needed by the
+    /// distance-window encoder so a shell's near boundary meets the *previous present* shell's far —
+    /// with an INTERNAL gap (present `{0,2}`, level 1 absent) `group_lod_range`'s bare `(min,max)`
+    /// would leave `(far(0), far(1)]` undrawn (an invisible-geometry hole). On a lean pack every
+    /// group is a single value so the map mirrors `group_lod_range` and the encoder never runs.
+    pub(crate) fn group_present_lods(&self) -> std::collections::HashMap<i32, Vec<i32>> {
+        let mut r: std::collections::HashMap<i32, Vec<i32>> = std::collections::HashMap::new();
+        for inst in &self.instances {
+            if inst.lod_group >= 0 {
+                let v = r.entry(inst.lod_group).or_default();
+                if let Err(pos) = v.binary_search(&inst.lod_index) {
+                    v.insert(pos, inst.lod_index); // keep sorted-unique
+                }
+            }
+        }
+        r
+    }
+
     /// Keep an instance at the requested LOD, CLAMPED into the group's present range `[min,max]` so
     /// (a) forcing a level a group lacks falls back to its coarsest, and (b) a group whose finest
     /// shipped shell is > 0 (reserve's LOD2-only windows) is NOT invisible at forced 0 — the old
