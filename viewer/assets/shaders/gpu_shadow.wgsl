@@ -28,12 +28,15 @@ struct InstanceGpu {
 @group(0) @binding(0) var<storage, read> instances: array<InstanceGpu>;
 @group(0) @binding(1) var<storage, read> visible: array<u32>;
 
-// group(1): per-cascade uniform. Byte-identical to the Rust `ShadowCascadeUniform`.
+// group(1): per-cascade uniform. Byte-identical to the Rust `ShadowCascadeUniform` (96 B).
 struct ShadowCascadeUniform {
     // world -> sun light clip (conventional 0..1-depth orthographic). Column-major Mat4 upload.
     view_proj: mat4x4<f32>,
     // xyz = Lsun (points TOWARD the sun; light travels along -Lsun), w = 1/shadow_map_size (PCF texel).
     dir_texel: vec4<f32>,
+    // x = grass casts shadows (1/0, B2). Grass cross-quads are the dominant shadow-pass fragment
+    // cost (alpha-tested albedo sample x 2 cascades) for micro-shadows invisible at map scale.
+    params: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> cascade: ShadowCascadeUniform;
 
@@ -89,6 +92,17 @@ fn vertex(
     // for well-formed packs; guards an OOB fetch (AMD garbage / NVIDIA 0) on corrupt draw args.
     let vi = min(ii, arrayLength(&visible) - 1u);
     let inst = instances[min(visible[vi], arrayLength(&instances) - 1u)];
+    // B2: grass caster skip (ids.z==1 marks the viewer-appended grass cross-quads, same flag the
+    // cull's grass screen-size path keys on). Emit every vertex at one out-of-depth point -> the
+    // triangle is zero-area AND beyond the far clip, so the rasterizer drops it: no fragments, no
+    // alpha-test albedo samples. cascade.params.x=1 (EFT_GRASS_SHADOWS=1) restores grass casters.
+    if (cascade.params.x < 0.5 && inst.ids.z == 1u) {
+        var g: ShadowVOut;
+        g.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        g.uv = vec2<f32>(0.0);
+        g.material_index = 0u;
+        return g;
+    }
     let col0 = vec3<f32>(inst.m0.x, inst.m1.x, inst.m2.x);
     let col1 = vec3<f32>(inst.m0.y, inst.m1.y, inst.m2.y);
     let col2 = vec3<f32>(inst.m0.z, inst.m1.z, inst.m2.z);
