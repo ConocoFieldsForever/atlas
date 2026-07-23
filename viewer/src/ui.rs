@@ -1286,6 +1286,42 @@ fn layers_panel(
                             egui::Slider::new(&mut g.sharpen, 0.0..=1.0).text("sharpen"),
                         )
                         .on_hover_text("EFT-style unsharp mask (the game ships ~0.5); needs the grade LUT");
+                        // ---- lighting (live: rides the LightGrid uniform, no rebuild) ----
+                        ui.separator();
+                        ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.lights, "practical lights"))
+                            .on_hover_text("realtime lamps/spots (maps with the direct/indirect light split); no effect on legacy full-bake packs");
+                        ui.add_enabled(
+                            is_gpu && g.lights,
+                            egui::Slider::new(&mut g.light_intensity, 0.0..=3.0).text("light intensity"),
+                        );
+                        ui.add_enabled(
+                            is_gpu,
+                            egui::Slider::new(&mut g.sun_diffuse, 0.0..=2.5).text("sun diffuse"),
+                        )
+                        .on_hover_text("direct-sun fill on indirect-bake maps (1 = shipped); no-op where the bake already includes the sun");
+                        ui.add_enabled(
+                            is_gpu,
+                            egui::Slider::new(&mut g.gi_intensity, 0.25..=2.0).text("GI brightness"),
+                        )
+                        .on_hover_text("baked ambient / global-illumination level");
+                        // ---- photoreal extras (camera post; work on every render path) ----
+                        ui.separator();
+                        ui.checkbox(&mut g.dof, "depth of field")
+                            .on_hover_text("bokeh focus blur (experimental)");
+                        ui.add_enabled(
+                            g.dof,
+                            egui::Slider::new(&mut g.dof_focal_m, 1.0..=120.0)
+                                .logarithmic(true)
+                                .text("focus dist m"),
+                        );
+                        ui.add_enabled(
+                            g.dof,
+                            egui::Slider::new(&mut g.dof_fstop, 0.5..=16.0)
+                                .logarithmic(true)
+                                .text("f-stop"),
+                        );
+                        ui.add(egui::Slider::new(&mut g.chroma, 0.0..=0.05).text("chromatic aberration"))
+                            .on_hover_text("subtle lens fringing; the game's own chain ships a touch of it");
                         // LOD selector: force ONE LOD level (0 = best/finest detail). Only meaningful
                         // on --alllod packs that carry multiple LODs; a no-op on lean LOD0-only packs.
                         // A real change marks ForcedLod changed -> bump_epoch_on_lod_change bumps

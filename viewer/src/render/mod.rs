@@ -73,6 +73,23 @@ pub struct GfxSettings {
     pub ssao_radius: f32,
     /// EFT-style unsharp-mask strength in the grade pass (0 = off; the game ships ~0.5).
     pub sharpen: f32,
+    /// Realtime practical lights (lamps/spots from the light grid) master toggle. Only affects maps
+    /// whose grid is populated (indirect-only bakes / EFT_LIGHTS-forced); a no-op on full bakes.
+    pub lights: bool,
+    /// Practical-light intensity MULTIPLIER on the baked-in scale (1 = shipped look).
+    pub light_intensity: f32,
+    /// Direct-sun diffuse MULTIPLIER on the B4-M base (EFT_SUN_DIFFUSE; the uniform slot is 0 on
+    /// full bakes — where the baked SH already integrates the sun — so the slider is a no-op there).
+    pub sun_diffuse: f32,
+    /// Baked-GI (SH ambient) intensity MULTIPLIER (render-audit "gi_intensity": lifts/dims the
+    /// whole indirect term without touching practicals or the sun).
+    pub gi_intensity: f32,
+    /// Depth of field (bokeh) — photoreal extra, default off.
+    pub dof: bool,
+    pub dof_focal_m: f32,
+    pub dof_fstop: f32,
+    /// Chromatic aberration intensity (0 = off).
+    pub chroma: f32,
 }
 
 impl Default for GfxSettings {
@@ -123,6 +140,14 @@ impl Default for GfxSettings {
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0.0),
+            lights: true,
+            light_intensity: 1.0,
+            sun_diffuse: 1.0,
+            gi_intensity: 1.0,
+            dof: false,
+            dof_focal_m: 15.0,
+            dof_fstop: 2.8,
+            chroma: 0.0,
         }
     }
 }
