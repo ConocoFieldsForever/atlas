@@ -1031,6 +1031,7 @@ def main():
         # it writes lod.json (same as instance placement). No hardcoded thresholds; keyed on path_ids present in every scene.
         lod0_rids = set(); all_lod_rids = set(); billboard_only_rids = set()
         rid2lod = {}                                              # renderer path_id -> (GLOBAL groupIdx, lodIndex)  [min index if shared]
+        group_min_lod = {}                                        # gidx -> FINEST non-billboard lodIndex that actually has renderers
         for o in env.objects:
             if o.type.name != "LODGroup": continue
             try:
@@ -1075,6 +1076,12 @@ def main():
                             billboard_only_rids.discard(rid)
                             if rid not in rid2lod or li < rid2lod[rid][1]:   # shared renderer -> highest-detail (min) lodIndex
                                 rid2lod[rid] = (gidx, li)
+                            # FINEST real (non-billboard) LOD present in THIS group. Usually 0, but some
+                            # LODGroups ship an EMPTY LOD0 slot (the object's only geometry lives at LOD1+
+                            # -- e.g. certain vehicles). Recording the finest-present index lets keep_renderer
+                            # treat it as the effective LOD0 instead of erasing the whole object.
+                            if gidx not in group_min_lod or li < group_min_lod[gidx]:
+                                group_min_lod[gidx] = li
             except Exception:
                 continue
 
@@ -1083,7 +1090,17 @@ def main():
                 return False                                          # only ever the billboard impostor -> cull (no billboard mesh)
             if args.alllod:
                 return True                                           # keep every LOD level (Stage C: runtime swaps among them)
-            return (rpid in lod0_rids) or (rpid not in all_lod_rids)  # default / --lod0only: today's behavior (LOD0 + un-grouped)
+            if rpid not in all_lod_rids:
+                return True                                           # un-grouped renderer -> always kept
+            # Grouped: keep iff this renderer is the FINEST LOD present in its group (the effective LOD0).
+            # For a normal group group_min_lod==0, so this is identical to the old `rpid in lod0_rids`.
+            # For a group with an EMPTY LOD0 slot it keeps the finest existing LOD instead of dropping the
+            # whole object -- the fix for vehicles/props whose only geometry is authored at LOD1+ and which
+            # used to VANISH entirely (map-agnostic; still exactly ONE LOD per object, no geometry bloat).
+            gi, li = rid2lod.get(rpid, (None, None))
+            if gi is None:
+                return rpid in lod0_rids
+            return li == group_min_lod.get(gi, 0)
         print(f"  [lv{lv}] LODGroups: +{sum(1 for grp in lodgroups)} cumulative={len(lodgroups)}, renderers tagged this level={len(rid2lod)}", flush=True)
 
         # ---- mesh renderers + skinned mesh renderers ----

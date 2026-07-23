@@ -175,19 +175,44 @@ def dataset_name(m):
     return m
 
 
-def dataset_levels(m):
-    """Comma-separated Unity level indices for the map (map config's source.levels) — the input to
-    the one-time full extraction. Empty string when unreadable (caller errors clearly)."""
+def _config_levels(m):
+    """The map config's hand-curated source.levels (fallback only). [] when unreadable."""
     for p in (os.path.join(TK, "maps", m, "config.json"),
               os.path.join(VIEWER, "extraction", "maps", m, "config.json")):
         if os.path.isfile(p):
             try:
-                lv = json.load(open(p, encoding="utf-8"))["source"]["levels"]
-                return ",".join(str(int(x)) for x in lv)
+                return [int(x) for x in json.load(open(p, encoding="utf-8"))["source"]["levels"]]
             except Exception as e:
                 print(f"[BUILD] WARNING: cannot read source.levels from {p} ({e})", flush=True)
-                return ""
-    return ""
+                return []
+    return []
+
+
+def dataset_levels(m):
+    """Comma-separated Unity level indices for the map — the input to the one-time full extraction.
+    DERIVED LIVE from BuildSettings (every non-service scene in the map's location folder) rather than
+    the hand-curated config.source.levels, which drifts as the game adds scenes: reserve's config was
+    missing level116 (Reserve_Base_DesignStuff -> vehicles/loot/props), so crates resting on that
+    geometry floated. The derived list is the game's own truth and self-heals across updates + all maps.
+    Falls back to (or UNIONS with) the config list if derivation is unavailable, so a config that
+    intentionally adds an off-folder level still contributes and we never regress to fewer levels."""
+    cfg = _config_levels(m)
+    folder = unity_location(m)
+    derived = []
+    if folder:
+        try:
+            out = subprocess.check_output(
+                [PY_UNITY, os.path.join(HERE, "gen_maps.py"), "--levels-for", folder],
+                text=True, stderr=subprocess.DEVNULL)
+            derived = [int(x) for x in json.loads(out.strip().splitlines()[-1])]
+        except Exception as e:
+            print(f"[BUILD] note: could not derive levels for {m} from BuildSettings ({e}) - "
+                  f"using config.source.levels", flush=True)
+    levels = sorted(set(derived) | set(cfg))          # union: never fewer than the config had
+    if derived and set(derived) - set(cfg):
+        print(f"[BUILD] levels derived from BuildSettings folder '{folder}': +{sorted(set(derived)-set(cfg))} "
+              f"beyond config (total {len(levels)})", flush=True)
+    return ",".join(str(x) for x in levels)
 
 
 def find_atlas_exe():
