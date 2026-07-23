@@ -349,6 +349,7 @@ dependencies = [
  "bevy_egui",
  "bytemuck",
  "glam",
+ "half",
  "image",
  "rayon",
  "rfd",

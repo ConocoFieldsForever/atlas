@@ -1326,36 +1326,36 @@ fn layers_panel(
                         );
                         ui.add(egui::Slider::new(&mut g.chroma, 0.0..=0.05).text("chromatic aberration"))
                             .on_hover_text("subtle lens fringing; the game's own chain ships a touch of it");
-                        // LOD selector: force ONE LOD level (0 = best/finest detail). Only meaningful
-                        // on --alllod packs that carry multiple LODs; a no-op on lean LOD0-only packs.
-                        // A real change marks ForcedLod changed -> bump_epoch_on_lod_change bumps
-                        // MapEpoch -> build_cpu_data rebuilds the instance set for the chosen level.
-                        ui.add_enabled_ui(is_gpu, |ui| ui.horizontal(|ui| {
-                            ui.label("LOD");
-                            let mut lod = gfx_ui.forced_lod.0;
-                            egui::ComboBox::from_id_salt("forced_lod")
-                                .selected_text(if lod == 0 { "0 (best)".to_string() } else { lod.to_string() })
-                                .show_ui(ui, |ui| {
-                                    for l in 0..=4 {
-                                        let label = if l == 0 { "0 (best)".to_string() } else { l.to_string() };
-                                        ui.selectable_value(&mut lod, l, label);
-                                    }
-                                });
-                            if lod != gfx_ui.forced_lod.0 {
-                                gfx_ui.forced_lod.0 = lod;
-                            }
-                        }).inner)
-                        .response
-                        .on_hover_text("Force a single LOD level (needs an --alllod pack; no effect on standard packs)");
+                        // DISTANCE LOD (LOD_DISTANCE_PLAN.md): draw coarser mesh shells for distant
+                        // objects. A LIVE cull-uniform switch — no rebuild. Meaningful only on an
+                        // --alllod pack (multiple shells per group); a no-op on lean LOD0-only packs.
+                        ui.add_enabled_ui(is_gpu, |ui| {
+                            ui.checkbox(&mut g.lod_distance, "Distance LOD")
+                                .on_hover_text("Swap in coarser shells for far geometry (needs an --alllod pack)");
+                            ui.add_enabled(
+                                g.lod_distance,
+                                egui::Slider::new(&mut g.lod_bias, 0.25..=4.0).logarithmic(true).text("LOD bias"),
+                            )
+                            .on_hover_text(">1 holds finer detail to a greater distance; <1 switches coarse sooner");
+                            ui.horizontal(|ui| {
+                                ui.label("force shell");
+                                let mut f = g.lod_force;
+                                egui::ComboBox::from_id_salt("lod_force")
+                                    .selected_text(if f < 0 { "off".to_string() } else { f.to_string() })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut f, -1, "off");
+                                        for l in 0..=4 {
+                                            ui.selectable_value(&mut f, l, l.to_string());
+                                        }
+                                    });
+                                g.lod_force = f;
+                            });
+                        });
                         if ui.small_button("reset to defaults").clicked() {
                             let keep = (g.grade_available, g.shadows_available);
                             g = crate::render::GfxSettings::default();
                             g.grade_available = keep.0;
                             g.shadows_available = keep.1;
-                            // Reset the LOD selector too (finding 7) — it lives outside GfxSettings.
-                            if gfx_ui.forced_lod.0 != 0 {
-                                gfx_ui.forced_lod.0 = 0;
-                            }
                         }
                         if g != *gfx_ui.gfx {
                             *gfx_ui.gfx = g;
