@@ -383,8 +383,12 @@ pub fn color32(color: bevy::prelude::Color) -> Color32 {
 /// One 32x32 rail icon button. Draws the active/hover background, paints the vector icon in the
 /// active-beige / idle-muted color, and returns true on click. `kind`: 0 = eye (visibility),
 /// 1 = camera, 2 = tasks/checklist, 3 = navigation (route pin).
-pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, tip: &str) -> bool {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, label: &str, tip: &str) -> bool {
+    // The button is a 32px icon with a small caption UNDER it (so the two near-identical house icons
+    // — "Menu" and "Map" — read apart at a glance, not just on hover). Full rail width so the caption
+    // can center under the icon and the whole cell is one click target.
+    let w = ui.available_width().max(32.0);
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 44.0), egui::Sense::click());
     // Idle icons sit at SECTION grey (brighter than the old dim MUTED): the rail is easy to miss, so
     // keep all three tabs clearly visible; the ACTIVE one gets beige + a bg fill + an indicator bar.
     let col = if active { BEIGE } else { SECTION };
@@ -397,7 +401,16 @@ pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, tip: &str) -> bool
     } else if resp.hovered() {
         ui.painter().rect_filled(rect, 0.0, CARD);
     }
-    paint_tool_icon(ui.painter(), rect, kind, col);
+    // Icon in the top 32px band, caption centered just below it.
+    let icon_rect = egui::Rect::from_center_size(egui::pos2(rect.center().x, rect.top() + 16.0), egui::vec2(32.0, 32.0));
+    paint_tool_icon(ui.painter(), icon_rect, kind, col);
+    ui.painter().text(
+        egui::pos2(rect.center().x, rect.top() + 32.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        egui::FontId::proportional(8.5),
+        col,
+    );
     resp.on_hover_text(tip).clicked()
 }
 
