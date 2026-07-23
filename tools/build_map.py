@@ -333,10 +333,31 @@ def main():
             sys.exit(3)
     print(f"[STAGE 1/{total}] check dataset: done", flush=True)
 
+    # 2a: POWER SWITCHES (optional, map-agnostic) -- scan the map's geometry levels for a power lever
+    #     (an EFT.Interactive.Switch whose serialized PPtr[] resolves entirely to LampController).
+    #     Writes switches_<lv>.json for each level that has one; those switch-bearing levels are then
+    #     folded into the light extraction below so their controlled lights (which ship OFF and are
+    #     absent from the *_Light scene) get extracted + group-tagged for the viewer's power toggle.
+    switch_levels = []
+    geom_levels = dataset_levels(m)
+    if geom_levels:
+        sw_missing = [lv for lv in geom_levels
+                      if force or not os.path.isfile(os.path.join(dataset, f"switches_{lv}.json"))]
+        if sw_missing:
+            run(2, total, "scan power switches",
+                [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_switches.py"),
+                 "--levels", ",".join(str(lv) for lv in sw_missing), "--name", dsname],
+                VIEWER, optional=True)
+        switch_levels = sorted(lv for lv in geom_levels
+                               if os.path.isfile(os.path.join(dataset, f"switches_{lv}.json")))
+        if switch_levels:
+            print(f"[STAGE 2/{total}] power switch levels: {switch_levels}", flush=True)
+
     # 2: lights (optional) -- extract EVERY `*_Light` scene the map uses. The level LIST comes from
     #    the manifest (or a BuildSettings-derived fallback), so streets/ground_zero -- which split
-    #    lighting across many district scenes -- now get full lighting, not just one scene.
-    levels_light = light_levels_for(m)
+    #    lighting across many district scenes -- now get full lighting, not just one scene. Switch-
+    #    bearing levels are appended so the switch-controlled (default-off) banks are extracted too.
+    levels_light = sorted(set(light_levels_for(m)) | set(switch_levels))
     if not levels_light:
         print(f"[STAGE 2/{total}] extract lights: none known for {m} - the bake will be SKY-ONLY "
               f"(dark interiors) unless a light sidecar already exists.", flush=True)
@@ -463,6 +484,21 @@ def main():
            VIEWER, optional=True):
         gd = os.path.join(out_dir, "gamedata.json")
         if os.path.isfile(gd):
+            # Fold the power-switch records (switches_<lv>.json, written by stage 2a) into gamedata's
+            # `switches` array so they ride the existing pack copy with no manifest/assembler change.
+            try:
+                data = json.load(open(gd, encoding="utf-8"))
+                sw = []
+                for lv in switch_levels:
+                    p = os.path.join(dataset, f"switches_{lv}.json")
+                    if os.path.isfile(p):
+                        sw.extend(json.load(open(p, encoding="utf-8")))
+                if sw:
+                    data["switches"] = sw
+                    json.dump(data, open(gd, "w", encoding="utf-8"))
+                    print(f"  merged {len(sw)} power switch(es) into gamedata.json", flush=True)
+            except Exception as e:
+                print(f"  note: could not merge switches into gamedata.json ({e})", flush=True)
             shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
             print("  gamedata.json -> pack", flush=True)
 

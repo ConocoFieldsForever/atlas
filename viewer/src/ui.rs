@@ -183,6 +183,8 @@ pub enum RightPanelTab {
     Tasks,
     /// Navigation: place your position + route to extracts (navigate_panel module).
     Navigate,
+    /// Level controls: power switches (toggle the lights each one drives) + the map's extracts.
+    Level,
 }
 
 pub struct UiPlugin;
@@ -199,6 +201,7 @@ impl Plugin for UiPlugin {
                 Ok("camera") => RightPanelTab::Camera,
                 Ok("tasks") => RightPanelTab::Tasks,
                 Ok("nav") | Ok("route") => RightPanelTab::Navigate,
+                Ok("level") => RightPanelTab::Level,
                 _ => RightPanelTab::Visibility,
             })
             // apply_loot_visibility ordered AFTER spawn_loot so a swap-respawn's fresh markers are
@@ -227,6 +230,7 @@ impl Plugin for UiPlugin {
                 toolbar_panel,
                 layers_panel,
                 camera_panel,
+                level_panel,
                 tasks_tab,
                 crate::navigate_panel::navigate_tab,
                 pos_hud,
@@ -1523,7 +1527,132 @@ fn toolbar_panel(
             if theme::rail_button(ui, cur == RightPanelTab::Navigate, 3, "Navigation \u{00B7} routes") {
                 *tab = RightPanelTab::Navigate;
             }
+            if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Level controls \u{00B7} power \u{00B7} extracts") {
+                *tab = RightPanelTab::Level;
+            }
         });
+}
+
+/// Level-controls tab: flip the map's POWER SWITCHES (each toggles the exact light bank it drives,
+/// derived from the game's own switch->LampController links) and jump to the map's EXTRACTS.
+/// Renders into the same right-panel slot as the other tabs, gated on the active tab.
+#[cfg(feature = "egui")]
+fn level_panel(
+    mut contexts: bevy_egui::EguiContexts,
+    tab: Res<RightPanelTab>,
+    menu: Option<Res<crate::menu::MenuState>>,
+    pack: Option<Res<crate::render::LoadedPack>>,
+    mut gfx: ResMut<crate::render::GfxSettings>,
+    mut cam: Query<&mut Transform, With<crate::render::CullCamera>>,
+) {
+    use bevy_egui::egui::{self, RichText};
+    use crate::ui_theme as theme;
+    if menu.is_some() || *tab != RightPanelTab::Level {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    let Some(pack) = pack else { return };
+    const DIM: bevy_egui::egui::Color32 = theme::MUTED;
+    let mut mask = gfx.light_groups; // clone-edit-compare so mere rendering never dirties change-detection
+    egui::SidePanel::right("map_layers")
+        .default_width(300.0)
+        .frame(theme::panel_frame())
+        .show(ctx, |ui| {
+            ui.label(theme::title("LEVEL CONTROLS"));
+            ui.add_space(theme::SP_MD);
+
+            // ---- POWER ----
+            ui.label(RichText::new("POWER").color(DIM).size(11.0));
+            if pack.0.switches.is_empty() {
+                ui.label(RichText::new("No power switches on this map.").color(DIM).size(11.0));
+            } else {
+                for (i, sw) in pack.0.switches.iter().enumerate() {
+                    let g = sw.group_idx;
+                    ui.horizontal(|ui| {
+                        if g >= 0 && g < 32 {
+                            let bit = 1u32 << g;
+                            let mut on = mask & bit != 0;
+                            let label = if pack.0.switches.len() == 1 {
+                                format!("Power  ({} lamps)", sw.count)
+                            } else {
+                                format!("Power {}  ({} lamps)", i + 1, sw.count)
+                            };
+                            if ui.checkbox(&mut on, label).changed() {
+                                if on { mask |= bit } else { mask &= !bit }
+                            }
+                        } else {
+                            ui.add_enabled(false, egui::Checkbox::new(&mut false, "Power (no lights)"));
+                        }
+                        if ui.small_button("go").on_hover_text("jump to the switch").clicked() {
+                            if let Ok(mut t) = cam.single_mut() {
+                                // stand a few metres back + above the lever, looking at it
+                                let p = sw.world_pos + Vec3::new(0.0, 2.0, 5.0);
+                                t.translation = p;
+                                t.look_at(sw.world_pos, Vec3::Y);
+                            }
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.small_button("All on").clicked() {
+                        for sw in &pack.0.switches {
+                            if (0..32).contains(&sw.group_idx) {
+                                mask |= 1 << sw.group_idx;
+                            }
+                        }
+                    }
+                    if ui.small_button("All off").clicked() {
+                        mask = 0;
+                    }
+                });
+                ui.label(
+                    RichText::new("Maps spawn un-powered (dark). Flip a switch to light its bank \u{2014} or click the switch in the world.")
+                        .color(DIM)
+                        .size(10.0),
+                );
+            }
+
+            // ---- EXTRACTS ----
+            ui.add_space(theme::SP_MD);
+            ui.label(RichText::new("EXTRACTS").color(DIM).size(11.0));
+            if pack.0.exfils.is_empty() {
+                ui.label(RichText::new("No extract data in this pack.").color(DIM).size(11.0));
+            } else {
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for ex in &pack.0.exfils {
+                        ui.horizontal(|ui| {
+                            // faction tint (pmc = blue-ish, scav = amber, shared = grey)
+                            let col = match ex.faction.to_ascii_lowercase().as_str() {
+                                "pmc" => egui::Color32::from_rgb(120, 170, 255),
+                                "scav" => egui::Color32::from_rgb(230, 180, 90),
+                                _ => theme::MUTED,
+                            };
+                            let txt = if ex.active {
+                                RichText::new(&ex.name).color(col)
+                            } else {
+                                RichText::new(format!("{} (off)", ex.name)).color(DIM).italics()
+                            };
+                            ui.label(txt);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("go").on_hover_text("jump to this extract").clicked() {
+                                    if let Ok(mut t) = cam.single_mut() {
+                                        t.translation = ex.world_pos + Vec3::new(0.0, 25.0, 25.0);
+                                        t.look_at(ex.world_pos, Vec3::Y);
+                                    }
+                                }
+                                ui.label(RichText::new(&ex.faction).color(col).size(10.0));
+                            });
+                        });
+                    }
+                });
+            }
+        });
+    if mask != gfx.light_groups {
+        gfx.light_groups = mask; // one write only on a real change
+    }
 }
 
 /// Camera-settings tab: FOV, exposure, fly speed (scroll-adjustable), walk-mode toggle. Renders

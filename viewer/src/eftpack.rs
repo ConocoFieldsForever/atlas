@@ -413,6 +413,10 @@ pub struct Light {
     pub cos_outer: f32,
     /// cos(innerSpotAngle/2): -1.0 for point lights. Always > `cos_outer` (smoothstep edges).
     pub cos_inner: f32,
+    /// Power-switch group index (-1 = always on). A grouped light is off until its switch's bit in
+    /// the live power state is set (mall dark until the lever is flipped). Assigned from the light's
+    /// `group` string via the pack's group table so it matches the switch's group index.
+    pub group_idx: i32,
 }
 
 /// Raw light record as authored in the `lights_*.json` sidecar (Unity world space).
@@ -436,6 +440,11 @@ struct LightRaw {
     inner_spot_angle: f32,
     #[serde(default = "yes")]
     on: bool,
+    /// Power-switch group id ("<level>:<switchGO>") when this light is switch-controlled; absent
+    /// otherwise. Present controlled lights are KEPT even when they ship off (mall dark until
+    /// powered) so the viewer can turn them on.
+    #[serde(default)]
+    group: Option<String>,
 }
 fn ident_quat() -> [f32; 4] {
     [0.0, 0.0, 0.0, 1.0]
@@ -464,7 +473,7 @@ enum Reduced {
 /// and any other non-point/spot type is reported `Unsupported` (skipped, not mis-coerced): the
 /// viewer lights interiors from the baked SH + sky sun, so a Directional (sun) is NOT a local point
 /// light and must not be dropped into the point loop at the sun's position.
-fn reduce_light(r: &LightRaw) -> Reduced {
+fn reduce_light(r: &LightRaw, group_map: &mut std::collections::HashMap<String, u32>) -> Reduced {
     // Classify the Unity light type. Empty kind is legacy "point" (older sidecars omitted it).
     let k = r.kind.trim().to_ascii_lowercase();
     let is_spot = k == "spot";
@@ -472,9 +481,19 @@ fn reduce_light(r: &LightRaw) -> Reduced {
     if !is_spot && !is_point {
         return Reduced::Unsupported; // Directional / Rectangle / Disc / Area / unknown
     }
-    if !r.on || r.intensity <= 0.0 || r.range <= 0.0 {
+    // A switch-controlled light ships OFF (mall dark until powered) but must survive so the viewer
+    // can turn it on; only its intensity/range need be valid. Ungrouped off lights still drop.
+    if (!r.on && r.group.is_none()) || r.intensity <= 0.0 || r.range <= 0.0 {
         return Reduced::Inactive;
     }
+    // Group index: stable per group string, shared with the switch table (first-seen order).
+    let group_idx = match &r.group {
+        Some(g) => {
+            let n = group_map.len() as u32;
+            *group_map.entry(g.clone()).or_insert(n) as i32
+        }
+        None => -1,
+    };
     // G3 = diag(-1,1,1): sign-flip X on the raw Unity world position.
     let pos = Vec3::new(-r.position[0], r.position[1], r.position[2]);
     let color = Vec3::new(r.color[0], r.color[1], r.color[2]) * r.intensity;
@@ -505,6 +524,7 @@ fn reduce_light(r: &LightRaw) -> Reduced {
         dir,
         cos_outer,
         cos_inner,
+        group_idx,
     })
 }
 
@@ -512,7 +532,12 @@ fn reduce_light(r: &LightRaw) -> Reduced {
 /// UNSUPPORTED-type lights skipped (Directional/Rectangle/Disc/…). A missing / unreadable /
 /// unparseable file logs a clear WARNING and contributes nothing — realtime lighting is optional and
 /// must NEVER fail the load, but a parse failure is no longer SILENT (finding 3c).
-fn parse_lights_into(root: &Path, sidecar: &str, out: &mut Vec<Light>) -> usize {
+fn parse_lights_into(
+    root: &Path,
+    sidecar: &str,
+    out: &mut Vec<Light>,
+    group_map: &mut std::collections::HashMap<String, u32>,
+) -> usize {
     let path = if Path::new(sidecar).is_absolute() {
         PathBuf::from(sidecar)
     } else {
@@ -537,13 +562,114 @@ fn parse_lights_into(root: &Path, sidecar: &str, out: &mut Vec<Light>) -> usize 
     };
     let mut unsupported = 0usize;
     for r in &raws {
-        match reduce_light(r) {
+        match reduce_light(r, group_map) {
             Reduced::Light(l) => out.push(l),
             Reduced::Inactive => {}
             Reduced::Unsupported => unsupported += 1,
         }
     }
     unsupported
+}
+
+/// A power switch loaded from `gamedata.json`'s `switches` array (emitted by `eft_extract_switches`).
+/// The viewer makes it clickable + lists it, and toggling it flips the light group's power.
+#[derive(Debug, Clone)]
+pub struct LevelSwitch {
+    /// Stable id ("unity:<level>:mb:<pathid>").
+    pub id: String,
+    /// Light-group index this switch powers (matches `Light.group_idx`); -1 if it controls no
+    /// loaded lights.
+    pub group_idx: i32,
+    /// VIEWER-world position (Unity raw X-flipped, like every light) for pick-matching + focus.
+    pub world_pos: Vec3,
+    /// Diagnostic label (the switch GameObject name); never used as a control rule.
+    pub label: String,
+    /// Number of lamp fixtures the switch controls (for the UI).
+    pub count: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SwitchRaw {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    group: String,
+    #[serde(rename = "world_pos", default)]
+    world_pos: [f32; 3],
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    count: u32,
+}
+
+/// A map extract loaded from `gamedata.json`. `faction` is the who-can-use-it requirement
+/// (pmc / scav / shared); the viewer lists + jumps to it.
+#[derive(Debug, Clone)]
+pub struct LevelExfil {
+    pub name: String,
+    pub faction: String,
+    /// VIEWER-world position (Unity raw X-flipped).
+    pub world_pos: Vec3,
+    /// Whether the exfil is enabled on this map (disabled ones are dimmed).
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExfilRaw {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    faction: String,
+    #[serde(default)]
+    pos: [f32; 3],
+    #[serde(default = "yes")]
+    active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GamedataIntel {
+    #[serde(default)]
+    switches: Vec<SwitchRaw>,
+    #[serde(default)]
+    exfils: Vec<ExfilRaw>,
+}
+
+/// Load the power switches + extracts from `gamedata.json`. Switches resolve to their light-group
+/// index via the group table built during light parsing. Best-effort: a missing file yields none.
+fn load_intel(
+    root: &Path,
+    group_map: &std::collections::HashMap<String, u32>,
+) -> (Vec<LevelSwitch>, Vec<LevelExfil>) {
+    let path = root.join("gamedata.json");
+    let Ok(s) = std::fs::read_to_string(&path) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(gd) = serde_json::from_str::<GamedataIntel>(&s) else {
+        return (Vec::new(), Vec::new());
+    };
+    let switches = gd
+        .switches
+        .into_iter()
+        .map(|r| LevelSwitch {
+            group_idx: group_map.get(&r.group).map(|&i| i as i32).unwrap_or(-1),
+            // G3 = diag(-1,1,1): X-flip the raw Unity world pos into viewer space (matches lights + pick).
+            world_pos: Vec3::new(-r.world_pos[0], r.world_pos[1], r.world_pos[2]),
+            id: r.id,
+            label: r.label,
+            count: r.count,
+        })
+        .collect();
+    let exfils = gd
+        .exfils
+        .into_iter()
+        .map(|r| LevelExfil {
+            world_pos: Vec3::new(-r.pos[0], r.pos[1], r.pos[2]),
+            name: r.name,
+            faction: r.faction,
+            active: r.active,
+        })
+        .collect();
+    (switches, exfils)
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +687,12 @@ pub struct Pack {
     /// Realtime point/spot lights reduced to viewer world space (empty if the pack
     /// ships no lights sidecar or it failed to parse — never fatal).
     pub lights: Vec<Light>,
+    /// Power switches (from gamedata.json) — clickable + listed; toggling one powers its light group.
+    pub switches: Vec<LevelSwitch>,
+    /// Number of distinct light-power groups (== bits used in the power state). 0 = no switches.
+    pub light_group_count: u32,
+    /// Extracts (from gamedata.json) — listed in the Level tab with name + faction, click to jump.
+    pub exfils: Vec<LevelExfil>,
 }
 
 impl Pack {
@@ -634,8 +766,21 @@ impl Pack {
         light_files.dedup();
         let mut lights = Vec::new();
         let mut unsupported = 0usize;
+        // Group table: light `group` string -> dense index, shared with the switch table so a
+        // switch and the lights it controls resolve to the SAME group index.
+        let mut group_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for f in &light_files {
-            unsupported += parse_lights_into(&root, f, &mut lights);
+            unsupported += parse_lights_into(&root, f, &mut lights, &mut group_map);
+        }
+        let (switches, exfils) = load_intel(&root, &group_map);
+        let light_group_count = group_map.len() as u32;
+        if !switches.is_empty() {
+            eprintln!(
+                "  power switches: {} ({} light group(s), {} controlled lights)",
+                switches.len(),
+                light_group_count,
+                lights.iter().filter(|l| l.group_idx >= 0).count(),
+            );
         }
         eprintln!(
             "  realtime lights: {} usable from {} sidecar(s){}",
@@ -655,6 +800,9 @@ impl Pack {
             meshes_bin,
             instances,
             lights,
+            switches,
+            light_group_count,
+            exfils,
         };
         // Complete checked structural validation BEFORE the pack is exposed (finding 5): a malformed
         // manifest that parsed fine but whose offsets/ranges/ids are out of bounds would otherwise
