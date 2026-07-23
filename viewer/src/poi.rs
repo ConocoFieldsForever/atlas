@@ -642,6 +642,10 @@ struct GdExfil {
     outline: Vec<[f32; 3]>,
     #[serde(default = "default_true")]
     active: bool,
+    /// Set by build_map when a power switch's serialized target is this extract's GameObject: the
+    /// extract only opens once the map's power is on. Surfaced as a "Requires switch: Power" line.
+    #[serde(default)]
+    requires_power: bool,
 }
 /// A typed zone (Minefield / SniperFiringZone / MineDirectional / quest trigger / trader
 /// zone) with its collider footprint.
@@ -750,7 +754,9 @@ fn gd_exfil_info(e: &GdExfil, friendly: Option<&str>) -> MarkerInfo {
         name: display.to_string(),
         fac: e.faction.clone(),
         outline: Vec::new(),
-        switches: Vec::new(),
+        // Power-gated extract (derived from the switch's serialized exfil target) -> the existing
+        // card renders this as "Requires switch: Power".
+        switches: if e.requires_power { vec!["Power".into()] } else { Vec::new() },
         transfer: None,
     };
     let mut info = extract_dev_info(&base, &e.faction);
