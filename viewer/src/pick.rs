@@ -150,6 +150,7 @@ fn pick_system(
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
     mut readout: Query<&mut Text, With<PickReadout>>,
     mut gfx: ResMut<crate::render::GfxSettings>,
+    mut door_click: ResMut<crate::render::gpu_driven::DoorClick>,
 ) {
     // Esc cancels an armed place-position mode (checked before the click gate so it works without
     // any click) — unless a text field has focus, where Esc means "defocus the field".
@@ -394,6 +395,10 @@ fn pick_system(
             set_text(&mut readout, line);
             return;
         }
+        // Not a switch: publish the hit point so the render world can toggle a door there (if any).
+        // A door within range swings; anywhere else it's a no-op. Also still shows the pick readout.
+        door_click.point = Some(wp);
+        door_click.gen = door_click.gen.wrapping_add(1);
         let line = format!(
             "PICK  {mesh}  #{id}  inst {inst}  mat {mat} {role}  d={dist:.1}m  ({x:.1}, {y:.1}, {z:.1})",
             mesh = mesh_name,
