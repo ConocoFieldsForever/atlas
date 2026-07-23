@@ -473,6 +473,27 @@ fn apply_gfx_camera(
     } else {
         ec.remove::<Bloom>();
     }
+    // Photoreal extras (Graphics panel): plain Bevy camera post components, so they work on every
+    // render path. DoF reads the main-pass depth (the GPU-driven pass writes the standard
+    // ViewDepthTexture); chromatic aberration is a pure color post.
+    if gfx.dof {
+        ec.insert(bevy::post_process::dof::DepthOfField {
+            mode: bevy::post_process::dof::DepthOfFieldMode::Bokeh,
+            focal_distance: gfx.dof_focal_m,
+            aperture_f_stops: gfx.dof_fstop,
+            ..default()
+        });
+    } else {
+        ec.remove::<bevy::post_process::dof::DepthOfField>();
+    }
+    if gfx.chroma > 0.0005 {
+        ec.insert(bevy::post_process::effect_stack::ChromaticAberration {
+            intensity: gfx.chroma,
+            ..default()
+        });
+    } else {
+        ec.remove::<bevy::post_process::effect_stack::ChromaticAberration>();
+    }
     if gfx.grade && gfx.grade_available {
         // Game grade LUT owns the display chain (the render node applies it after Bloom).
         ec.insert(Tonemapping::None);

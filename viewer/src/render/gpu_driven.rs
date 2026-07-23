@@ -1185,6 +1185,11 @@ impl Plugin for EftGpuDrivenPlugin {
                     prepare_shadow_uniforms
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
+                    // Live lighting sliders: base x GfxSettings multipliers into the LightGrid
+                    // uniform (48 B/frame; byte-identical at the default multipliers).
+                    update_light_uniform
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
                     queue_gpu_driven.in_set(RenderSystems::QueueMeshes),
                 ),
             )
@@ -2457,12 +2462,15 @@ struct EftShResources {
     /// Realtime lighting group(3) additions (bindings 8/9/10): the LightGrid uniform, the packed
     /// light records storage buffer, and the CSR grid storage buffer. Kept alive so `EftShBindGroup`
     /// stays valid; torn down with the rest of the per-map group(3) on an epoch swap.
-    #[allow(dead_code)]
     light_uniform: Buffer,
     #[allow(dead_code)]
     lights_buf: Buffer,
     #[allow(dead_code)]
     light_grid_buf: Buffer,
+    /// The as-built LightGridUniform (params = light_scale/ambient/rt/sun_diffuse BASE values).
+    /// `update_light_uniform` rewrites the GPU copy per frame as base x GfxSettings multipliers,
+    /// so the UI lighting sliders are live with no rebuild (identical bytes at multiplier 1).
+    light_base: LightGridUniform,
 }
 
 #[derive(Resource)]
@@ -3456,6 +3464,7 @@ fn prepare_gpu_buffers(
         light_uniform,
         lights_buf,
         light_grid_buf,
+        light_base: lg.uniform,
     });
     commands.insert_resource(EftShBindGroup(sh_bg));
     // #5 shadows: the runtime switch, the queued pipeline + cascade layout, and the GPU resources.
@@ -4243,6 +4252,26 @@ fn upload_frustum(
 // set, and builds a conventional 0..1-depth orthographic `view_proj = ortho * light_view`. Uploads
 // the per-cascade uniforms (shadow pass) + the combined SunShadowUniform (main pass). No-op cost
 // when disabled is trivial (still uploads, but the main shader gates everything on enabled).
+/// Live lighting controls: rewrite the 48-byte LightGrid uniform each frame as the as-built BASE
+/// values x the UI multipliers (GfxSettings.lights / light_intensity / gi_intensity / sun_diffuse).
+/// At the default multipliers this writes bytes identical to the build, so the shipped look is
+/// untouched; a slider change lands the same frame with no rebuild. params.w stays 0 on full bakes
+/// (base is 0), so the sun-diffuse slider can never double-count a baked sun.
+fn update_light_uniform(
+    render_queue: Res<RenderQueue>,
+    res: Option<Res<EftShResources>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+) {
+    let (Some(res), Some(g)) = (res, settings) else {
+        return;
+    };
+    let mut u = res.light_base;
+    u.params[0] *= if g.lights { g.light_intensity.max(0.0) } else { 0.0 };
+    u.params[1] *= g.gi_intensity.max(0.0);
+    u.params[3] *= g.sun_diffuse.max(0.0);
+    render_queue.write_buffer(&res.light_uniform, 0, bytemuck::bytes_of(&u));
+}
+
 fn prepare_shadow_uniforms(
     render_queue: Res<RenderQueue>,
     config: Option<Res<EftShadowConfig>>,
