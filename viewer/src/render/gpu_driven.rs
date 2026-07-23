@@ -3296,6 +3296,11 @@ fn prepare_gpu_buffers(
     });
     // DOORS: match each swing door to its GPU instance (the panel sits at the door pivot) so
     // `animate_doors` can rotate it on click. Nearest instance by translation within 1.5 m.
+    // AUDIT #4 (deferred, --alllod only): if a door leaf lands in a MULTI-SHELL LOD group, only this
+    // one nearest shell gets the rotation — when distance-LOD (cs_cull mode 1) hands off to another
+    // shell the door snaps closed. Fix when the alllod pipeline is live (so it can be validated that
+    // doors are actually multi-shell): collect every instance sharing this pivot AND lod_group (plumb
+    // lod_group into CpuData) and animate all of them. On lean packs this collapses to the one shell.
     if !cpu.doors.is_empty() {
         let mut door_insts: Vec<DoorInst> = Vec::new();
         for d in &cpu.doors {

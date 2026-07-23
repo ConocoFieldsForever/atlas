@@ -1103,6 +1103,14 @@ def main():
                             billboard_only_rids.discard(rid)
                             if rid not in rid2lod or li < rid2lod[rid][1]:   # shared renderer -> highest-detail (min) lodIndex
                                 rid2lod[rid] = (gidx, li)
+                            # AUDIT #3 (deferred, --alllod only): a renderer LISTED in several LOD
+                            # levels is collapsed to its MIN level here, so on an alllod pack it is
+                            # emitted once (at that finest level) and DISAPPEARS in the coarser bands
+                            # where Unity keeps it visible. Harmless when the shared span starts at the
+                            # group's finest present index (near'=0 -> always drawn). Fix when alllod is
+                            # exercised: record the full level SPAN per renderer and emit one shell per
+                            # level so their per-level windows tile with no gap. Standard EFT authoring
+                            # uses distinct renderers per level, so this may be rare-to-absent.
                             # FINEST real (non-billboard) LOD present in THIS group. Usually 0, but some
                             # LODGroups ship an EMPTY LOD0 slot (the object's only geometry lives at LOD1+
                             # -- e.g. certain vehicles). Recording the finest-present index lets keep_renderer

@@ -169,8 +169,12 @@ first `srh` threshold; `clampCoarsest` on for a viewer) into the cull pass using
 > cull-uniform toggle** (`Graphics ▸ Distance LOD` + bias + force-shell), no rebuild. Default packs
 > resolve to the finest shell only (`ids.w==0` sentinel) → byte-identical to the pre-LOD path.
 > Producer→consumer contract verified end-to-end; correctness proven on a synthetic 3-shell inject
-> (force-0 ≡ max-detail byte-identical, distance grounds near / raises far). The real per-frame perf
-> delta awaits a decimated `--alllod` rebuild (coarse shells = fewer triangles).
+> (force-0 ≡ max-detail byte-identical, distance grounds near / raises far). A post-ship Codex +
+> multi-agent audit found 6 LATENT defects (all `--alllod`-only; lean packs are byte-identical
+> sentinels) — 4 hardened (present-adjacency holes, group-center shell-switch metric via a
+> `lod_centers` buffer, f16/lod_index/bias guards), 2 deferred to when the alllod pipeline is first
+> built (producer shared-renderer span, door multi-shell binding). The real per-frame perf delta
+> awaits a decimated `--alllod` rebuild (coarse shells = fewer triangles).
 
 **M2 — Lighting / GI.**
 SH-L1 irradiance volume as a real `Rgba16Float` **3D texture** (probe order `((z·ny)+y)·nx+x`;
