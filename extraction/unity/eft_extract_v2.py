@@ -533,6 +533,24 @@ def write_terrain_obj(td, path, step=4):
     H = np.asarray(g(hm, "m_Heights"), dtype=np.float64).reshape(res, res)
     Hw = (H / 65535.0) * 2.0 * sy
     Hs = Hw[::step, ::step]; rr, cc = Hs.shape
+    # Unity TERRAIN HOLES (m_Heightmap.m_Holes): a (res-1)x(res-1) coverage grid where <128 = a HOLE
+    # (the game CUTS these quads out for tunnels / bunker mouths / pits). Emitting them anyway fills the
+    # tunnels with solid terrain -> "missing cut-outs" + objects inside a bunker read as floating over
+    # solid ground. Cut a decimated quad if ANY full-res hole cell it spans is holed (conservative: a
+    # tunnel is never re-filled; edge is at most step-1 cells wide). Same (r,c) topology as the faces
+    # below, so the X-negation/winding needs no hole-index change. EFT_TERRAIN_HOLES=0 disables. General
+    # Unity behavior, not per-map.
+    holes = None
+    if os.environ.get("EFT_TERRAIN_HOLES", "1") != "0":
+        try:
+            raw = g(hm, "m_Holes")
+            if raw:
+                hh = np.frombuffer(bytes(raw), np.uint8)
+                hres = int(round(len(hh) ** 0.5))
+                if hres * hres == len(hh) and hres >= res - 1:
+                    holes = hh.reshape(hres, hres)      # <128 == hole
+        except Exception:
+            holes = None
     # Match UnityPy's mesh.export() convention so the builder's uniform FLIPX/coord pipeline handles terrain
     # IDENTICALLY to every other mesh: negate X and reverse triangle winding. (Writing raw +X here would make
     # FLIPX wrongly flip the terrain, offsetting it from the rest of the map.) General, not a per-map fudge.
@@ -546,11 +564,20 @@ def write_terrain_obj(td, path, step=4):
         for r in range(rr):
             for c in range(cc):
                 f.write(f"vt {c/(cc-1):.5f} {r/(rr-1):.5f}\n")
+        cut = 0
         for r in range(rr - 1):
             for c in range(cc - 1):
+                if holes is not None:
+                    r0, r1 = r * step, min((r + 1) * step, holes.shape[0])
+                    c0, c1 = c * step, min((c + 1) * step, holes.shape[1])
+                    if r1 > r0 and c1 > c0 and (holes[r0:r1, c0:c1] < 128).any():
+                        cut += 1
+                        continue                                     # holed quad -> cut out (tunnel/pit)
                 a = r*cc + c + 1; b = r*cc + (c+1) + 1; d = (r+1)*cc + c + 1; e = (r+1)*cc + (c+1) + 1
                 f.write(f"f {b}/{b} {d}/{d} {a}/{a}\n"); f.write(f"f {e}/{e} {d}/{d} {b}/{b}\n")
     os.replace(tmp, path)
+    if holes is not None and cut:
+        print(f"  terrain holes: cut {cut} decimated quad(s) from {os.path.basename(path)}", flush=True)
     return (res - 1) * sx, (res - 1) * sz, float(Hw.max() - Hw.min())
 
 
