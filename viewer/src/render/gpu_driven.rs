@@ -99,6 +99,9 @@ pub struct InstanceGpuRecord {
     /// xyz = world center, w = conservative world radius (Frobenius-norm scaled).
     pub sphere: [f32; 4],
 }
+// #6: LOCK the byte layout — matches `InstanceGpu` in gpu_cull.wgsl / gpu_draw.wgsl / gpu_shadow.wgsl
+// (5×vec4 = 80). A silent drift corrupts every instance's transform on the GPU.
+const _: () = assert!(std::mem::size_of::<InstanceGpuRecord>() == 80);
 
 /// Per-mesh static metadata. 32 bytes (16-aligned).
 #[repr(C)]
@@ -109,8 +112,14 @@ pub struct MeshMeta {
     pub base_vertex: i32,
     pub instance_base: u32,
     pub instance_count: u32,
-    pub _pad: [u32; 3],
+    /// Blend-pass class carried to the GPU: 0 = opaque-only, 1 = blend-only, 2 = mixed (draws in
+    /// both passes). Read by gpu_cull.wgsl `cs_reset` (field `blend_class`) to zero the opaque vs
+    /// blend indirect index_count per class. NOT padding — do not zero it.
+    pub blend_class: u32,
+    pub _pad: [u32; 2],
 }
+// #6: LOCK the byte layout — matches `MeshMeta` in gpu_cull.wgsl (8×u32 = 32, blend_class @20).
+const _: () = assert!(std::mem::size_of::<MeshMeta>() == 32);
 
 /// wgpu `DrawIndexedIndirect` layout (20 bytes). Kept for reference / size checks;
 /// the buffer is GPU-written so we never upload this from the CPU.
@@ -139,6 +148,8 @@ pub struct CullUniform {
     /// Zeros = cull nothing (build-time seed before the first upload_frustum).
     pub cam_k: [f32; 4],
 }
+// #6: LOCK the byte layout — matches `CullGlobals` in gpu_cull.wgsl (array<vec4,6> + 2×vec4 = 128).
+const _: () = assert!(std::mem::size_of::<CullUniform>() == 128);
 
 /// Stride of one indirect draw record, in bytes.
 pub const DRAW_ARG_STRIDE: u64 = 20;
@@ -308,6 +319,8 @@ pub struct TerrainSplatGpu {
     /// (Streets-scale maps can carry more slices than Interchange's 4 / Lighthouse's 6.)
     pub ctrl_idx: [u32; 48],
 }
+// #6: LOCK the byte layout — matches `TerrainSplat` in gpu_draw.wgsl (12+12+48 u32/f32 = 288).
+const _: () = assert!(std::mem::size_of::<TerrainSplatGpu>() == 288);
 
 /// Vert-Paint 3-layer splat table entry (group(2) binding(5), storage; one per MAT_FLAG_VP
 /// material, indexed by `GpuMaterial::_pad2`). The EXACT game blend was RE'd from the DX11
@@ -352,6 +365,8 @@ pub struct ShVolumeUniform {
     /// xyz = (sx, sy, sz) probe spacing in meters, w unused.
     pub spacing: [f32; 4],
 }
+// #6: LOCK the byte layout — matches `ShVolume` in gpu_draw.wgsl (4×vec4 = 64).
+const _: () = assert!(std::mem::size_of::<ShVolumeUniform>() == 64);
 
 /// Default normal-bias (meters) written to `ShVolumeUniform::vol_inv_extent.w`: the shading
 /// point is pushed this far along the surface normal before sampling the probe grid, so a
@@ -587,6 +602,8 @@ struct ShadowCascadeUniform {
     /// xyz = Lsun (toward the sun), w = 1/SHADOW_MAP_SIZE (PCF texel).
     dir_texel: [f32; 4],
 }
+// #6: LOCK the byte layout — matches `ShadowCascadeUniform` in gpu_shadow.wgsl (mat4 + vec4 = 80).
+const _: () = assert!(std::mem::size_of::<ShadowCascadeUniform>() == 80);
 
 /// group(3) binding(5) main sun-shadow uniform read by gpu_draw.wgsl. Byte-identical to the WGSL
 /// `SunShadowUniform` (208 bytes: 2×64 + 5×16).
@@ -607,6 +624,9 @@ struct SunShadowUniform {
     /// y = sky-reflection gain scale, z = emissive scale, w = reserved. All 1.0 = shipped look.
     gfx: [f32; 4],
 }
+// #6: LOCK the byte layout — matches `SunShadowUniform` in gpu_draw.wgsl (2×mat4 = 128 + 5×vec4 = 80
+// => 208). SHADOW_CASCADES is fixed at 2; bumping it changes this size (update the WGSL twin too).
+const _: () = assert!(std::mem::size_of::<SunShadowUniform>() == 208);
 
 /// Runtime shadow feature switch + the pack's sun direction (already X-flipped into pack space).
 /// Default ON; `enabled=false` (missing sun_dir, EFT_SHADOWS=0, or the UI toggle off) makes the
@@ -2026,7 +2046,8 @@ fn build_cpu_data(
             base_vertex,
             instance_base,
             instance_count,
-            _pad: [blend_class, 0, 0],
+            blend_class,
+            _pad: [0, 0],
         });
     }
 
@@ -2166,7 +2187,8 @@ fn build_cpu_data(
             base_vertex,
             instance_base,
             instance_count: count,
-            _pad: [0; 3],
+            blend_class: 0,
+            _pad: [0; 2],
         });
         info!("gpu-driven #4 grass: {count} clumps appended (cross-quad, alpha-cutout)");
     }
