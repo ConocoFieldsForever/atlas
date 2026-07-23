@@ -159,11 +159,17 @@ impl GroundGrid {
 
         // Phase 1 (parallel): each worker collects (ground, wall) world triangles.
         let per_thread: Vec<(Vec<[Vec3; 3]>, Vec<[Vec3; 3]>)> = pool.scope(|s| {
-            for c in instances.chunks(chunk) {
+            for (ci, c) in instances.chunks(chunk).enumerate() {
+                let base = ci * chunk;
                 s.spawn(async move {
                     let mut ground: Vec<[Vec3; 3]> = Vec::new();
                     let mut walls: Vec<[Vec3; 3]> = Vec::new();
-                    for inst in c {
+                    for (j, inst) in c.iter().enumerate() {
+                        // All-LOD pack: only the default shell contributes collision triangles
+                        // (else the ground/wall grids double-count overlapping shells).
+                        if !pack.is_default_lod(base + j) {
+                            continue;
+                        }
                         let aff = inst.affine3a();
                         // Skip singular instances (degenerate affine → garbage transform).
                         if aff.matrix3.determinant().abs() < 1e-12 {

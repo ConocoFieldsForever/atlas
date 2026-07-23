@@ -286,6 +286,11 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
             }
         }
         for &iid in inst_ids {
+            // All-LOD pack: bake nav from the default shell only (else the BVH soup has stacked
+            // overlapping shells → slower bake + coarse-shell walkability artifacts).
+            if !pack.is_default_lod(iid as usize) {
+                continue;
+            }
             let inst = &pack.instances[iid as usize];
             let root_is_door = pack
                 .manifest
