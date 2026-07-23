@@ -100,7 +100,10 @@ EXFIL_CLASSES = {
     "CarExtraction": "shared",
 }
 DOOR_CLASSES = {"Door": "door", "Trunk": "trunk", "KeycardDoor": "door", "SlidingDoor": "door",
-                "ExfiltrationDoor": "exfil_door"}
+                "ExfiltrationDoor": "exfil_door", "DoorSwitch": "door"}
+# Swing doors we can open by rotating about the owner's local Z (Codex audit): Trunk / sliding /
+# exfil doors need different motion and are marked non-swing so the viewer doesn't rotate them.
+SWING_DOOR_CLASSES = {"Door", "KeycardDoor", "DoorSwitch"}
 # EDoorState (EFT.Interactive) — flags; scenes serialize a single initial state.
 DOOR_STATE = {0: "none", 1: "locked", 2: "shut", 4: "open", 8: "interacting", 16: "breach"}
 # EPlayerSideMask
@@ -149,16 +152,24 @@ def dec_exfil_name(pl):
 
 def dec_door(pl):
     """WorldInteractiveObject prefix: 28 bytes, KeyId str, 12 bytes, Id str, ... state at +92.
-    Validated on 299 lighthouse doors: state column reads only {1,2,4,16}; keyed doors all 1."""
+    Validated on 299 lighthouse doors: state column reads only {1,2,4,16}; keyed doors all 1.
+    Also recovers the signed OPEN ANGLE (degrees) at IdEnd+56 (Codex audit: matched the authored
+    open transform within 0.15deg on all 97 open Interchange doors). Returns (key, id, state, angle)."""
+    import struct as _st
     key, kend = read_cstr(pl, 28)
     if key is None:
-        return None, None, None
+        return None, None, None, None
     did, iend = read_cstr(pl, kend + 12)
     st = None
     if iend + 96 <= len(pl):
         v = int.from_bytes(pl[iend + 92:iend + 96], "little")
         st = DOOR_STATE.get(v)                              # unknown value -> None, not garbage
-    return (key or None), (did or None), st
+    ang = None
+    if iend + 60 <= len(pl):
+        a = _st.unpack_from("<f", pl, iend + 56)[0]
+        if a == a and 0.0 < abs(a) <= 180.0:                # finite, door-scale
+            ang = round(float(a), 2)
+    return (key or None), (did or None), st, ang
 
 
 def dec_spawn(pl):
@@ -481,11 +492,18 @@ def scan_level(lv, sink):
                 "name": name, "active": active, "lv": lv,
             })
         elif cls in DOOR_CLASSES:
-            key, did, st = dec_door(pl)
-            sink["doors"].append({
+            key, did, st, ang = dec_door(pl)
+            rec = {
                 "pos": tpos, "key_id": key, "state": st, "kind": DOOR_CLASSES[cls],
                 "id": did, "name": name, "active": active, "lv": lv,
-            })
+            }
+            # Swing doors (Door/KeycardDoor/DoorSwitch) carry the open angle so the viewer can
+            # animate them about their pivot; trunks/sliding/exfil doors move differently (no swing).
+            if cls in SWING_DOOR_CLASSES:
+                rec["swing"] = True
+                if ang is not None:
+                    rec["open_angle"] = ang
+            sink["doors"].append(rec)
         elif cls == "TransitPoint":
             box = cols[0] if cols else None
             sink["transit_points"].append({
