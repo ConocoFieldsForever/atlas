@@ -234,7 +234,15 @@ class MaterialFactory:
         col  = sb.get('col')
         rough, metal = _pbr(sh, role)
         gloss = sb.get('gloss'); metalf = sb.get('metal')
-        if gloss is not None:  rough = round(max(0.02, min(1.0, 1.0 - float(gloss))), 4)   # real smoothness wins
+        # `gloss` may override the shader-family default -- but ONLY for families that actually
+        # evaluate smoothness. A pure-Diffuse Unity shader (p0/Cutout/Bumped Diffuse etc.) has NO
+        # specular term at all, and the extractor records a fabricated default gloss=0.5 for shaders
+        # without a _Glossiness property. Letting that override made diffuse fabrics glossy: reserve's
+        # camo NETS rendered with white sky/sun sheen blowing the tan blotches out (game = matte).
+        _s = sh.lower()
+        _has_spec = any(h in _s for h in ('specular', 'reflective', 'smap', 'chrome', 'metal', 'standard'))
+        if gloss is not None and _has_spec:
+            rough = round(max(0.02, min(1.0, 1.0 - float(gloss))), 4)   # real smoothness wins
         if metalf is not None: metal = round(max(0.0, min(1.0, float(metalf))), 4)
 
         tint = _col4(col)
