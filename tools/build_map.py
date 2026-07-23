@@ -495,8 +495,18 @@ def main():
                         sw.extend(json.load(open(p, encoding="utf-8")))
                 if sw:
                     data["switches"] = sw
+                    # Tag POWER-GATED extracts: a switch's exfil target (by GameObject name) means
+                    # that extract "requires power". Feeds the viewer's "Requires switch" card line.
+                    ex_by_go = {e.get("go"): e for e in data.get("exfils", []) if e.get("go")}
+                    n_tag = 0
+                    for s in sw:
+                        for t in s.get("targets", []):
+                            if "Exfil" in t.get("type", "") and t.get("name") in ex_by_go:
+                                ex_by_go[t["name"]]["requires_power"] = True
+                                n_tag += 1
                     json.dump(data, open(gd, "w", encoding="utf-8"))
-                    print(f"  merged {len(sw)} power switch(es) into gamedata.json", flush=True)
+                    print(f"  merged {len(sw)} power switch(es) into gamedata.json "
+                          f"({n_tag} power-gated extract(s) tagged)", flush=True)
             except Exception as e:
                 print(f"  note: could not merge switches into gamedata.json ({e})", flush=True)
             shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
