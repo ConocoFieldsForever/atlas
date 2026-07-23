@@ -183,7 +183,7 @@ pub enum RightPanelTab {
     Tasks,
     /// Navigation: place your position + route to extracts (navigate_panel module).
     Navigate,
-    /// Level controls: power switches (toggle the lights each one drives) + the map's extracts.
+    /// Level controls: power switches (toggle the lights each one drives).
     Level,
 }
 
@@ -1527,14 +1527,15 @@ fn toolbar_panel(
             if theme::rail_button(ui, cur == RightPanelTab::Navigate, 3, "Navigation \u{00B7} routes") {
                 *tab = RightPanelTab::Navigate;
             }
-            if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Level controls \u{00B7} power \u{00B7} extracts") {
+            if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Level controls \u{00B7} power switches") {
                 *tab = RightPanelTab::Level;
             }
         });
 }
 
 /// Level-controls tab: flip the map's POWER SWITCHES (each toggles the exact light bank it drives,
-/// derived from the game's own switch->LampController links) and jump to the map's EXTRACTS.
+/// derived from the game's own switch->LampController links). Extracts are shown in the map-overlay
+/// layers (Visibility tab) already, so they are NOT duplicated here.
 /// Renders into the same right-panel slot as the other tabs, gated on the active tab.
 #[cfg(feature = "egui")]
 fn level_panel(
@@ -1613,41 +1614,6 @@ fn level_panel(
                         .color(DIM)
                         .size(10.0),
                 );
-            }
-
-            // ---- EXTRACTS ----
-            ui.add_space(theme::SP_MD);
-            ui.label(RichText::new("EXTRACTS").color(DIM).size(11.0));
-            if pack.0.exfils.is_empty() {
-                ui.label(RichText::new("No extract data in this pack.").color(DIM).size(11.0));
-            } else {
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for ex in &pack.0.exfils {
-                        ui.horizontal(|ui| {
-                            // faction tint (pmc = blue-ish, scav = amber, shared = grey)
-                            let col = match ex.faction.to_ascii_lowercase().as_str() {
-                                "pmc" => egui::Color32::from_rgb(120, 170, 255),
-                                "scav" => egui::Color32::from_rgb(230, 180, 90),
-                                _ => theme::MUTED,
-                            };
-                            let txt = if ex.active {
-                                RichText::new(&ex.name).color(col)
-                            } else {
-                                RichText::new(format!("{} (off)", ex.name)).color(DIM).italics()
-                            };
-                            ui.label(txt);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("go").on_hover_text("jump to this extract").clicked() {
-                                    if let Ok(mut t) = cam.single_mut() {
-                                        t.translation = ex.world_pos + Vec3::new(0.0, 25.0, 25.0);
-                                        t.look_at(ex.world_pos, Vec3::Y);
-                                    }
-                                }
-                                ui.label(RichText::new(&ex.faction).color(col).size(10.0));
-                            });
-                        });
-                    }
-                });
             }
         });
     if mask != gfx.light_groups {
