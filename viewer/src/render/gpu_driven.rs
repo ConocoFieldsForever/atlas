@@ -2943,11 +2943,12 @@ fn prepare_gpu_buffers(
     let sync_load = std::env::var("EFT_SYNC_LOAD")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
-    let (async_albedo, async_normal): (
+    let (async_albedo, async_normal, async_geo): (
         Option<Vec<(Texture, TextureView)>>,
         Option<Vec<(Texture, TextureView)>>,
+        Option<(Buffer, Buffer)>,
     ) = if sync_load {
-        (None, None) // escape hatch: the synchronous loops below produce the textures
+        (None, None, None) // escape hatch: the synchronous path below produces textures + geometry
     } else {
         // -- KICKOFF: spawn off-thread prep for every texture (once per map epoch) --
         let need_kickoff = build.as_ref().map(|b| b.epoch != epoch).unwrap_or(true);
@@ -2979,6 +2980,22 @@ fn prepare_gpu_buffers(
                 .collect();
             let n_a = albedo_tasks.len();
             let n_n = normal_tasks.len();
+            // Step 4: create the vertex+index buffers EMPTY now (COPY_DST) so the geometry can be
+            // streamed in across the following frames rather than memcpy'd in one finalize frame.
+            let vtx_total = std::mem::size_of_val(cpu.vertex_data.as_slice());
+            let idx_total = std::mem::size_of_val(cpu.index_data.as_slice());
+            let vertex = render_device.create_buffer(&BufferDescriptor {
+                label: Some("eft_gpu_vertex"),
+                size: vtx_total as u64,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let index = render_device.create_buffer(&BufferDescriptor {
+                label: Some("eft_gpu_index"),
+                size: idx_total as u64,
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             commands.insert_resource(GpuBuildState {
                 epoch,
                 albedo_tasks,
@@ -2988,6 +3005,14 @@ fn prepare_gpu_buffers(
                 started: std::time::Instant::now(),
                 frames: 0,
                 peak_ms: 0.0,
+                geo: GeoStream {
+                    vertex,
+                    index,
+                    vtx_total,
+                    idx_total,
+                    vtx_cursor: 0,
+                    idx_cursor: 0,
+                },
             });
             if let Some(s) = &load_signal {
                 s.set(true);
@@ -3046,12 +3071,33 @@ fn prepare_gpu_buffers(
                 bs.normal_tasks[i] = None;
             }
         }
+        // Step 4: stream a budgeted slice of the ~1.1 GiB geometry into the pre-created buffers
+        // this frame (write_buffer chunks are 4-byte aligned — whole f32/u32 records). One vtx +
+        // one idx chunk per frame overlaps the texture window, so the finalize frame no longer does
+        // a big one-shot memcpy. GEO_CHUNK is per-buffer per-frame.
+        const GEO_CHUNK: usize = 16 * 1024 * 1024;
+        {
+            let g = &mut bs.geo;
+            if g.vtx_cursor < g.vtx_total {
+                let end = (g.vtx_cursor + GEO_CHUNK).min(g.vtx_total);
+                let bytes: &[u8] = bytemuck::cast_slice(&cpu.vertex_data);
+                render_queue.write_buffer(&g.vertex, g.vtx_cursor as u64, &bytes[g.vtx_cursor..end]);
+                g.vtx_cursor = end;
+            }
+            if g.idx_cursor < g.idx_total {
+                let end = (g.idx_cursor + GEO_CHUNK).min(g.idx_total);
+                let bytes: &[u8] = bytemuck::cast_slice(&cpu.index_data);
+                render_queue.write_buffer(&g.index, g.idx_cursor as u64, &bytes[g.idx_cursor..end]);
+                g.idx_cursor = end;
+            }
+        }
+        let geo_done = bs.geo.vtx_cursor >= bs.geo.vtx_total && bs.geo.idx_cursor >= bs.geo.idx_total;
         let frame_ms = frame_t0.elapsed().as_secs_f64() * 1000.0;
         bs.peak_ms = bs.peak_ms.max(frame_ms);
         bs.frames += 1;
         let a_done = bs.albedo_tex.iter().all(|o| o.is_some());
         let n_done = bs.normal_tex.iter().all(|o| o.is_some());
-        if !(a_done && n_done) {
+        if !(a_done && n_done && geo_done) {
             return; // more frames needed — map stays gated off, indicator keeps animating
         }
 
@@ -3064,32 +3110,47 @@ fn prepare_gpu_buffers(
         for slot in std::mem::take(&mut bs.normal_tex) {
             n.push(slot.expect("normal slot filled once n_done"));
         }
+        // Step 4: hand the fully-streamed geometry buffers to the finalize block (Buffer clones
+        // share the same GPU allocation — no copy).
+        let geo = (bs.geo.vertex.clone(), bs.geo.index.clone());
         eprintln!(
-            "[stall] prepare_gpu_buffers ASYNC build DONE: {} albedo + {} normal textures over {} \
-             frames, {:.0} ms wall — LONGEST single render-thread stall {:.1} ms (budget {:.0} ms)",
+            "[stall] prepare_gpu_buffers ASYNC build DONE: {} albedo + {} normal textures + \
+             {:.0} MiB geometry over {} frames, {:.0} ms wall — LONGEST single render-thread stall \
+             {:.1} ms (budget {:.0} ms)",
             a.len(),
             n.len(),
+            (bs.geo.vtx_total + bs.geo.idx_total) as f64 / 1048576.0,
             bs.frames,
             bs.started.elapsed().as_secs_f64() * 1000.0,
             bs.peak_ms,
             upload_budget_ms(),
         );
         commands.remove_resource::<GpuBuildState>();
-        (Some(a), Some(n))
+        (Some(a), Some(n), Some(geo))
     };
 
     let prep_t0 = std::time::Instant::now(); // STALL: the finalize frame (geometry + SH + shadows)
 
-    let vertex = render_device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("eft_gpu_vertex"),
-        contents: bytemuck::cast_slice(&cpu.vertex_data),
-        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
-    });
-    let index = render_device.create_buffer_with_data(&BufferInitDescriptor {
-        label: Some("eft_gpu_index"),
-        contents: bytemuck::cast_slice(&cpu.index_data),
-        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
-    });
+    // Step 4: in the async path the vertex+index buffers were already created + streamed full over
+    // the loading window, so the finalize frame just adopts them (no ~1.1 GiB memcpy here). The
+    // sync (EFT_SYNC_LOAD) path still builds them one-shot in this frame.
+    let geo_streamed = async_geo.is_some();
+    let (vertex, index) = match async_geo {
+        Some((v, i)) => (v, i),
+        None => {
+            let v = render_device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("eft_gpu_vertex"),
+                contents: bytemuck::cast_slice(&cpu.vertex_data),
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            });
+            let i = render_device.create_buffer_with_data(&BufferInitDescriptor {
+                label: Some("eft_gpu_index"),
+                contents: bytemuck::cast_slice(&cpu.index_data),
+                usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            });
+            (v, i)
+        }
+    };
     let instances = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_gpu_instances"),
         contents: bytemuck::cast_slice(&cpu.instances),
@@ -3734,11 +3795,12 @@ fn prepare_gpu_buffers(
     }
     eprintln!(
         "[stall] prepare_gpu_buffers FINALIZE frame (render thread): {:.1} ms  \
-         [geo {:.1} ({:.0}MiB vtx + {:.0}MiB idx) | albedo {} tex {:.1} | normal {} tex {:.1} | SH+shadows {:.1}]{}",
+         [geo-finalize {:.1} ({:.0}MiB vtx + {:.0}MiB idx {}) | albedo {} tex {:.1} | normal {} tex {:.1} | SH+shadows {:.1}]{}",
         prep_t0.elapsed().as_secs_f64() * 1000.0,
         geo_ms,
         std::mem::size_of_val(cpu.vertex_data.as_slice()) as f64 / 1048576.0,
         std::mem::size_of_val(cpu.index_data.as_slice()) as f64 / 1048576.0,
+        if geo_streamed { "STREAMED over load window" } else { "one-shot" },
         tex_count,
         albedo_ms,
         normal_count,
@@ -4377,6 +4439,21 @@ struct GpuBuildState {
     started: std::time::Instant,
     frames: u32,
     peak_ms: f64,
+    /// Step 4: the ~1.1 GiB vertex+index upload, streamed in budgeted chunks across these same
+    /// frames (via `write_buffer`) instead of one big `create_buffer_with_data` memcpy in the
+    /// finalize frame. The buffers are created empty at kickoff and filled progressively.
+    geo: GeoStream,
+}
+
+/// Streamed geometry upload state (Step 4). Buffers are created empty (COPY_DST) at kickoff and
+/// filled a chunk at a time each PROGRESS frame; the finalize block reuses them once full.
+struct GeoStream {
+    vertex: Buffer,
+    index: Buffer,
+    vtx_total: usize, // total bytes
+    idx_total: usize,
+    vtx_cursor: usize, // bytes written so far (4-byte aligned; f32/u32 records)
+    idx_cursor: usize,
 }
 
 /// Per-frame render-thread upload budget (ms). Uploads run until this is exceeded, then yield to
