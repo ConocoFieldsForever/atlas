@@ -626,12 +626,45 @@ struct ExfilRaw {
     active: bool,
 }
 
+/// A swing door (gamedata.json `doors` with `swing:true`) the viewer can open on click.
+#[derive(Debug, Clone)]
+pub struct LevelDoor {
+    /// Hinge pivot = the door component's Transform world origin (viewer space, already bridged).
+    pub pivot: Vec3,
+    /// Signed open angle in degrees (rotation about the door's up axis to the open pose).
+    pub open_angle: f32,
+    /// Initial state: "shut" | "open" | "locked" | ... (from EDoorState).
+    pub state: String,
+    /// Required key/keycard item id (locked doors); None otherwise.
+    pub key_id: Option<String>,
+    /// GameObject name (diagnostic; e.g. "Inside_Door_Metal_08_R_210-110_Door").
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DoorRaw {
+    #[serde(default)]
+    pos: [f32; 3],
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    key_id: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    swing: bool,
+    #[serde(default, rename = "open_angle")]
+    open_angle: Option<f32>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct GamedataIntel {
     #[serde(default)]
     switches: Vec<SwitchRaw>,
     #[serde(default)]
     exfils: Vec<ExfilRaw>,
+    #[serde(default)]
+    doors: Vec<DoorRaw>,
 }
 
 /// Load the power switches + extracts from `gamedata.json`. Switches resolve to their light-group
@@ -639,13 +672,13 @@ struct GamedataIntel {
 fn load_intel(
     root: &Path,
     group_map: &std::collections::HashMap<String, u32>,
-) -> (Vec<LevelSwitch>, Vec<LevelExfil>) {
+) -> (Vec<LevelSwitch>, Vec<LevelExfil>, Vec<LevelDoor>) {
     let path = root.join("gamedata.json");
     let Ok(s) = std::fs::read_to_string(&path) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     let Ok(gd) = serde_json::from_str::<GamedataIntel>(&s) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     };
     let switches = gd
         .switches
@@ -669,7 +702,24 @@ fn load_intel(
             active: r.active,
         })
         .collect();
-    (switches, exfils)
+    // Swing doors: gamedata door `pos` is ALREADY viewer-space (bridged by extract_gamedata),
+    // unlike the switch world_pos, so no X-flip here. Keep only swing doors with a real open angle.
+    let doors = gd
+        .doors
+        .into_iter()
+        .filter(|d| d.swing)
+        .filter_map(|d| {
+            let ang = d.open_angle?;
+            Some(LevelDoor {
+                pivot: Vec3::new(d.pos[0], d.pos[1], d.pos[2]),
+                open_angle: ang,
+                state: d.state.unwrap_or_else(|| "shut".into()),
+                key_id: d.key_id,
+                name: d.name,
+            })
+        })
+        .collect();
+    (switches, exfils, doors)
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +743,8 @@ pub struct Pack {
     pub light_group_count: u32,
     /// Extracts (from gamedata.json) — listed in the Level tab with name + faction, click to jump.
     pub exfils: Vec<LevelExfil>,
+    /// Swing doors (gamedata.json) the viewer can open on click.
+    pub doors: Vec<LevelDoor>,
 }
 
 impl Pack {
@@ -772,7 +824,7 @@ impl Pack {
         for f in &light_files {
             unsupported += parse_lights_into(&root, f, &mut lights, &mut group_map);
         }
-        let (switches, exfils) = load_intel(&root, &group_map);
+        let (switches, exfils, doors) = load_intel(&root, &group_map);
         let light_group_count = group_map.len() as u32;
         if !switches.is_empty() {
             eprintln!(
@@ -803,6 +855,7 @@ impl Pack {
             switches,
             light_group_count,
             exfils,
+            doors,
         };
         // Complete checked structural validation BEFORE the pack is exposed (finding 5): a malformed
         // manifest that parsed fine but whose offsets/ranges/ids are out of bounds would otherwise

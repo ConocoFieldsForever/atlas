@@ -1012,6 +1012,9 @@ pub struct CpuData {
     light_grid: LightGridCpu,
     instance_total: u32,
     mesh_count: u32,
+    /// Swing doors (gamedata) the viewer can open on click. Matched to their GPU instance +
+    /// animated in `prepare_gpu_buffers` / `animate_doors`.
+    doors: Vec<crate::eftpack::LevelDoor>,
 }
 
 /// The repacked CPU geometry blob + the `MapEpoch` it was built for. `prepare_gpu_buffers` builds
@@ -1175,7 +1178,10 @@ impl Plugin for EftGpuDrivenPlugin {
             // The map epoch reaches the render world so `reset_gpu_map_if_epoch_changed` can tear
             // down the old pack's GPU state on a swap.
             ExtractResourcePlugin::<super::MapEpoch>::default(),
+            // Door click-to-open: the pick's world point crosses into the render world.
+            ExtractResourcePlugin::<DoorClick>::default(),
         ))
+        .init_resource::<DoorClick>()
         // The CPU staging build re-runs on every map epoch (the initial insert included) so an
         // in-place .eftpack swap rebuilds the blob; the render-world reset then rebuilds the GPU
         // side. Step 3: `kick_cpu_build` spawns the heavy build onto the AsyncComputeTaskPool (so
@@ -1226,6 +1232,11 @@ impl Plugin for EftGpuDrivenPlugin {
                     // Live POWER SWITCH toggle: re-upload the light buffer with unpowered groups
                     // zeroed when GfxSettings.light_groups changes (no-op until a switch is flipped).
                     update_light_power
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
+                    // Door click-to-open: toggle the nearest door + ease in-flight swings, mutating
+                    // the matched instance record (no-op until a door is clicked).
+                    animate_doors
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
                     queue_gpu_driven.in_set(RenderSystems::QueueMeshes),
@@ -2488,6 +2499,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         light_grid,
         instance_total,
         mesh_count,
+        doors: pack.doors.clone(),
     })
 }
 
@@ -3176,6 +3188,48 @@ fn prepare_gpu_buffers(
         contents: bytemuck::cast_slice(&cpu.instances),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
+    // DOORS: match each swing door to its GPU instance (the panel sits at the door pivot) so
+    // `animate_doors` can rotate it on click. Nearest instance by translation within 1.5 m.
+    if !cpu.doors.is_empty() {
+        let mut door_insts: Vec<DoorInst> = Vec::new();
+        for d in &cpu.doors {
+            let mut best: Option<(usize, f32)> = None;
+            for (i, r) in cpu.instances.iter().enumerate() {
+                let t = Vec3::new(r.m0[3], r.m1[3], r.m2[3]);
+                let dist = t.distance_squared(d.pivot);
+                if dist < 2.25 && best.map(|(_, b)| dist < b).unwrap_or(true) {
+                    best = Some((i, dist));
+                }
+            }
+            if let Some((i, _)) = best {
+                let base = cpu.instances[i];
+                // swing axis = door local-Z in viewer world (= instance affine column 2), normalized.
+                let axis = Vec3::new(base.m0[2], base.m1[2], base.m2[2]).normalize_or_zero();
+                if axis.length_squared() < 0.5 {
+                    continue;
+                }
+                let locked = d.state.eq_ignore_ascii_case("locked");
+                let start = if d.state.eq_ignore_ascii_case("open") { 1.0 } else { 0.0 };
+                // EFT_DOORS_OPEN=1 opens every unlocked door INSTANTLY at spawn (debug / screenshots).
+                let dbg_open = std::env::var("EFT_DOORS_OPEN").map(|v| v.trim() == "1").unwrap_or(false);
+                let p = if dbg_open && !locked { 1.0 } else { start };
+                door_insts.push(DoorInst {
+                    gpu_idx: i as u32,
+                    base,
+                    axis,
+                    open_rad: d.open_angle.to_radians(),
+                    locked,
+                    progress: p,
+                    target: p,
+                });
+            }
+        }
+        eprintln!("[doors] matched {} of {} swing doors to instances", door_insts.len(), cpu.doors.len());
+        commands.insert_resource(EftDoors {
+            doors: door_insts,
+            instances_buf: instances.clone(),
+        });
+    }
     let mesh_meta = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_gpu_mesh_meta"),
         contents: bytemuck::cast_slice(&cpu.mesh_meta),
@@ -4628,6 +4682,116 @@ fn update_light_power(
     let mut records = res.light_records_base.clone();
     apply_light_power_records(&mut records, &res.light_group, mask);
     render_queue.write_buffer(&res.lights_buf, 0, bytemuck::cast_slice(&records));
+}
+
+// ============================================================================
+// DOORS: click-to-open swing. A swing door's panel instance sits at its hinge origin (Codex audit:
+// panel is a direct child at ~identity, its local X=0 edge is the hinge), so opening it is a
+// rotation of the instance's linear part about the door's local-Z axis, keeping translation. We
+// match each gamedata door to its GPU instance by pivot proximity at finalize, then animate the
+// matched instance record + re-upload it (like update_light_power, but per instance).
+// ============================================================================
+
+/// One matched, animatable door (render world).
+struct DoorInst {
+    gpu_idx: u32,                 // index into the instance storage buffer
+    base: InstanceGpuRecord,      // authored (closed/initial) record — the animation base
+    axis: Vec3,                   // swing axis (door local-Z in viewer world), normalized
+    open_rad: f32,                // signed open angle in radians (progress 0->1 sweeps 0->open_rad)
+    locked: bool,                 // locked+keyed doors don't swing on a plain click
+    progress: f32,                // current 0=closed .. 1=open
+    target: f32,                  // where it's heading
+}
+
+#[derive(Resource)]
+struct EftDoors {
+    doors: Vec<DoorInst>,
+    instances_buf: Buffer,
+}
+
+/// Main-world one-shot: the last world point a non-switch left click landed on (pick.rs writes it).
+/// A generation counter makes it a one-shot across the world boundary without a clear-back channel.
+#[derive(Resource, Clone, Default)]
+pub struct DoorClick {
+    pub point: Option<Vec3>,
+    pub gen: u64,
+}
+impl ExtractResource for DoorClick {
+    type Source = DoorClick;
+    fn extract_resource(s: &Self) -> Self {
+        s.clone()
+    }
+}
+
+/// Rotate a door's base instance record about `axis` through `progress*open_rad`, keeping its
+/// translation (the hinge is at the instance origin). Returns the mutated 80-byte record.
+fn door_record(base: &InstanceGpuRecord, axis: Vec3, open_rad: f32, progress: f32) -> InstanceGpuRecord {
+    let r = Mat3::from_axis_angle(axis, open_rad * progress);
+    let base_lin = Mat3::from_cols(
+        Vec3::new(base.m0[0], base.m1[0], base.m2[0]),
+        Vec3::new(base.m0[1], base.m1[1], base.m2[1]),
+        Vec3::new(base.m0[2], base.m1[2], base.m2[2]),
+    );
+    let l = r * base_lin; // rotate the linear part about the origin (== the hinge)
+    let mut rec = *base;
+    rec.m0[0] = l.x_axis.x; rec.m0[1] = l.y_axis.x; rec.m0[2] = l.z_axis.x;
+    rec.m1[0] = l.x_axis.y; rec.m1[1] = l.y_axis.y; rec.m1[2] = l.z_axis.y;
+    rec.m2[0] = l.x_axis.z; rec.m2[1] = l.y_axis.z; rec.m2[2] = l.z_axis.z;
+    rec // translation (m*[3]) + ids + sphere unchanged
+}
+
+/// Toggle the nearest door on a click + ease all in-flight doors, re-uploading changed instances.
+fn animate_doors(
+    time: Res<Time>,
+    render_queue: Res<RenderQueue>,
+    doors: Option<ResMut<EftDoors>>,
+    click: Option<Res<DoorClick>>,
+    mut last_gen: Local<u64>,
+) {
+    let Some(mut res) = doors else { return };
+    // First frame for this map's doors: write every door's initial-pose record so already-open
+    // doors (or EFT_DOORS_OPEN) show open from the start (the buffer was built with closed bases).
+    let force_all = res.is_added();
+    // ---- process a fresh click: toggle the nearest openable door ----
+    if let Some(c) = click.as_ref() {
+        if c.gen != *last_gen {
+            *last_gen = c.gen;
+            if let Some(p) = c.point {
+                let mut best: Option<(usize, f32)> = None;
+                for (i, d) in res.doors.iter().enumerate() {
+                    let t = Vec3::new(d.base.m0[3], d.base.m1[3], d.base.m2[3]);
+                    let dist = t.distance_squared(p);
+                    if dist < 6.25 && best.map(|(_, b)| dist < b).unwrap_or(true) {
+                        best = Some((i, dist));
+                    }
+                }
+                if let Some((i, _)) = best {
+                    let d = &mut res.doors[i];
+                    if !d.locked {
+                        d.target = if d.target > 0.5 { 0.0 } else { 1.0 };
+                    }
+                }
+            }
+        }
+    }
+    // ---- ease in-flight doors + upload the ones that moved ----
+    let step = (time.delta_secs() / 0.35).clamp(0.0, 1.0); // ~0.35 s open/close
+    // Split the borrow: read buffer handle, then mutate doors.
+    let buf = res.instances_buf.clone();
+    for d in res.doors.iter_mut() {
+        let moving = (d.progress - d.target).abs() >= 1.0e-4;
+        if !moving && !force_all {
+            continue;
+        }
+        if moving {
+            d.progress += (d.target - d.progress).signum() * step;
+            d.progress = d.progress.clamp(0.0, 1.0);
+        }
+        // ease (smoothstep) for a nicer swing
+        let e = d.progress * d.progress * (3.0 - 2.0 * d.progress);
+        let rec = door_record(&d.base, d.axis, d.open_rad, e);
+        render_queue.write_buffer(&buf, d.gpu_idx as u64 * 80, bytemuck::bytes_of(&rec));
+    }
 }
 
 fn prepare_shadow_uniforms(
