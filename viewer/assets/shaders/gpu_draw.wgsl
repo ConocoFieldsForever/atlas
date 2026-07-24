@@ -296,13 +296,15 @@ fn sh_outside_t(p: vec3<f32>) -> f32 {
     let margin = 2.0 * max(sh.spacing.x, max(sh.spacing.y, sh.spacing.z));
     return smoothstep(0.0, max(margin, 1e-3), max(d.x, max(d.y, d.z)));
 }
-fn sh_effective_pos(p: vec3<f32>) -> vec3<f32> {
+fn sh_sky_pos(p: vec3<f32>) -> vec3<f32> {
     let ext = vec3<f32>(1.0) / max(sh.vol_inv_extent.xyz, vec3<f32>(1e-9));
     let lo = sh.vol_min.xyz;
     let hi = lo + ext;
     let edge = clamp(p, lo, hi);
-    let sky = vec3<f32>(edge.x, hi.y - 0.5 * sh.spacing.y, edge.z); // top-layer probe row = open sky
-    return mix(p, sky, sh_outside_t(p));
+    return vec3<f32>(edge.x, hi.y - 0.5 * sh.spacing.y, edge.z); // top-layer probe row = open sky
+}
+fn sh_effective_pos(p: vec3<f32>) -> vec3<f32> {
+    return mix(p, sh_sky_pos(p), sh_outside_t(p));
 }
 
 fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
@@ -329,7 +331,18 @@ fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // texture_3d fetches an exact probe texel (no filtering, sampler ignored) so no
 // derivatives are required — still callable after a `discard`.
 fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let wp = sh_effective_pos(world_pos);
+    // Blend RESULTS across the volume boundary, not positions: a position lerp walks the sample
+    // through mid-air heights where the hemisphere weights below collapse near a probe plane and
+    // the epsilon fallback averages in the dark below-floor probes (a dark crease line hugging the
+    // volume edge, stepped bands at each layer crossing). The local 8-tap always runs at the TRUE
+    // point; the redirected sky value (hardware path, ground-ratio scaled) mixes in by t.
+    let t_out = sh_outside_t(world_pos);
+    // Clamp the LOCAL sample onto the AABB: for an outside point every clamped probe sits far to
+    // one side horizontally, the hemisphere weights collapse laterally, and the epsilon fallback
+    // averages in the dark below-floor probes (a soft dark band hugging the boundary). On the face
+    // itself the probe pair still straddles vertically, so the weights stay well-conditioned.
+    let ext_l = vec3<f32>(1.0) / max(sh.vol_inv_extent.xyz, vec3<f32>(1e-9));
+    let wp = clamp(world_pos, sh.vol_min.xyz, sh.vol_min.xyz + ext_l);
     let bias = sh.vol_inv_extent.w;
     let sp   = wp + n * bias;
     let dims = sh.dims.xyz;
@@ -362,8 +375,11 @@ fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     }
     // Fallback: if the hemisphere weighting rejected essentially everything (fully
     // enclosed point), don't go black — use the plain hardware-trilinear reconstruction.
-    if (wsum < 1e-3) { return sh_irradiance_hw(wp, n); }
-    return (sum / wsum) * mix(1.0, sh.dims.w, sh_outside_t(world_pos));
+    var local_e = sum / wsum;
+    if (wsum < 1e-3) { local_e = sh_irradiance_hw(wp, n); }
+    if (t_out <= 0.0) { return local_e; }
+    let sky_e = sh_irradiance_hw(sh_sky_pos(world_pos), n) * sh.dims.w; // top layer is inside -> no recursion depth
+    return mix(local_e, sky_e, t_out);
 }
 
 // --- Phase 1.6: dominant light direction + radiance from the SH volume -------
