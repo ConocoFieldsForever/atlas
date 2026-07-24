@@ -580,6 +580,34 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         let t_b = Instant::now();
         // per-material albedo/emissive (mean of the pack's source PNGs) — colored bounce = Warp parity
         let (albedo_lut, emis_lut) = build_material_luts(pack);
+        let inv_pi_boost = std::f32::consts::FRAC_1_PI * albedo_boost; // albedo/pi * boost
+        // GPU bounce (nearest-hit re-cast + trilinear gather + per-material re-emit, combined with pass
+        // A) — EXPERIMENTAL, opt-in via EFT_SH_GPU_BOUNCE=1. The nearest-hit bounce is far costlier and
+        // more per-probe-variable than pass A's any-hit occlusion, so a hot batch can exceed the OS GPU
+        // watchdog (~2 s) and reset the device; TDR-safe batches for it would be so small that giant-map
+        // GPU pass B barely beats the rayon pass anyway. Default is the reliable CPU bounce below.
+        let gpu_b = if matches!(backend, Backend::Gpu | Backend::Auto) && env_usize("EFT_SH_GPU_BOUNCE", 0) > 0 {
+            crate::sh_bake_gpu::pass_b_gpu(
+                &bvh, &sh_a, gmin, spacing, [nx, ny, nz], bounce_rays,
+                &albedo_lut, &emis_lut, inv_pi_boost, emis_gain,
+            )
+        } else {
+            None
+        };
+        if let Some(combined) = gpu_b {
+            // combined = pass A + bounce*bnorm (done on GPU); just pack to f16
+            halfs.par_chunks_mut(12).zip(combined.par_iter()).for_each(|(out, c)| {
+                for k in 0..4 {
+                    out[k * 3] = f16_bits(c[k].x);
+                    out[k * 3 + 1] = f16_bits(c[k].y);
+                    out[k * 3 + 2] = f16_bits(c[k].z);
+                }
+            });
+            eprintln!(
+                "  sh-bake: pass B (1 diffuse bounce, per-material colored albedo, {bounce_rays} rays) [GPU] in {:.2}s",
+                t_b.elapsed().as_secs_f32()
+            );
+        } else {
         let bdirs: Vec<(Vec3, [f32; 4])> =
             (0..bounce_rays).map(|i| { let d = fib_dir(i, bounce_rays); (d, sh_basis(d)) }).collect();
         let bnorm = 4.0 * std::f32::consts::PI / bounce_rays as f32;
@@ -587,7 +615,6 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         // full mesh diagonal (BVH root AABB) — a bounce ray may hit geometry well outside the probe band
         let root = bvh.nodes[0];
         let max_dist = (root.max - root.min).length() * 1.2;
-        let inv_pi_boost = std::f32::consts::FRAC_1_PI * albedo_boost; // albedo/pi * boost
         halfs.par_chunks_mut(12).enumerate().for_each_init(
             || Vec::<u32>::with_capacity(64),
             |stack, (pi, out)| {
@@ -621,9 +648,10 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
             },
         );
         eprintln!(
-            "  sh-bake: pass B (1 diffuse bounce, per-material colored albedo, {bounce_rays} rays) in {:.2}s",
+            "  sh-bake: pass B (1 diffuse bounce, per-material colored albedo, {bounce_rays} rays) [CPU] in {:.2}s",
             t_b.elapsed().as_secs_f32()
         );
+        }
         1
     } else {
         // bounce off -> pack pass A directly (identical to the M2 direct bake)
