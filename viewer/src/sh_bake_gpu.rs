@@ -92,6 +92,13 @@ fn init_gpu() -> Option<Gpu> {
         trace: wgpu::Trace::Off,
     }))
     .ok()?;
+    // Device-lost must NOT panic: wgpu's default uncaptured-error handler panics (observed on the
+    // streets bake — a mid-batch TDR surfaced as "Device::poll: Validation Error / Parent device is
+    // lost" and ABORTED the whole build stage), which skips run_batched's graceful `poll Err ->
+    // CPU fallback` path. Log-and-continue lets poll return the error so the fallback engages.
+    device.on_uncaptured_error(Box::new(|e| {
+        eprintln!("  sh-bake/gpu: uncaptured wgpu error (continuing; CPU fallback will engage): {e}");
+    }));
     Some(Gpu { device, queue, limits, name: info.name, backend: info.backend })
 }
 
@@ -373,7 +380,7 @@ pub fn pass_a_gpu(
     let off = std::mem::offset_of!(ParamsA, chunk) + 8; // chunk.z
     let payload = run_batched(
         &g, &pipeline, &bind, &param_buf, bytemuck::bytes_of(&params).to_vec(), off,
-        n_probe, &out_buf, &read_buf, out_bytes,
+        n_probe, n_nodes, &out_buf, &read_buf, out_bytes,
     )?;
     eprintln!("  sh-bake/gpu: pass A done in {:.2}s (GPU)", t.elapsed().as_secs_f32());
     Some(to_sh4(&payload, n_probe))
@@ -508,7 +515,7 @@ pub fn pass_b_gpu(
     let off = std::mem::offset_of!(ParamsB, chunk) + 8; // chunk.z
     let payload = run_batched(
         &g, &pipeline, &bind, &param_buf, bytemuck::bytes_of(&params).to_vec(), off,
-        n_probe, &out_buf, &read_buf, out_bytes,
+        n_probe, n_nodes, &out_buf, &read_buf, out_bytes,
     )?;
     eprintln!("  sh-bake/gpu: pass B done in {:.2}s (GPU)", t.elapsed().as_secs_f32());
     Some(to_sh4(&payload, n_probe))
@@ -571,6 +578,7 @@ fn run_batched(
     mut param_bytes: Vec<u8>,
     off_pos: usize, // byte offset of the probe_offset u32 (chunk.z) within the params struct
     n_probe: usize,
+    n_nodes: usize, // BVH size — sets the first batch (see below); adaptive sizing takes over after
     out_buf: &wgpu::Buffer,
     read_buf: &wgpu::Buffer,
     out_bytes: u64,
@@ -592,7 +600,21 @@ fn run_batched(
         .and_then(|s| s.trim().parse::<f32>().ok())
         .unwrap_or(0.9)
         .clamp(0.3, 1.4);
-    let mut bsz = 4096usize;
+    // FIRST-batch size must scale with SCENE COST, not be a constant: adaptive sizing only kicks in
+    // from batch 2, so on a heavy scene the fixed 4096-probe opener alone blew the watchdog before
+    // any measurement existed (streets: 129 M tris / 67 M BVH nodes -> device lost, and with
+    // `panic = "abort"` wgpu's internal poll panic kills the process outright — no CPU fallback
+    // possible). Cost per probe tracks BVH depth (~log2 nodes), so divide the opener down as the
+    // tree grows; the doubling ramp recovers full throughput within a few batches on light maps.
+    let mut bsz = std::env::var("EFT_SH_GPU_BATCH0")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            let depth = (n_nodes.max(2) as f64).log2();          // ~26 on streets, ~20 on a small map
+            let shrink = ((depth - 18.0).max(0.0) / 2.0).exp2(); // 1x under 2^18 nodes, 16x at 2^26
+            (4096.0 / shrink).max(128.0) as usize
+        })
+        .max(64);
     let mut start = 0usize;
     let mut nbatch = 0u32;
     while start < n_probe {

@@ -113,11 +113,11 @@ pub struct Manifest {
     /// `#[serde(default)]` so packs that predate the reader (or lack the field) load unchanged.
     #[serde(rename = "lodGroups", default)]
     pub lod_groups: Vec<LodGroupEntry>,
-    /// World-Y of the map's OCEAN surface, when the map has one (coastal maps). EFT's sea is a
-    /// runtime water SYSTEM, not a mesh — nothing extractable ships in any level, so coastal packs
-    /// render a void past the beach and boats float in air. When present, the viewer synthesizes an
-    /// untextured deep-water plane at this height (build_map patches it in from the map config;
-    /// EFT_SEA_LEVEL overrides at runtime for tuning). None = inland map, no sea.
+    /// World-Y of the map's OCEAN surface, when the map has one (coastal maps). DERIVED from the
+    /// game data at build time (build_map `derive_sea_level`: the map-scale water-plane height in
+    /// the scene, +5 cm), never authored. The viewer synthesizes an untextured deep-water horizon
+    /// quad at this height above the shipped sea tiles (EFT_SEA_LEVEL overrides at runtime for
+    /// tuning). None = inland map, no sea.
     #[serde(rename = "seaLevel", default)]
     pub sea_level: Option<f32>,
 }
@@ -651,17 +651,41 @@ pub struct LevelSwitch {
     pub group_idx: i32,
     /// VIEWER-world position (Unity raw X-flipped, like every light) for pick-matching + focus.
     pub world_pos: Vec3,
-    /// Diagnostic label (the interactable's GameObject name); never used as a control rule.
+    /// Display label built by extract_interact from the GO hierarchy + payload (context · action);
+    /// never used as a control rule.
     pub label: String,
     /// Number of lamp fixtures the switch controls (power kind only; 0 otherwise).
     pub count: u32,
+    /// Display names of the items this interaction REQUIRES or ACCEPTS, from the 24-hex item
+    /// templates its payload serializes (the Icebreaker frozen hatch's cutting torch; a
+    /// CardReader's whole accepted-keycard list). Resolved at build time from the tarkov.dev
+    /// static dump; icons ride the shared `<slug>.png` cache. A legacy pack carrying only the
+    /// scalar `item_name` is folded into this at parse.
+    pub item_names: Vec<String>,
+    /// In-game interaction verb serialized in the payload ("Use" / "Open" / "Place"); display only.
+    pub verb: Option<String>,
+    /// What this interactable DRIVES: class-validated PPtr edges (exfil gates / doors / transits)
+    /// plus the trigger-hash switch->door links wired by the build merge.
+    pub targets: Vec<SwitchTarget>,
+}
+
+/// One target edge of a [`LevelSwitch`] — the door/exfil/transit the interactable drives.
+#[derive(Debug, Clone)]
+pub struct SwitchTarget {
+    /// Short component kind ("Door" / "ExfiltrationPoint" / "TransitPoint" ...).
+    pub kind: String,
+    /// Target GameObject / door id name (diagnostic-grade; prettified for display).
+    pub name: String,
+    /// VIEWER-world position (bridged on load; see the via-dependent space rule in `load_intel`).
+    pub world_pos: Vec3,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct SwitchRaw {
     #[serde(default)]
     id: String,
-    /// "power" | "switch"; absent on legacy (power-only) packs -> treated as power below.
+    /// "power" | "switch" | "card_reader" | "dialog"; absent on legacy (power-only) packs ->
+    /// treated as power below.
     #[serde(default)]
     kind: String,
     #[serde(default)]
@@ -672,6 +696,28 @@ struct SwitchRaw {
     label: String,
     #[serde(default)]
     count: u32,
+    #[serde(default)]
+    item_name: Option<String>,
+    #[serde(default)]
+    item_names: Vec<String>,
+    #[serde(default)]
+    verb: Option<String>,
+    #[serde(default)]
+    targets: Vec<SwitchTargetRaw>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SwitchTargetRaw {
+    #[serde(rename = "type", default)]
+    ty: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    world_pos: Option<[f32; 3]>,
+    /// "trigger-link" on merge-wired door edges (whose pos is ALREADY viewer-bridged);
+    /// absent on extract_interact's PPtr edges (raw Unity pos).
+    #[serde(default)]
+    via: Option<String>,
 }
 
 /// A map extract loaded from `gamedata.json`. `faction` is the who-can-use-it requirement
@@ -755,14 +801,43 @@ fn load_intel(
     let switches = gd
         .switches
         .into_iter()
-        .map(|r| LevelSwitch {
-            group_idx: group_map.get(&r.group).map(|&i| i as i32).unwrap_or(-1),
-            // G3 = diag(-1,1,1): X-flip the raw Unity world pos into viewer space (matches lights + pick).
-            world_pos: Vec3::new(-r.world_pos[0], r.world_pos[1], r.world_pos[2]),
-            kind: if r.kind.is_empty() { "power".to_string() } else { r.kind },
-            id: r.id,
-            label: r.label,
-            count: r.count,
+        .map(|r| {
+            let targets = r
+                .targets
+                .into_iter()
+                .filter_map(|t| {
+                    let p = t.world_pos?;
+                    // Space rule: merge-wired trigger-link edges carry a gamedata door pos
+                    // (ALREADY viewer-bridged); extract_interact's PPtr edges carry raw Unity
+                    // world -> X-flip like the switch itself.
+                    let world_pos = if t.via.as_deref() == Some("trigger-link") {
+                        Vec3::new(p[0], p[1], p[2])
+                    } else {
+                        Vec3::new(-p[0], p[1], p[2])
+                    };
+                    Some(SwitchTarget {
+                        kind: t.ty.rsplit('.').next().unwrap_or("").to_string(),
+                        name: t.name.unwrap_or_default(),
+                        world_pos,
+                    })
+                })
+                .collect();
+            let mut item_names = r.item_names;
+            if item_names.is_empty() {
+                item_names.extend(r.item_name);   // legacy pack: scalar field only
+            }
+            LevelSwitch {
+                group_idx: group_map.get(&r.group).map(|&i| i as i32).unwrap_or(-1),
+                // G3 = diag(-1,1,1): X-flip the raw Unity world pos into viewer space (matches lights + pick).
+                world_pos: Vec3::new(-r.world_pos[0], r.world_pos[1], r.world_pos[2]),
+                kind: if r.kind.is_empty() { "power".to_string() } else { r.kind },
+                id: r.id,
+                label: r.label,
+                count: r.count,
+                item_names,
+                verb: r.verb,
+                targets,
+            }
         })
         .collect();
     let exfils = gd

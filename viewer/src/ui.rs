@@ -1547,6 +1547,7 @@ fn level_panel(
     pack: Option<Res<crate::render::LoadedPack>>,
     mut gfx: ResMut<crate::render::GfxSettings>,
     mut cam: Query<&mut Transform, With<crate::render::CullCamera>>,
+    mut icons: ResMut<crate::tasks_panel::TaskIconCache>,
 ) {
     use bevy_egui::egui::{self, RichText};
     use crate::ui_theme as theme;
@@ -1628,24 +1629,134 @@ fn level_panel(
                 );
             }
 
-            // ---- INTERACTABLES (alarms, buttons, triggers, keycard/exfil levers, ...) ----
+            // ---- INTERACTABLES (alarms, buttons, card readers, dialogs, exfil levers, ...) ----
+            // One compact card per interactable, tasks-panel style: title row (label + "go"),
+            // a muted kind/verb meta line, one row per required/accepted ITEM (16px icon +
+            // name, straight from the payload's serialized template ids), and one row per
+            // TARGET the interactable drives (class-validated PPtr edges + the trigger-hash
+            // switch->door links), each with its own jump.
             if !others.is_empty() {
                 ui.add_space(theme::SP_MD);
                 ui.label(RichText::new("INTERACTABLES").color(DIM).size(11.0));
+                ui.add_space(theme::SP_XS);
+                // Icon dirs for requirement items: pack-local first, then the cross-map shared
+                // cache (same `<slug>.png` contract as the task/loot icons).
+                let icon_root = pack.0.root.join("icons");
+                let icon_shared = pack.0.root.parent().map(|p| p.join("shared").join("icons"));
                 for sw in &others {
-                    ui.horizontal(|ui| {
-                        // GO name lightly cleaned (drop the Node_ prefix, underscores -> spaces) for display.
-                        let name = sw.label.strip_prefix("Node_").unwrap_or(&sw.label).replace('_', " ");
-                        ui.label(RichText::new(name).size(11.0));
-                        if ui.small_button("go").on_hover_text("jump to it").clicked() {
-                            jump_to(&mut cam, sw.world_pos);
+                    theme::card(ui, theme::BORDER, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 3.0);
+                        // Title row: "go" pinned right, the label truncating into the rest.
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("go").on_hover_text("jump to it").clicked() {
+                                    jump_to(&mut cam, sw.world_pos);
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    // Label built upstream from the GO hierarchy + payload
+                                    // (context · action); legacy packs ship a raw GO name —
+                                    // same light cleanup either way.
+                                    let name = sw
+                                        .label
+                                        .strip_prefix("Node_")
+                                        .unwrap_or(&sw.label)
+                                        .replace('_', " ");
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(name)
+                                                .size(12.0)
+                                                .color(theme::TEXT_BRIGHT)
+                                                .strong(),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(&sw.label);
+                                });
+                            });
+                        });
+                        // Kind/verb meta line ("card reader · use") — only when it says something.
+                        let mut meta: Vec<String> = Vec::new();
+                        if sw.kind != "switch" && sw.kind != "power" {
+                            meta.push(sw.kind.replace('_', " "));
+                        }
+                        if let Some(v) = sw.verb.as_deref() {
+                            meta.push(v.to_lowercase());
+                        }
+                        if !meta.is_empty() {
+                            ui.label(RichText::new(meta.join("  \u{00B7}  ")).size(9.0).color(DIM));
+                        }
+                        // Required / accepted items (a card reader lists its whole card set).
+                        let req_word = if sw.kind == "card_reader" { "accepts" } else { "needs" };
+                        for item in &sw.item_names {
+                            ui.horizontal(|ui| {
+                                let slug = crate::inspect::icon_slug(item);
+                                if let Some(tex) = icons.get(
+                                    ui.ctx(), Some(icon_root.as_path()), icon_shared.as_deref(), &slug,
+                                ) {
+                                    ui.add(
+                                        egui::Image::new((tex.id(), egui::vec2(16.0, 16.0)))
+                                            .fit_to_exact_size(egui::vec2(16.0, 16.0)),
+                                    );
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(format!("{req_word} {item}"))
+                                            .size(10.0)
+                                            .color(theme::BONE),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(item);
+                            });
+                        }
+                        // What it drives. Door ids can be raw GUIDs — show the kind word alone
+                        // then (display rule only, the full name stays on hover).
+                        for t in &sw.targets {
+                            let what = match t.kind.as_str() {
+                                "Door" | "KeycardDoor" | "SlidingDoor" | "ExfiltrationDoor"
+                                | "DoorSwitch" | "Trunk" => "door",
+                                k if k.contains("Exfiltration") || k == "CarExtraction" => "extract",
+                                "TransitPoint" => "transit",
+                                _ => "object",
+                            };
+                            let looks_like_id = t.name.len() >= 20
+                                && t.name.chars().all(|c| c.is_ascii_hexdigit());
+                            let label = if t.name.is_empty() || looks_like_id {
+                                format!("\u{2192} opens a {what}")
+                            } else {
+                                format!("\u{2192} {what}  {}", t.name.replace('_', " "))
+                            };
+                            ui.horizontal(|ui| {
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .small_button(RichText::new("go").size(9.0))
+                                        .on_hover_text("jump to the target")
+                                        .clicked()
+                                    {
+                                        jump_to(&mut cam, t.world_pos);
+                                    }
+                                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(label).size(10.0).color(DIM),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&t.name);
+                                    });
+                                });
+                            });
                         }
                     });
+                    ui.add_space(theme::SP_XS);
                 }
                 ui.label(
-                    RichText::new("Alarms, buttons, triggers and other interactable switches on this map.")
-                        .color(DIM)
-                        .size(10.0),
+                    RichText::new(
+                        "Alarms, buttons, card readers and other interactables from the game files.",
+                    )
+                    .color(DIM)
+                    .size(10.0),
                 );
             }
         });

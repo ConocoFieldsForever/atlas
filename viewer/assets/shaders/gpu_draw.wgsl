@@ -1298,9 +1298,14 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // Glass: PREMULTIPLIED. Transmission alpha scales only the DIFFUSE (lit) — the env reflection,
     // GGX glint and emissive are ADDED at full strength so a clear pane mirrors the bright overcast
     // sky instead of reading as a dark tinted slab. Emissive rides here too (lit windows/signage).
+    // RFA glass (smoothness-in-alpha — nearly ALL glass): tex.a is a SMOOTHNESS map, not coverage;
+    // multiplying it into opacity painted the smoothness pattern (shard shapes on the dusty retail
+    // panes) as opacity blotches. Coverage is the authored _Color.a alone; tex.a already feeds the
+    // per-pixel roughness above, so the pattern shows up in reflection sharpness — as authored.
+    let glass_a = select(albedo.a, m.tint.a, (m.flags & MAT_FLAG_RFA) != 0u);
     return vec4<f32>(
-        apply_fog(lit, o.world_pos, dom.directionality) * albedo.a + spec_rgb + refl_rgb + em_rgb,
-        albedo.a
+        apply_fog(lit, o.world_pos, dom.directionality) * glass_a + spec_rgb + refl_rgb + em_rgb,
+        glass_a
     );
 #else
     // DEEP WATER (untextured role=water: the sea + treatment basins) — OPAQUE pass, so depth-write

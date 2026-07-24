@@ -1583,9 +1583,12 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             flags |= MAT_FLAG_DECAL;
         }
         // Per-pixel roughness from the albedo alpha (Unity Standard smoothness-in-alpha).
-        // Opaque-only: glass keeps its authored sharp 0.05, cutout alpha is coverage. 82% of
-        // materials carry this — without it everything specular-shades at one constant roughness.
-        if mat.roughness_from_albedo_alpha && mat.role == "opaque" {
+        // Opaque AND glass (cutout alpha is coverage). 82% of materials carry this — without it
+        // everything specular-shades at one constant roughness. For GLASS the flag additionally
+        // switches the shader's coverage source to tint.a alone: nearly every glass material
+        // (streets: 479/489) packs SMOOTHNESS in tex.a, and multiplying it into opacity painted
+        // the smoothness pattern as opacity blotches (the "shattered" dusty retail panes).
+        if mat.roughness_from_albedo_alpha && (mat.role == "opaque" || mat.role == "glass") {
             flags |= MAT_FLAG_RFA;
         }
         // M3b2 SoftCutout / water classification. The Vert-Paint SoftCutout family (Custom/Vert
@@ -1606,6 +1609,13 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         if vp_params.is_some() && mat.role == "decal" {
             flags |= MAT_FLAG_SOFTCUTOUT | MAT_FLAG_BLEND;
             flags &= !MAT_FLAG_CUTOUT;
+        } else if vp_params.is_some() {
+            // Vert-Paint SOLID splat that the assembler classified cutout/MASK (streets ships 160
+            // ground/courtyard slabs like that): its tex.a is SMOOTHNESS, so the opaque-pass
+            // alpha-test discarded most of each slab — see-through rectangular holes in the park
+            // ground with only the high-smoothness chunks surviving. Same principle as the decal
+            // gate above: a vp SOLID splat has NO alpha gate; render it fully opaque.
+            flags &= !(MAT_FLAG_CUTOUT | MAT_FLAG_BLEND);
         }
         // Vert-Paint 3-layer splat (BOTH the SoftCutout decal AND the opaque "Solid" variant):
         // build the VpGpu entry so the fragment blends the game's 3 layers by COLOR_0.rgb ×
@@ -2523,14 +2533,15 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         info!("gpu-driven #4 grass: {count} clumps appended (cross-quad, alpha-cutout)");
     }
 
-    // ---- SEA: synthesize the ocean surface the game renders procedurally. EFT's sea is a runtime
-    //      water SYSTEM (Hidden/Water/* shader stack), not a mesh — no level ships extractable ocean
-    //      geometry, so coastal maps (shoreline/lighthouse) render a VOID past the beach and moored
-    //      boats float in air. One big untextured role-water quad at the map's sea level rides the
-    //      existing deep-water shading (dark teal body + band-limited ripple + fresnel sky mirror +
-    //      sun glint) — the same path the recovered lake/pond planes use. Height: EFT_SEA_LEVEL env
-    //      (live tuning) > manifest.seaLevel (authored per-map config, patched in by build_map).
-    //      Absent -> inland map, no sea, byte-identical render. ----
+    // ---- SEA: horizon fill for coastal maps. The game DOES ship its ocean surface as geometry
+    //      (shoreline: tiled `*_Sea_Water_*` role-water planes, all at one height) and those render
+    //      through the deep-water path below — but they stop a couple km out, so the horizon past
+    //      them is a VOID. One big untextured role-water quad 5 cm above the shipped tiles rides
+    //      the same deep-water shading (dark teal body + band-limited ripple + fresnel sky mirror +
+    //      sun glint), covering the tiles and running to the horizon. Height: EFT_SEA_LEVEL env
+    //      (live tuning) > manifest.seaLevel (DERIVED from the scene's water planes by build_map's
+    //      `derive_sea_level` — game truth, never authored). Absent -> inland map, no sea,
+    //      byte-identical render. ----
     'sea: {
         let sea_level = std::env::var("EFT_SEA_LEVEL")
             .ok()

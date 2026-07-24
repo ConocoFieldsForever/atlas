@@ -179,10 +179,12 @@ Outputs land in `EFT_TARKMAP_ROOT\out\` (`<map>\semantics.json`, `<map>\gamedata
 `loot.json`, `tasks.json`). Re-run loot/tasks each wipe — prices, containers and quests shift.
 
 `extract_gamedata.py` reads the map's TYPED gameplay MonoBehaviours (ExfiltrationPoint /
-Minefield / SniperFiringZone / Door / Trunk / TransitPoint / StationaryWeapon /
-SpawnPointMarker) instead of name-matching GameObjects; in the viewer its exfils (with
-faction + collider footprint outlines) replace the tarkov.dev extract layer, and minefields /
-sniper zones get their own outline layers. If the map's config levels carry no exfils it
+Minefield / SniperFiringZone / Door / Trunk / TransitPoint / StationaryWeapon (with the
+mounted weapon + firing arc) / SpawnPointMarker / LootableContainer / FlameDamageTrigger /
+CardReader / RaidDialogEntryPoint / GuardedZone) instead of name-matching GameObjects; in
+the viewer its exfils (with faction + collider footprint outlines) replace the tarkov.dev
+extract layer, minefields / sniper zones get their own outline layers, and typed lootable
+containers replace the name-classified semantics "loot" props. If the map's config levels carry no exfils it
 auto-probes the sibling scenes from BuildSettings for the logic scene (factory: level 68).
 Copy the output next to the pack like semantics.json (step 8).
 

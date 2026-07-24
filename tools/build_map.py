@@ -18,6 +18,7 @@ Env (contract per extraction/README.md; unset -> legacy dev-machine defaults):
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -213,6 +214,106 @@ def dataset_levels(m):
         print(f"[BUILD] levels derived from BuildSettings folder '{folder}': +{sorted(set(derived)-set(cfg))} "
               f"beyond config (total {len(levels)})", flush=True)
     return ",".join(str(x) for x in levels)
+
+
+def derive_sea_level(dataset):
+    """GAME-TRUTH ocean height, derived from the dataset's scene.json at build time — no authored
+    per-map constants. EFT coastal maps DO ship their ocean surface as geometry (shoreline: 14
+    tiled `Shoreline_Sea_Water_*` planes, role='water', all at one height), so the sea is found
+    structurally: among water-role, non-decal (puddles ride 'Decal/Water ...' shaders), FLAT
+    (world-Y span <= 2 m, which excludes river cascades) instances, bin by world height (0.1 m);
+    the SEA is the bin whose union XZ footprint is MAP-SCALE — >= 10% of the scene's own
+    translation AABB. Lakes/canals/ponds are orders of magnitude smaller and never qualify, so
+    inland maps return None (no synthesized sea). Extents are measured in raw Unity world space
+    (the viewer's X-flip conjugation preserves areas and Y, so no bridge is needed here).
+    Returns the sea height + 0.05 m — the viewer's horizon quad rides just above the shipped
+    tiles; both draw with the same deep-water shading, so the overlap cannot z-fight visibly."""
+    scene = os.path.join(dataset, "scene.json")
+    if not os.path.isfile(scene):
+        return None
+    d = json.load(open(scene, encoding="utf-8"))
+    inst = d["instances"] if isinstance(d, dict) else d
+    if not inst:
+        return None
+
+    mesh_aabb = {}
+
+    def aabb_of(mesh):
+        """Local-space AABB of a dataset OBJ (v-lines only); None when unreadable."""
+        if mesh not in mesh_aabb:
+            box = None
+            try:
+                lo = [float("inf")] * 3
+                hi = [float("-inf")] * 3
+                with open(os.path.join(dataset, "meshes", mesh), encoding="utf-8",
+                          errors="replace") as f:
+                    for line in f:
+                        if line.startswith("v "):
+                            p = line.split()
+                            for k in range(3):
+                                v = float(p[k + 1])
+                                lo[k] = min(lo[k], v)
+                                hi[k] = max(hi[k], v)
+                if lo[0] <= hi[0]:
+                    box = (lo, hi)
+            except Exception:
+                box = None
+            mesh_aabb[mesh] = box
+        return mesh_aabb[mesh]
+
+    sx = [it["m"][3] for it in inst]
+    sz = [it["m"][11] for it in inst]
+    scene_area = max(1.0, (max(sx) - min(sx)) * (max(sz) - min(sz)))
+    bins = {}                                     # y-bin -> [minx, maxx, minz, maxz, y]
+    def is_water_sub(sb):
+        """True water surface: role water AND a water shader (or untextured water, sh=None, the
+        shoreline sea tiles). Excludes puddle DECALS and role-water tagged 'Standard'-shader
+        collision/occluder PROXIES (streets ships a map-wide TEMP_GROUND_COLIDER cube like that
+        — same proxy signal the structural culls use)."""
+        if sb.get("role") != "water":
+            return False
+        sh = sb.get("sh")
+        if sh is None:
+            return True
+        return "water" in sh.lower() and "decal" not in sh.lower()
+
+    for it in inst:
+        if not any(is_water_sub(sb) for sb in (it.get("subs") or [])):
+            continue
+        box = aabb_of(it.get("mesh", ""))
+        if box is None:
+            continue
+        mm = it["m"]
+        wy = [float("inf"), float("-inf")]
+        wx = [float("inf"), float("-inf")]
+        wz = [float("inf"), float("-inf")]
+        for cx in (box[0][0], box[1][0]):
+            for cy in (box[0][1], box[1][1]):
+                for cz in (box[0][2], box[1][2]):
+                    x = mm[0] * cx + mm[1] * cy + mm[2] * cz + mm[3]
+                    y = mm[4] * cx + mm[5] * cy + mm[6] * cz + mm[7]
+                    z = mm[8] * cx + mm[9] * cy + mm[10] * cz + mm[11]
+                    wx = [min(wx[0], x), max(wx[1], x)]
+                    wy = [min(wy[0], y), max(wy[1], y)]
+                    wz = [min(wz[0], z), max(wz[1], z)]
+        if wy[1] - wy[0] > 2.0:                   # sloped/cascade water is never the sea surface
+            continue
+        y_surf = (wy[0] + wy[1]) * 0.5
+        key = round(y_surf * 10.0)
+        b = bins.setdefault(key, [wx[0], wx[1], wz[0], wz[1], y_surf])
+        b[0] = min(b[0], wx[0])
+        b[1] = max(b[1], wx[1])
+        b[2] = min(b[2], wz[0])
+        b[3] = max(b[3], wz[1])
+        b[4] = max(b[4], y_surf)
+    best = None
+    for b in bins.values():
+        area = (b[1] - b[0]) * (b[3] - b[2])
+        if area >= 0.10 * scene_area and (best is None or area > best[0]):
+            best = (area, b[4])
+    if best is None:
+        return None
+    return round(best[1] + 0.05, 3)
 
 
 def find_atlas_exe():
@@ -457,24 +558,30 @@ def main():
             _sc["volumeMeta"] = "volume.json"
             if os.path.isfile(os.path.join(pack, "volume.vis.bin")):
                 _sc["volumeVis"] = "volume.vis.bin"
-            # SEA: coastal maps author their ocean height in config.json ("sea_level"). EFT's sea is
-            # a runtime water system (no extractable mesh), so the viewer synthesizes a deep-water
-            # plane at manifest.seaLevel — patch it through here, same trip as the volume sidecars.
-            try:
-                _cfg = _json.load(open(os.path.join(HERE, "..", "extraction", "maps", m, "config.json"),
-                                       encoding="utf-8"))
-                _slv = _cfg.get("sea_level")
-                if isinstance(_slv, (int, float)):
-                    _m["seaLevel"] = float(_slv)
-                    print(f"  sea: manifest seaLevel = {_slv} (from config)", flush=True)
-            except Exception:
-                pass
             _json.dump(_m, open(_mp, "w", encoding="utf-8"))
             print("  lighting: manifest volume sidecars -> volume.bin / volume.json (in-pack)", flush=True)
         except Exception as _e:
             print(f"  lighting: WARNING manifest volume-sidecar patch failed ({_e})", flush=True)
     else:
         print("  lighting: none (flat realtime fallback until the baker runs)", flush=True)
+
+    # SEA: derive the ocean height FROM THE GAME DATA (dataset scene.json) and patch it into the
+    # assembled manifest — never authored per-map. The viewer synthesizes its horizon quad at
+    # manifest.seaLevel; absent -> inland map, no quad. (Own step, not gated on the volume bake.)
+    try:
+        _slv = derive_sea_level(dataset)
+        _mp = os.path.join(pack, "manifest.json")
+        if os.path.isfile(_mp):
+            _m = json.load(open(_mp, encoding="utf-8"))
+            if _slv is not None:
+                _m["seaLevel"] = _slv
+                print(f"  sea: manifest seaLevel = {_slv} (derived from scene water planes)", flush=True)
+            elif "seaLevel" in _m:
+                del _m["seaLevel"]                 # no sea in the game data -> no synthesized sea
+                print("  sea: no map-scale water plane in the scene - seaLevel removed", flush=True)
+            json.dump(_m, open(_mp, "w", encoding="utf-8"))
+    except Exception as _e:
+        print(f"  sea: WARNING seaLevel derivation failed ({_e})", flush=True)
 
     # 5: grass -- DATA-DRIVEN: a map has grass iff its dataset actually yields density grids. Indoor/
     #    no-terrain maps (Factory/Labs/Labyrinth) produce none and are skipped automatically -- no
@@ -523,6 +630,31 @@ def main():
                     p = os.path.join(dataset, f"interact_{lv}.json")
                     if os.path.isfile(p):
                         sw.extend(json.load(open(p, encoding="utf-8")))
+                # Fold gamedata's own typed POINT-interactables (CardReader keycard readers,
+                # RaidDialogEntryPoint dialogs) into the same `switches` array: identical record
+                # shape (kind tags them), so the LEVEL CONTROLS panel + click pipeline pick them
+                # up with zero viewer plumbing. gamedata pos is viewer-bridged; the switch
+                # world_pos contract is RAW Unity, so the X-flip is undone here.
+                def _disp(n):
+                    s = re.sub(r"^(INTERACTIVE_|SBG_|Node_)", "", str(n or ""))
+                    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s).replace("_", " ").strip()
+                    return (s[:1].upper() + s[1:]) if s else "Interactable"
+                for key, kind in (("card_readers", "card_reader"), ("dialogs", "dialog")):
+                    for i, r in enumerate(data.get(key) or []):
+                        p = r.get("pos") or [0.0, 0.0, 0.0]
+                        rec = {"id": f"gd:{r.get('lv')}:{kind}:{i}", "level": r.get("lv"),
+                               "kind": kind, "world_pos": [-p[0], p[1], p[2]],
+                               "label": _disp(r.get("name")), "count": 0, "targets": []}
+                        names = [it["n"] for it in r.get("items") or [] if it.get("n")]
+                        ids = ([it["id"] for it in r.get("items") or [] if it.get("id")]
+                               or r.get("item_ids") or [])
+                        if ids:
+                            rec["item_id"] = ids[0]
+                            rec["item_ids"] = ids
+                        if names:
+                            rec["item_name"] = names[0]
+                            rec["item_names"] = names
+                        sw.append(rec)
                 if sw:
                     data["switches"] = sw
                     # Tag POWER-GATED extracts: a switch's exfil target (by GameObject name) means
@@ -534,10 +666,54 @@ def main():
                             if "Exfil" in t.get("type", "") and t.get("name") in ex_by_go:
                                 ex_by_go[t["name"]]["requires_power"] = True
                                 n_tag += 1
+                    # Wire switch->door edges via the serialized TRIGGER-HASH link (newer maps):
+                    # a Switch's trigger "Open_01_<hash>" and the door it drives carry the SAME
+                    # digit hash (extract_interact `link` <-> extract_gamedata door `links`) —
+                    # byte-derived on both sides, zero name matching. The door also learns which
+                    # interactable controls it (`controlled_by` = the switch label).
+                    door_by_link = {}
+                    for dr in data.get("doors", []):
+                        for L in dr.get("links", []):
+                            door_by_link.setdefault(L, []).append(dr)
+                    n_link = 0
+                    for s in sw:
+                        for dr in door_by_link.get(s.get("link") or "", []):
+                            s.setdefault("targets", []).append({
+                                "type": "EFT.Interactive.Door",
+                                "name": dr.get("id") or dr.get("name"),
+                                "world_pos": dr.get("pos"), "via": "trigger-link"})
+                            dr["controlled_by"] = s.get("label")
+                            n_link += 1
+                    # Requirement ITEMS: a switch payload can serialize a required 24-hex item
+                    # template id (extract_interact `item_id` — e.g. the frozen hatch wants the
+                    # cutting torch). Resolve display names via the cached tarkov.dev static dump
+                    # (offline-safe: disk cache or skip) so the viewer can show the requirement
+                    # with its icon — stage 7 caches the PNG under the same name slug.
+                    iids = sorted({s["item_id"] for s in sw if s.get("item_id")})
+                    if iids:
+                        try:
+                            _intel = os.path.join(VIEWER, "extraction", "intel")
+                            if _intel not in sys.path:
+                                sys.path.insert(0, _intel)
+                            import tarkov_static
+                            got = {it["id"]: it["name"]
+                                   for it in tarkov_static.load_static_items(ids=iids).get("items") or []
+                                   if it.get("id") and it.get("name")}
+                            n_nm = 0
+                            for s in sw:
+                                nm = got.get(s.get("item_id") or "")
+                                if nm:
+                                    s["item_name"] = nm
+                                    n_nm += 1
+                            print(f"  resolved {n_nm} switch requirement item name(s) "
+                                  f"({len(iids)} id(s))", flush=True)
+                        except Exception as e:
+                            print(f"  note: switch item-name resolution skipped ({e})", flush=True)
                     json.dump(data, open(gd, "w", encoding="utf-8"))
                     npow = sum(1 for s in sw if s.get("kind") == "power")
                     print(f"  merged {len(sw)} interactable(s) [{npow} power] into gamedata.json "
-                          f"({n_tag} power-gated extract(s) tagged)", flush=True)
+                          f"({n_tag} power-gated extract(s) tagged, {n_link} switch->door "
+                          f"link(s))", flush=True)
             except Exception as e:
                 print(f"  note: could not merge interactables into gamedata.json ({e})", flush=True)
             shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
