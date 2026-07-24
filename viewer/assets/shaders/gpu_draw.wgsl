@@ -278,6 +278,16 @@ struct LightGrid {
 // open-sky-lit — so out-of-volume reads slide the sample point to the volume's own TOP LAYER above
 // the nearest edge: real open-sky probes, giving the exact ambient AND sun direction/strength the
 // open ground inside gets. Fades in over ~2 cells; inside samples are untouched. No per-map data.
+// Texel-center uvw for the HARDWARE-sampled SH reads. Probes sit at world = min + i*spacing and a
+// 3D texture's texel CENTERS sit at (i+0.5)/N — the old align-corners mapping ((p-min)/extent) was
+// off by up to half a texel, so a ground-height sample blended ~40% of the below-floor probe layer
+// (whose L1 is inverted) into the dominant light even when aimed exactly at layer 1. The manual
+// 8-tap (textureLoad, integer texels) never suffered this — which is why diffuse GI matched across
+// the volume boundary but the sun/dominant terms did not.
+fn sh_uvw(p: vec3<f32>) -> vec3<f32> {
+    return ((p - sh.vol_min.xyz) / sh.spacing.xyz + vec3<f32>(0.5)) / sh.dims.xyz;
+}
+
 fn sh_outside_t(p: vec3<f32>) -> f32 {
     let ext = vec3<f32>(1.0) / max(sh.vol_inv_extent.xyz, vec3<f32>(1e-9));
     let lo = sh.vol_min.xyz;
@@ -297,7 +307,7 @@ fn sh_effective_pos(p: vec3<f32>) -> vec3<f32> {
 
 fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let wp = sh_effective_pos(world_pos);
-    let uvw = (wp - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
+    let uvw = sh_uvw(wp);
     let cr = textureSampleLevel(sh_r, sh_samp, uvw, 0.0); // (c0,c1,c2,c3) for R
     let cg = textureSampleLevel(sh_g, sh_samp, uvw, 0.0);
     let cb = textureSampleLevel(sh_b, sh_samp, uvw, 0.0);
@@ -306,7 +316,8 @@ fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         0.282095 * cr.x + cr.y * w.x + cr.z * w.y + cr.w * w.z,
         0.282095 * cg.x + cg.y * w.x + cg.z * w.y + cg.w * w.z,
         0.282095 * cb.x + cb.y * w.x + cb.z * w.y + cb.w * w.z);
-    return max(e, vec3<f32>(0.0)); // clamp >= 0 (SH rings negative)
+    // redirected (out-of-volume) samples scaled from top-of-dome to ground-equivalent sky
+    return max(e, vec3<f32>(0.0)) * mix(1.0, sh.dims.w, sh_outside_t(world_pos));
 }
 
 // MANUAL 8-tap irradiance-volume sample (irradiance-volume leak fix). Replaces the
@@ -352,7 +363,7 @@ fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     // Fallback: if the hemisphere weighting rejected essentially everything (fully
     // enclosed point), don't go black — use the plain hardware-trilinear reconstruction.
     if (wsum < 1e-3) { return sh_irradiance_hw(wp, n); }
-    return sum / wsum;
+    return (sum / wsum) * mix(1.0, sh.dims.w, sh_outside_t(world_pos));
 }
 
 // --- Phase 1.6: dominant light direction + radiance from the SH volume -------
@@ -373,8 +384,16 @@ struct DomLight {
                          // don't re-darken places the SH volume already shadowed (double-darkening).
 };
 fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
-    let wp = sh_effective_pos(world_pos);
-    let uvw = (wp - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
+    var wp = sh_effective_pos(world_pos);
+    // The grid's BOTTOM probe layer sits below all walkable ground BY CONSTRUCTION (the baker's
+    // y-band starts at the 0.5-percentile minus 2 m), and those below-surface probes carry an
+    // INVERTED L1 that plain trilinear mixes into every ground-level sample — halving the dominant
+    // light's magnitude and directionality map-wide (icebreaker open ice: mag 0.95/dir 0.20 as-is
+    // vs 1.85/0.31 one layer up, matching the top layer's 1.84/0.30). The irradiance 8-tap already
+    // rejects these probes via its hemisphere weight; give the dominant light the same protection
+    // by clamping its sample a full cell above the volume floor.
+    wp.y = max(wp.y, sh.vol_min.y + sh.spacing.y);
+    let uvw = sh_uvw(wp);
     let cr = textureSampleLevel(sh_r, sh_samp, uvw, 0.0); // (c0,c1,c2,c3) for R
     let cg = textureSampleLevel(sh_g, sh_samp, uvw, 0.0);
     let cb = textureSampleLevel(sh_b, sh_samp, uvw, 0.0);
@@ -408,6 +427,8 @@ fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
     // inflated the GGX "sun" ~6.8x in flat-lit (isotropic) probes — indoor floors got sun
     // glints from what is actually ambient. Genuinely sun-lit areas (directionality -> 1)
     // keep their current tuning; isotropic probes smoothly lose the phantom highlight.
+    // NOTE: no dims.w scale here — the ground/top ratio applies to the AMBIENT band only
+    // (measured: c0 layer1/top ~0.9, but dominant-band radiance layer1/top ~1.0).
     out.radiance = max(vec3<f32>(rr, rg, rb), vec3<f32>(0.0)) * out.directionality;
     return out;
 }
@@ -442,8 +463,7 @@ fn eval_realtime_lights(world_pos: vec3<f32>, N: vec3<f32>, V: vec3<f32>, rough:
         // are realtime), and it is occlusion-aware, so a direction blocked by a wall reads DARK. Gating
         // each light by radiance(toward-light)/ambient softly attenuates lights that leak from behind
         // geometry, with NO per-light shadow map. amb~0 (no volume / fully-black probe) -> disabled.
-        let occ_uvw = clamp((sh_effective_pos(world_pos) - sh.vol_min.xyz) * sh.vol_inv_extent.xyz,
-                            vec3<f32>(0.0), vec3<f32>(1.0));
+        let occ_uvw = clamp(sh_uvw(sh_effective_pos(world_pos)), vec3<f32>(0.0), vec3<f32>(1.0));
         let occ_cr = textureSampleLevel(sh_r, sh_samp, occ_uvw, 0.0);
         let occ_cg = textureSampleLevel(sh_g, sh_samp, occ_uvw, 0.0);
         let occ_cb = textureSampleLevel(sh_b, sh_samp, occ_uvw, 0.0);
