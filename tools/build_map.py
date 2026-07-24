@@ -457,6 +457,18 @@ def main():
             _sc["volumeMeta"] = "volume.json"
             if os.path.isfile(os.path.join(pack, "volume.vis.bin")):
                 _sc["volumeVis"] = "volume.vis.bin"
+            # SEA: coastal maps author their ocean height in config.json ("sea_level"). EFT's sea is
+            # a runtime water system (no extractable mesh), so the viewer synthesizes a deep-water
+            # plane at manifest.seaLevel — patch it through here, same trip as the volume sidecars.
+            try:
+                _cfg = _json.load(open(os.path.join(HERE, "..", "extraction", "maps", m, "config.json"),
+                                       encoding="utf-8"))
+                _slv = _cfg.get("sea_level")
+                if isinstance(_slv, (int, float)):
+                    _m["seaLevel"] = float(_slv)
+                    print(f"  sea: manifest seaLevel = {_slv} (from config)", flush=True)
+            except Exception:
+                pass
             _json.dump(_m, open(_mp, "w", encoding="utf-8"))
             print("  lighting: manifest volume sidecars -> volume.bin / volume.json (in-pack)", flush=True)
         except Exception as _e:

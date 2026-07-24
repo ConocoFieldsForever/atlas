@@ -1292,7 +1292,27 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let lvl_w = dot(env_w, vec3<f32>(0.2126, 0.7152, 0.0722));
         let refl = max(env_w, sky_reflect(Rw, lvl_w));
         let deep = vec3<f32>(0.015, 0.045, 0.060);
-        let col = deep * gi_w * (1.0 - wf) + refl * wf + spec_rgb;
+        // Reinhard-compress the sky mirror: the baked open-sky SH is HDR-bright (sky_scale ≈ 2), and
+        // reflecting it raw washed the whole sea to a pale slab (term-bisected: refl*wf ≈ 4x the
+        // body+glint terms). The game's overcast sea is a MUTED sheen over a dark teal body — compress
+        // the reflection into [0,1) and weight it down so the body color owns the look head-on and the
+        // sky only takes over toward grazing angles (wf -> 1 keeps the horizon bright, like the game).
+        let refl_c = refl / (vec3<f32>(1.0) + refl);
+        // Keep the INPUT luminance low: the pack's warm grade LUT (+exposure) renders any bright
+        // pale-blue as cream (grade-off A/B measured [152,170,172] -> graded beige). The game's sea
+        // is dark enough that the same warm grade reads dark green-grey — so (a) the body ABSORBS:
+        // clamp the open-sky irradiance instead of scaling linearly with it, and (b) the sky mirror
+        // stays grazing-weighted (bright horizon band like the game, dark head-on body).
+        // The pack's game grade LUT is LDR-authored: after the x1.35 exposure it CLIPS every
+        // channel >= ~0.74 linear to one flat highlight plateau (~(244,227,191) -> the "white slab").
+        // So the water must arrive BELOW that plateau or its color is unrecoverable. Cap the radiance
+        // hue-preservingly: dark teal body head-on (~0.18), brighter grazing band (~0.28) like the
+        // game's horizon sheen — never into the LUT clip. (Codex-diagnosed via LUT evaluation.)
+        let body = deep * min(gi_w, vec3<f32>(1.2));
+        let raw_col = body * (1.0 - wf) + refl_c * (wf * mix(0.08, 0.24, wf)) + spec_rgb;
+        let peak = max(raw_col.r, max(raw_col.g, raw_col.b));
+        let water_cap = mix(0.18, 0.28, wf);
+        let col = raw_col * min(1.0, water_cap / max(peak, 1.0e-5));
         // Open water is never indoors: directionality=1 keeps the full outdoor fog. The per-pixel
         // dom.directionality (unlifted SH) alternated with the probe grid and MODULATED THE FOG
         // into the residual banding (survived the gi/env/spec eliminations above).
