@@ -116,70 +116,85 @@ fn plan_chunks(n_tris: usize, n_nodes: usize, limits: &wgpu::Limits) -> Option<C
     Some(ChunkPlan { tpc, npc, tri_chunks, node_chunks, cap })
 }
 
-/// The tri chunk buffers (MAX_CHUNKS of them; unused slots are 1-element dummies). `with_mat` stores
-/// each tri's material id in `a.w` (bitcast) for the bounce pass; pass A leaves it 0.
-fn tri_bufs(device: &wgpu::Device, bvh: &Bvh, plan: &ChunkPlan, with_mat: bool) -> Vec<wgpu::Buffer> {
-    let n = bvh.tris.len();
-    (0..MAX_CHUNKS)
-        .map(|c| {
-            if c >= plan.tri_chunks {
-                return dummy(device, TRI_STRIDE, "sh_bake tris(dummy)");
-            }
-            let start = c * plan.tpc as usize;
-            let cnt = (n - start).min(plan.tpc as usize);
-            let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sh_bake tris"),
-                size: cnt as u64 * TRI_STRIDE,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: true,
-            });
-            {
-                let mut view = buf.slice(..).get_mapped_range_mut();
-                let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
-                for (k, t) in bvh.tris[start..start + cnt].iter().enumerate() {
-                    let o = k * 12;
-                    f[o] = t.a.x; f[o + 1] = t.a.y; f[o + 2] = t.a.z;
-                    f[o + 3] = if with_mat { f32::from_bits(t.mat) } else { 0.0 };
-                    f[o + 4] = t.b.x; f[o + 5] = t.b.y; f[o + 6] = t.b.z; f[o + 7] = 0.0;
-                    f[o + 8] = t.c.x; f[o + 9] = t.c.y; f[o + 10] = t.c.z; f[o + 11] = 0.0;
-                }
-            }
-            buf.unmap();
-            buf
-        })
-        .collect()
+/// Create a `mapped_at_creation` buffer GUARDED by its own error-scope pair. On an allocation failure
+/// (VRAM exhausted — e.g. the bake running while the viewer holds the GPU) wgpu hands back an ERROR
+/// buffer, and calling `get_mapped_range_mut()` on it PANICS (Windows 0xc0000409) — the OOM only
+/// becomes catchable at scope-pop, AFTER the panic would have fired. So: pop-check BEFORE mapping,
+/// and return None so the caller falls back to the CPU pass instead of dying.
+fn checked_mapped(device: &wgpu::Device, size: u64, label: &str) -> Option<wgpu::Buffer> {
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
+    device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size.max(16),
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: true,
+    });
+    let oom = bevy::tasks::block_on(device.pop_error_scope());
+    let val = bevy::tasks::block_on(device.pop_error_scope());
+    if let Some(e) = oom.or(val) {
+        eprintln!("  sh-bake/gpu: '{label}' allocation failed ({e}) — deferring to CPU");
+        return None;
+    }
+    Some(buf)
 }
 
-fn node_bufs(device: &wgpu::Device, bvh: &Bvh, plan: &ChunkPlan) -> Vec<wgpu::Buffer> {
+/// The tri chunk buffers (MAX_CHUNKS of them; unused slots are 1-element dummies). `with_mat` stores
+/// each tri's material id in `a.w` (bitcast) for the bounce pass; pass A leaves it 0. None on OOM.
+fn tri_bufs(device: &wgpu::Device, bvh: &Bvh, plan: &ChunkPlan, with_mat: bool) -> Option<Vec<wgpu::Buffer>> {
+    let n = bvh.tris.len();
+    let mut out = Vec::with_capacity(MAX_CHUNKS);
+    for c in 0..MAX_CHUNKS {
+        if c >= plan.tri_chunks {
+            out.push(dummy(device, TRI_STRIDE, "sh_bake tris(dummy)"));
+            continue;
+        }
+        let start = c * plan.tpc as usize;
+        let cnt = (n - start).min(plan.tpc as usize);
+        let buf = checked_mapped(device, cnt as u64 * TRI_STRIDE, "sh_bake tris")?;
+        {
+            let mut view = buf.slice(..).get_mapped_range_mut();
+            let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
+            for (k, t) in bvh.tris[start..start + cnt].iter().enumerate() {
+                let o = k * 12;
+                f[o] = t.a.x; f[o + 1] = t.a.y; f[o + 2] = t.a.z;
+                f[o + 3] = if with_mat { f32::from_bits(t.mat) } else { 0.0 };
+                f[o + 4] = t.b.x; f[o + 5] = t.b.y; f[o + 6] = t.b.z; f[o + 7] = 0.0;
+                f[o + 8] = t.c.x; f[o + 9] = t.c.y; f[o + 10] = t.c.z; f[o + 11] = 0.0;
+            }
+        }
+        buf.unmap();
+        out.push(buf);
+    }
+    Some(out)
+}
+
+fn node_bufs(device: &wgpu::Device, bvh: &Bvh, plan: &ChunkPlan) -> Option<Vec<wgpu::Buffer>> {
     let n = bvh.nodes.len();
-    (0..MAX_CHUNKS)
-        .map(|c| {
-            if c >= plan.node_chunks {
-                return dummy(device, NODE_STRIDE, "sh_bake nodes(dummy)");
+    let mut out = Vec::with_capacity(MAX_CHUNKS);
+    for c in 0..MAX_CHUNKS {
+        if c >= plan.node_chunks {
+            out.push(dummy(device, NODE_STRIDE, "sh_bake nodes(dummy)"));
+            continue;
+        }
+        let start = c * plan.npc as usize;
+        let cnt = (n - start).min(plan.npc as usize);
+        let buf = checked_mapped(device, cnt as u64 * NODE_STRIDE, "sh_bake nodes")?;
+        {
+            let mut view = buf.slice(..).get_mapped_range_mut();
+            let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
+            for (k, nd) in bvh.nodes[start..start + cnt].iter().enumerate() {
+                let o = k * 8;
+                f[o] = nd.min.x; f[o + 1] = nd.min.y; f[o + 2] = nd.min.z;
+                f[o + 3] = f32::from_bits(nd.start);
+                f[o + 4] = nd.max.x; f[o + 5] = nd.max.y; f[o + 6] = nd.max.z;
+                f[o + 7] = f32::from_bits(nd.count);
             }
-            let start = c * plan.npc as usize;
-            let cnt = (n - start).min(plan.npc as usize);
-            let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("sh_bake nodes"),
-                size: cnt as u64 * NODE_STRIDE,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: true,
-            });
-            {
-                let mut view = buf.slice(..).get_mapped_range_mut();
-                let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
-                for (k, nd) in bvh.nodes[start..start + cnt].iter().enumerate() {
-                    let o = k * 8;
-                    f[o] = nd.min.x; f[o + 1] = nd.min.y; f[o + 2] = nd.min.z;
-                    f[o + 3] = f32::from_bits(nd.start);
-                    f[o + 4] = nd.max.x; f[o + 5] = nd.max.y; f[o + 6] = nd.max.z;
-                    f[o + 7] = f32::from_bits(nd.count);
-                }
-            }
-            buf.unmap();
-            buf
-        })
-        .collect()
+        }
+        buf.unmap();
+        out.push(buf);
+    }
+    Some(out)
 }
 
 fn dummy(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
@@ -191,13 +206,8 @@ fn dummy(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
     })
 }
 
-fn storage_buf_mapped(device: &wgpu::Device, bytes: u64, label: &str) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: bytes.max(16),
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: true,
-    })
+fn storage_buf_mapped(device: &wgpu::Device, bytes: u64, label: &str) -> Option<wgpu::Buffer> {
+    checked_mapped(device, bytes, label)
 }
 
 fn ro(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -294,14 +304,14 @@ pub fn pass_a_gpu(
         g.name, g.backend, plan.tri_chunks, plan.node_chunks, lights.len(), plan.cap as f64 / (1u64 << 30) as f64,
     );
 
-    g.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    g.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-
-    let tbufs = tri_bufs(&g.device, bvh, &plan, false);
-    let nbufs = node_bufs(&g.device, bvh, &plan);
+    // Mapped uploads are individually scope-guarded (checked_mapped) — a VRAM OOM returns None -> CPU
+    // fallback. The outer scope pair below covers everything AFTER the uploads (out/read/param/pipeline
+    // /dispatch) and is popped in finish_read.
+    let tbufs = tri_bufs(&g.device, bvh, &plan, false)?;
+    let nbufs = node_bufs(&g.device, bvh, &plan)?;
 
     // lights (>=1 element so the binding is valid; the shader loops n_light so a dummy is unread)
-    let light_buf = storage_buf_mapped(&g.device, lights.len().max(1) as u64 * LIGHT_STRIDE, "sh_bake lights");
+    let light_buf = storage_buf_mapped(&g.device, lights.len().max(1) as u64 * LIGHT_STRIDE, "sh_bake lights")?;
     {
         let mut view = light_buf.slice(..).get_mapped_range_mut();
         let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
@@ -313,6 +323,9 @@ pub fn pass_a_gpu(
         }
     }
     light_buf.unmap();
+
+    g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    g.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
     let out_buf = g.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sh_bake out"),
@@ -408,14 +421,13 @@ pub fn pass_b_gpu(
         g.name, g.backend, bounce_rays,
     );
 
-    g.device.push_error_scope(wgpu::ErrorFilter::Validation);
-    g.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-
-    let tbufs = tri_bufs(&g.device, bvh, &plan, true); // bounce needs material ids in a.w
-    let nbufs = node_bufs(&g.device, bvh, &plan);
+    // Mapped uploads individually scope-guarded (checked_mapped) — OOM -> None -> CPU bounce. The
+    // outer pair below covers post-upload work and is popped in finish_read.
+    let tbufs = tri_bufs(&g.device, bvh, &plan, true)?; // bounce needs material ids in a.w
+    let nbufs = node_bufs(&g.device, bvh, &plan)?;
 
     // pass-A grid (12 f32/probe)
-    let sha_buf = storage_buf_mapped(&g.device, out_bytes, "sh_bake sh_a");
+    let sha_buf = storage_buf_mapped(&g.device, out_bytes, "sh_bake sh_a")?;
     {
         let mut view = sha_buf.slice(..).get_mapped_range_mut();
         let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
@@ -429,7 +441,7 @@ pub fn pass_b_gpu(
     sha_buf.unmap();
 
     // per-material albedo|emissive (2 vec4 each); >=1 element for a valid binding
-    let mat_buf = storage_buf_mapped(&g.device, n_mat.max(1) as u64 * MAT_STRIDE, "sh_bake mats");
+    let mat_buf = storage_buf_mapped(&g.device, n_mat.max(1) as u64 * MAT_STRIDE, "sh_bake mats")?;
     {
         let mut view = mat_buf.slice(..).get_mapped_range_mut();
         let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
@@ -442,6 +454,9 @@ pub fn pass_b_gpu(
         }
     }
     mat_buf.unmap();
+
+    g.device.push_error_scope(wgpu::ErrorFilter::Validation);
+    g.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
     let out_buf = g.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("sh_bounce out"),
