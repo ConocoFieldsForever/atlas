@@ -6,8 +6,10 @@
 // PNGs, computed CPU-side). The occluder BVH is nav_bake's, CHUNKED across up to 3 storage bindings
 // (tris carry their material id in a.w) exactly like sh_bake.wgsl, so giants stay on-GPU.
 
-struct Node { lo: vec4<f32>, hi: vec4<f32> };   // lo.xyz=min, lo.w=bitcast(start); hi.xyz=max, hi.w=bitcast(count)
-struct Tri  { a: vec4<f32>, b: vec4<f32>, c: vec4<f32> };   // .xyz verts; a.w = bitcast(material id)
+// start/count/mat as REAL u32 fields packed into the vec3 padding (byte layout unchanged) — loaded as
+// u32 directly, never round-tripped through an f32 load (which some GPUs may denorm-flush). AMD-safe.
+struct Node { min: vec3<f32>, start: u32, max: vec3<f32>, count: u32 };
+struct Tri  { a: vec3<f32>, mat: u32, b: vec3<f32>, p1: u32, c: vec3<f32>, p2: u32 };
 
 struct Params {
     gmin: vec4<f32>,    // xyz grid min, w = inv_pi_boost (albedo/pi * boost)
@@ -80,13 +82,13 @@ fn ray_hit(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> Hit {
         if (sp == 0u) { break; }
         sp = sp - 1u;
         let node = node_at(stack[sp]);
-        let t0 = (node.lo.xyz - o) * inv_d;
-        let t1 = (node.hi.xyz - o) * inv_d;
+        let t0 = (node.min - o) * inv_d;
+        let t1 = (node.max - o) * inv_d;
         let enter = max(max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z)), RAY_EPS);
         let exit = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
         if (enter > exit || enter > best_t) { continue; }
-        let count = bitcast<u32>(node.hi.w);
-        let start = bitcast<u32>(node.lo.w);
+        let count = node.count;
+        let start = node.start;
         if (count > 0u) {
             for (var i = 0u; i < count; i = i + 1u) {
                 let tt = ray_tri_t(o, d, tri_at(start + i), best_t);
@@ -95,8 +97,8 @@ fn ray_hit(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> Hit {
         } else {
             let na = node_at(start);
             let nb = node_at(start + 1u);
-            let pa = min((na.lo.xyz - o) * inv_d, (na.hi.xyz - o) * inv_d);
-            let pb = min((nb.lo.xyz - o) * inv_d, (nb.hi.xyz - o) * inv_d);
+            let pa = min((na.min - o) * inv_d, (na.max - o) * inv_d);
+            let pb = min((nb.min - o) * inv_d, (nb.max - o) * inv_d);
             let ea = max(max(pa.x, pa.y), pa.z);
             let eb = max(max(pb.x, pb.y), pb.z);
             if (ea <= eb) {
@@ -181,7 +183,7 @@ fn cs_bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (dot(n, d) > 0.0) { n = -n; }                            // orient toward the incoming ray
         let h = o + d * hit.t + n * 0.05;                           // hit point, nudged off surface
         let e = irr_at(h, n);
-        let mat = bitcast<u32>(tri.a.w);
+        let mat = tri.mat;
         var alb = vec3<f32>(0.3); var emi = vec3<f32>(0.0);         // untextured/oob fallback (matches CPU)
         if (mat < n_mat) { alb = mats[2u * mat].xyz; emi = mats[2u * mat + 1u].xyz; }
         let rad = e * alb * inv_pi_boost + emi * emis_gain;         // albedo/pi * E + emissive

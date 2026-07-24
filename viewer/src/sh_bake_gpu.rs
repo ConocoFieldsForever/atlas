@@ -17,8 +17,11 @@ use crate::nav_bake::Bvh;
 use glam::Vec3;
 
 const MAX_CHUNKS: usize = 3; // MUST match sh_bake.wgsl / sh_bounce.wgsl (tris0..2 / nodes0..2)
-const TRI_STRIDE: u64 = 48; // 3 x vec4<f32> (a,b,c; a.w carries the material id for pass B)
-const NODE_STRIDE: u64 = 32; // 2 x vec4<f32> (min|start, max|count)
+// Byte layouts match the WGSL structs, which pack the u32 index fields (start/count/mat) into the vec3
+// padding so the shader loads them as REAL u32 (no f32-bitcast that some GPUs could denorm-flush). The
+// Rust writes those bits via `f32::from_bits` into an f32 slot at the same offset — same bytes either way.
+const TRI_STRIDE: u64 = 48; // a:vec3 + mat:u32 + b:vec3 + _pad + c:vec3 + _pad
+const NODE_STRIDE: u64 = 32; // min:vec3 + start:u32 + max:vec3 + count:u32
 const LIGHT_STRIDE: u64 = 48; // 3 x vec4<f32>
 const MAT_STRIDE: u64 = 32; // 2 x vec4<f32> (albedo|_, emissive|_)
 

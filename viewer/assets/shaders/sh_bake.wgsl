@@ -10,8 +10,10 @@
 
 const MAX_CHUNKS: u32 = 3u;   // keep in lockstep with sh_bake_gpu.rs (bindings tris0..2 / nodes0..2)
 
-struct Node { lo: vec4<f32>, hi: vec4<f32> };   // lo.xyz=aabb min, lo.w=bitcast(start); hi.xyz=max, hi.w=bitcast(count)
-struct Tri  { a: vec4<f32>, b: vec4<f32>, c: vec4<f32> };          // .xyz = world verts (all tris occlude, incl doors)
+// start/count/mat are REAL u32 fields packed into the vec3 padding (byte layout unchanged) so they are
+// loaded as u32 directly — never round-tripped through an f32 load, which some GPUs may denorm-flush.
+struct Node { min: vec3<f32>, start: u32, max: vec3<f32>, count: u32 };   // aabb + child/tri range
+struct Tri  { a: vec3<f32>, mat: u32, b: vec3<f32>, p1: u32, c: vec3<f32>, p2: u32 };   // world verts (+material id)
 struct Light { l0: vec4<f32>, l1: vec4<f32>, l2: vec4<f32> };      // l0=pos+range, l1=color+cos_outer, l2=dir+cos_inner
 
 struct Params {
@@ -91,9 +93,9 @@ fn ray_occluded(o: vec3<f32>, d: vec3<f32>, t_max: f32) -> bool {
         if (sp == 0u) { break; }
         sp = sp - 1u;
         let node = node_at(stack[sp]);
-        if (!slab_hit(node.lo.xyz, node.hi.xyz, o, inv_d, t_max)) { continue; }
-        let count = bitcast<u32>(node.hi.w);
-        let start = bitcast<u32>(node.lo.w);
+        if (!slab_hit(node.min, node.max, o, inv_d, t_max)) { continue; }
+        let count = node.count;
+        let start = node.start;
         if (count > 0u) {
             for (var i = 0u; i < count; i = i + 1u) {
                 if (ray_tri(o, d, tri_at(start + i), t_max)) { return true; }
