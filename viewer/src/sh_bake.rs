@@ -56,6 +56,17 @@ fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(d)
 }
 
+/// Which pass-A engine to use. `Auto` (default) tries the vendor-neutral wgpu-compute backend and
+/// silently falls back to the rayon CPU pass if there's no usable GPU (or the map won't fit even
+/// chunked); `Gpu` forces the GPU attempt (still falls back on failure, with a warning); `Cpu` skips
+/// the GPU entirely. Pass B (the diffuse bounce) always runs on the CPU for now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    Auto,
+    Gpu,
+    Cpu,
+}
+
 /// The baked grid + SH payload, ready to serialize.
 struct Baked {
     min: [f32; 3],
@@ -371,7 +382,7 @@ fn build_material_luts(pack: &Pack) -> (Vec<Vec3>, Vec<Vec3>) {
     (albedo, emissive)
 }
 
-fn bake(pack: &Pack) -> Result<Baked> {
+fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
     let n_dir = env_usize("EFT_SH_RAYS", 256).max(8);
     let sky_scale = env_f32("EFT_SKY", 2.0);
     let light_scale = env_f32("EFT_LIGHT_SCALE", 6.0); // Unity color*intensity -> SH radiance (bake_volume2 default)
@@ -465,11 +476,26 @@ fn bake(pack: &Pack) -> Result<Baked> {
     }
 
     // ================= PASS A — direct: sky-visibility (M1) + shadow-tested practicals (M2) =========
-    // Kept in f32 (NOT packed yet) so the M3 diffuse bounce can trilinearly gather irradiance from it.
+    // GPU (vendor-neutral wgpu compute; the tri/node BVH is chunked across storage bindings to keep
+    // even interchange/streets-scale giants on-GPU) when available + it fits; else the rayon CPU pass
+    // below. Kept in f32 (NOT packed yet) so the M3 diffuse bounce can trilinearly gather irradiance.
     let t_bake = Instant::now();
-    let inside = std::sync::atomic::AtomicUsize::new(0);
-    let mut sh_a: Vec<[Vec3; 4]> = vec![[Vec3::ZERO; 4]; n_probe];
-    sh_a.par_iter_mut().enumerate().for_each_init(
+    let gpu_a = if matches!(backend, Backend::Gpu | Backend::Auto) {
+        crate::sh_bake_gpu::pass_a_gpu(
+            &bvh, lights, gmin, spacing, dims, n_dir, sky_scale, light_scale, indirect_only,
+        )
+    } else {
+        None
+    };
+    let (sh_a, inside_solid): (Vec<[Vec3; 4]>, usize) = if let Some(v) = gpu_a {
+        (v, 0) // inside-solid is a CPU-pass diagnostic only (never serialized); GPU path skips the count
+    } else {
+        if backend == Backend::Gpu {
+            eprintln!("  sh-bake: --backend gpu unavailable — falling back to the CPU pass A");
+        }
+        let inside = std::sync::atomic::AtomicUsize::new(0);
+        let mut sh_a: Vec<[Vec3; 4]> = vec![[Vec3::ZERO; 4]; n_probe];
+        sh_a.par_iter_mut().enumerate().for_each_init(
         || Vec::<u32>::with_capacity(64),
         |stack, (pi, out)| {
             let o = probe_o(pi, nx, ny, gmin, spacing);
@@ -529,8 +555,9 @@ fn bake(pack: &Pack) -> Result<Baked> {
             } // end if !indirect_only (M2 practicals)
             *out = sh;
         },
-    );
-    let inside_solid = inside.into_inner();
+        );
+        (sh_a, inside.into_inner())
+    };
     eprintln!(
         "  sh-bake: pass A (direct) {n_probe} probes in {:.2}s ({} fully-occluded/inside-solid)",
         t_bake.elapsed().as_secs_f32(),
@@ -685,6 +712,7 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
 /// Handle the headless `bake-sh` subcommand. Returns a process exit code (0 = ok). Never panics.
 pub fn run_cli(args: &[String]) -> i32 {
     let mut pack_dir: Option<String> = None;
+    let mut backend = Backend::Auto;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -701,6 +729,20 @@ pub fn run_cli(args: &[String]) -> i32 {
             // Direct/indirect split: bake only INDIRECT (sky + bounce); the practicals become
             // real-time direct lights in the viewer. Marks volume.json "direct": false.
             "--indirect-only" | "--indirect" => std::env::set_var("EFT_SH_INDIRECT", "1"),
+            // Pass-A engine: auto (default; GPU with silent CPU fallback), gpu (force GPU attempt),
+            // cpu (rayon only). The GPU path is vendor-neutral wgpu compute (NVIDIA + AMD).
+            "--backend" => {
+                i += 1;
+                backend = match args.get(i).map(String::as_str) {
+                    Some("auto") => Backend::Auto,
+                    Some("gpu") => Backend::Gpu,
+                    Some("cpu") => Backend::Cpu,
+                    other => {
+                        eprintln!("bake-sh: --backend needs auto|gpu|cpu (got {other:?})");
+                        return 2;
+                    }
+                };
+            }
             s if s.starts_with('-') => {
                 eprintln!("bake-sh: unknown flag '{s}'");
                 return 2;
@@ -717,7 +759,7 @@ pub fn run_cli(args: &[String]) -> i32 {
         i += 1;
     }
     let Some(dir) = pack_dir else {
-        eprintln!("usage: atlas bake-sh <pack_dir> [--rays 256]");
+        eprintln!("usage: atlas bake-sh <pack_dir> [--rays 256] [--backend auto|gpu|cpu] [--indirect-only]");
         return 2;
     };
     let dir_path = Path::new(&dir);
@@ -730,7 +772,7 @@ pub fn run_cli(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let baked = match bake(&pack) {
+    let baked = match bake(&pack, backend) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("bake-sh: bake failed: {e:#}");
