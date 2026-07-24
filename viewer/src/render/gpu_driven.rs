@@ -379,7 +379,8 @@ pub struct ShVolumeUniform {
     /// xyz = 1/(max-min) (world -> [0,1] uvw, hardware-trilinear fallback path),
     /// w = normal_bias in meters (default 0.75) for the manual 8-tap.
     pub vol_inv_extent: [f32; 4],
-    /// xyz = (nx, ny, nz) probe grid dims (as f32), w unused.
+    /// xyz = (nx, ny, nz) probe grid dims (as f32); w = mean ground-adjacent / top-layer sky
+    /// luma ratio (scales out-of-volume redirected samples down to ground-equivalent).
     pub dims: [f32; 4],
     /// xyz = (sx, sy, sz) probe spacing in meters, w unused.
     pub spacing: [f32; 4],
@@ -762,6 +763,10 @@ struct ShVolumeCpu {
     spacing: [f32; 3],
     /// Per-map SH GI intensity (shader `vol_min.w`); from the sidecar's `gi_intensity`, else 1.0.
     gi_intensity: f32,
+    /// mean(layer-1 c0 luma) / mean(top-layer c0 luma) over sky-lit probes — the out-of-volume
+    /// redirect samples the TOP layer (clean sky) but ground sees a slightly dimmer dome
+    /// (horizon occlusion), so redirected samples are scaled by this (shader `dims.w`).
+    ground_over_top: f32,
     tex_r: Vec<u8>,
     tex_g: Vec<u8>,
     tex_b: Vec<u8>,
@@ -775,6 +780,7 @@ impl ShVolumeCpu {
         // half(1.0) = 0x3C00, half(0.0) = 0x0000 (LE bytes). texel = (c0=1, c1=0, c2=0, c3=0).
         let texel: [u8; 8] = [0x00, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         Self {
+            ground_over_top: 1.0,
             dims: [1, 1, 1],
             min: [0.0, 0.0, 0.0],
             max: [1.0, 1.0, 1.0],
@@ -854,8 +860,22 @@ fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
         let o = base + h * 2;
         dst.extend_from_slice(&bin[o..o + 2]);
     };
+    let read_half = |base: usize, h: usize| -> f32 {
+        let o = base + h * 2;
+        half::f16::from_le_bytes([bin[o], bin[o + 1]]).to_f32()
+    };
+    let (mut g_sum, mut g_n, mut t_sum, mut t_n) = (0f64, 0u32, 0f64, 0u32);
     for pi in 0..n_probes {
         let base = pi * 24;
+        // ground-adjacent (layer 1) vs top-layer mean c0 luma of sky-lit probes, for the
+        // out-of-volume redirect scale (see ShVolumeCpu::ground_over_top).
+        let yl = (pi / nx as usize) % ny as usize;
+        if yl == 1.min(ny as usize - 1) || yl == ny as usize - 1 {
+            let l = 0.2126 * read_half(base, 0) + 0.7152 * read_half(base, 1) + 0.0722 * read_half(base, 2);
+            if l.is_finite() && l > 0.05 {
+                if yl == ny as usize - 1 { t_sum += l as f64; t_n += 1; } else { g_sum += l as f64; g_n += 1; }
+            }
+        }
         for &h in &[0usize, 3, 6, 9] {
             copy_half(&mut tex_r, base, h);
         }
@@ -901,7 +921,13 @@ fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
         meta.max,
         spacing
     );
+    let ground_over_top = if g_n > 0 && t_n > 0 {
+        (((g_sum / g_n as f64) / (t_sum / t_n as f64)) as f32).clamp(0.5, 1.5)
+    } else {
+        1.0
+    };
     Some(ShVolumeCpu {
+        ground_over_top,
         dims: meta.dims,
         min: meta.min,
         max: meta.max,
@@ -3749,8 +3775,8 @@ fn prepare_gpu_buffers(
         vol_min: [sh.min[0], sh.min[1], sh.min[2], gi_intensity], // w = gi_intensity (EFT_GI / sidecar / 1.0)
         // w = normal_bias (meters) for the manual 8-tap leak fix.
         vol_inv_extent: [sh_inv_extent[0], sh_inv_extent[1], sh_inv_extent[2], SH_NORMAL_BIAS],
-        // xyz = probe grid dims (as f32), for the manual 8-tap corner enumeration.
-        dims: [sh_nx as f32, sh_ny as f32, sh_nz as f32, 0.0],
+        // xyz = probe grid dims (as f32); w = ground/top sky ratio (out-of-volume redirect scale).
+        dims: [sh_nx as f32, sh_ny as f32, sh_nz as f32, sh.ground_over_top],
         // xyz = probe spacing (meters); probe i sits at vol_min + i*spacing.
         spacing: [sh.spacing[0], sh.spacing[1], sh.spacing[2], 0.0],
     };
