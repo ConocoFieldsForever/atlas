@@ -65,6 +65,14 @@ class Culls:
         # registers. KEEP inactive geometry by default; only ShadowsOnly/disabled are truly never drawn.
         # TARKMAP_DROP_INACTIVE=1 restores the old aggressive drop for A/B.
         self.drop_inactive = os.environ.get("TARKMAP_DROP_INACTIVE") == "1"
+        # ...but the keep-exemption is for LOOT-SCALE objects (crates/registers/counters). Artist-parked
+        # scenery duplicates are ALSO aih==False (shoreline ships a disabled 140 m Lighthouse_Mountain
+        # copy floating mid-air, tipped over) and must not ride the exemption: an inactive instance whose
+        # world bounding DIAMETER exceeds this keeps only via TARKMAP_KEEP_HIDDEN=1. The caller supplies
+        # the mesh-size lookup (filter(..., mesh_diam=...)); without one the gate is inert (old behavior).
+        self.inactive_keep_max_m = float(c.get("inactive_keep_max_m", 10.0))
+        self._mesh_diam = None
+        self._n_oversize = 0
         # OFF-MAP BACKDROP cull: EFT scenes carry a distant city-skyline cluster (e.g. Interchange's build03_part*/
         # bulding_city_LOD0/concrete2 under SBG_Shopping_Mall_2) placed ~1-2km OUTSIDE the terrain footprint. Nothing culls
         # them by name (they sit under an allowlisted root), so they render as giant intrusive silhouettes over the map.
@@ -94,6 +102,13 @@ class Culls:
                 mname = str(it.get("mesh") or "").split("/")[-1].split("__")[0]
                 if self.drop_inactive or mname.isdigit():
                     return False
+                # Size gate (see __init__): raid-activated objects are loot-scale; oversized
+                # inactive geometry is parked/disabled scenery the game never draws.
+                if self._mesh_diam is not None:
+                    d = self._mesh_diam(it)
+                    if d is not None and d > self.inactive_keep_max_m:
+                        self._n_oversize += 1
+                        return False
         root = it.get("root") or ""
         # ALLOWLIST = PROTECTION, NOT EXCLUSION (2026-07-13). The allowlist's one legitimate job is to shield
         # declared-content roots from the generic name denylist (DEFAULT_DROP_ROOT_RE's '.*light' would nuke
@@ -147,9 +162,13 @@ class Culls:
                 keep2.append(it)
         return keep2, off, examples
 
-    def filter(self, instances):
-        """Return (kept, report). report = {'raw','kept','dropped','top_dropped_roots',...} for fail-loud logging."""
+    def filter(self, instances, mesh_diam=None):
+        """Return (kept, report). report = {'raw','kept','dropped','top_dropped_roots',...} for fail-loud logging.
+        `mesh_diam(it) -> world bounding diameter (m) or None` arms the oversized-inactive gate (see __init__);
+        callers that can't size meshes just omit it and keep the old behavior."""
         kept, dropped_roots = [], {}; hidden = 0
+        self._mesh_diam = mesh_diam
+        self._n_oversize = 0
         for it in instances:
             if self.keep_instance(it):
                 kept.append(it)
@@ -160,5 +179,6 @@ class Culls:
         kept, offmap, offmap_examples = self._offmap_backdrop_filter(kept, dropped_roots)
         top = sorted(dropped_roots.items(), key=lambda kv: -kv[1])[:12]
         return kept, {"raw": len(instances), "kept": len(kept), "hidden_unity": hidden,
+                      "inactive_oversize": self._n_oversize,
                       "offmap_backdrop": offmap, "offmap_examples": offmap_examples,
                       "dropped": sum(dropped_roots.values()), "top_dropped_roots": top}

@@ -166,6 +166,83 @@ def load_static_items(names=(), ids=()):
     return {"items": out}
 
 
+def map_slug(display):
+    """tarkov.dev map normalizedName from a display name ('Streets of Tarkov' ->
+    'streets-of-tarkov') — the same slug rule as the asset CDN uses."""
+    out, dash = [], False
+    for ch in str(display).lower():
+        if ch.isascii() and ch.isalnum():
+            out.append(ch)
+            dash = False
+        elif not dash:
+            out.append("-")
+            dash = True
+    return "".join(out).strip("-")
+
+
+def _display_name(entry, en_tables):
+    """localized name for a data.* entry: the '<id> Name' translation when any table has it,
+    else the normalizedName prettified ('duffle-bag' -> 'Duffle bag', short leading token
+    upper-cased so 'nsv-...' reads 'NSV ...'). Display only — never a join key."""
+    for en in en_tables:
+        nm = en.get(entry.get("name") or "")
+        if nm:
+            return nm
+    toks = (entry.get("normalizedName") or "").split("-")
+    toks = [t for t in toks if t]
+    if not toks:
+        return None
+    if len(toks[0]) <= 4 and toks[0].isalpha():
+        toks[0] = toks[0].upper()
+    else:
+        toks[0] = toks[0].capitalize()
+    return " ".join(toks)
+
+
+def load_static_containers():
+    """lootContainer template id -> display name ('Jacket' / 'Duffle bag' / 'Dead Scav')
+    from the maps dump's data.lootContainers table."""
+    d = _get("maps").get("data", {})
+    en = [_get("maps_en").get("data", {}) or {}, _get("items_en").get("data", {}) or {}]
+    out = {}
+    for c in _list(d.get("lootContainers") or {}):
+        nm = _display_name(c, en)
+        if c.get("id") and nm:
+            out[str(c["id"])] = nm
+    return out
+
+
+def load_static_stationary():
+    """{'weapons': {id -> display name}, 'maps': {map normalizedName -> [{'id', 'pos'}]}}
+    from the maps dump: the stationaryWeapons TYPE table + every map's mount positions
+    (raw Unity coordinates, exactly as the game serializes them)."""
+    d = _get("maps").get("data", {})
+    en = [_get("maps_en").get("data", {}) or {}, _get("items_en").get("data", {}) or {}]
+    weapons = {}
+    for w in _list(d.get("stationaryWeapons") or {}):
+        nm = _display_name(w, en)
+        if w.get("id") and nm:
+            weapons[str(w["id"])] = nm
+    per_map = {}
+    for m in _list(d.get("maps") or {}):
+        slug = m.get("normalizedName") or ""
+        rows = []
+        for w in m.get("stationaryWeapons") or []:
+            p = w.get("position") or {}
+            if all(k in p for k in "xyz"):
+                rows.append({"id": str(w.get("stationaryWeapon") or ""),
+                             "pos": [p["x"], p["y"], p["z"]]})
+        if slug and rows:
+            # variant scenes ('ground-zero-21') fold into their base map's row set.
+            base = slug
+            for known in per_map:
+                if slug.startswith(known + "-") or known.startswith(slug + "-"):
+                    base = known
+                    break
+            per_map.setdefault(base, []).extend(rows)
+    return {"weapons": weapons, "maps": per_map}
+
+
 def load_static_maps():
     """Rebuild the build_loot.py QUERY response ({'maps': [...]}) from the static dumps.
 

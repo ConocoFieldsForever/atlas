@@ -509,7 +509,8 @@ pub struct TaskIconCache {
 #[cfg(feature = "egui")]
 impl TaskIconCache {
     /// Fetch (and cache) the texture for `slug`, or `None` if no `<slug>.png` exists in either dir.
-    fn get(
+    /// `pub(crate)`: the LEVEL CONTROLS interactables list borrows it for requirement-item icons.
+    pub(crate) fn get(
         &mut self,
         ctx: &bevy_egui::egui::Context,
         root: Option<&Path>,
