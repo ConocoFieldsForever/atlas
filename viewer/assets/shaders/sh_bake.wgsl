@@ -123,7 +123,7 @@ fn sky(d: vec3<f32>, scale: f32) -> f32 {
 
 @compute @workgroup_size(64)
 fn cs_bake(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pi = gid.x;
+    let pi = P.chunk.z + gid.x; // chunk.z = probe batch offset (TDR-avoiding batched dispatch)
     if (pi >= P.counts.w) { return; }
 
     // probe origin (idx = ((z*ny)+y)*nx + x) — matches sh_bake.rs::probe_o
