@@ -2497,6 +2497,77 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         info!("gpu-driven #4 grass: {count} clumps appended (cross-quad, alpha-cutout)");
     }
 
+    // ---- SEA: synthesize the ocean surface the game renders procedurally. EFT's sea is a runtime
+    //      water SYSTEM (Hidden/Water/* shader stack), not a mesh — no level ships extractable ocean
+    //      geometry, so coastal maps (shoreline/lighthouse) render a VOID past the beach and moored
+    //      boats float in air. One big untextured role-water quad at the map's sea level rides the
+    //      existing deep-water shading (dark teal body + band-limited ripple + fresnel sky mirror +
+    //      sun glint) — the same path the recovered lake/pond planes use. Height: EFT_SEA_LEVEL env
+    //      (live tuning) > manifest.seaLevel (authored per-map config, patched in by build_map).
+    //      Absent -> inland map, no sea, byte-identical render. ----
+    'sea: {
+        let sea_level = std::env::var("EFT_SEA_LEVEL")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok())
+            .or(pack.manifest.sea_level);
+        let Some(sl) = sea_level else { break 'sea };
+        let b = &pack.manifest.bounds;
+        let (cx, cz) = ((b[0] + b[3]) * 0.5, (b[2] + b[5]) * 0.5);
+        // The sea reaches well past the playable AABB so the horizon never shows the quad edge.
+        let (hx, hz) = ((b[3] - b[0]) * 0.5 + 1200.0, (b[5] - b[2]) * 0.5 + 1200.0);
+        let sea_mat_id = materials_gpu.len() as u32;
+        materials_gpu.push(GpuMaterial {
+            albedo_index: NO_ALBEDO, // untextured => the shader's DEEP-water branch (dark teal body)
+            flags: MAT_FLAG_WATER,   // opaque pass: depth-write, no z-fight with the blend pass
+            alpha_cutoff: 0.0,
+            roughness: 0.08, // near-mirror: crisp fresnel sky reflection + tight sun glint
+            uv_xform: [1.0, 1.0, 0.0, 0.0],
+            tint: [1.0, 1.0, 1.0, 1.0], // ignored by the deep-water branch (dark teal body)
+            vp: [0.0; 4],
+            normal_index: NO_NORMAL,
+            normal_flags: 0,
+            normal_scale: 1.0,
+            _pad2: 0,
+            emissive_index: NO_EMISSIVE,
+            ..GpuMaterial::default()
+        });
+        let base_vertex = vtx_cursor as i32;
+        let first_index = idx_cursor;
+        let mbits = f32::from_bits(sea_mat_id);
+        // One quad, +Y normal, local origin at the center (height baked into the instance row).
+        let mk = |x: f32, z: f32, u: f32, v: f32| [x, 0.0, z, 0.0, 1.0, 0.0, u, v, mbits, 1.0, 1.0, 1.0, 1.0];
+        for vtx in [
+            mk(-hx, -hz, 0.0, 0.0),
+            mk(hx, -hz, 1.0, 0.0),
+            mk(hx, hz, 1.0, 1.0),
+            mk(-hx, hz, 0.0, 1.0),
+        ] {
+            vertex_data.extend_from_slice(&vtx);
+        }
+        index_data.extend_from_slice(&[0, 1, 2, 0, 2, 3]); // shader flips N on back faces, winding-forgiving
+        let instance_base = inst_cursor;
+        instances.push(InstanceGpuRecord {
+            m0: [1.0, 0.0, 0.0, cx],
+            m1: [0.0, 1.0, 0.0, sl],
+            m2: [0.0, 0.0, 1.0, cz],
+            ids: [mesh_meta.len() as u32, 0, 0, 0],
+            sphere: [cx, sl, cz, (hx * hx + hz * hz).sqrt() + 1.0],
+        });
+        inst_cursor += 1;
+        vtx_cursor += 4;
+        idx_cursor += 6;
+        mesh_meta.push(MeshMeta {
+            index_count: 6,
+            first_index,
+            base_vertex,
+            instance_base,
+            instance_count: 1,
+            blend_class: 0, // deep water is OPAQUE (depth-write) — see the material-flag comment
+            _pad: [0; 2],
+        });
+        info!("gpu-driven sea: synthesized ocean quad at y={sl:.1} ({:.0}x{:.0} m)", hx * 2.0, hz * 2.0);
+    }
+
     let mesh_count = mesh_meta.len() as u32;
     let instance_total = inst_cursor;
     if mesh_count == 0 || instance_total == 0 {

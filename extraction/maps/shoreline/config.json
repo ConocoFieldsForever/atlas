@@ -2,6 +2,7 @@
   "schema_version": 1,
   "id": "shoreline",
   "name": "Shoreline",
+  "sea_level": -64.5,
   "source": {
     "type": "unity_eft_v2",
     "unity_location": "shorline",
