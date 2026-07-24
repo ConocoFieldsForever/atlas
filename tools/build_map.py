@@ -410,7 +410,7 @@ def main():
             if os.path.isfile(s):
                 shutil.copyfile(s, os.path.join(out_dir, dst))
     else:
-        print(f"[STAGE 3/{total}] bake lighting: portable CPU SH (runs post-assemble)", flush=True)
+        print(f"[STAGE 3/{total}] bake lighting: portable SH (GPU if available, else CPU; runs post-assemble)", flush=True)
 
     # 4: assemble the pack (atomic; auto-ships loot/tasks/grade sidecars)
     run(4, total, "assemble pack",
@@ -427,7 +427,7 @@ def main():
     if bake_mode != "warp" or not os.path.isfile(os.path.join(pack, "volume.bin")):
         atlas_exe = find_atlas_exe()
         if atlas_exe:
-            run(3, total, "bake lighting (portable CPU SH, direct/indirect split)",
+            run(3, total, "bake lighting (portable SH: GPU auto w/ CPU fallback, direct/indirect split)",
                 [atlas_exe, "bake-sh", pack, "--indirect-only"], VIEWER, optional=True)
         else:
             print(f"[STAGE 3/{total}] lighting: skipped - viewer exe not found. Build it "
