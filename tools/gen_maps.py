@@ -76,6 +76,10 @@ ROSTER = [
     _M("ground_zero",    "Sandbox",        "ground-zero"),
     _M("streets",        "City",           "streets-of-tarkov"),
     _M("labyrinth",      "Labyrinth",      "the-labyrinth"),
+    # SHIPPED (was mis-filed under "upcoming" below when the roster went game-derived, which silently
+    # dropped it from the menu even though its extraction config — extraction/maps/icebreaker/
+    # config.json, levels 699-705 — and packs had been building fine before that).
+    _M("icebreaker",     "Icebreaker",     "icebreaker"),
     # --- known NON-playable location folders (excluded from the menu ON PURPOSE) ---
     _M("", "Factory",               "", playable=False),   # legacy pre-rework Factory (rework ships)
     _M("", "Arena",                 "", playable=False),   # Arena mode, not a raid map
@@ -83,7 +87,6 @@ ROSTER = [
     _M("", "Sandbox_StartLocation", "", playable=False),   # Ground Zero tutorial start, not the raid
     _M("", "Terminal",              "", playable=False),   # upcoming, not shipped
     _M("", "Venders",               "", playable=False),   # hideout/vendor scenes, not a raid map
-    _M("", "Icebreaker",            "", playable=False),   # upcoming, not shipped
 ]
 
 # Offline fallback display names (used ONLY when tarkov.dev is unreachable, so a no-network regen
@@ -101,6 +104,7 @@ FALLBACK_NAMES = {
     "ground_zero":    ("Ground Zero",       "Эпицентр"),
     "streets":        ("Streets of Tarkov", "Улицы Таркова"),
     "labyrinth":      ("The Labyrinth",     "Лабиринт"),
+    "icebreaker":     ("Icebreaker",        "Ледокол"),
 }
 
 # Legacy hardcoded scalar LIGHT_LEVELS (the pre-manifest tools/build_map.py table), kept HERE only as
