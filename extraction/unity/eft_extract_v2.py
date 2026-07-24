@@ -947,6 +947,18 @@ def main():
                 if (_dA or _dN) and _dM:
                     _t = exp_tex(_dM[0])
                     if _t: extra["detMask"] = _t
+                # PARALLAX (Unity _ParallaxMap height + _Parallax amount): the p0/*Bumped Specular
+                # *Parallax family + Standard shaders ship a grayscale height map that fakes surface
+                # relief via view-dependent UV offset (the Factory basement "fake rooms" ride this).
+                # ~44 materials game-wide carry one. Height is DATA (not color) -> exported like a
+                # control map; the assembler/loader upload it LINEAR.
+                _pm = slots.get("_ParallaxMap")
+                if _pm:
+                    _t = exp_tex(_pm[0])
+                    if _t:
+                        extra["par"] = _t
+                        _ps = fd.get("_Parallax")
+                        extra["parS"] = round(float(_ps), 5) if _ps is not None else 0.02
                 res = (exp_tex(alb) if alb else None, exp_tex(nrm, True) if nrm else None, sh, tile, col, role, cut, vp, extra or None)
                 mat_cache[key] = res; return res
             except Exception:

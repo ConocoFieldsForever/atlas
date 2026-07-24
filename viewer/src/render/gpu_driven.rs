@@ -230,14 +230,24 @@ pub struct GpuMaterial {
     /// conventions.colorSpace.emissive), or `NO_EMISSIVE`. @160
     pub emissive_index: u32,
     /// linear rgb emissive = factor × hdr, precomputed on CPU. Declared as 3 scalars (not a
-    /// vec3) in WGSL too, so the struct stays exactly 176 B with no implicit vec3 16-padding. @164
-    pub emissive_rgb: [f32; 3], // -> total 176 bytes (16-aligned)
+    /// vec3) in WGSL too, so the struct stays vec4-aligned with no implicit vec3 16-padding. @164
+    pub emissive_rgb: [f32; 3], // @164
+    // ---- Parallax: adds 16 bytes (176 -> 192). Zero for the ~all non-parallax materials
+    //      (parallax_index == NO_ALBEDO -> the shader's steep-parallax path is fully skipped ->
+    //      those materials render byte-identical). The height map is appended to the SAME bindless
+    //      `albedo_tex` array as the base textures (uploaded LINEAR — it is height DATA). ----
+    /// bindless `albedo_tex` index of the grayscale height map, or `NO_ALBEDO` when absent. @176
+    pub parallax_index: u32,
+    /// Unity `_Parallax` amount (max tangent-space UV offset; typical 0.02-0.08). @180
+    pub parallax_scale: f32,
+    pub _ppad0: u32, // @184
+    pub _ppad1: u32, // @188  -> total 192 bytes (16-aligned)
 }
 
-// #6: compile-time guard that GpuMaterial stays byte-matched to the WGSL `MaterialGpu` (176 B, all
+// #6: compile-time guard that GpuMaterial stays byte-matched to the WGSL `MaterialGpu` (192 B, all
 // vec4 lanes 16-aligned). A silent mismatch here would corrupt EVERY material's GPU record, so this
 // is checked at `cargo check` time (const eval) rather than trusted by eye.
-const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 176);
+const _: () = assert!(std::mem::size_of::<GpuMaterial>() == 192);
 const _: () = assert!(std::mem::align_of::<GpuMaterial>() == 4);
 
 /// `GpuMaterial::albedo_index` sentinel: material has no albedo texture.
@@ -295,6 +305,10 @@ pub const MAT_FLAG_WATER_MATTE: u32 = 1 << 9;
 /// `GpuMaterial::flags` bit: plain surface decal. Transparent texels mask every lighting term;
 /// glass intentionally keeps its reflection outside that coverage mask.
 pub const MAT_FLAG_DECAL: u32 = 1 << 10;
+/// `GpuMaterial::flags` bit: parallax (steep/occlusion) mapping — offset the base albedo/normal UV
+/// along the tangent-space view vector using `parallax_index`'s height map. Set only when a valid
+/// height map is present; skipped entirely otherwise (byte-identical to the pre-parallax path).
+pub const MAT_FLAG_PARALLAX: u32 = 1 << 11;
 /// Per-mesh transparent-pass membership. A mixed-material mesh may set more than one bit and is
 /// then submitted to each relevant specialization; the fragment material flag keeps only its class.
 const BLEND_MESH_SOFTCUTOUT: u32 = 1 << 0;
@@ -1752,6 +1766,24 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                 ];
             }
         }
+        // PARALLAX height map: resolve into the SAME bindless albedo array (dedup by path, first-seen),
+        // mark it LINEAR (height is data, not sRGB color), set the flag + amount. Absent -> NO_ALBEDO
+        // + no flag -> the shader skips the whole steep-parallax path (byte-identical render). VP/terrain
+        // own their own UV blend so they never carry parallax (assembler already omits it for VP).
+        let mut parallax_index = NO_ALBEDO;
+        let mut parallax_scale = 0.0f32;
+        if let Some(par) = &mat.parallax {
+            if let Some(p) = par.map.as_deref().filter(|p| !p.is_empty()) {
+                parallax_index = *path_to_index.entry(p.to_string()).or_insert_with(|| {
+                    let idx = albedo_paths.len() as u32;
+                    albedo_paths.push(p.to_string());
+                    idx
+                });
+                ctrl_tex_linear.insert(parallax_index); // height is linear DATA, not sRGB
+                parallax_scale = par.scale.clamp(0.0, 0.5);
+                flags |= MAT_FLAG_PARALLAX;
+            }
+        }
         materials_gpu.push(GpuMaterial {
             albedo_index,
             flags,
@@ -1780,6 +1812,10 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             detail_mean_gain,
             emissive_index,
             emissive_rgb,
+            parallax_index,
+            parallax_scale,
+            _ppad0: 0,
+            _ppad1: 0,
         });
     }
 

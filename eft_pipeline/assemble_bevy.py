@@ -299,8 +299,20 @@ class MaterialFactory:
             # neutralized albedo blend + whiteout normal blend + 8-15 m distance fade. See
             # CODEX_5_6_SHADOW_DETAIL_PLAN.md #6. Textures referenced in place from tex/ like normals.
             "detail": self._detail(sb),
+            # PARALLAX: grayscale height map + _Parallax amount -> the shader fakes surface relief by
+            # offsetting the base UV along the tangent-space view vector (Unity Bumped-Specular-Parallax
+            # / Standard). Referenced in place from tex/ like the normal; uploaded LINEAR (height=data).
+            "parallax": self._parallax(sb),
         }
         return rec
+
+    def _parallax(self, sb):
+        """Parallax block {map, scale} or None. `map` = grayscale height PNG (referenced in place);
+        `scale` = Unity `_Parallax` (typical 0.02-0.08). VP subs skip it (the vp splat owns their UV)."""
+        if sb.get('vp') or not sb.get('par'):
+            return None
+        return {"map": self._tex(sb['par']),
+                "scale": round(float(sb['parS']), 5) if sb.get('parS') is not None else 0.02}
 
     def _detail(self, sb):
         """Detail-map block {albedo, albedoUv, albedoStrength, normal, normalUv, normalScale} or None.

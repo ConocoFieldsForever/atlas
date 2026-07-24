@@ -113,7 +113,12 @@ struct MaterialGpu {
     emissive_index: u32,           // @160  bindless albedo_tex index, or MAT_EMISSIVE_NONE
     em_r: f32,                     // @164  linear rgb emissive = factor × hdr (CPU-precomputed)
     em_g: f32,                     // @168
-    em_b: f32,                     // @172  -> 176
+    em_b: f32,                     // @172
+    // Parallax (steep/occlusion) mapping @176 (size -> 192). Byte-identical to the Rust POD.
+    parallax_index: u32,           // @176  bindless albedo_tex index of the grayscale HEIGHT map, or NONE
+    parallax_scale: f32,           // @180  Unity _Parallax amount (max tangent-space UV offset)
+    _ppad0: u32,                   // @184
+    _ppad1: u32,                   // @188  -> 192
 };
 
 // Phase 1.6 GGX specular tuning: global multiplier on the dielectric spec lobe. 1.0 = physical.
@@ -152,6 +157,7 @@ const MAT_FLAG_TERRAIN: u32 = 16u;        // bit4: MicroSplat terrain (splat-ble
 const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary albedo/normal; never on terrain)
 const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW tex.a (smoothness-in-alpha)
 const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpGpu at _pad2)
+const MAT_FLAG_PARALLAX: u32 = 2048u;     // bit11: steep parallax mapping (offset UV by parallax_index height)
 const MAT_FLAG_PUDDLE_LUMA: u32 = 256u;   // bit8: puddle shape mask in luma(rgb), not alpha (atlas)
 const MAT_FLAG_WATER_MATTE: u32 = 512u;   // bit9: STRETCHED floor water-decal (tire marks / wet-ground) -> matte, no mirror
 const MAT_FLAG_DECAL: u32 = 1024u;        // bit10: plain surface decal; mask ALL lighting terms by texture coverage
@@ -673,6 +679,40 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     return o;
 }
 
+// Steep parallax-occlusion mapping (MAT_FLAG_PARALLAX): march the tangent-space view ray against the
+// grayscale HEIGHT map and return the UV where it first pierces the surface, so a flat panel fakes
+// recessed relief (Unity _ParallaxMap; the Factory basement "fake rooms" ride this). The screen-space
+// derivatives are passed IN (the caller computed them in uniform control flow), so the whole march can
+// live inside the per-material `if` — textureSampleGrad takes them explicitly, needing no implicit
+// derivatives. Height = 1 - sample.g (white = surface top, black = deepest recess).
+fn parallax_uv(uv: vec2<f32>, dwx: vec3<f32>, dwy: vec3<f32>, dux: vec2<f32>, duy: vec2<f32>,
+               gN: vec3<f32>, wp: vec3<f32>, pidx: u32, scale: f32) -> vec2<f32> {
+    // Mikkelsen cotangent frame from the world-pos + uv screen derivatives (matches perturb_normal).
+    let T = normalize(dwx * duy.y - dwy * dux.y);
+    let B = normalize(dwy * dux.x - dwx * duy.x);
+    let Vw = normalize(view.world_position.xyz - wp);
+    let Vts = vec3<f32>(dot(Vw, T), dot(Vw, B), dot(Vw, gN));
+    let vz = max(Vts.z, 0.15);                       // clamp grazing (bound the max offset)
+    let num = mix(32.0, 8.0, clamp(vz, 0.0, 1.0));   // more layers at grazing angles (larger offset)
+    let layer = 1.0 / num;
+    let dtex = (Vts.xy / vz) * scale / num;          // per-layer UV step along the view ray
+    var cuv = uv;
+    var cl = 0.0;
+    var h = 1.0 - textureSampleGrad(albedo_tex[pidx], albedo_samp, cuv, dux, duy).g;
+    for (var i = 0; i < 32; i = i + 1) {
+        if (cl >= h) { break; }
+        cuv = cuv - dtex;
+        h = 1.0 - textureSampleGrad(albedo_tex[pidx], albedo_samp, cuv, dux, duy).g;
+        cl = cl + layer;
+    }
+    // Occlusion interpolation between the last (below-surface) and previous (above-surface) samples.
+    let prev = cuv + dtex;
+    let after = h - cl;
+    let before = (1.0 - textureSampleGrad(albedo_tex[pidx], albedo_samp, prev, dux, duy).g) - (cl - layer);
+    let w = clamp(after / max(after - before, 1e-4), 0.0, 1.0);
+    return mix(cuv, prev, w);
+}
+
 @fragment
 fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     // B5: clamp the material index (per-vertex Uint32 from the pack) into the materials table. The
@@ -685,6 +725,21 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // derivatives and keep correct mipmapping.
     let duv_dx = dpdx(o.uv);
     let duv_dy = dpdy(o.uv);
+
+    // --- Parallax (steep) mapping ------------------------------------------------
+    // Offset the base albedo/normal UV along the tangent-space view ray using the height map, so a
+    // flat panel fakes recessed relief (Unity _ParallaxMap). The WORLD-pos derivatives are taken here
+    // UNCONDITIONALLY (uniform control flow) so the per-material march below is legal; the march uses
+    // textureSampleGrad (explicit gradients) and needs no implicit derivatives. `puv == o.uv` for the
+    // ~all non-parallax materials, so their albedo/normal sampling is byte-identical.
+    let dwp_dx = dpdx(o.world_pos);
+    let dwp_dy = dpdy(o.world_pos);
+    var puv = o.uv;
+    if ((m.flags & MAT_FLAG_PARALLAX) != 0u) {
+        let gN = select(-normalize(o.world_normal), normalize(o.world_normal), front);
+        puv = parallax_uv(o.uv, dwp_dx, dwp_dy, duv_dx, duv_dy, gN, o.world_pos,
+                          m.parallax_index, m.parallax_scale);
+    }
 
     // --- #6 Detail maps: shared gate + distance fade -----------------------------
     // Strictly ADDITIVE and gated: `has_detail` is false for every non-detail material AND for all
@@ -720,7 +775,7 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // within one draw -> requires SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING
     // (guarded Rust-side); that feature covers the non-uniform INDEX, not non-uniform control flow.
     let idx = select(0u, m.albedo_index, has_albedo);
-    let tex = textureSample(albedo_tex[idx], albedo_samp, o.uv);
+    let tex = textureSampleGrad(albedo_tex[idx], albedo_samp, puv, duv_dx, duv_dy);
 
     // Emissive (windows / monitors / signs / lamps): same uniform-flow pattern as the albedo —
     // sample slot 0 unconditionally and select the result. Lives in the sRGB albedo array
@@ -766,7 +821,7 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // Read only XY (tangent) and RECONSTRUCT Z. Normal maps are stored BC5 (Rg two-channel, Z is
     // redundant); reading .z would give 0. This is also correct for the legacy raw-RGB normals
     // (Z = sqrt(1 - x² - y²) regardless), so it is a drop-in. Matches the detail-normal decode below.
-    var base_xy = textureSample(normal_tex[nidx], albedo_samp, o.uv).xy * 2.0 - vec2<f32>(1.0);
+    var base_xy = textureSampleGrad(normal_tex[nidx], albedo_samp, puv, duv_dx, duv_dy).xy * 2.0 - vec2<f32>(1.0);
     if ((m.normal_flags & 1u) != 0u) { base_xy.y = -base_xy.y; } // DirectX green-flip (no derivative op)
     base_xy = base_xy * m.normal_scale;
     var base_ts = vec3<f32>(base_xy, sqrt(max(1.0 - dot(base_xy, base_xy), 1.0e-4)));
