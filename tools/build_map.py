@@ -266,6 +266,14 @@ def main():
     total = 9
 
     print(f"[BUILD] map={m} dataset={dsname} dataset_dir={dataset}", flush=True)
+    # Hand the built atlas exe to every child (extraction, bakes) so the GPU steps that shell out to it
+    # -- e.g. the vendor-neutral terrain composite (`atlas bake-terrain`) in stage-1 extraction -- can
+    # find it in CLI builds too, not only when the viewer launches the build. No-op if already set or
+    # no exe is built (those steps then use their CPU fallback).
+    if not os.environ.get("EFT_ATLAS_EXE"):
+        _ax = find_atlas_exe()
+        if _ax:
+            os.environ["EFT_ATLAS_EXE"] = _ax
     if force and not dry:
         # Invalidate the game-derived cache gates so stages 1/2/3/8 re-run instead of "exists ->
         # skip". Best-effort: a missing file is fine; a locked one just means that stage re-runs

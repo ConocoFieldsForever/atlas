@@ -22,6 +22,7 @@ mod nav;
 mod nav_bake;
 mod sh_bake;
 mod sh_bake_gpu;
+mod terrain_bake;
 mod navigate_panel;
 mod pathfind;
 mod paths;
@@ -563,6 +564,12 @@ fn main() {
         // lighting instead of the flat realtime fallback. Replaces bake_volume2.py in the pipeline.
         if argv.get(1).map(String::as_str) == Some("bake-sh") {
             std::process::exit(sh_bake::run_cli(&argv[2..]));
+        }
+        // Headless vendor-neutral GPU MicroSplat terrain-albedo bake — `atlas bake-terrain <manifest>`.
+        // Ports the numpy `_terrain_bake_composite` (a ~961 s Reserve tail) to wgpu compute; the Python
+        // extractor writes the manifest + pixels and falls back to numpy if this exits non-zero.
+        if argv.get(1).map(String::as_str) == Some("bake-terrain") {
+            std::process::exit(terrain_bake::run_cli(&argv[2..]));
         }
     }
     // --version/--help fast path BEFORE any Bevy/GPU init: CI runners have no usable GPU, so
