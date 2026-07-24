@@ -357,6 +357,28 @@ pub struct Material {
     /// Deserializes cleanly to `None` when the field is missing or JSON null.
     #[serde(default)]
     pub detail: Option<DetailMap>,
+    /// Parallax block (grayscale height map + `_Parallax` amount), or `null`/absent. See `ParallaxMap`.
+    #[serde(default)]
+    pub parallax: Option<ParallaxMap>,
+}
+
+/// Unity parallax-offset mapping. Optional grayscale HEIGHT map (`_ParallaxMap`) + the `_Parallax`
+/// amount that fakes surface relief by offsetting the base UV along the tangent-space view vector
+/// (steep parallax / occlusion mapping in the shader). ~44 materials game-wide carry one — concrete
+/// slabs, cobblestone, roof tiles, and the Factory basement "fake rooms". Height is DATA → uploaded
+/// LINEAR (like a terrain control map), NOT sRGB.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ParallaxMap {
+    /// grayscale height PNG (referenced in place from tex/), or absent.
+    #[serde(default)]
+    pub map: Option<String>,
+    /// Unity `_Parallax` amount (max UV offset in tangent units; typical 0.02-0.08).
+    #[serde(default = "default_parallax_scale")]
+    pub scale: f32,
+}
+
+fn default_parallax_scale() -> f32 {
+    0.02
 }
 
 fn default_uv() -> [f32; 4] {
