@@ -113,6 +113,13 @@ pub struct Manifest {
     /// `#[serde(default)]` so packs that predate the reader (or lack the field) load unchanged.
     #[serde(rename = "lodGroups", default)]
     pub lod_groups: Vec<LodGroupEntry>,
+    /// World-Y of the map's OCEAN surface, when the map has one (coastal maps). EFT's sea is a
+    /// runtime water SYSTEM, not a mesh — nothing extractable ships in any level, so coastal packs
+    /// render a void past the beach and boats float in air. When present, the viewer synthesizes an
+    /// untextured deep-water plane at this height (build_map patches it in from the map config;
+    /// EFT_SEA_LEVEL overrides at runtime for tuning). None = inland map, no sea.
+    #[serde(rename = "seaLevel", default)]
+    pub sea_level: Option<f32>,
 }
 
 /// Emitter-declared conventions. Every flag here changes how a shader must treat
