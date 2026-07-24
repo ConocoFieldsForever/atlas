@@ -628,20 +628,25 @@ fn parse_lights_into(
     unsupported
 }
 
-/// A power switch loaded from `gamedata.json`'s `switches` array (emitted by `eft_extract_switches`).
-/// The viewer makes it clickable + lists it, and toggling it flips the light group's power.
+/// An INTERACTABLE loaded from `gamedata.json`'s `switches` array (emitted by `extract_interact`):
+/// the power lever AND every other `EFT.Interactive.Switch` (alarm / floor-call button / water-plane
+/// / keycard-exfil trigger). The viewer makes it clickable + lists it; a `power` one also toggles
+/// its light group.
 #[derive(Debug, Clone)]
 pub struct LevelSwitch {
     /// Stable id ("unity:<level>:mb:<pathid>").
     pub id: String,
+    /// `"power"` (owns a light bank — the toggle) or `"switch"` (alarm/button/trigger/etc.). Typed
+    /// name-free upstream; empty legacy packs are treated as `"power"`.
+    pub kind: String,
     /// Light-group index this switch powers (matches `Light.group_idx`); -1 if it controls no
-    /// loaded lights.
+    /// loaded lights (always -1 for non-power interactables).
     pub group_idx: i32,
     /// VIEWER-world position (Unity raw X-flipped, like every light) for pick-matching + focus.
     pub world_pos: Vec3,
-    /// Diagnostic label (the switch GameObject name); never used as a control rule.
+    /// Diagnostic label (the interactable's GameObject name); never used as a control rule.
     pub label: String,
-    /// Number of lamp fixtures the switch controls (for the UI).
+    /// Number of lamp fixtures the switch controls (power kind only; 0 otherwise).
     pub count: u32,
 }
 
@@ -649,6 +654,9 @@ pub struct LevelSwitch {
 struct SwitchRaw {
     #[serde(default)]
     id: String,
+    /// "power" | "switch"; absent on legacy (power-only) packs -> treated as power below.
+    #[serde(default)]
+    kind: String,
     #[serde(default)]
     group: String,
     #[serde(rename = "world_pos", default)]
@@ -744,6 +752,7 @@ fn load_intel(
             group_idx: group_map.get(&r.group).map(|&i| i as i32).unwrap_or(-1),
             // G3 = diag(-1,1,1): X-flip the raw Unity world pos into viewer space (matches lights + pick).
             world_pos: Vec3::new(-r.world_pos[0], r.world_pos[1], r.world_pos[2]),
+            kind: if r.kind.is_empty() { "power".to_string() } else { r.kind },
             id: r.id,
             label: r.label,
             count: r.count,

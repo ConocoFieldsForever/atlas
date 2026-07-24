@@ -1566,18 +1566,33 @@ fn level_panel(
             ui.label(theme::title("LEVEL CONTROLS"));
             ui.add_space(theme::SP_MD);
 
+            // Partition: power levers (own a light bank -> a toggle) vs. every other interactable
+            // (alarm / button / trigger / ... -> a labelled jump-to row). `kind` is typed name-free
+            // upstream by extract_interact.
+            let powers: Vec<&crate::eftpack::LevelSwitch> =
+                pack.0.switches.iter().filter(|s| s.kind == "power").collect();
+            let others: Vec<&crate::eftpack::LevelSwitch> =
+                pack.0.switches.iter().filter(|s| s.kind != "power").collect();
+            // reusable camera jump: stand a few metres back + above the target, looking at it.
+            let jump_to = |cam: &mut Query<&mut Transform, With<crate::render::CullCamera>>, p: Vec3| {
+                if let Ok(mut t) = cam.single_mut() {
+                    t.translation = p + Vec3::new(0.0, 2.0, 5.0);
+                    t.look_at(p, Vec3::Y);
+                }
+            };
+
             // ---- POWER ----
             ui.label(RichText::new("POWER").color(DIM).size(11.0));
-            if pack.0.switches.is_empty() {
+            if powers.is_empty() {
                 ui.label(RichText::new("No power switches on this map.").color(DIM).size(11.0));
             } else {
-                for (i, sw) in pack.0.switches.iter().enumerate() {
+                for (i, sw) in powers.iter().enumerate() {
                     let g = sw.group_idx;
                     ui.horizontal(|ui| {
                         if g >= 0 && g < 32 {
                             let bit = 1u32 << g;
                             let mut on = mask & bit != 0;
-                            let label = if pack.0.switches.len() == 1 {
+                            let label = if powers.len() == 1 {
                                 format!("Power  ({} lamps)", sw.count)
                             } else {
                                 format!("Power {}  ({} lamps)", i + 1, sw.count)
@@ -1589,19 +1604,14 @@ fn level_panel(
                             ui.add_enabled(false, egui::Checkbox::new(&mut false, "Power (no lights)"));
                         }
                         if ui.small_button("go").on_hover_text("jump to the switch").clicked() {
-                            if let Ok(mut t) = cam.single_mut() {
-                                // stand a few metres back + above the lever, looking at it
-                                let p = sw.world_pos + Vec3::new(0.0, 2.0, 5.0);
-                                t.translation = p;
-                                t.look_at(sw.world_pos, Vec3::Y);
-                            }
+                            jump_to(&mut cam, sw.world_pos);
                         }
                     });
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.small_button("All on").clicked() {
-                        for sw in &pack.0.switches {
+                        for sw in &powers {
                             if (0..32).contains(&sw.group_idx) {
                                 mask |= 1 << sw.group_idx;
                             }
@@ -1613,6 +1623,27 @@ fn level_panel(
                 });
                 ui.label(
                     RichText::new("Maps spawn un-powered (dark). Flip a switch to light its bank \u{2014} or click the switch in the world.")
+                        .color(DIM)
+                        .size(10.0),
+                );
+            }
+
+            // ---- INTERACTABLES (alarms, buttons, triggers, keycard/exfil levers, ...) ----
+            if !others.is_empty() {
+                ui.add_space(theme::SP_MD);
+                ui.label(RichText::new("INTERACTABLES").color(DIM).size(11.0));
+                for sw in &others {
+                    ui.horizontal(|ui| {
+                        // GO name lightly cleaned (drop the Node_ prefix, underscores -> spaces) for display.
+                        let name = sw.label.strip_prefix("Node_").unwrap_or(&sw.label).replace('_', " ");
+                        ui.label(RichText::new(name).size(11.0));
+                        if ui.small_button("go").on_hover_text("jump to it").clicked() {
+                            jump_to(&mut cam, sw.world_pos);
+                        }
+                    });
+                }
+                ui.label(
+                    RichText::new("Alarms, buttons, triggers and other interactable switches on this map.")
                         .color(DIM)
                         .size(10.0),
                 );
