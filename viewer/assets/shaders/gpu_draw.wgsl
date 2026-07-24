@@ -270,8 +270,34 @@ struct LightGrid {
 // Uses textureSampleLevel (explicit LOD 0, no mips) so it needs NO derivatives and
 // can be called anywhere — even after a `discard` — avoiding naga's uniformity
 // constraint (unlike the albedo textureSample, which must stay in uniform flow).
+// OUT-OF-VOLUME redirect (universal): the probe grid can under-cover big open maps — its bounds
+// are tri-density-derived and collapse around dense hubs (icebreaker's SHIP shrank the grid to a
+// 222x480 m box under a 600x700 m ice field). Beyond the AABB the samplers used to CLAMP, smearing
+// whatever the nearest EDGE probe held (ship-shadowed interior columns included) into razor-straight
+// infinite bands ("giant shadow across the ice"; same on lighthouse). In the game those areas are
+// open-sky-lit — so out-of-volume reads slide the sample point to the volume's own TOP LAYER above
+// the nearest edge: real open-sky probes, giving the exact ambient AND sun direction/strength the
+// open ground inside gets. Fades in over ~2 cells; inside samples are untouched. No per-map data.
+fn sh_outside_t(p: vec3<f32>) -> f32 {
+    let ext = vec3<f32>(1.0) / max(sh.vol_inv_extent.xyz, vec3<f32>(1e-9));
+    let lo = sh.vol_min.xyz;
+    let hi = lo + ext;
+    let d = max(max(lo - p, p - hi), vec3<f32>(0.0));
+    let margin = 2.0 * max(sh.spacing.x, max(sh.spacing.y, sh.spacing.z));
+    return smoothstep(0.0, max(margin, 1e-3), max(d.x, max(d.y, d.z)));
+}
+fn sh_effective_pos(p: vec3<f32>) -> vec3<f32> {
+    let ext = vec3<f32>(1.0) / max(sh.vol_inv_extent.xyz, vec3<f32>(1e-9));
+    let lo = sh.vol_min.xyz;
+    let hi = lo + ext;
+    let edge = clamp(p, lo, hi);
+    let sky = vec3<f32>(edge.x, hi.y - 0.5 * sh.spacing.y, edge.z); // top-layer probe row = open sky
+    return mix(p, sky, sh_outside_t(p));
+}
+
 fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
-    let uvw = (world_pos - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
+    let wp = sh_effective_pos(world_pos);
+    let uvw = (wp - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
     let cr = textureSampleLevel(sh_r, sh_samp, uvw, 0.0); // (c0,c1,c2,c3) for R
     let cg = textureSampleLevel(sh_g, sh_samp, uvw, 0.0);
     let cb = textureSampleLevel(sh_b, sh_samp, uvw, 0.0);
@@ -292,8 +318,9 @@ fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // texture_3d fetches an exact probe texel (no filtering, sampler ignored) so no
 // derivatives are required — still callable after a `discard`.
 fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    let wp = sh_effective_pos(world_pos);
     let bias = sh.vol_inv_extent.w;
-    let sp   = world_pos + n * bias;
+    let sp   = wp + n * bias;
     let dims = sh.dims.xyz;
     let spacing = sh.spacing.xyz;
     let grid = clamp((sp - sh.vol_min.xyz) / spacing, vec3<f32>(0.0), dims - vec3<f32>(1.0)); // continuous grid coords
@@ -308,7 +335,7 @@ fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         let probe_pos = sh.vol_min.xyz + pc * spacing;
         let tw3 = mix(vec3<f32>(1.0) - f, f, o);      // per-axis trilinear weight
         let tw  = tw3.x * tw3.y * tw3.z;
-        let dir = probe_pos - world_pos;
+        let dir = probe_pos - wp;
         let wn  = max(dot(normalize(dir + n * 1e-3), n), 0.0);  // ~0 for below-slab / back-facing probes (the leak)
         let w   = tw * wn + 1e-4;
         let cr = textureLoad(sh_r, ipc, 0);
@@ -324,7 +351,7 @@ fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     }
     // Fallback: if the hemisphere weighting rejected essentially everything (fully
     // enclosed point), don't go black — use the plain hardware-trilinear reconstruction.
-    if (wsum < 1e-3) { return sh_irradiance_hw(world_pos, n); }
+    if (wsum < 1e-3) { return sh_irradiance_hw(wp, n); }
     return sum / wsum;
 }
 
@@ -346,7 +373,8 @@ struct DomLight {
                          // don't re-darken places the SH volume already shadowed (double-darkening).
 };
 fn sh_dominant_light(world_pos: vec3<f32>) -> DomLight {
-    let uvw = (world_pos - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
+    let wp = sh_effective_pos(world_pos);
+    let uvw = (wp - sh.vol_min.xyz) * sh.vol_inv_extent.xyz;
     let cr = textureSampleLevel(sh_r, sh_samp, uvw, 0.0); // (c0,c1,c2,c3) for R
     let cg = textureSampleLevel(sh_g, sh_samp, uvw, 0.0);
     let cb = textureSampleLevel(sh_b, sh_samp, uvw, 0.0);
@@ -414,7 +442,7 @@ fn eval_realtime_lights(world_pos: vec3<f32>, N: vec3<f32>, V: vec3<f32>, rough:
         // are realtime), and it is occlusion-aware, so a direction blocked by a wall reads DARK. Gating
         // each light by radiance(toward-light)/ambient softly attenuates lights that leak from behind
         // geometry, with NO per-light shadow map. amb~0 (no volume / fully-black probe) -> disabled.
-        let occ_uvw = clamp((world_pos - sh.vol_min.xyz) * sh.vol_inv_extent.xyz,
+        let occ_uvw = clamp((sh_effective_pos(world_pos) - sh.vol_min.xyz) * sh.vol_inv_extent.xyz,
                             vec3<f32>(0.0), vec3<f32>(1.0));
         let occ_cr = textureSampleLevel(sh_r, sh_samp, occ_uvw, 0.0);
         let occ_cg = textureSampleLevel(sh_g, sh_samp, occ_uvw, 0.0);
