@@ -570,26 +570,71 @@ def main():
     tex = _TexTest(DS)
 
     # ---- STEP 1: structural culls (culls.Culls -- verbatim) --------------------------------------------------
+    # Lazy world-diameter lookup for the oversized-INACTIVE gate: local OBJ AABB diagonal (v-lines
+    # only, cached per mesh — invoked solely for the rare aih==False instances) x the instance's
+    # conservative row-norm scale. None on any read failure -> the gate skips that instance.
+    _aabb_cache = {}
+
+    def _mesh_diam(it):
+        mesh = it.get('mesh') or ''
+        if mesh not in _aabb_cache:
+            box = None
+            try:
+                lo = [float('inf')] * 3
+                hi = [float('-inf')] * 3
+                with open(os.path.join(DS, cfg.get('source.mesh_dir', 'meshes'), mesh),
+                          encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        if line.startswith('v '):
+                            p = line.split()
+                            for k in range(3):
+                                v = float(p[k + 1])
+                                lo[k] = min(lo[k], v)
+                                hi[k] = max(hi[k], v)
+                if lo[0] <= hi[0]:
+                    box = ((hi[0] - lo[0]) ** 2 + (hi[1] - lo[1]) ** 2 + (hi[2] - lo[2]) ** 2) ** 0.5
+            except Exception:
+                box = None
+            _aabb_cache[mesh] = box
+        diag = _aabb_cache[mesh]
+        if diag is None:
+            return None
+        m = it.get('m') or []
+        if len(m) < 12:
+            return None
+        s = max((m[0] ** 2 + m[1] ** 2 + m[2] ** 2) ** 0.5,
+                (m[4] ** 2 + m[5] ** 2 + m[6] ** 2) ** 0.5,
+                (m[8] ** 2 + m[9] ** 2 + m[10] ** 2) ** 0.5)
+        return diag * s
+
     CULLS = Culls(cfg.get('cull'))
-    inst, rep = CULLS.filter(scene['instances'])
+    inst, rep = CULLS.filter(scene['instances'], mesh_diam=_mesh_diam)
     print(f"[bevy] cull: kept {rep['kept']:,}/{rep['raw']:,} (dropped {rep['dropped']:,}; "
           f"Unity-hidden {rep.get('hidden_unity', 0):,}); top dropped roots "
           f"{[r for r, _ in rep['top_dropped_roots'][:5]]}")
+    if rep.get('inactive_oversize'):
+        print(f"[bevy] oversized-inactive cull: dropped {rep['inactive_oversize']} parked/disabled "
+              f"scenery instance(s) (> {CULLS.inactive_keep_max_m:.0f} m, aih=False)")
     if rep.get('offmap_backdrop'):
         print(f"[bevy] off-map backdrop cull: dropped {rep['offmap_backdrop']} distant-skyline instances")
     if rep['kept'] == 0 or rep['kept'] < rep['raw'] * 0.005:
         raise SystemExit(f"[bevy] FATAL: cull kept only {rep['kept']}/{rep['raw']} for '{MAP}'. Fix cull config.")
 
     # ---- STEP 2: DECAL normal-map albedo drop (correctness fix -- port) ---------------------------------------
+    # MARK, never REMOVE. The geometry loop walks `subs` in order carrying a running FACE cursor
+    # (`f0 += n`), so a sub deleted here takes its `n` out of that walk: every later sub then reads
+    # a face range shifted EARLIER by n, and the mesh's LAST sub loses its final n faces entirely.
+    # That silently corrupted real ground: streets' SW_01_cortyard_A_02 lost the last 216 grass
+    # triangles (== the dropped bevel-decal's face count) and rendered a see-through HOLE in the
+    # park, with the grass material drawing the decal's faces instead. Marked subs are skipped by
+    # the same path as shadow/proxy subs, which advances `f0` correctly and never emits a material.
     ndrop = 0
     for it in inst:
-        keep = []
         for sb in it['subs']:
             if sb.get('role') == 'decal' and sb.get('tex') and tex.albedo_is_normalmap(sb['tex']):
-                ndrop += 1; continue
-            keep.append(sb)
-        it['subs'] = keep
-    inst = [it for it in inst if it.get('subs')]
+                sb['drop_nm_decal'] = True
+                ndrop += 1
+    inst = [it for it in inst if any(not sb.get('drop_nm_decal') for sb in it['subs'])]
     if ndrop: print(f"[bevy] dropped {ndrop} normal-map-albedo decal submeshes (would paint edges blue)")
 
     # ---- STEP 3: LOD-SHELL DEDUP -- group by (lv, lod.g), keep only lod.i == group-min -----------------------
@@ -695,7 +740,10 @@ def main():
                     print(f"[bevy] WARNING: submesh span overruns OBJ tris "
                           f"({f0}+{n} > {len(F)}) - geometry silently dropped for this sub")
                 f0 += max(n, 0); continue
-            if not CULLS.keep_submesh(sb): f0 += n; continue          # shadow / billboard-LOD / fog / proxy
+            # Skip-but-consume: shadow / billboard-LOD / fog / proxy subs, plus the normal-map-albedo
+            # decals marked in STEP 2. `f0 += n` MUST happen for every skipped sub or the remaining
+            # subs read shifted face ranges (see STEP 2).
+            if sb.get('drop_nm_decal') or not CULLS.keep_submesh(sb): f0 += n; continue
             cor = F[f0:f0 + n]; f0 += n
             vi = cor[:, :, 0].reshape(-1); ti = cor[:, :, 1].reshape(-1)
             pos = V[vi]

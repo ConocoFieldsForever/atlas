@@ -624,6 +624,13 @@ struct GameDataFile {
     buffer_zones: Vec<GdZone>,
     #[serde(default)]
     loot_groups: Vec<GdZone>,
+    /// Typed LootableContainer components (jackets / duffle bags / PC blocks / corpses) — the
+    /// ground-truth replacement for the name-classified semantics "loot" layer.
+    #[serde(default)]
+    containers: Vec<GdContainer>,
+    /// Typed damage-trigger zones (FlameDamageTrigger gas fires / furnaces) — Hazard layer.
+    #[serde(default)]
+    damage_zones: Vec<GdZone>,
 }
 fn default_true() -> bool {
     true
@@ -690,6 +697,30 @@ struct GdStationary {
     pos: [f32; 3],
     #[serde(default)]
     name: String,
+    #[serde(default = "default_true")]
+    active: bool,
+    /// Mounted weapon display name (extractor: serialized weapon-template id, then a <=3 m
+    /// position join against tarkov.dev's per-map stationaryWeapons). Absent offline.
+    #[serde(default)]
+    weapon_name: Option<String>,
+    /// Serialized traverse arc [min, max] + elevation [min, max] (Unity-world degrees).
+    #[serde(default)]
+    yaw_range: Option<[f32; 2]>,
+    #[serde(default)]
+    pitch_range: Option<[f32; 2]>,
+}
+/// A typed LootableContainer (gamedata.json `containers`): a REAL lootable — jacket / duffle
+/// bag / PC block / corpse — with its serialized container-template id resolved to a display
+/// name. Ground truth for the layer the semantics name-classifier only guesses at.
+#[derive(Deserialize)]
+struct GdContainer {
+    pos: [f32; 3],
+    /// Raw GameObject name ("jacket_02_LOOTABLE").
+    #[serde(default)]
+    name: Option<String>,
+    /// Container type display name ("Jacket" / "Duffle bag" / "Dead Scav"); absent offline.
+    #[serde(default)]
+    tpl_name: Option<String>,
     #[serde(default = "default_true")]
     active: bool,
 }
@@ -1765,7 +1796,7 @@ fn spawn_pois(
     // Exfil markers REPLACE extracts_dev (gated above); minefields / sniper zones are their
     // own layers; typed doors replace the semantics door layer and carry KeyId/DoorState.
     let mut gd_zones = GameDataZones::default();
-    let mut have_gd_stationary = false;
+    let mut have_gd_containers = false;
     if let Some(gd) = &gamedata {
         gd_zones.live = have_gd_extracts || !gd.minefields.is_empty() || !gd.sniper_zones.is_empty();
         gd_zones.draped = gd.draped;
@@ -1883,6 +1914,52 @@ fn spawn_pois(
             commands.entity(ent).insert((DenseMarker, crate::loot::LootTime(5.0)));
             if !z.active { commands.entity(ent).insert(SceneInactive); }
         }
+        // Typed LOOTABLE CONTAINERS (jackets / duffle bags / PC blocks / corpses): the real
+        // thing on the layer the semantics name-classifier only approximates — when present
+        // they OWN the Interactable layer and the semantics "loot" guesses stay home.
+        have_gd_containers = !gd.containers.is_empty();
+        for c in &gd.containers {
+            let title = c
+                .tpl_name
+                .clone()
+                .or_else(|| c.name.as_deref().map(prettify))
+                .unwrap_or_else(|| "Lootable container".into());
+            let mut detail = Vec::new();
+            if c.tpl_name.is_some() {
+                if let Some(n) = c.name.as_deref().filter(|n| !n.is_empty()) {
+                    detail.push(prettify(n));
+                }
+            }
+            let ent = spawn(&mut commands, PoiLayer::Interactable, c.pos, MarkerInfo {
+                title,
+                subtitle: "Lootable container \u{00B7} game files".into(),
+                detail,
+                accent: poi_look(PoiLayer::Interactable).0,
+            }, None);
+            commands.entity(ent).insert(DenseMarker);
+            if !c.active { commands.entity(ent).insert(SceneInactive); }
+        }
+        if have_gd_containers {
+            info!("poi: {} typed lootable containers (semantics loot layer suppressed)",
+                  gd.containers.len());
+        }
+        // Typed DAMAGE zones (FlameDamageTrigger gas fires / furnace mouths): Hazard layer
+        // marker + footprint wall, exactly like the other typed hazards.
+        for z in &gd.damage_zones {
+            let kind = z.kind.as_deref().unwrap_or("damage");
+            let ent = spawn(&mut commands, PoiLayer::Hazard, z.pos, MarkerInfo {
+                title: z.name.as_deref().map(prettify).unwrap_or_else(|| "Damage zone".into()),
+                subtitle: "Damage zone \u{00B7} game files".into(),
+                detail: vec![format!("{} damage on contact", titlecase(kind))],
+                accent: poi_look(PoiLayer::Hazard).0,
+            }, None);
+            if !z.active { commands.entity(ent).insert(SceneInactive); }
+            if z.outline.len() >= 3 {
+                let pts: Vec<Vec3> = z.outline.iter().copied().map(Vec3::from).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::Hazard, &pts, poi_look(PoiLayer::Hazard).0, z.active);
+                gd_zones.hazard_zones.push((pts, z.active));
+            }
+        }
         // Quest TRIGGER markers only. The zone FOOTPRINTS (walls + outlines) are intentionally NOT
         // built here: gamedata triggers carry no task id, so they can't be limited to the currently
         // tracked quest. Tracked-quest zones come from the tasks.json path below (`QuestMarkerTask`
@@ -1969,18 +2046,31 @@ fn spawn_pois(
             );
         }
         // Typed stationary weapons fill the gap when tarkov.dev shipped none (positions are
-        // the game's own StationaryWeapon components — better than mining the geometry).
+        // the game's own StationaryWeapon components; the card carries the serialized weapon
+        // + firing arc the dev data lacks).
         if !have_dev_stationary && !gd.stationary.is_empty() {
-            have_gd_stationary = true;
             for s in &gd.stationary {
+                let mut detail = Vec::new();
+                if s.weapon_name.is_some() && !s.name.is_empty() {
+                    detail.push(format!("Mount  {}", prettify(&s.name)));
+                }
+                if let Some([lo, hi]) = s.yaw_range {
+                    let mut line = format!("Traverse  {:.0}\u{00B0}", hi - lo);
+                    if let Some([plo, phi]) = s.pitch_range {
+                        line.push_str(&format!(
+                            "  \u{00B7}  elevation {plo:.0}\u{00B0} to {phi:.0}\u{00B0}"
+                        ));
+                    }
+                    detail.push(line);
+                }
                 let ent = spawn(
                     &mut commands,
                     PoiLayer::Stationary,
                     s.pos,
                     MarkerInfo {
-                        title: prettify(&s.name),
+                        title: s.weapon_name.clone().unwrap_or_else(|| prettify(&s.name)),
                         subtitle: "Stationary weapon \u{00B7} game files".into(),
-                        detail: Vec::new(),
+                        detail,
                         accent: poi_look(PoiLayer::Stationary).0,
                     },
                     None,
@@ -2034,6 +2124,11 @@ fn spawn_pois(
                 continue;
             }
             if lname == "door" && have_gd_doors {
+                continue;
+            }
+            // typed LootableContainer records own the props layer when the pack ships them
+            // (real lootables, no decorative twins).
+            if lname == "loot" && have_gd_containers {
                 continue;
             }
             if let Some(v) = layers.get(lname) {
@@ -2119,64 +2214,12 @@ fn spawn_pois(
         info!("poi: {quest_count} tasks tracked on this map");
     }
 
-    // ---- STATIONARY weapons from GAME GEOMETRY (fills the tarkov.dev gap) ----
-    // tarkov.dev's `stationaryWeapons` is empty for many maps (incl. Interchange), yet the map
-    // HAS mounted MGs — in the pack they're `reciever_*` (and NSV/Kord/DShK/Utes) meshes. When
-    // neither loot.json nor gamedata.json gave us stationary data, scan the pack instances and
-    // dedupe co-located receiver parts (one gun = several meshes at ~one spot) into one marker
-    // per gun.
-    if !have_dev_stationary && !have_gd_stationary {
-        let pack = &lp.0;
-        let is_mg = |name: &str| {
-            let s = name.to_ascii_lowercase();
-            !s.contains("sandbag")
-                && (s.contains("reciever")
-                    || s.contains("receiver")
-                    || s.contains("dshk")
-                    || s.contains("nsv")
-                    || s.contains("kord")
-                    || s.contains("utes")
-                    || s.contains("pkm")
-                    || s.contains("pulemet"))
-        };
-        let mut seen: Vec<Vec3> = Vec::new();
-        for (idx, inst) in pack.instances.iter().enumerate() {
-            // All-LOD pack: mine stationary weapons from the default shell only (the 3 m dedupe
-            // would mostly absorb duplicates, but filter to be exact + cheap).
-            if !pack.is_default_lod(idx) {
-                continue;
-            }
-            let mid = inst.mesh_id as usize;
-            let Some(m) = pack.manifest.meshes.get(mid) else {
-                continue;
-            };
-            if !is_mg(&m.name) {
-                continue;
-            }
-            let t = inst.affine3a().translation;
-            let p = Vec3::new(t.x, t.y, t.z);
-            // one gun spans several receiver meshes at ~the same spot — collapse them.
-            if seen.iter().any(|q| (q.x - p.x).abs() < 3.0 && (q.z - p.z).abs() < 3.0) {
-                continue;
-            }
-            seen.push(p);
-            spawn(
-                &mut commands,
-                PoiLayer::Stationary,
-                [p.x, p.y, p.z],
-                MarkerInfo {
-                    title: "Stationary gun".into(),
-                    subtitle: "Mounted MG".into(),
-                    detail: vec!["From map geometry".into()],
-                    accent: poi_look(PoiLayer::Stationary).0,
-                },
-                None,
-            );
-        }
-        if !seen.is_empty() {
-            info!("poi: +{} stationary guns mined from geometry", seen.len());
-        }
-    }
+    // Stationary weapons are entirely DATA-driven now: tarkov.dev positions (loot.json) when
+    // shipped, else the typed `StationaryWeapon` components in gamedata.json (positions, mounted
+    // weapon + firing arc from the game's own scene data). The old third tier — mining the pack
+    // geometry for receiver/`utes`/`nsv` MESH NAMES — is gone: it was a name-rule papering over
+    // packs built before gamedata shipped the typed array, and on maps with genuinely zero
+    // StationaryWeapon components it could only invent markers out of decorative props.
 
     info!("poi: {n} POI markers spawned (spawns/extracts/doors/interactables + map intel + quests)");
 }

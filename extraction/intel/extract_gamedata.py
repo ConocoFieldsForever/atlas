@@ -118,7 +118,14 @@ BUFFER_ZONE_CLASSES = {
     "IgnorePlayerInputZone": "input_lock", "LighthouseKeeperZone": "lightkeeper",
     "EventObjectInteractive": "event_interactive",
     "InteractiveObjectCutsceneTrigger": "cutscene",
+    # AI-guarded no-fire zone around an event transit (shoreline Terminal: GuardedTrasitZone +
+    # GuardedZoneGates). Zone footprint + marker ride the existing buffer_zones sink.
+    "GuardedZone": "guarded",
 }
+# Typed DAMAGE zones: a FlameDamageTrigger is an empty marker component (payload 0 B) whose
+# BoxCollider IS the burn zone (shoreline gas fires, factory furnaces). kind stays per-class so
+# future damage trigger types slot in without a format change.
+DAMAGE_ZONE_CLASSES = {"FlameDamageTrigger": "flame"}
 
 
 def read_cstr(buf, off):
@@ -151,25 +158,70 @@ def dec_exfil_name(pl):
 
 
 def dec_door(pl):
-    """WorldInteractiveObject prefix: 28 bytes, KeyId str, 12 bytes, Id str, ... state at +92.
-    Validated on 299 lighthouse doors: state column reads only {1,2,4,16}; keyed doors all 1.
-    Also recovers the signed OPEN ANGLE (degrees) at IdEnd+56 (Codex audit: matched the authored
-    open transform within 0.15deg on all 97 open Interchange doors). Returns (key, id, state, angle)."""
+    """WorldInteractiveObject: [20B zeros][dword N = interaction-trigger count][N x (dword kind,
+    trigger str)][dword 0x0F layer][KeyId str][12B][Id str][tail rel. Id end: open angle @+56,
+    state @+92]. Classic doors (every pre-Icebreaker map) serialize N=0, which collapses to the
+    original fixed layout (KeyId @28) validated on 299 lighthouse doors (state column {1,2,4,16},
+    keyed doors all 1) + 97 open Interchange doors (angle within 0.15deg of the authored pose).
+    Icebreaker+ doors driven by handles/switches/quests serialize N=1..2 trigger-name strings
+    ("Open_01_<hash>"/"Close_01_<hash>"/"Quest_Complete_<hash>") BEFORE that block — the old
+    fixed-offset read returned the trigger name as KeyId and lost state+angle (the 15 dead doors
+    on the Icebreaker deck). The 0x0F layer dword anchors both layouts; if it isn't where the
+    trigger walk says it should be, degrade to Nones rather than shipping garbage.
+    Returns (key, id, state, angle, triggers) — `triggers` are the interaction trigger names
+    (e.g. "Open_01_722179887"); their trailing digit-hash links a door to the Switch interactable
+    that drives it (the switch serializes the same hash in ITS trigger string), letting the merge
+    wire switch->door target edges with zero name matching. Classic doors: []."""
     import struct as _st
+
+    def u32(off):
+        return int.from_bytes(pl[off:off + 4], "little") if off + 4 <= len(pl) else None
+
+    def tail(kend):
+        """KeyId ended at `kend`: read Id + the fixed-offset tail relative to the Id end."""
+        did, iend = read_cstr(pl, kend + 12)
+        st = None
+        if iend + 96 <= len(pl):
+            v = int.from_bytes(pl[iend + 92:iend + 96], "little")
+            st = DOOR_STATE.get(v)                          # unknown value -> None, not garbage
+        ang = None
+        if iend + 60 <= len(pl):
+            a = _st.unpack_from("<f", pl, iend + 56)[0]
+            if a == a and 0.0 < abs(a) <= 180.0:            # finite, door-scale
+                ang = round(float(a), 2)
+        return (did or None), st, ang
+
+    def is_key(s):
+        """A serialized KeyId is always empty or a 24-hex item template id — a trigger name
+        ("Open_01_<hash>") is neither, which is how the two layouts are told apart."""
+        return s == "" or (len(s) == 24 and all(c in "0123456789abcdef" for c in s))
+
+    # Classic layout first (KeyId @28) — the exact pre-Icebreaker read, validated on every old map.
     key, kend = read_cstr(pl, 28)
-    if key is None:
-        return None, None, None, None
-    did, iend = read_cstr(pl, kend + 12)
-    st = None
-    if iend + 96 <= len(pl):
-        v = int.from_bytes(pl[iend + 92:iend + 96], "little")
-        st = DOOR_STATE.get(v)                              # unknown value -> None, not garbage
-    ang = None
-    if iend + 60 <= len(pl):
-        a = _st.unpack_from("<f", pl, iend + 56)[0]
-        if a == a and 0.0 < abs(a) <= 180.0:                # finite, door-scale
-            ang = round(float(a), 2)
-    return (key or None), (did or None), st, ang
+    if key is not None and is_key(key):
+        did, st, ang = tail(kend)
+        return (key or None), did, st, ang, []
+    # Trigger-block layout: [dword N @20][N x (kind dword, trigger str)][0x0F][KeyId][12B][Id][tail].
+    # The 0x0F anchor is required HERE only (validated on every Icebreaker door variant) — classic
+    # payloads never reach this path, so older maps keep their anchor-free read above.
+    n_trig = u32(20)
+    if n_trig is None or not 0 < n_trig <= 8:               # defensive: real doors carry 1-2
+        return None, None, None, None, []
+    off = 24
+    triggers = []
+    for _ in range(n_trig):
+        off += 4                                            # trigger kind dword (4=open, 2=close)
+        s, off = read_cstr(pl, off)
+        if s is None:
+            return None, None, None, None, []
+        triggers.append(s)
+    if u32(off) != 0x0F:                                    # layer anchor must line up
+        return None, None, None, None, []
+    key, kend = read_cstr(pl, off + 4)
+    if key is None or not is_key(key):
+        return None, None, None, None, []
+    did, st, ang = tail(kend)
+    return (key or None), did, st, ang, triggers
 
 
 def dec_spawn(pl):
@@ -187,9 +239,104 @@ def dec_spawn(pl):
     return sid, name, pos, sides, cats, inf
 
 
-def dec_stationary_name(pl):
-    s, _ = read_cstr(pl, 20)
-    return (s or "").strip() or None
+def read_cstr_strict(buf, off):
+    """extract_interact's PRINTABLE length-prefixed string read (len 1..256, every char in
+    0x20..0x7e). The lenient module `read_cstr` is wrong for blind payload WALKS: arbitrary
+    binary bytes < 0x80 decode as valid utf8, so a garbage dword can masquerade as a long
+    "string" and carry the walk past the real field."""
+    if off + 4 > len(buf):
+        return None, off
+    ln = int.from_bytes(buf[off:off + 4], "little")
+    if ln <= 0 or ln > 256 or off + 4 + ln > len(buf):
+        return None, off
+    try:
+        s = buf[off + 4:off + 4 + ln].decode("utf8")
+    except UnicodeDecodeError:
+        return None, off
+    if not all(31 < ord(c) < 127 for c in s):
+        return None, off
+    return s, (off + 4 + ln + 3) & ~3
+
+
+def walk_strings(pl, off):
+    """(offset, string) pairs from `off` on — the defensive dword-step walk extract_interact
+    uses, with the strict printable reader above."""
+    out = []
+    n = len(pl or b"")
+    while off + 4 <= n:
+        s, e = read_cstr_strict(pl, off)
+        if s and len(s) >= 3:
+            out.append((off, s))
+            off = e
+        else:
+            off += 4
+    return out
+
+
+def hex24_strings(pl, off):
+    """every length-prefixed 24-hex template id from `off` on, in serialized order."""
+    return [s for _, s in walk_strings(pl, off)
+            if len(s) == 24 and all(c in "0123456789abcdef" for c in s)]
+
+
+def dec_stationary(pl):
+    """StationaryWeapon: [20B float block][Name str @20][dword N][N x 12B mount PPtrs]
+    [3 x 12B fixed PPtrs][7 floats: default yaw, 0, pitch min, pitch max, yaw min, yaw max, 0]
+    [...][24-hex weapon template str][...]. Validated on shoreline lv29 / streets lv396 /
+    ground_zero lv505 (14 components; NSV "Utes" 452-488 B and AGS 296-332 B layouts agree).
+    Angles are Unity-world degrees. Everything is defensive: a field that doesn't look right
+    ships as None instead of garbage. Returns (name, weapon_id, aim) with aim =
+    {yaw, yaw_range, pitch_range} or None."""
+    name, nend = read_cstr(pl, 20)
+    name = (name or "").strip() or None
+    ids = hex24_strings(pl, nend if name else 20)
+    wid = ids[0] if len(ids) == 1 else None                 # exactly one id serialized today
+    aim = None
+    n_ptr = int.from_bytes(pl[nend:nend + 4], "little") if name and nend + 4 <= len(pl) else -1
+    if 0 <= n_ptr <= 64:
+        p = nend + 4 + 12 * n_ptr + 36                      # mount PPtr array + 3 fixed PPtrs
+        if p + 28 <= len(pl):
+            f = struct.unpack_from("<7f", pl, p)
+            ok = (all(math.isfinite(v) and abs(v) <= 720.0 for v in f)
+                  and f[2] < f[3] and f[4] < f[5] and f[4] - 1.0 <= f[0] <= f[5] + 1.0)
+            if ok:
+                aim = {"yaw": round(f[0], 2),
+                       "yaw_range": [round(f[4], 2), round(f[5], 2)],
+                       "pitch_range": [round(f[2], 2), round(f[3], 2)]}
+    return name, wid, aim
+
+
+def dec_container(pl):
+    """LootableContainer: [44B fixed][Id str @44 ("container_<zone>_00001")][...][24-hex
+    container TEMPLATE id (tarkov.dev lootContainers: jacket / duffle-bag / dead-scav / ...)]
+    [optional group tag]. Validated on icebreaker 704/705, shoreline 28, factory_rework 533
+    (424-488 B payloads). Returns (id, template) — either may be None."""
+    cid, e = read_cstr(pl, 44)
+    cid = (cid or "").strip() or None
+    ids = hex24_strings(pl, e if cid else 44)
+    return cid, (ids[0] if ids else None)
+
+
+def dec_card_reader(pl):
+    """CardReader: an id string, then PAIRS of (24-hex ACCEPTED-card item id, event name), then
+    a fallback event ("on_unknown_card_used"). Validated on the shoreline Terminal reader
+    (lv29, 648 B: 5 keycards). Returns the ordered unique accepted-card template ids."""
+    ids = hex24_strings(pl, 0)
+    seen, out = set(), []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            out.append(i)
+    return out
+
+
+def dec_dialog(pl):
+    """RaidDialogEntryPoint: [..][localization key str ("Dialog/EntryPoint/<map>/ActionName")]
+    [..][dialog id str ("raid_dialog_scientist")]. Validated on icebreaker lv704."""
+    strs = [s for _, s in walk_strings(pl, 0)]
+    key = next((s for s in strs if "/" in s), None)
+    did = next((s for s in reversed(strs) if "/" not in s), None)
+    return key, did
 
 
 def dec_zone_id(pl):
@@ -456,7 +603,9 @@ def scan_level(lv, sink):
                 and cls not in QUEST_TRIGGER_CLASSES and cls not in (
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
                 "SpawnPointMarker", "MineDirectional", "LootPoint", "LootPointsGroup",
-                "LighthouseTraderZone", "BufferGateSwitcher") and cls not in BUFFER_ZONE_CLASSES:
+                "LighthouseTraderZone", "BufferGateSwitcher", "LootableContainer",
+                "CardReader", "RaidDialogEntryPoint") \
+                and cls not in BUFFER_ZONE_CLASSES and cls not in DAMAGE_ZONE_CLASSES:
             continue
         go_pid = (hdr.get("m_GameObject") or {}).get("m_PathID")
         if not go_pid:
@@ -492,7 +641,7 @@ def scan_level(lv, sink):
                 "name": name, "active": active, "lv": lv,
             })
         elif cls in DOOR_CLASSES:
-            key, did, st, ang = dec_door(pl)
+            key, did, st, ang, triggers = dec_door(pl)
             rec = {
                 "pos": tpos, "key_id": key, "state": st, "kind": DOOR_CLASSES[cls],
                 "id": did, "name": name, "active": active, "lv": lv,
@@ -503,6 +652,14 @@ def scan_level(lv, sink):
                 rec["swing"] = True
                 if ang is not None:
                     rec["open_angle"] = ang
+            # Trigger-hash links (newer maps): the trailing digit-hash of each trigger name joins
+            # this door to the Switch interactable that drives it (build_map's stage-6 merge turns
+            # the join into switch->door target edges). Omitted when absent -> classic maps' output
+            # stays byte-identical.
+            links = [t.rsplit("_", 1)[1] for t in triggers
+                     if "_" in t and t.rsplit("_", 1)[1].isdigit() and len(t.rsplit("_", 1)[1]) >= 6]
+            if links:
+                rec["links"] = sorted(set(links))
             sink["doors"].append(rec)
         elif cls == "TransitPoint":
             box = cols[0] if cols else None
@@ -511,10 +668,47 @@ def scan_level(lv, sink):
                 "outline": footprint(M, box) if box else [], "active": active, "lv": lv,
             })
         elif cls == "StationaryWeapon":
-            sink["stationary"].append({
-                "pos": tpos, "name": dec_stationary_name(pl) or name or "Stationary weapon",
+            snm, wid, aim = dec_stationary(pl)
+            rec = {
+                "pos": tpos, "name": snm or name or "Stationary weapon",
                 "active": active, "lv": lv,
+            }
+            # The mounted WEAPON's serialized template id + firing arc — optional fields so a
+            # payload that fails the defensive decode ships the classic record unchanged.
+            if wid:
+                rec["weapon_id"] = wid
+            if aim:
+                rec.update(aim)
+            sink["stationary"].append(rec)
+        elif cls == "LootableContainer":
+            cid, tpl = dec_container(pl)
+            rec = {"pos": tpos, "name": name, "active": active, "lv": lv}
+            if cid:
+                rec["id"] = cid
+            if tpl:
+                rec["template"] = tpl
+            sink["containers"].append(rec)
+        elif cls in DAMAGE_ZONE_CLASSES:
+            box = cols[0] if cols else None
+            sink["damage_zones"].append({
+                "pos": col_center(M, box) if box else tpos, "name": name,
+                "kind": DAMAGE_ZONE_CLASSES[cls],
+                "outline": footprint(M, box) if box else [], "active": active, "lv": lv,
             })
+        elif cls == "CardReader":
+            rec = {"pos": tpos, "name": name or "Card reader", "active": active, "lv": lv}
+            items = dec_card_reader(pl)
+            if items:
+                rec["item_ids"] = items
+            sink["card_readers"].append(rec)
+        elif cls == "RaidDialogEntryPoint":
+            key, did = dec_dialog(pl)
+            rec = {"pos": tpos, "name": name or "Dialog", "active": active, "lv": lv}
+            if did:
+                rec["id"] = did
+            if key:
+                rec["loc_key"] = key
+            sink["dialogs"].append(rec)
         elif cls == "SpawnPointMarker":
             d = dec_spawn(pl)
             if d:
@@ -713,8 +907,9 @@ def outline_extent(outline):
 
 # Ground-hugging zones (colliders that genuinely sit on the terrain): drape to the ground so
 # the outline follows undulating terrain instead of floating/sinking at the flat collider face.
+# damage_zones (gas fires / furnace mouths) sit on the ground like the rest.
 DRAPE_KEYS = ("exfils", "transit_points", "quest_triggers", "trader_zones",
-              "buffer_zones", "loot_groups")
+              "buffer_zones", "loot_groups", "damage_zones")
 # Elevated collider zones (minefields, sniper zones, directional mines): keep the collider's own
 # world height. Their trigger boxes are frequently TALL volumes whose bottom face reaches the base
 # terrain far below a raised platform (e.g. ground_zero Minefield_LowPower: collider center Y=15.65
@@ -900,6 +1095,66 @@ def finalize_loose(sink):
     sink["loose_points"] = merged
 
 
+def resolve_new_intel(sink):
+    """Display-name resolution for the typed additions, all via the tarkov_static disk-cached
+    dumps (zero GraphQL) and all optional — offline or unresolvable ids just ship raw:
+      * containers:   template -> `tpl_name` (static lootContainers: jacket / duffle-bag / ...)
+      * card_readers: accepted-card `item_ids` -> `items` [{id, n}] (static items)
+      * stationary:   weapon name, id-first then a NEAREST-POSITION join (<= 3 m) against the
+        static per-map stationaryWeapons (same convention as the door<->lock 2 m and
+        LootPoint<->lootLoose joins) -> `weapon_name`. The game serializes a PRESET-style id
+        tarkov.dev does not index, so the position join is what actually names the mounts.
+    """
+    if os.environ.get("EFT_GAMEDATA_OFFLINE"):
+        return
+    if not (sink["containers"] or sink["card_readers"] or sink["stationary"]):
+        return
+    try:
+        sys.path.insert(0, HERE)
+        import tarkov_static
+        if sink["containers"]:
+            tbl = tarkov_static.load_static_containers()
+            n = 0
+            for r in sink["containers"]:
+                nm = tbl.get(r.get("template") or "")
+                if nm:
+                    r["tpl_name"] = nm
+                    n += 1
+            print(f"[containers] {n}/{len(sink['containers'])} templates named "
+                  f"(static lootContainers)")
+        ids = sorted({i for r in sink["card_readers"] for i in r.get("item_ids") or []})
+        if ids:
+            got = {it["id"]: it["name"]
+                   for it in tarkov_static.load_static_items(ids=ids).get("items") or []
+                   if it.get("id") and it.get("name")}
+            for r in sink["card_readers"]:
+                items = [{"id": i, **({"n": got[i]} if i in got else {})}
+                         for i in r.get("item_ids") or []]
+                if items:
+                    r["items"] = items
+                    del r["item_ids"]
+            print(f"[card_readers] {len(got)}/{len(ids)} accepted-card ids named")
+        if sink["stationary"]:
+            sw = tarkov_static.load_static_stationary()
+            dev = sw["maps"].get(tarkov_static.map_slug(DEV_NAME.get(MAP, MAP))) or []
+            n = 0
+            for r in sink["stationary"]:
+                nm = sw["weapons"].get(r.get("weapon_id") or "")
+                if not nm and dev:
+                    # dev positions are raw Unity; bridge to viewer space like everything else.
+                    best = min(dev, key=lambda w: math.dist(r["pos"], bridge(w["pos"])))
+                    if math.dist(r["pos"], bridge(best["pos"])) <= 3.0:
+                        nm = sw["weapons"].get(best["id"])
+                if nm:
+                    r["weapon_name"] = nm
+                    n += 1
+            print(f"[stationary] {n}/{len(sink['stationary'])} mounts named "
+                  f"({len(dev)} tarkov.dev positions on this map)")
+    except Exception as ex:
+        print(f"[resolve] static resolution OFFLINE/failed ({type(ex).__name__}: {ex}) "
+              f"- shipping raw ids")
+
+
 def sibling_levels(scanned):
     """AUTO-PROBE for the gameplay-logic scene: the map config's level list is the GEOMETRY
     set and may not include it (factory: exfils live in Factory_DesignStuff = level 68, not in
@@ -932,7 +1187,10 @@ def main():
                             "transit_points", "stationary", "spawn_points",
                             "mines_directional", "loose_points",
                             "quest_triggers", "trader_zones", "buffer_switches",
-                            "buffer_zones", "loot_groups")}
+                            "buffer_zones", "loot_groups",
+                            # typed additions (2026-07 audit); OMITTED from the output when
+                            # empty so maps without them keep byte-identical gamedata.json.
+                            "containers", "damage_zones", "card_readers", "dialogs")}
     t0 = time.time()
     scanned = list(LEVELS)
     for lv in LEVELS:
@@ -948,9 +1206,15 @@ def main():
     sink["exfils"] = dedupe(sink["exfils"], lambda r: (r["faction"], r["name"]))
     sink["doors"] = dedupe(sink["doors"], lambda r: r["id"] or (r["name"], tuple(r["pos"])))
     for k in ("minefields", "sniper_zones", "transit_points", "stationary", "mines_directional",
-              "quest_triggers", "trader_zones", "buffer_switches", "buffer_zones", "loot_groups"):
+              "quest_triggers", "trader_zones", "buffer_switches", "buffer_zones", "loot_groups",
+              "damage_zones", "card_readers", "dialogs"):
         sink[k] = dedupe(sink[k], lambda r: (r.get("name"), tuple(r["pos"])))
+    # containers re-serialize across scene variants; the Id string is the stable key.
+    sink["containers"] = dedupe(sink["containers"],
+                                lambda r: r.get("id") or (r.get("name"), tuple(r["pos"])))
     sink["spawn_points"] = dedupe(sink["spawn_points"], lambda r: (r.get("name"), tuple(r["pos"])))
+    # display names for the typed additions (static dumps; degrades to raw ids offline).
+    resolve_new_intel(sink)
 
     # first-party loose loot: guid-dedupe + slot-merge, then tarkov.dev resolution + join.
     finalize_loose(sink)
@@ -960,11 +1224,15 @@ def main():
         print(f"[drape] outline verts {ol_before} -> {ol_after}")
 
     logic_levels = sorted({e["lv"] for e in sink["exfils"]})
-    counts = {k: len(v) for k, v in sink.items()}
+    # New sinks are dropped entirely (data AND count) when empty: a map without them keeps a
+    # byte-identical gamedata.json across this extractor change.
+    NEW_SINKS = ("containers", "damage_zones", "card_readers", "dialogs")
+    ship = {k: v for k, v in sink.items() if v or k not in NEW_SINKS}
+    counts = {k: len(v) for k, v in ship.items()}
     counts["exfils_by_faction"] = dict(Counter(e["faction"] for e in sink["exfils"]))
     counts["doors_with_key"] = sum(1 for d in sink["doors"] if d.get("key_id"))
     out = {"map": MAP, "generated_levels": scanned, "logic_levels": logic_levels,
-           "draped": draped, "counts": counts, **sink}
+           "draped": draped, "counts": counts, **ship}
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     json.dump(out, open(OUT, "w"), separators=(",", ":"))
     print(f"\n[out] {OUT}  ({os.path.getsize(OUT)/1e3:.0f} kB, {time.time()-t0:.0f}s)")
@@ -974,7 +1242,21 @@ def main():
     for t in sink["transit_points"]:
         print(f"  transit {t['name']:24s} pos={t['pos']}")
     for s in sink["stationary"]:
-        print(f"  stationary {s['name']:12s} pos={s['pos']}")
+        arc = (f" yaw={s['yaw']} arc={s['yaw_range']} pitch={s['pitch_range']}"
+               if "yaw_range" in s else "")
+        print(f"  stationary {s['name']:12s} pos={s['pos']} "
+              f"weapon={s.get('weapon_name') or s.get('weapon_id') or '?'}{arc}")
+    if sink["containers"]:
+        ck = Counter(c.get("tpl_name") or c.get("template") or "?" for c in sink["containers"])
+        print(f"  containers: {len(sink['containers'])} typed lootable(s) {dict(ck)}")
+    for z in sink["damage_zones"]:
+        print(f"  damage_zone [{z.get('kind')}] {str(z.get('name'))[:32]:32s} pos={z['pos']} "
+              f"outline_pts={len(z['outline'])} active={z['active']}")
+    for r in sink["card_readers"]:
+        cards = [it.get("n") or it["id"] for it in r.get("items") or []] or r.get("item_ids") or []
+        print(f"  card_reader {r['name']} pos={r['pos']} accepts={cards}")
+    for r in sink["dialogs"]:
+        print(f"  dialog {r['name']} pos={r['pos']} id={r.get('id')}")
     st = Counter(d["state"] for d in sink["doors"])
     print(f"  doors: {len(sink['doors'])} states={dict(st)} with_key={counts['doors_with_key']}")
     mk = Counter(m.get("kind") for m in sink["mines_directional"])

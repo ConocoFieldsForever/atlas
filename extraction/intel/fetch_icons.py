@@ -73,6 +73,14 @@ def collect_refs(map_name, pack, tasks_all):
         for door in gd.get("doors") or []:
             if door.get("key_id"):
                 ids.add(door["key_id"])
+        # Interactable requirement items (switch payload `item_id`, e.g. the Icebreaker
+        # frozen hatch's cutting torch; `item_ids` = a card reader's whole accepted-card
+        # list) — the LEVEL CONTROLS panel shows them with icons.
+        for sw in gd.get("switches") or []:
+            if sw.get("item_id"):
+                ids.add(sw["item_id"])
+            for iid in sw.get("item_ids") or []:
+                ids.add(iid)
 
     loot = jload(os.path.join(pack, "loot.json")) or jload(
         os.path.join(os.path.dirname(pack), "shared", "loot.json"))
