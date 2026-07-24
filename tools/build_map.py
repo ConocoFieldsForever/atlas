@@ -345,16 +345,20 @@ def main():
     geom_levels = [int(x) for x in dataset_levels(m).split(",") if x.strip()]
     if geom_levels:
         sw_missing = [lv for lv in geom_levels
-                      if force or not os.path.isfile(os.path.join(dataset, f"switches_{lv}.json"))]
+                      if force or not os.path.isfile(os.path.join(dataset, f"interact_{lv}.json"))]
         if sw_missing:
-            run(2, total, "scan power switches",
-                [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_switches.py"),
+            # extract_interact = superset of eft_extract_switches: keeps EVERY interactable Switch
+            # (power lever + alarms + floor/call buttons + water-plane + keycard/exfil triggers),
+            # classified name-free. Writes interact_<lv>.json (the power records match the old format,
+            # so the stage-6 merge + eft_extract_lights light-grouping keep working).
+            run(2, total, "scan interactables",
+                [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "extract_interact.py"),
                  "--levels", ",".join(str(lv) for lv in sw_missing), "--name", dsname],
                 VIEWER, optional=True)
         switch_levels = sorted(lv for lv in geom_levels
-                               if os.path.isfile(os.path.join(dataset, f"switches_{lv}.json")))
+                               if os.path.isfile(os.path.join(dataset, f"interact_{lv}.json")))
         if switch_levels:
-            print(f"[STAGE 2/{total}] power switch levels: {switch_levels}", flush=True)
+            print(f"[STAGE 2/{total}] interactable levels: {switch_levels}", flush=True)
 
     # 2: lights (optional) -- extract EVERY `*_Light` scene the map uses. The level LIST comes from
     #    the manifest (or a BuildSettings-derived fallback), so streets/ground_zero -- which split
@@ -487,13 +491,16 @@ def main():
            VIEWER, optional=True):
         gd = os.path.join(out_dir, "gamedata.json")
         if os.path.isfile(gd):
-            # Fold the power-switch records (switches_<lv>.json, written by stage 2a) into gamedata's
+            # Fold the interactable records (interact_<lv>.json, written by stage 2) into gamedata's
             # `switches` array so they ride the existing pack copy with no manifest/assembler change.
+            # This now carries EVERY interactable (power lever + alarms + buttons + water + triggers),
+            # each with a `kind` (power|switch); the viewer renders the power one with its light toggle
+            # and the rest as typed interactable markers.
             try:
                 data = json.load(open(gd, encoding="utf-8"))
                 sw = []
                 for lv in switch_levels:
-                    p = os.path.join(dataset, f"switches_{lv}.json")
+                    p = os.path.join(dataset, f"interact_{lv}.json")
                     if os.path.isfile(p):
                         sw.extend(json.load(open(p, encoding="utf-8")))
                 if sw:
@@ -508,10 +515,11 @@ def main():
                                 ex_by_go[t["name"]]["requires_power"] = True
                                 n_tag += 1
                     json.dump(data, open(gd, "w", encoding="utf-8"))
-                    print(f"  merged {len(sw)} power switch(es) into gamedata.json "
+                    npow = sum(1 for s in sw if s.get("kind") == "power")
+                    print(f"  merged {len(sw)} interactable(s) [{npow} power] into gamedata.json "
                           f"({n_tag} power-gated extract(s) tagged)", flush=True)
             except Exception as e:
-                print(f"  note: could not merge switches into gamedata.json ({e})", flush=True)
+                print(f"  note: could not merge interactables into gamedata.json ({e})", flush=True)
             shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
             print("  gamedata.json -> pack", flush=True)
 
