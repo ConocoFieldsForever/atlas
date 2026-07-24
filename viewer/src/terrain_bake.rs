@@ -146,20 +146,30 @@ fn bake(mpath: &Path) -> Result<f32> {
 
     device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
-    let mk_storage = |data: &[u8], label: &str| {
+    // Each mapped upload is scope-guarded: on a failed allocation (e.g. VRAM held by a running viewer)
+    // wgpu returns an ERROR buffer whose get_mapped_range_mut() would PANIC (0xc0000409) — catch it at
+    // pop and error out instead (the Python caller then falls back to the numpy composite per-tile).
+    let mk_storage = |data: &[u8], label: &str| -> Result<wgpu::Buffer> {
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: data.len().max(16) as u64,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: true,
         });
+        let oom = bevy::tasks::block_on(device.pop_error_scope());
+        let val = bevy::tasks::block_on(device.pop_error_scope());
+        if let Some(e) = oom.or(val) {
+            return Err(anyhow!("'{label}' allocation failed ({e})"));
+        }
         buf.slice(..).get_mapped_range_mut()[..data.len()].copy_from_slice(data);
         buf.unmap();
-        buf
+        Ok(buf)
     };
-    let pixels_buf = mk_storage(&pix_bytes, "pixels");
-    let texs_buf = mk_storage(bytemuck::cast_slice(&texs), "texs");
-    let layers_buf = mk_storage(bytemuck::cast_slice(&layers), "layers");
+    let pixels_buf = mk_storage(&pix_bytes, "pixels")?;
+    let texs_buf = mk_storage(bytemuck::cast_slice(&texs), "texs")?;
+    let layers_buf = mk_storage(bytemuck::cast_slice(&layers), "layers")?;
     let out_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("out"),
         size: out_bytes,

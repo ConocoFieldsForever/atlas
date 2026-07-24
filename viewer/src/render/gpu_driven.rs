@@ -1770,9 +1770,13 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         // mark it LINEAR (height is data, not sRGB color), set the flag + amount. Absent -> NO_ALBEDO
         // + no flag -> the shader skips the whole steep-parallax path (byte-identical render). VP/terrain
         // own their own UV blend so they never carry parallax (assembler already omits it for VP).
+        // EFT_PARALLAX=0 kill switch: masks the flag for EVERY material so the shader's steep-parallax
+        // path never runs — the byte-identical A/B lever for "texture swimming" reports (parallax is
+        // the only per-pixel view-dependent UV math in the pipeline).
         let mut parallax_index = NO_ALBEDO;
         let mut parallax_scale = 0.0f32;
-        if let Some(par) = &mat.parallax {
+        let parallax_enabled = std::env::var("EFT_PARALLAX").map(|v| v.trim() != "0").unwrap_or(true);
+        if let Some(par) = mat.parallax.as_ref().filter(|_| parallax_enabled) {
             if let Some(p) = par.map.as_deref().filter(|p| !p.is_empty()) {
                 parallax_index = *path_to_index.entry(p.to_string()).or_insert_with(|| {
                     let idx = albedo_paths.len() as u32;

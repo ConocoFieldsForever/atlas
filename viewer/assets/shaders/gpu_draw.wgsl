@@ -687,15 +687,27 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
 // derivatives. Height = 1 - sample.g (white = surface top, black = deepest recess).
 fn parallax_uv(uv: vec2<f32>, dwx: vec3<f32>, dwy: vec3<f32>, dux: vec2<f32>, duy: vec2<f32>,
                gN: vec3<f32>, wp: vec3<f32>, pidx: u32, scale: f32) -> vec2<f32> {
+    // DISTANCE FADE: beyond ~25m the surface covers few pixels, the screen-derivative frame turns
+    // per-2x2-quad noisy, and the march offset shimmers under camera motion ("texture jitter"). The
+    // relief is invisible at that range anyway — fade out over 25..50m and skip entirely past it.
+    let dvec = view.world_position.xyz - wp;
+    let dist = length(dvec);
+    let fade = 1.0 - smoothstep(25.0, 50.0, dist);
+    if (fade <= 0.001) { return uv; }
     // Mikkelsen cotangent frame from the world-pos + uv screen derivatives (matches perturb_normal).
-    let T = normalize(dwx * duy.y - dwy * dux.y);
-    let B = normalize(dwy * dux.x - dwx * duy.x);
-    let Vw = normalize(view.world_position.xyz - wp);
+    // Degenerate-UV guard: on constant/screen-axis-aligned UV surfaces these cross terms collapse to
+    // ~0 and normalize() emits NaN that rides the UV into garbage texels (per-quad sparkle) — bail.
+    let t_raw = dwx * duy.y - dwy * dux.y;
+    let b_raw = dwy * dux.x - dwx * duy.x;
+    if (dot(t_raw, t_raw) < 1e-16 || dot(b_raw, b_raw) < 1e-16) { return uv; }
+    let T = normalize(t_raw);
+    let B = normalize(b_raw);
+    let Vw = dvec / max(dist, 1e-4);
     let Vts = vec3<f32>(dot(Vw, T), dot(Vw, B), dot(Vw, gN));
     let vz = max(Vts.z, 0.15);                       // clamp grazing (bound the max offset)
     let num = mix(32.0, 8.0, clamp(vz, 0.0, 1.0));   // more layers at grazing angles (larger offset)
     let layer = 1.0 / num;
-    let dtex = (Vts.xy / vz) * scale / num;          // per-layer UV step along the view ray
+    let dtex = (Vts.xy / vz) * (scale * fade) / num; // per-layer UV step, relief fading with distance
     var cuv = uv;
     var cl = 0.0;
     var h = 1.0 - textureSampleGrad(albedo_tex[pidx], albedo_samp, cuv, dux, duy).g;
