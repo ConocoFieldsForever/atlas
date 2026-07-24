@@ -15,7 +15,7 @@ the codex/agent review:
   python extraction/unity/eft_extract_v2.py --levels 63 --name ix_terrain --terrain-only
 """
 import os, sys, json, argparse, time, gc
-import shutil, hashlib, threading
+import shutil, hashlib, threading, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -413,7 +413,9 @@ def _terrain_bake_prepare(td, res_out=4096, ss=2):
         w = _bilinear(ctrl[tex_i][..., ch], ci, cj, wrap=False)
         W0[(tex_i, ch)] = w if w.max() > 0.001 else None
     LD = [e for e in LD if W0[(e[0], e[1])] is not None]
-    return {"R": R, "ss": ss, "LD": LD, "W0": W0}
+    # `ctrl` (native control textures) is retained so the GPU baker can resample the control weights
+    # itself (it does not use the pre-sampled W0); the numpy composite ignores it.
+    return {"R": R, "ss": ss, "LD": LD, "W0": W0, "ctrl": ctrl}
 
 
 def _terrain_bake_composite(prep):
@@ -467,6 +469,65 @@ def bake_terrain_albedo(td, res_out=4096, ss=2):
     F1: thin wrapper over prepare (UnityPy reads) + composite (pure numpy) — see those for the split rationale."""
     prep = _terrain_bake_prepare(td, res_out, ss)
     return None if prep is None else _terrain_bake_composite(prep)
+
+
+def _find_atlas():
+    """The atlas exe for the GPU terrain baker: EFT_ATLAS_EXE (the viewer/build hands its own path) if
+    it points at a real file, else None -> numpy fallback. EFT_TERRAIN_GPU=0 force-disables the GPU."""
+    if os.environ.get("EFT_TERRAIN_GPU", "1").strip() == "0":
+        return None
+    p = os.environ.get("EFT_ATLAS_EXE", "").strip()
+    return p if p and os.path.isfile(p) else None
+
+
+def _terrain_bake_gpu(atlas, prep, out_path):
+    """Composite one tile on the GPU via `atlas bake-terrain`: writes a manifest + a concatenated RGBA
+    f32 `pixels.bin` (all control + diffuse textures) that terrain_bake.wgsl resamples exactly like
+    `_terrain_bake_composite`. Writes `out_path` atomically on success; returns True/False (caller falls
+    back to numpy on False). Validated pixel-exact vs the numpy bake on synthetic inputs."""
+    R, ss, LD, ctrl = prep["R"], prep["ss"], prep["LD"], prep.get("ctrl")
+    if not LD or not ctrl:
+        return False
+    texs, pix, off = [], [], 0
+    for c in ctrl:                                        # control textures first: layer.ctrl == tex_i
+        h, w = c.shape[:2]
+        texs.append([off, int(w), int(h)]); pix.append(np.ascontiguousarray(c, np.float32).reshape(-1, 4)); off += w * h
+    diff_idx, layers = {}, []
+    for tex_i, ch, dimg, repX, repZ in LD:
+        di = -1
+        if dimg is not None:
+            key = id(dimg)
+            if key not in diff_idx:
+                h, w = dimg.shape[:2]
+                rgba = np.concatenate([np.ascontiguousarray(dimg, np.float32).reshape(-1, 3),
+                                       np.zeros((h * w, 1), np.float32)], 1)
+                diff_idx[key] = len(texs); texs.append([off, int(w), int(h)]); pix.append(rgba); off += w * h
+            di = diff_idx[key]
+        layers.append({"ctrl": int(tex_i), "ch": int(ch), "diffuse": int(di),
+                       "repX": float(repX), "repZ": float(repZ)})
+    d = tempfile.mkdtemp(prefix="eftterr_")
+    try:
+        pbin = os.path.join(d, "pixels.bin")
+        np.concatenate(pix, 0).astype("<f4").tofile(pbin)
+        tmp_out = out_path + ".gpu.tmp"                   # same dir as final -> os.replace is atomic
+        json.dump({"R": int(R), "ss": int(ss), "out": tmp_out, "pixels": pbin, "texs": texs, "layers": layers},
+                  open(os.path.join(d, "m.json"), "w"))
+        r = subprocess.run([atlas, "bake-terrain", os.path.join(d, "m.json")], capture_output=True, text=True)
+        if r.returncode == 0 and os.path.isfile(tmp_out) and os.path.getsize(tmp_out) > 0:
+            os.replace(tmp_out, out_path)
+            return True
+        if os.path.exists(tmp_out):
+            try: os.remove(tmp_out)
+            except OSError: pass
+        tail = (r.stderr or "").strip().splitlines()
+        if tail:
+            print(f"  terrain GPU fell back to CPU: {tail[-1]}")
+        return False
+    except Exception as e:
+        print(f"  terrain GPU error, CPU fallback: {e}")
+        return False
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def export_terrain_splat(td, tname, splat_root, manifest, layer_saved, thresh=0.005):
@@ -1256,18 +1317,32 @@ def main():
                     return None
                 except Exception as e:
                     return f"  terrain bake err ({tname}): {e}"
-            _tj = os.environ.get("EFT_TERRAIN_TILE_JOBS", "").strip()
-            _tj = int(_tj) if _tj.isdigit() and int(_tj) > 0 else 4
-            n_jobs = min(_tj, len(_tile_jobs))
-            if n_jobs > 1:
-                with ThreadPoolExecutor(max_workers=n_jobs) as ex:
-                    for err in ex.map(_bake_tile, _tile_jobs):
-                        if err: print(err)
-                print(f"  terrain: composited {len(_tile_jobs)} tile(s) across {n_jobs} threads")
-            else:
+            _atlas = _find_atlas()
+            if _atlas:
+                # GPU terrain composite (vendor-neutral wgpu, `atlas bake-terrain`): one device, tiles
+                # SEQUENTIALLY (each 4096^2 bake is sub-second and the GPU serialises anyway), with a
+                # per-tile numpy fallback so a single GPU miss never fails the map.
+                n_gpu = 0
                 for job in _tile_jobs:
-                    err = _bake_tile(job)
-                    if err: print(err)
+                    if _terrain_bake_gpu(_atlas, job[2], job[1]):
+                        n_gpu += 1
+                    else:
+                        err = _bake_tile(job)
+                        if err: print(err)
+                print(f"  terrain: composited {len(_tile_jobs)} tile(s) [{n_gpu} GPU, {len(_tile_jobs) - n_gpu} CPU]")
+            else:
+                _tj = os.environ.get("EFT_TERRAIN_TILE_JOBS", "").strip()
+                _tj = int(_tj) if _tj.isdigit() and int(_tj) > 0 else 4
+                n_jobs = min(_tj, len(_tile_jobs))
+                if n_jobs > 1:
+                    with ThreadPoolExecutor(max_workers=n_jobs) as ex:
+                        for err in ex.map(_bake_tile, _tile_jobs):
+                            if err: print(err)
+                    print(f"  terrain: composited {len(_tile_jobs)} tile(s) across {n_jobs} threads")
+                else:
+                    for job in _tile_jobs:
+                        err = _bake_tile(job)
+                        if err: print(err)
             _tile_jobs.clear()
         print(f"level{lv}: +{cnt} mesh +{tcnt} terrain  total={len(instances)} meshes={len([v for v in exported.values() if v])} tex={len(tex_done)} ({time.time()-t0:.0f}s)", flush=True)
         del env, tfm, wcache, go2tf, _tf, _goc, mesh_intrinsic; gc.collect()
