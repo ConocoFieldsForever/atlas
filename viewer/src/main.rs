@@ -21,6 +21,7 @@ mod menu_fx;
 mod nav;
 mod nav_bake;
 mod sh_bake;
+mod sh_bake_gpu;
 mod navigate_panel;
 mod pathfind;
 mod paths;
