@@ -339,7 +339,10 @@ def main():
     #     folded into the light extraction below so their controlled lights (which ship OFF and are
     #     absent from the *_Light scene) get extracted + group-tagged for the viewer's power toggle.
     switch_levels = []
-    geom_levels = dataset_levels(m)
+    # dataset_levels() returns a COMMA-SEPARATED STRING ("52,54,...,520"); parse it to an int LIST here
+    # (iterating the raw string fed the switch scanner single characters -> "--levels 5,2,,,5,4,..." ->
+    # it scanned bogus levels 5/2/4/... , found no lever, and DELETED the real switches_*.json sidecars).
+    geom_levels = [int(x) for x in dataset_levels(m).split(",") if x.strip()]
     if geom_levels:
         sw_missing = [lv for lv in geom_levels
                       if force or not os.path.isfile(os.path.join(dataset, f"switches_{lv}.json"))]
