@@ -999,6 +999,10 @@ impl Baked {
 }
 
 /// Bake a nav grid for an already-loaded pack. Pure CPU; parallel over grid columns.
+/// Half-width (m) of the passable disc stamped around a typed door's pivot. Door leaves are ~1 m
+/// wide and the pivot sits at the hinge, so this must span the leaf plus a little for the frame.
+const DOOR_STAMP_R: f32 = 1.1;
+
 pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     if res <= 0.0 {
         return Err(anyhow!("res must be > 0 (got {res})"));
@@ -1087,6 +1091,51 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
         .par_chunks(k)
         .filter(|c| c[0] > MISS_HALF)
         .count();
+    // Stamp door cells from the TYPED door table (gamedata.json), not just from column-ray hits.
+    //
+    // A door panel is a near-vertical sheet, so its XZ projection is ~a line and it is deliberately
+    // skipped when building the column BVH (`MIN_XZ_AREA2`). Only the panel's thin horizontal caps
+    // survived, and a cell was stamped only if the ray at its exact CENTRE happened to clip one --
+    // so in practice almost no door registered (measured: 21 of interchange's 479 typed doors; ZERO
+    // on icebreaker). Door cells are what force an opening to stay passable through the wall mask,
+    // so a doorway that never stamps is a doorway the router treats as sealed.
+    //
+    // The typed doors carry a real world pivot, so stamp a small disc around each one. This is the
+    // game's own door table -- derived, not a name-regex guess -- and it covers locked doors too:
+    // locked doors stay PASSABLE (the player may hold the key); the route surfaces which key it
+    // needs rather than refusing to path.
+    let mut stamped_doors = 0usize;
+    for d in &pack.doors {
+        let cx = ((d.pivot.x - min_x) / res).round() as i64;
+        let cz = ((d.pivot.z - min_z) / res).round() as i64;
+        let r = (DOOR_STAMP_R / res).ceil() as i64;
+        let mut any = false;
+        for dz in -r..=r {
+            for dx in -r..=r {
+                let (gx, gz) = (cx + dx, cz + dz);
+                if gx < 0 || gz < 0 || gx >= nx as i64 || gz >= nz as i64 {
+                    continue;
+                }
+                // Disc, not square: a square would punch holes in walls flanking the doorway.
+                let (wx, wz) = (dx as f32 * res, dz as f32 * res);
+                if wx * wx + wz * wz > DOOR_STAMP_R * DOOR_STAMP_R {
+                    continue;
+                }
+                let ci = gz as usize * nx + gx as usize;
+                // Only stamp cells that actually have a floor — a door disc must not invent
+                // walkable space in a void.
+                if heights[ci * k] > MISS_HALF {
+                    door[ci] = 1;
+                    any = true;
+                }
+            }
+        }
+        stamped_doors += any as usize;
+    }
+    eprintln!(
+        "  nav-bake: door stamp: {stamped_doors}/{} typed doors marked a nav door cell",
+        pack.doors.len()
+    );
     let door_cells = door.iter().filter(|&&d| d != 0).count();
     eprintln!(
         "  nav-bake: cast {cells} columns in {:.2}s; {walkable} walkable ({:.1}%), {door_cells} door cells",
