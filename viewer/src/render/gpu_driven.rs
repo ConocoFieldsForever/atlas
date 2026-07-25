@@ -610,7 +610,22 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
 // uniform, and the depth array — always allocated so the group(3) layout stays stable — is ignored.
 
 /// Shadow-map resolution per cascade (square). 2048² * 2 layers * 4 bytes = 32 MiB.
-const SHADOW_MAP_SIZE: u32 = 2048;
+const SHADOW_MAP_SIZE_DEFAULT: u32 = 2048;
+/// Live-tunable shadow-map resolution (`EFT_SHADOW_SIZE`, default 2048). Exposed so the shadow
+/// pass cost can be bisected: if frame time scales with this, the cascades are FILL-bound; if it
+/// barely moves, the cost is geometry resubmission (the cascades replay the main camera's
+/// indirect buffer, so every visible instance is rasterized 3x per frame).
+fn shadow_map_size() -> u32 {
+    use std::sync::OnceLock;
+    static S: OnceLock<u32> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("EFT_SHADOW_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.clamp(256, 8192))
+            .unwrap_or(SHADOW_MAP_SIZE_DEFAULT)
+    })
+}
 /// Cascade count (2 near cascades). The depth array has this many layers.
 const SHADOW_CASCADES: usize = 2;
 /// Practical/log split distances (metres): cascade i covers [SHADOW_SPLITS[i], SHADOW_SPLITS[i+1]].
@@ -634,7 +649,7 @@ const SHADOW_FADE_END: f32 = 80.0;
 struct ShadowCascadeUniform {
     /// world -> sun light clip (conventional 0..1-depth ortho). Column-major Mat4 upload.
     view_proj: [[f32; 4]; 4],
-    /// xyz = Lsun (toward the sun), w = 1/SHADOW_MAP_SIZE (PCF texel).
+    /// xyz = Lsun (toward the sun), w = 1/shadow_map_size() (PCF texel).
     dir_texel: [f32; 4],
     /// x = grass casts shadows (1/0). B2: the 109k grass cross-quads were ~the whole shadow-pass
     /// fragment cost (alpha-tested albedo sample × 2 cascades) for micro-shadows that read as
@@ -653,7 +668,7 @@ struct SunShadowUniform {
     view_proj: [[[f32; 4]; 4]; SHADOW_CASCADES],
     /// x = far0 (15), y = far1 (80), z = overlap (0.10), w = enabled (1/0).
     split_depths: [f32; 4],
-    /// xyz = Lsun (toward the sun), w = 1/SHADOW_MAP_SIZE (PCF texel).
+    /// xyz = Lsun (toward the sun), w = 1/shadow_map_size() (PCF texel).
     sun_dir_texel: [f32; 4],
     /// x = cascade0 world texel, y = cascade1 world texel (world-space bias units), z,w reserved.
     texel_world: [f32; 4],
@@ -3927,7 +3942,7 @@ fn prepare_gpu_buffers(
     info!(
         "gpu-driven #5 shadows: enabled={shadows_enabled} debug={shadow_debug} Lsun={lsun:?} \
          (2 cascades, {sz}²×{n} Depth32Float; default ON, EFT_SHADOWS=0 to disable, diag EFT_SHADOW_DEBUG=1)",
-        sz = SHADOW_MAP_SIZE,
+        sz = shadow_map_size(),
         n = SHADOW_CASCADES,
     );
 
@@ -3936,8 +3951,8 @@ fn prepare_gpu_buffers(
     let shadow_depth = render_device.create_texture(&TextureDescriptor {
         label: Some("eft_shadow_depth"),
         size: Extent3d {
-            width: SHADOW_MAP_SIZE,
-            height: SHADOW_MAP_SIZE,
+            width: shadow_map_size(),
+            height: shadow_map_size(),
             depth_or_array_layers: SHADOW_CASCADES as u32,
         },
         mip_level_count: 1,
@@ -4016,7 +4031,7 @@ fn prepare_gpu_buffers(
             SHADOW_FADE_END,
             if shadow_debug { 1.0 } else { 0.0 },
         ],
-        sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+        sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / shadow_map_size() as f32],
         gfx: [1.0, 1.0, 1.0, 0.0], // neutral scales — a zeroed lane would kill fog on frame 0
         ..default()
     };
@@ -5366,7 +5381,7 @@ fn prepare_shadow_uniforms(
             SHADOW_CASCADE_OVERLAP,
             if shadows_on { 1.0 } else { 0.0 },
         ],
-        sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+        sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / shadow_map_size() as f32],
         combine: [
             SHADOW_DIFFUSE_CAP,
             SHADOW_FADE_START,
@@ -5414,7 +5429,7 @@ fn prepare_shadow_uniforms(
         let light_view = Mat4::look_at_rh(eye, center, up);
 
         // Texel-snap the light-space XY centre so the cascade doesn't crawl as the camera moves.
-        let world_texel = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+        let world_texel = (2.0 * radius) / shadow_map_size() as f32;
         let center_ls = light_view.transform_point3(center);
         let snapped_x = (center_ls.x / world_texel).round() * world_texel;
         let snapped_y = (center_ls.y / world_texel).round() * world_texel;
@@ -5453,7 +5468,7 @@ fn prepare_shadow_uniforms(
 
         let cascade = ShadowCascadeUniform {
             view_proj: vp_cols,
-            dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / SHADOW_MAP_SIZE as f32],
+            dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / shadow_map_size() as f32],
             params: [if grass_casters { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
         };
         render_queue.write_buffer(
