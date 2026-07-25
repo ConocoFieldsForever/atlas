@@ -757,6 +757,11 @@ pub struct LevelDoor {
     pub key_id: Option<String>,
     /// GameObject name (diagnostic; e.g. "Inside_Door_Metal_08_R_210-110_Door").
     pub name: String,
+    /// The renderers that swing WITH the panel — (mesh name, viewer-world position) for every
+    /// MeshFilter in the door's transform SUBTREE (panel + its glass + inlays). The game's own
+    /// grouping: the frame is a SIBLING and stays put. Empty on a pack built before the
+    /// extractor shipped this, where the viewer falls back to the single nearest instance.
+    pub parts: Vec<(String, Vec3)>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -773,6 +778,9 @@ struct DoorRaw {
     swing: bool,
     #[serde(default, rename = "open_angle")]
     open_angle: Option<f32>,
+    /// [[mesh name, [x, y, z]], ...] — see `LevelDoor::parts`.
+    #[serde(default)]
+    parts: Vec<(String, [f32; 3])>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -864,6 +872,11 @@ fn load_intel(
                 state: d.state.unwrap_or_else(|| "shut".into()),
                 key_id: d.key_id,
                 name: d.name,
+                parts: d
+                    .parts
+                    .into_iter()
+                    .map(|(m, p)| (m, Vec3::new(p[0], p[1], p[2])))
+                    .collect(),
             })
         })
         .collect();

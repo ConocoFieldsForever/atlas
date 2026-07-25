@@ -11,6 +11,7 @@
 
 mod eftpack;
 mod game_watch;
+mod gpu_lease;
 mod i18n;
 mod inspect;
 mod jobs;
@@ -86,6 +87,10 @@ impl Default for FlyCam {
 #[derive(Resource, Default)]
 pub struct CameraCommand {
     pub fly_to: Option<Vec3>,
+    /// Put the camera EXACTLY here, looking exactly this way -- (eye position, forward), both in
+    /// viewer world space. Unlike `fly_to` (which pulls back for context) this is a 1:1 pose, used
+    /// by the screenshot position fix to stand in the player's eyes. Takes priority over `fly_to`.
+    pub eye: Option<(Vec3, Vec3)>,
 }
 
 /// Camera-tab settings (the toolbar's camera panel edits these; the flycam systems read them).
@@ -530,8 +535,27 @@ fn apply_gfx_camera(
 /// Consume a pending `CameraCommand::fly_to`: place the fly-cam at a framing offset above the target,
 /// looking at it, and sync `FlyCam.yaw/pitch` so subsequent mouse-look continues smoothly.
 fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Transform, &mut FlyCam)>) {
-    if cmd.fly_to.is_none() {
-        return; // read-only fast path: a take() through DerefMut would dirty change detection
+    // Read-only fast path: a take() through DerefMut would dirty change detection every frame.
+    // BOTH commands must be checked — gating on `fly_to` alone made the screenshot-to-eyes pose
+    // (which sets only `eye`) unreachable.
+    if cmd.fly_to.is_none() && cmd.eye.is_none() {
+        return;
+    }
+    // EXACT pose first (screenshot fix): stand in the player's eyes rather than framing them.
+    if let Some((eye, fwd)) = cmd.eye.take() {
+        if let Ok((mut tf, mut cam)) = q.single_mut() {
+            let dir = fwd.normalize_or_zero();
+            if dir.length_squared() > 0.5 {
+                // Same yaw/pitch inversion as below, so the flycam keeps flying from this pose.
+                cam.yaw = (-dir.x).atan2(-dir.z);
+                cam.pitch = dir.y.clamp(-1.0, 1.0).asin();
+                tf.rotation = Quat::from_axis_angle(Vec3::Y, cam.yaw)
+                    * Quat::from_axis_angle(Vec3::X, cam.pitch);
+            }
+            tf.translation = eye;
+        }
+        cmd.fly_to = None; // an exact pose wins over any queued framing request
+        return;
     }
     let Some(target) = cmd.fly_to.take() else {
         return;
@@ -677,6 +701,19 @@ fn main() {
         );
         std::process::exit(1);
     }
+
+    // Take the INTERACTIVE-GPU lease for this process's lifetime. A bake worker started while we
+    // render sees it and picks the CPU backend instead of fighting us for the adapter — a TDR
+    // resets the DEVICE, not just the offending process, so a runaway compute dispatch would take
+    // this viewer down with it (that is the 0xC0000409 abort we hit). Held in a `static` so the
+    // handle lives until the process exits, and released by the OS even on an abort/kill.
+    // See viewer/src/gpu_lease.rs.
+    static GPU_LEASE: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    let _ = GPU_LEASE.set(gpu_lease::acquire());
+    eprintln!(
+        "[gpu-lease] viewer holding = {}",
+        GPU_LEASE.get().map(|o| o.is_some()).unwrap_or(false)
+    );
 
     let mut app = App::new();
     app.add_plugins(

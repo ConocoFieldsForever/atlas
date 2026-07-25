@@ -167,8 +167,13 @@ impl Default for GfxSettings {
             } else {
                 0
             },
-            // Distance-LOD default OFF (shipped look). EFT_LOD=1 spawns it on; EFT_LOD_BIAS tunes.
-            lod_distance: std::env::var("EFT_LOD").map(|v| v.trim() == "1").unwrap_or(false),
+            // Distance-LOD default ON: when a pack ships more than one shell per LODGroup the GPU
+            // picks the cheapest one that still covers its screen size, which is the single biggest
+            // lever on draw cost (and matters most when Atlas shares the GPU with the game). It is a
+            // NO-OP on the lean LOD0-only packs the pipeline builds today -- those carry one shell
+            // per group, so there is nothing to switch to -- but costs nothing to leave on and takes
+            // effect the moment an `--alllod` pack is loaded. EFT_LOD=0 forces it off.
+            lod_distance: std::env::var("EFT_LOD").map(|v| v.trim() != "0").unwrap_or(true),
             lod_bias: std::env::var("EFT_LOD_BIAS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1.0),
             lod_force: std::env::var("EFT_LOD_FORCE").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(-1),
         }

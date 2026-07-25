@@ -103,6 +103,8 @@ pub enum K {
     LanguageTip,
     ProcessInBackground,
     ProcessInBackgroundTip,
+    ScreenshotLocate,
+    ScreenshotLocateTip,
     BuildDeps,
     DepsReady,
     DepsMissing,
@@ -252,6 +254,18 @@ fn pair(k: K) -> [&'static str; 2] {
         ProcessInBackgroundTip => [
             "Builds keep running even if you close Atlas - reopen it later to see the progress or the finished map.",
             "Сборка продолжается, даже если закрыть Atlas - откройте его позже, чтобы увидеть прогресс или готовую карту.",
+        ],
+        ScreenshotLocate => [
+            "Screenshot to locate current position",
+            "Скриншот определяет текущую позицию",
+        ],
+        ScreenshotLocateTip => [
+            "Take a screenshot in raid and Atlas moves the camera to exactly where you are standing, looking the way you look - EFT writes your position and view angle into the screenshot filename.
+
+Check Settings > Controls in Tarkov for your screenshot key. You may need to REBIND it: the default can collide with the Windows Snipping Tool or another screenshot app, which grabs the key first so EFT never writes the file.",
+            "Сделайте скриншот в рейде, и Atlas переместит камеру точно туда, где вы стоите, и в ту же сторону - EFT записывает позицию и угол обзора в имя файла скриншота.
+
+Проверьте клавишу скриншота в Настройки > Управление вТарков. Возможно, её придётся ПЕРЕНАЗНАЧИТЬ: стандартная клавиша может конфликтовать с «Ножницами» Windows или другой программой скриншотов, которая перехватывает нажатие, и EFT не создаёт файл.",
         ],
         BuildDeps => ["BUILD DEPS", "ЗАВИСИМОСТИ"],
         DepsReady => ["ready", "готово"],
