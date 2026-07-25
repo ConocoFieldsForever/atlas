@@ -245,8 +245,20 @@ fn load_texture(
     if let Some(h) = cache.get(&key) {
         return h.clone();
     }
+    // Texture quality (Settings ▸ General): Full/Half/Quarter. The gpu-driven path implements this
+    // by skipping mip levels at upload; THIS path decoded full-res regardless, so the setting did
+    // nothing here and VRAM was identical on every setting (field report from a user pushed onto
+    // the Standard path by the LLPC fallback). Downscale by the same 2^skip factor before upload.
+    let skip = crate::render::gpu_driven::TEX_MIP_SKIP.load(std::sync::atomic::Ordering::Relaxed);
     let handle = match image::open(path) {
         Ok(img) => {
+            let img = if skip > 0 {
+                let (w, h) = (img.width().max(1), img.height().max(1));
+                let (nw, nh) = ((w >> skip).max(1), (h >> skip).max(1));
+                img.resize_exact(nw, nh, image::imageops::FilterType::Triangle)
+            } else {
+                img
+            };
             let dyn_img = if flip_green {
                 let mut rgba = img.to_rgba8();
                 for px in rgba.pixels_mut() {
