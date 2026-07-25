@@ -164,7 +164,12 @@ pub const DRAW_ARG_STRIDE: u64 = 20;
 /// slot @32 as `Uint32` and recovers the id bit-exact (a pure reinterpretation, NOT a numeric
 /// cast which would corrupt large ids). The trailing f32x4 @36 is the per-vertex COLOR_0
 /// vert-paint weight (interpolated); the SoftCutout road/track feather rides on color.a.
-pub const DRAW_VERTEX_STRIDE: u64 = 52;
+/// GPU vertex stride: pos f32x3 @0, normal f32x3 @12, uv f32x2 @24, material Uint32 @32,
+/// color **Unorm8x4** @36. The pack stores colour as unorm8x4 already; this used to inflate it to
+/// Float32x4 (stride 52) for no reason, costing 12 B on every one of the map's tens of millions of
+/// vertices (653 MiB on streets). Unorm8x4 still arrives in the shader as a normalised
+/// `vec4<f32>`, so the WGSL is unchanged and the values are bit-identical to the source data.
+pub const DRAW_VERTEX_STRIDE: u64 = 40;
 
 /// Per-material GPU record (M3; 80 bytes after Phase 2b normal mapping, 160 bytes after #6 detail maps), 16-aligned. Indexed DIRECTLY by the global
 /// materialId (SubMesh.material_id == materials.json array index for this pack), which the
@@ -1036,7 +1041,14 @@ pub struct CpuData {
     /// where `material_bits = f32::from_bits(material_id)` (read as Uint32 on the GPU).
     vertex_data: Vec<f32>,
     /// Global u32 indices (LOCAL to each mesh; base_vertex offsets them).
-    index_data: Vec<u32>,
+    /// Index bytes ready for upload, in `index_u16`'s width. Indices are LOCAL to each mesh
+    /// (base_vertex offsets them), so when every mesh fits under 65,536 vertices the whole buffer
+    /// can be u16 and halves in size (341 MiB on streets). Built from the u32 staging vec, which
+    /// is dropped before upload so the narrow copy never coexists with the wide one for long.
+    index_bytes: Vec<u8>,
+    /// True when `index_bytes` is u16 (else u32). Drives `IndexFormat` at draw time.
+    index_u16: bool,
+    index_count: usize,
     instances: Vec<InstanceGpuRecord>,
     mesh_meta: Vec<MeshMeta>,
     /// Per-material GPU table, indexed by global materialId (== materials.json order).
@@ -2311,24 +2323,25 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             // M3b2: per-vertex COLOR_0 vert-paint weight. Every mesh in this pack carries a
             // color attr (unorm8x4 @32) so geom.colors is populated; default opaque-white for
             // any mesh that lacks it (color.a=1 -> SoftCutout coverage stays fully covered).
-            let col = match col_off {
+            // Colour rides through as the pack's own unorm8x4 bytes: pack them into one u32
+            // (little-endian => memory order r,g,b,a, which is what Unorm8x4 reads) and smuggle it
+            // through the f32 staging vec bit-exactly, the same trick material_index uses.
+            let col_bits = match col_off {
                 Some(o) => {
                     let b = base + o;
-                    [
-                        vb[b] as f32 / 255.0,
-                        vb[b + 1] as f32 / 255.0,
-                        vb[b + 2] as f32 / 255.0,
-                        vb[b + 3] as f32 / 255.0,
-                    ]
+                    u32::from(vb[b])
+                        | (u32::from(vb[b + 1]) << 8)
+                        | (u32::from(vb[b + 2]) << 16)
+                        | (u32::from(vb[b + 3]) << 24)
                 }
-                None => [1.0, 1.0, 1.0, 1.0],
+                None => 0xFFFF_FFFF, // opaque white (color.a=1 -> SoftCutout stays fully covered)
             };
             vertex_data.extend_from_slice(&[
                 p[0], p[1], p[2],
                 nrm[0], nrm[1], nrm[2],
                 uv[0], uv[1],
                 f32::from_bits(vert_mat[k]), // material_index (read as Uint32 on the GPU)
-                col[0], col[1], col[2], col[3], // color f32x4 @36 (interpolated in the shader)
+                f32::from_bits(col_bits),    // color Unorm8x4 @36 (interpolated in the shader)
             ]);
         }
         vtx_cursor += n as u32;
@@ -2519,8 +2532,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             let (s, c) = ang.sin_cos();
             let (dx, dz) = (c * hw, s * hw);
             let b = nverts;
+            let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @36
             let mk = |x: f32, y: f32, z: f32, u: f32, v: f32| {
-                [x, y, z, 0.0, 1.0, 0.0, u, v, mbits, 1.0, 1.0, 1.0, 1.0]
+                [x, y, z, 0.0, 1.0, 0.0, u, v, mbits, white]
             };
             for vtx in [
                 mk(-dx, 0.0, -dz, 0.0, 1.0),
@@ -2609,7 +2623,8 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         let first_index = idx_cursor;
         let mbits = f32::from_bits(sea_mat_id);
         // One quad, +Y normal, local origin at the center (height baked into the instance row).
-        let mk = |x: f32, z: f32, u: f32, v: f32| [x, 0.0, z, 0.0, 1.0, 0.0, u, v, mbits, 1.0, 1.0, 1.0, 1.0];
+        let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @36
+        let mk = |x: f32, z: f32, u: f32, v: f32| [x, 0.0, z, 0.0, 1.0, 0.0, u, v, mbits, white];
         for vtx in [
             mk(-hx, -hz, 0.0, 0.0),
             mk(hx, -hz, 1.0, 0.0),
@@ -2762,9 +2777,40 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             index_data.len(),
         );
     }
+    // Narrow the index buffer when every mesh is u16-eligible. Indices are mesh-LOCAL, so the
+    // deciding value is the largest index actually stored, not the global vertex count. The guard
+    // is a real check (not an assumption about the pack): any pack with a >64Ki-vertex mesh simply
+    // stays on u32.
+    let index_count = index_data.len();
+    let index_u16 = index_data.iter().copied().max().is_none_or(|m| m < 65_536);
+    let mut index_bytes: Vec<u8> = if index_u16 {
+        let mut b = Vec::with_capacity(index_count * 2 + 2);
+        for &i in &index_data {
+            b.extend_from_slice(&(i as u16).to_le_bytes());
+        }
+        b
+    } else {
+        bytemuck::cast_slice(&index_data).to_vec()
+    };
+    // wgpu requires buffer writes to be 4-byte aligned in BOTH offset and size. An odd number of
+    // u16 triangles lands on a 2-byte boundary, which would trip validation on the final streaming
+    // chunk — pad with unused indices (draws are bounded by the indirect args, so they're inert).
+    while index_bytes.len() % 4 != 0 {
+        index_bytes.push(0);
+    }
+    eprintln!(
+        "[stall]   index buffer: {} indices as {} -> {:.1} MiB{}",
+        index_count,
+        if index_u16 { "u16" } else { "u32" },
+        index_bytes.len() as f64 / 1048576.0,
+        if index_u16 { " (halved; all meshes < 64Ki verts)" } else { " (a mesh exceeds 64Ki verts)" },
+    );
+    drop(index_data); // the wide staging copy is dead now — free it before the upload
     Some(CpuData {
         vertex_data,
-        index_data,
+        index_bytes,
+        index_u16,
+        index_count,
         instances,
         mesh_meta,
         mesh_names,
@@ -2942,6 +2988,8 @@ struct EftDrawPipeline {
 struct EftGpuBuffers {
     vertex: Buffer,
     index: Buffer,
+    /// Width the index buffer was uploaded in (u16 when every mesh fits under 64Ki vertices).
+    index_format: IndexFormat,
     /// P1 OPAQUE indirect args (multidraw over all meshes; blend-only records zeroed by cs_reset).
     /// Also drives the shadow casters (blend never casts).
     indirect: Buffer,
@@ -3320,7 +3368,7 @@ fn prepare_gpu_buffers(
             // Step 4: create the vertex+index buffers EMPTY now (COPY_DST) so the geometry can be
             // streamed in across the following frames rather than memcpy'd in one finalize frame.
             let vtx_total = std::mem::size_of_val(cpu.vertex_data.as_slice());
-            let idx_total = std::mem::size_of_val(cpu.index_data.as_slice());
+            let idx_total = cpu.index_bytes.len();
             let vertex = render_device.create_buffer(&BufferDescriptor {
                 label: Some("eft_gpu_vertex"),
                 size: vtx_total as u64,
@@ -3423,7 +3471,7 @@ fn prepare_gpu_buffers(
             }
             if g.idx_cursor < g.idx_total {
                 let end = (g.idx_cursor + GEO_CHUNK).min(g.idx_total);
-                let bytes: &[u8] = bytemuck::cast_slice(&cpu.index_data);
+                let bytes: &[u8] = &cpu.index_bytes;
                 render_queue.write_buffer(&g.index, g.idx_cursor as u64, &bytes[g.idx_cursor..end]);
                 g.idx_cursor = end;
             }
@@ -3482,7 +3530,7 @@ fn prepare_gpu_buffers(
             });
             let i = render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("eft_gpu_index"),
-                contents: bytemuck::cast_slice(&cpu.index_data),
+                contents: &cpu.index_bytes,
                 usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
             });
             (v, i)
@@ -4269,6 +4317,7 @@ fn prepare_gpu_buffers(
         blend_meshes: cpu.blend_meshes.clone(),
         mesh_count: cpu.mesh_count,
         instance_total: cpu.instance_total,
+        index_format: if cpu.index_u16 { IndexFormat::Uint16 } else { IndexFormat::Uint32 },
     });
     commands.insert_resource(EftCullBindGroup(cull_bg));
     commands.insert_resource(EftDrawBindGroup(draw_bg));
@@ -4283,7 +4332,7 @@ fn prepare_gpu_buffers(
         prep_t0.elapsed().as_secs_f64() * 1000.0,
         geo_ms,
         std::mem::size_of_val(cpu.vertex_data.as_slice()) as f64 / 1048576.0,
-        std::mem::size_of_val(cpu.index_data.as_slice()) as f64 / 1048576.0,
+        cpu.index_bytes.len() as f64 / 1048576.0,
         if geo_streamed { "STREAMED over load window" } else { "one-shot" },
         tex_count,
         albedo_ms,
@@ -5812,8 +5861,9 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                         },
                         // M3b2: per-vertex COLOR_0 vert-paint weight @36 (SoftCutout coverage
                         // rides on color.a). Interpolated (NOT flat) in the fragment shader.
+                        // Unorm8x4: the pack's native format, expanded to vec4<f32> by the fetch.
                         VertexAttribute {
-                            format: VertexFormat::Float32x4,
+                            format: VertexFormat::Unorm8x4,
                             offset: 36,
                             shader_location: 4,
                         },
@@ -5998,7 +6048,7 @@ impl Node for EftShadowNode {
             pass.set_bind_group(1, &res.cascade_bind_groups[c], &[]); // this cascade's view_proj
             pass.set_bind_group(2, &material_bg.0, &[]); // material table + albedo (alpha test)
             pass.set_vertex_buffer(0, buffers.vertex.slice(..));
-            pass.set_index_buffer(buffers.index.slice(..), 0, IndexFormat::Uint32);
+            pass.set_index_buffer(buffers.index.slice(..), 0, buffers.index_format);
             pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count);
         }
         Ok(())
@@ -6047,7 +6097,7 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
         pass.set_bind_group(2, &material_bg.0, &[]); // M3: bindless materials/textures/sampler
         pass.set_bind_group(3, &sh_bg.0, &[]); // Phase 1: SH-GI irradiance volume + uniform
         pass.set_vertex_buffer(0, buffers.vertex.slice(..));
-        pass.set_index_buffer(buffers.index.slice(..), 0, IndexFormat::Uint32);
+        pass.set_index_buffer(buffers.index.slice(..), 0, buffers.index_format);
 
         // OPAQUE item (extra_index None): ONE multi-draw for ALL meshes from the opaque indirect
         // buffer (blend-only records are zeroed by cs_reset). BLEND items carry their mesh index
