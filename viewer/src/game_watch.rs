@@ -241,6 +241,11 @@ with the overlay up"
                 }
                 if summon {
                     if let Some(st) = overlay_state.as_mut() {
+                        // ALWAYS ask for a re-raise, even when already shown: the game reclaims the
+                        // foreground (and on exclusive fullscreen can push us behind entirely)
+                        // between screenshots, and a summon that only fires on the rising edge
+                        // leaves the overlay flagged shown but invisible.
+                        st.raise_nonce = st.raise_nonce.wrapping_add(1);
                         if !st.shown {
                             st.shown = true;
                             info!("game link: screenshot fix -> summoning the overlay");
