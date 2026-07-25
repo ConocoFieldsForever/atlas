@@ -234,6 +234,7 @@ impl Plugin for UiPlugin {
                 tasks_tab,
                 crate::navigate_panel::navigate_tab,
                 pos_hud,
+                unbuilt_map_banner,
                 // NOTE: the in-raid EN/RU toggle is intentionally NOT registered (finding 8). It
                 // flipped the shared Lang but the raid panels (navigate/tasks) are hardcoded
                 // English, so it changed only the badge and misrepresented that RU took effect.
@@ -301,6 +302,80 @@ fn map_loading_indicator(
                     );
                 });
         });
+}
+
+/// LIVE-LINK WARNING: the raid is on a map whose pack is NOT built, so what's on screen is not
+/// where the player is. Silence here is the worst outcome (the overlay would confidently show the
+/// wrong map), so say it plainly, top-centre, until the raid ends or the map is built.
+#[cfg(feature = "egui")]
+fn unbuilt_map_banner(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    mut link: Option<ResMut<crate::game_watch::GameLink>>,
+    mut worker: ResMut<crate::jobs::JobWorker>,
+    lang: Res<crate::i18n::Lang>,
+) {
+    use bevy_egui::egui::{self, RichText};
+    use crate::i18n::{t, K};
+    use crate::ui_theme as theme;
+    let lg = *lang;
+    if menu.is_some() {
+        return;
+    }
+    let Some(link) = link.as_mut() else { return };
+    let Some(map) = link.unbuilt_map.as_ref() else { return };
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let pretty = crate::inspect::prettify(map);
+    let map = map.clone();
+    let mut build_now: Option<String> = None;
+    let mut dismiss = false;
+    egui::Area::new(egui::Id::new("unbuilt_map"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 12.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, theme::DANGER))
+                .inner_margin(egui::Margin::symmetric(16, 10))
+                .show(ui, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.label(
+                        RichText::new(format!("{pretty} {}", t(lg, K::UnbuiltNotProcessed)))
+                            .size(13.0)
+                            .strong()
+                            .color(theme::DANGER_TEXT),
+                    );
+                    ui.label(
+                        RichText::new(t(lg, K::UnbuiltBody)).size(11.0).color(theme::TEXT_BRIGHT),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new(t(lg, K::UnbuiltProcess)).size(12.0).strong())
+                            .on_hover_text(t(lg, K::UnbuiltProcessTip))
+                            .clicked()
+                        {
+                            build_now = Some(map.clone());
+                        }
+                        if ui.button(RichText::new(t(lg, K::UnbuiltCancel)).size(12.0)).clicked() {
+                            dismiss = true;
+                        }
+                    });
+                });
+        });
+    if let Some(id) = build_now {
+        // Same queue + code path the start menu's BUILD uses -- one worker, one pipeline.
+        worker.enqueue(crate::jobs::Job::BuildMap {
+            map: id.clone(),
+            game_dir: crate::menu::detect_game_dir(),
+            force: false,
+            background: crate::menu::config_process_in_background(),
+        });
+        info!("game link: user asked to process '{id}' from the in-raid prompt");
+        link.unbuilt_map = None;
+    } else if dismiss {
+        link.unbuilt_map = None;
+    }
 }
 
 /// A failed async PLAY (corrupt/partial pack) used to leave a blank window with no message and no
