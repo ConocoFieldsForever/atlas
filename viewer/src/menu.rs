@@ -761,6 +761,12 @@ pub struct MenuState {
     /// "Screenshot to locate current position" — poll the EFT screenshot folder and move the
     /// camera onto each new position fix (see `config_screenshot_locate`).
     pub screenshot_locate: bool,
+    /// Overlay settings (the menu edits them; `overlay::OverlayPlugin` reads the same keys back
+    /// out of atlas.config.json at startup). One struct so a settings panel can bind to it.
+    pub overlay: crate::overlay::OverlayConfig,
+    /// Which SETTINGS tab the right-hand panel shows (0 = Overlay, 1 = Live link, 2 = General).
+    /// `None` = the panel is collapsed and the map list has the full width.
+    pub settings_tab: Option<u8>,
     /// One-shot guard: on the first menu frame we scan for detached builds a previous run left running
     /// and reattach/surface them. Set true after that scan so it never re-runs.
     pub reattached: bool,
@@ -985,6 +991,40 @@ fn save_config_str(key: &str, val: &str) -> bool {
 
 /// Generic single-key BOOL read from atlas.config.json (mirrors `config_str`). None when the key is
 /// absent / not a bool — callers supply the default.
+/// Public wrappers so other modules (overlay.rs) can persist their own settings through the SAME
+/// atlas.config.json read-modify-write path instead of inventing a second config file.
+pub fn config_bool_pub(key: &str) -> Option<bool> {
+    config_bool(key)
+}
+pub fn save_config_bool_pub(key: &str, val: bool) -> bool {
+    save_config_bool(key, val)
+}
+/// f32 variants (overlay geometry / fps cap). Stored as JSON numbers.
+pub fn config_f32_pub(key: &str) -> Option<f32> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+    v.get(key).and_then(|n| n.as_f64()).map(|n| n as f32)
+}
+#[must_use]
+pub fn save_config_f32_pub(key: &str, val: f32) -> bool {
+    let path = config_path();
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[key] = serde_json::json!(val);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("menu: could not save config to {}: {e}", path.display());
+            false
+        }
+    }
+}
+
 fn config_bool(key: &str) -> Option<bool> {
     let v: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
@@ -1356,6 +1396,8 @@ pub fn build_state() -> MenuState {
         config_err: None,
         process_in_background: config_process_in_background(),
         screenshot_locate: config_screenshot_locate(),
+        overlay: crate::overlay::OverlayConfig::load().sanitized(),
+        settings_tab: None,
         reattached: false,
     }
 }
@@ -1511,6 +1553,14 @@ pub fn menu_ui(
     // `update_check.dismissed` is the LATER-this-session flag.
     update_status: Res<crate::update::UpdateStatus>,
     mut update_check: ResMut<crate::update::UpdateCheck>,
+    // The LIVE overlay settings. The menu edits `MenuState.overlay` and persists it, but the
+    // running app reads this RESOURCE -- without pushing the change here, ticking the box only
+    // took effect on the next launch (the toggle looked broken).
+    mut overlay_cfg: ResMut<crate::overlay::OverlayConfig>,
+    // Settings writes waiting for the pointer to be released: sliders fire `.changed()` every
+    // frame of a drag, and each save() is 12 read-parse-rewrite cycles of atlas.config.json.
+    // Apply lives immediately; persist once, when the drag ends.
+    mut settings_save_pending: Local<bool>,
 ) {
     use bevy_egui::egui::{self, Color32, RichText};
     use crate::i18n::{map_title, t, K};
@@ -1641,6 +1691,19 @@ pub fn menu_ui(
                 ui.label(RichText::new(format!("|  {}", t(lg, K::Map))).color(BEIGE).size(13.0));
                 ui.label(RichText::new(t(lg, K::SelectLocation)).color(DIM).size(13.0));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // SETTINGS opens the tabbed panel beside the map list (overlay / live link /
+                    // general). Toggles, so the same button closes it.
+                    if ui
+                        .selectable_label(
+                            state.settings_tab.is_some(),
+                            RichText::new(t(lg, K::Settings)).color(BEIGE).size(12.0),
+                        )
+                        .on_hover_text("Overlay, live game link and general options")
+                        .clicked()
+                    {
+                        state.settings_tab = if state.settings_tab.is_some() { None } else { Some(0) };
+                    }
+                    ui.add_space(10.0);
                     ui.label(
                         RichText::new(fmt_size(state.total_bytes)).color(BEIGE).size(13.0),
                     );
@@ -1802,6 +1865,48 @@ pub fn menu_ui(
                 }
                 ui.label(RichText::new("\u{24d8}").color(DIM).size(12.0))
                     .on_hover_text(t(lg, K::ScreenshotLocateTip));
+            });
+            // Sub-option: house-keeping for the screenshots the locator consumes. Indented under
+            // its parent and greyed out with it — it only means anything while the folder is
+            // being polled. (Same control as Settings -> Live link; both write OverlayConfig.)
+            ui.horizontal(|ui| {
+                ui.add_space(22.0);
+                ui.add_enabled_ui(state.screenshot_locate, |ui| {
+                    let mut del = state.overlay.delete_processed_shots;
+                    if ui
+                        .checkbox(
+                            &mut del,
+                            RichText::new(t(lg, K::DeleteShots)).color(BONE).size(11.0),
+                        )
+                        .on_hover_text(t(lg, K::DeleteShotsTip))
+                        .changed()
+                    {
+                        state.overlay.delete_processed_shots = del;
+                        *overlay_cfg = state.overlay.clone(); // live, no relaunch needed
+                        crate::game_watch::set_delete_processed_shots(del);
+                        state.config_err = (!state.overlay.save())
+                            .then(|| "settings could not be saved (read-only folder?)".to_string());
+                    }
+                });
+            });
+            // Overlay mode (opt-in, default OFF). The tooltip carries the two things that decide
+            // whether it works at all: EFT must be BORDERLESS, and this is the user's call to make.
+            // Only the master switch lives here for now; the geometry/throttle fields of
+            // `OverlayConfig` are ready for a proper settings panel.
+            ui.horizontal(|ui| {
+                let mut ov = state.overlay.enabled;
+                if ui
+                    .checkbox(&mut ov, RichText::new(t(lg, K::OverlayEnable)).color(BONE).size(11.0))
+                    .on_hover_text(t(lg, K::OverlayEnableTip))
+                    .changed()
+                {
+                    state.overlay.enabled = ov;
+                    *overlay_cfg = state.overlay.clone(); // live, no relaunch needed
+                    state.config_err = (!state.overlay.save())
+                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                }
+                ui.label(RichText::new("\u{24d8}").color(DIM).size(12.0))
+                    .on_hover_text(t(lg, K::OverlayEnableTip));
             });
             // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
             // (venv + pip) from here without closing the app; progress streams into the panel above.
@@ -2040,6 +2145,162 @@ pub fn menu_ui(
     }
     if toggle_log {
         state.show_log = !state.show_log;
+    }
+
+    // ---- SETTINGS: a tabbed panel beside the map list ------------------------------------------
+    // Collapsed by default (the map list is the point of this screen). Everything binds to
+    // `MenuState.overlay` (`overlay::OverlayConfig`) and every change is pushed to the LIVE
+    // resource as well as persisted — writing only the file is what made the toggle look broken.
+    if let Some(tab) = state.settings_tab {
+        egui::SidePanel::right("menu_settings")
+            .default_width(330.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::CARD_TRANSLUCENT)
+                    .inner_margin(egui::Margin::symmetric(16, 14)),
+            )
+            .show(ctx, |ui| {
+                let mut cfg = state.overlay.clone();
+                let mut dirty = false;
+                ui.horizontal(|ui| {
+                    ui.label(theme::title(t(lg, K::Settings)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("close").clicked() {
+                            state.settings_tab = None;
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let tabs = [
+                        t(lg, K::SettingsTabOverlay),
+                        t(lg, K::SettingsTabLive),
+                        t(lg, K::SettingsTabGeneral),
+                    ];
+                    for (i, name) in tabs.iter().enumerate() {
+                        if ui
+                            .selectable_label(tab == i as u8, RichText::new(*name).size(11.0))
+                            .clicked()
+                        {
+                            state.settings_tab = Some(i as u8);
+                        }
+                    }
+                });
+                ui.separator();
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| match tab {
+                    0 => {
+                        dirty |= ui
+                            .checkbox(&mut cfg.enabled, RichText::new(t(lg, K::OverlayEnable)).size(11.0))
+                            .on_hover_text(t(lg, K::OverlayEnableTip))
+                            .changed();
+                        ui.label(
+                            RichText::new(t(lg, K::OverlayBorderlessNote)).size(10.0).color(DIM),
+                        );
+                        ui.add_space(8.0);
+                        ui.add_enabled_ui(cfg.enabled, |ui| {
+                            dirty |= ui
+                                .checkbox(&mut cfg.always_on_top, RichText::new(t(lg, K::OverlayKeepAbove)).size(11.0))
+                                .changed();
+                            dirty |= ui
+                                .checkbox(&mut cfg.borderless, RichText::new(t(lg, K::OverlayBorderlessShown)).size(11.0))
+                                .changed();
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(t(lg, K::OverlayPanelSize)).size(10.0).color(DIM));
+                            dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.x, 0.2..=1.0).text("width")).changed();
+                            dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.y, 0.2..=1.0).text("height")).changed();
+                            ui.label(RichText::new(t(lg, K::OverlayPanelPos)).size(10.0).color(DIM));
+                            dirty |= ui.add(egui::Slider::new(&mut cfg.anchor.x, 0.0..=1.0).text("x")).changed();
+                            dirty |= ui.add(egui::Slider::new(&mut cfg.anchor.y, 0.0..=1.0).text("y")).changed();
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(t(lg, K::OverlayPerf)).size(10.0).color(DIM));
+                            let mut cap = cfg.fps_cap as f32;
+                            if ui.add(egui::Slider::new(&mut cap, 0.0..=144.0).text("fps cap")).changed() {
+                                cfg.fps_cap = cap.round() as u32;
+                                dirty = true;
+                            }
+                            dirty |= ui
+                                .checkbox(&mut cfg.pause_when_hidden, RichText::new(t(lg, K::OverlayIdleHidden)).size(11.0))
+                                .on_hover_text(t(lg, K::OverlayIdleHiddenTip))
+                                .changed();
+                            ui.add_space(8.0);
+                            ui.separator();
+                            // THE one-keypress flow: the player's OWN screenshot key does both.
+                            dirty |= ui
+                                .checkbox(
+                                    &mut cfg.show_on_screenshot,
+                                    RichText::new(t(lg, K::OverlayOpenOnShot)).size(11.0),
+                                )
+                                .on_hover_text(t(lg, K::OverlayOpenOnShotTip))
+                                .changed();
+                            dirty |= ui
+                                .checkbox(
+                                    &mut cfg.return_focus_to_game,
+                                    RichText::new(t(lg, K::OverlayReturnFocus)).size(11.0),
+                                )
+                                .on_hover_text(t(lg, K::OverlayReturnFocusTip))
+                                .changed();
+                        });
+                    }
+                    1 => {
+                        let loc_now = {
+                            let mut loc = state.screenshot_locate;
+                            if ui
+                                .checkbox(&mut loc, RichText::new(t(lg, K::ScreenshotLocate)).size(11.0))
+                                .on_hover_text(t(lg, K::ScreenshotLocateTip))
+                                .changed()
+                            {
+                                state.screenshot_locate = loc;
+                                crate::game_watch::set_screenshot_locate(loc);
+                                let _ = save_config_screenshot_locate(loc);
+                            }
+                            loc
+                        };
+                        // Sub-option of screenshot-locate: it only means anything while the folder
+                        // is being polled, so it lives INDENTED under its parent and greys out
+                        // with it (a live checkbox for a dead feature reads as a bug).
+                        ui.horizontal(|ui| {
+                            ui.add_space(22.0); // indent under the parent checkbox
+                            ui.add_enabled_ui(loc_now, |ui| {
+                                dirty |= ui
+                                    .checkbox(
+                                        &mut cfg.delete_processed_shots,
+                                        RichText::new(t(lg, K::DeleteShots)).size(11.0),
+                                    )
+                                    .on_hover_text(t(lg, K::DeleteShotsTip))
+                                    .changed();
+                            });
+                        });
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(t(lg, K::LiveLinkNote)).size(10.0).color(DIM));
+                    }
+                    _ => {
+                        let mut bg = state.process_in_background;
+                        if ui
+                            .checkbox(&mut bg, RichText::new(t(lg, K::ProcessInBackground)).size(11.0))
+                            .on_hover_text(t(lg, K::ProcessInBackgroundTip))
+                            .changed()
+                        {
+                            state.process_in_background = bg;
+                            let _ = save_config_process_in_background(bg);
+                        }
+                    }
+                });
+                if dirty {
+                    let cfg = cfg.sanitized();
+                    state.overlay = cfg.clone();
+                    *overlay_cfg = cfg.clone(); // live: no relaunch needed
+                    crate::game_watch::set_delete_processed_shots(cfg.delete_processed_shots);
+                    *settings_save_pending = true; // persisted below, once the pointer is up
+                }
+            });
+    }
+    // Deferred settings persist: live-apply happened the frame the value changed; the file write
+    // waits for the drag to end so a slider doesn't rewrite atlas.config.json hundreds of times.
+    if *settings_save_pending && !ctx.input(|i| i.pointer.any_down()) {
+        *settings_save_pending = false;
+        state.config_err = (!state.overlay.save())
+            .then(|| "settings could not be saved (read-only folder?)".to_string());
     }
 
     egui::CentralPanel::default()
