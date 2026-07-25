@@ -192,20 +192,63 @@ an opaque third-party binary and the same room information is more cheaply appro
 `IndoorTrigger` MonoBehaviours (already present, class-resolved). Skip unless a room-volume
 feature is specifically requested.
 
-### Explicitly NOT accessible (don't spend effort)
-- **Named door/interactable fields** — only in the encrypted metadata; no unencrypted mirror (§2).
+### Explicitly NOT accessible *from the current install* (see the correction below before
+### concluding "impossible")
+- **Named door/interactable fields** — not in anything the 1.0.6.5 install ships (§2). But an
+  OUT-OF-INSTALL source does have them: see §6.
 - **Loot spawn tables / boss spawn configs / extract timers & requirements** — server-side; the
   client ships only mock `LootData`/`Test*` objects in `resources.assets` (`docs/GAME_DATA_SOURCES.md`).
   Get these from tarkov.dev/SPT, not from the client files.
 
 ---
 
+## 6. CORRECTION — two routes this audit missed (prior work, `[[eft-il2cpp-metadata-decrypt]]`)
+
+This audit scoped itself to the *current retail install* and concluded field names are
+unobtainable. That conclusion is too broad. Earlier static-disassembly work (capstone over
+`GameAssembly.dll`, build 2026-06-16, no process touched) reached the same encryption verdict but
+also established two routes that do not involve the encrypted metadata at all:
+
+**Route A — field NAMES from the pre-1.0 Mono build (Rank 2 in the prior work).** EFT was a
+**Mono** game until 1.0 (2025-11-15); it only became il2cpp at 1.0. The last pre-1.0 build's
+`Assembly-CSharp.dll` is ordinary .NET metadata — real class *and field* names, statically
+deobfuscatable (`sp-tarkov/assembly-tool` + de4dot), no encryption anywhere. Field ORDER in that
+assembly is what Unity's binary serializer writes, so it maps directly onto the byte offsets we
+decode empirically (`IdEnd+56` = openAngle, `IdEnd+92` = EDoorState, …). Layouts drift across
+versions, so this **confirms and names** our offsets rather than replacing them — exactly the
+"named-field confirmation" this audit set out to find. Not on this machine: no
+`Assembly-CSharp.dll` from an SPT/pre-1.0 build exists on disk (verified), so the route is open
+but untaken.
+
+**Route B — the tuned lighting VALUES need no metadata at all (Rank 1).** Fog, exposure,
+colour-grade, LUT and bloom are **serialized Unity asset data**, not il2cpp fields:
+PostProcessingV2 `ColorGrading`/`Bloom`/`PostProcessProfile` and URP/HDRP `Volume` are ENGINE
+types with hardcoded type-trees in AssetRipper/AssetStudio, readable with zero decryption and
+zero process contact. That is the unfinished half of the lighting audit (LUT-anchored exposure +
+RenderSettings fog) available for free — and it outranks §4.2's empirical `WeatherController`
+decode, which should be attempted only for what the engine types don't carry.
+
+**Runtime dumping stays off the table.** The prior work is explicit: never dump, attach to, or
+scan the retail live process. BattlEye's kernel driver catches debuggers, cross-process reads and
+injected threads; retail "offline/PVE" is not BE-free. Il2CppDumper and Cpp2IL both reject an
+encrypted `.dat`, so neither is a shortcut. The cipher is custom (not AES — no S-boxes/AES-NI in
+the binary; loader at VA `0x180592dd0`, control-flow-flattened with self-generated RWX stubs) and
+it **rekeys every patch**: the first dword was `e82b66cd` in the 2026-06-16 build and is
+`63153607` in 1.0.6.5.46221. Cracking it would be days of work invalidated by each update — the
+reason it was deliberately not pursued.
+
+---
+
 ## Summary
 
-Encryption unchanged on 1.0.6.5. No unencrypted source (GameAssembly.dll, Odin payloads,
-bundles, type trees, config JSON) yields MonoBehaviour field names or offsets — those live only
-in the encrypted metadata. What *is* authoritative and already exploited is the **class name**
-of every component (8,220 MonoScripts in `globalgamemanagers.assets`). The empirical decoders
-stay the only route to fields. The best next steps are pure reuse of that backbone — a per-map
-component census to catch patch drift and find un-decoded interactables (highest ROI), then
-empirical weather/lighting-preset extraction and tarkov.dev keycard enrichment.
+Encryption unchanged on 1.0.6.5 (and rekeyed since June). Nothing the *current install* ships —
+GameAssembly.dll, Odin payloads, bundles, type trees, config JSON — yields MonoBehaviour field
+names or offsets. What is authoritative and already exploited is the **class name** of every
+component (8,220 MonoScripts in `globalgamemanagers.assets`).
+
+Two out-of-install routes remain open (§6) and change the plan: the **pre-1.0 Mono
+`Assembly-CSharp.dll`** carries real field names that can confirm every empirically-derived
+offset, and **AssetRipper on the engine post-processing types** yields the tuned fog/exposure/
+colour-grade/LUT values with no decryption at all. Ranked next steps: per-map component census
+(highest ROI, pure reuse), then AssetRipper lighting values, then the Mono-assembly field-name
+confirmation pass, then tarkov.dev keycard enrichment.
