@@ -764,6 +764,8 @@ pub struct MenuState {
     /// Overlay settings (the menu edits them; `overlay::OverlayPlugin` reads the same keys back
     /// out of atlas.config.json at startup). One struct so a settings panel can bind to it.
     pub overlay: crate::overlay::OverlayConfig,
+    /// Texture quality: 0 = full, 1 = half, 2 = quarter (mip levels dropped at upload).
+    pub tex_quality: u8,
     /// Which SETTINGS tab the right-hand panel shows (0 = Overlay, 1 = Live link, 2 = General).
     /// `None` = the panel is collapsed and the map list has the full width.
     pub settings_tab: Option<u8>,
@@ -1397,6 +1399,7 @@ pub fn build_state() -> MenuState {
         process_in_background: config_process_in_background(),
         screenshot_locate: config_screenshot_locate(),
         overlay: crate::overlay::OverlayConfig::load().sanitized(),
+        tex_quality: config_f32_pub("textureQuality").unwrap_or(0.0) as u8,
         settings_tab: None,
         reattached: false,
     }
@@ -2284,6 +2287,39 @@ pub fn menu_ui(
                             state.process_in_background = bg;
                             let _ = save_config_process_in_background(bg);
                         }
+                        ui.add_space(10.0);
+                        // TEXTURE QUALITY — the one VRAM lever that matters (docs/VRAM_AUDIT.md:
+                        // textures are ~59% of streets' residency; Half reclaims ~3.8 GiB there).
+                        ui.label(RichText::new(t(lg, K::TexQuality)).size(11.0))
+                            .on_hover_text(t(lg, K::TexQualityTip));
+                        ui.horizontal(|ui| {
+                            for (i, key) in
+                                [K::TexQualityFull, K::TexQualityHalf, K::TexQualityQuarter]
+                                    .into_iter()
+                                    .enumerate()
+                            {
+                                if ui
+                                    .selectable_label(
+                                        state.tex_quality == i as u8,
+                                        RichText::new(t(lg, key)).size(11.0),
+                                    )
+                                    .on_hover_text(t(lg, K::TexQualityTip))
+                                    .clicked()
+                                {
+                                    state.tex_quality = i as u8;
+                                    crate::render::gpu_driven::set_tex_mip_skip(i as u8);
+                                    if !save_config_f32_pub("textureQuality", i as f32) {
+                                        state.config_err = Some(
+                                            "settings could not be saved (read-only folder?)"
+                                                .to_string(),
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                        ui.label(
+                            RichText::new(t(lg, K::TexQualityNote)).size(10.0).color(DIM),
+                        );
                     }
                 });
                 if dirty {

@@ -3258,6 +3258,9 @@ fn prepare_gpu_buffers(
         if need_kickoff {
             let pool = bevy::tasks::AsyncComputeTaskPool::get();
             let bc = bc_enabled(&render_device);
+            // Texture-quality mip skip, captured ONCE per map build so every texture of one map
+            // agrees (a mid-build settings change applies to the next load, not half of this one).
+            let mip_skip = TEX_MIP_SKIP.load(std::sync::atomic::Ordering::Relaxed) as u32;
             let albedo_tasks: Vec<Option<bevy::tasks::Task<TexCpu>>> = cpu
                 .albedo_paths
                 .iter()
@@ -3267,7 +3270,7 @@ fn prepare_gpu_buffers(
                     // Terrain CONTROL maps are blend weights: load LINEAR + never BC (data_linear).
                     let data_linear = cpu.ctrl_tex_linear.contains(&(i as u32));
                     Some(pool.spawn(async move {
-                        prepare_tex_cpu(path, bc, data_linear, false, [255, 0, 255, 255]) // magenta placeholder
+                        prepare_tex_cpu(path, bc, data_linear, false, [255, 0, 255, 255], mip_skip) // magenta placeholder
                     }))
                 })
                 .collect();
@@ -3277,7 +3280,7 @@ fn prepare_gpu_buffers(
                 .map(|path| {
                     let path = path.clone();
                     Some(pool.spawn(async move {
-                        prepare_tex_cpu(path, bc, false, true, [128, 128, 255, 255]) // flat-normal placeholder (is_normal: raw linear, never BC)
+                        prepare_tex_cpu(path, bc, false, true, [128, 128, 255, 255], mip_skip) // flat-normal placeholder (is_normal: raw linear, never BC)
                     }))
                 })
                 .collect();
@@ -4773,6 +4776,99 @@ enum TexCpu {
     Raw { w: u32, h: u32, mips: u32, chain: Vec<u8> },
 }
 
+/// TEXTURE QUALITY (menu setting): how many TOP mip levels to drop at upload. 0 = full,
+/// 1 = half resolution, 2 = quarter. The VRAM audit (docs/VRAM_AUDIT.md) measured textures at
+/// 59% of streets' 8.7 GiB residency, all uploaded full-res; dropping one level reclaims ~3.8 GiB
+/// on that map. Static atomic (the game_watch flag pattern): the prepare tasks run off-thread and
+/// the kickoff captures the value once per map build — changing it live applies on the NEXT map
+/// (re)load, which the menu tooltip says out loud.
+pub static TEX_MIP_SKIP: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_tex_mip_skip(n: u8) {
+    TEX_MIP_SKIP.store(n.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drop the first `skip` mip levels of an already-prepared chain — pure byte slicing, no
+/// re-encode (both the texcache and fresh encodes store full concatenated chains, so "half
+/// resolution" is literally "start the upload at level 1").
+///
+/// Two guards keep it safe and worth it:
+///   * stop shrinking once the longest side would fall below 128 px — small textures are cheap,
+///     and crushing them buys nothing;
+///   * for BC formats never produce a base level that isn't a multiple of the 4px block (wgpu
+///     validates base-level dimensions against the block size).
+fn slice_mips(tex: TexCpu, skip: u32) -> TexCpu {
+    if skip == 0 {
+        return tex;
+    }
+    fn effective(w: u32, h: u32, mips: u32, skip: u32, block4: bool) -> u32 {
+        let mut e = skip.min(mips.saturating_sub(1));
+        while e > 0 {
+            let (nw, nh) = ((w >> e).max(1), (h >> e).max(1));
+            let too_small = nw.max(nh) < 128;
+            let misaligned = block4 && (nw % 4 != 0 || nh % 4 != 0);
+            if too_small || misaligned {
+                e -= 1;
+            } else {
+                break;
+            }
+        }
+        e
+    }
+    // Byte offset of level `e` in a BC chain (16-byte blocks for both BC3 and BC5).
+    fn bc_offset(w: u32, h: u32, e: u32) -> usize {
+        (0..e)
+            .map(|l| {
+                let (mw, mh) = (((w >> l).max(1) as usize), ((h >> l).max(1) as usize));
+                mw.div_ceil(4) * mh.div_ceil(4) * 16
+            })
+            .sum()
+    }
+    match tex {
+        TexCpu::Bc3 { w, h, mips, payload } => {
+            let e = effective(w, h, mips, skip, true);
+            if e == 0 {
+                return TexCpu::Bc3 { w, h, mips, payload };
+            }
+            let off = bc_offset(w, h, e);
+            TexCpu::Bc3 {
+                w: (w >> e).max(1),
+                h: (h >> e).max(1),
+                mips: mips - e,
+                payload: payload[off..].to_vec(),
+            }
+        }
+        TexCpu::Bc5 { w, h, mips, payload } => {
+            let e = effective(w, h, mips, skip, true);
+            if e == 0 {
+                return TexCpu::Bc5 { w, h, mips, payload };
+            }
+            let off = bc_offset(w, h, e);
+            TexCpu::Bc5 {
+                w: (w >> e).max(1),
+                h: (h >> e).max(1),
+                mips: mips - e,
+                payload: payload[off..].to_vec(),
+            }
+        }
+        TexCpu::Raw { w, h, mips, chain } => {
+            let e = effective(w, h, mips, skip, false);
+            if e == 0 {
+                return TexCpu::Raw { w, h, mips, chain };
+            }
+            let off: usize = (0..e)
+                .map(|l| ((w >> l).max(1) as usize) * ((h >> l).max(1) as usize) * 4)
+                .sum();
+            TexCpu::Raw {
+                w: (w >> e).max(1),
+                h: (h >> e).max(1),
+                mips: mips - e,
+                chain: chain[off..].to_vec(),
+            }
+        }
+    }
+}
+
 /// OFF-THREAD texture preparation: exactly the CPU half of `load_albedo_texture` /
 /// `load_normal_texture` / `load_data_texture` (fs::read -> content hash -> warm shared-cache read
 /// OR PNG decode + mip chain + BC3 encode + cache write), returning a `TexCpu` the render thread
@@ -4783,7 +4879,22 @@ enum TexCpu {
 /// shader): 4x smaller than raw Rgba8, and unlike BC3 no X/Y-relief crush. `placeholder` = the 1x1
 /// fill on any load/decode failure (magenta for albedo, flat normal for normals) so the bindless
 /// array index stays aligned with materials.json.
-fn prepare_tex_cpu(path: String, bc: bool, data_linear: bool, is_normal: bool, placeholder: [u8; 4]) -> TexCpu {
+fn prepare_tex_cpu(
+    path: String,
+    bc: bool,
+    data_linear: bool,
+    is_normal: bool,
+    placeholder: [u8; 4],
+    mip_skip: u32,
+) -> TexCpu {
+    let tex = prepare_tex_cpu_inner(path, bc, data_linear, is_normal, placeholder);
+    if data_linear {
+        return tex; // terrain control/data maps: the resolution IS the data — never degrade
+    }
+    slice_mips(tex, mip_skip)
+}
+
+fn prepare_tex_cpu_inner(path: String, bc: bool, data_linear: bool, is_normal: bool, placeholder: [u8; 4]) -> TexCpu {
     // Cache is keyed by format extension so BC5 (normal) and BC3 (albedo) entries never collide.
     let cache_ext = if is_normal { "bc5c" } else { "bc3c" };
     // Build the RGBA8 mip chain OFF-THREAD (the render thread just copies it) — mirrors what
