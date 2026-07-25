@@ -141,29 +141,51 @@ impl Grid {
     }
 }
 
-/// Prebuilt walk queries: a ground grid (stand/jump) and a wall grid (collision).
-#[derive(Resource)]
-pub struct GroundGrid {
+/// Prebuilt walk/flight queries: a ground grid (stand/jump), a wall grid (collision), and — when
+/// built `with_ceilings` (drone / agent-link mode) — a ceiling grid (down-facing faces) so a flying
+/// sphere can't pass up through floors. Walk-only builds skip ceilings to save memory.
+pub struct GroundData {
     ground: Grid,
     walls: Grid,
+    ceilings: Grid,
+    pub has_ceilings: bool,
+}
+
+/// The Bevy resource is an `Arc` over the immutable grid data so the agent-link server thread can
+/// hold the same grids and query them lock-free while the ECS walk/drone systems do too.
+#[derive(Resource, Clone)]
+pub struct GroundGrid(pub std::sync::Arc<GroundData>);
+
+impl std::ops::Deref for GroundGrid {
+    type Target = GroundData;
+    fn deref(&self) -> &GroundData {
+        &self.0
+    }
 }
 
 impl GroundGrid {
+    pub fn build(pack: &Pack, with_ceilings: bool) -> Self {
+        GroundGrid(std::sync::Arc::new(GroundData::build(pack, with_ceilings)))
+    }
+}
+
+impl GroundData {
     /// Enumerate + classify + bucket every world triangle. Parallel over instances, single pass.
-    pub fn build(pack: &Pack) -> Self {
+    pub fn build(pack: &Pack, with_ceilings: bool) -> Self {
         let t0 = std::time::Instant::now();
         let instances = &pack.instances;
         let pool = ComputeTaskPool::get();
         let threads = pool.thread_num().max(1);
         let chunk = instances.len().div_ceil(threads).max(1);
 
-        // Phase 1 (parallel): each worker collects (ground, wall) world triangles.
-        let per_thread: Vec<(Vec<[Vec3; 3]>, Vec<[Vec3; 3]>)> = pool.scope(|s| {
+        // Phase 1 (parallel): each worker collects (ground, wall, ceiling) world triangles.
+        let per_thread: Vec<(Vec<[Vec3; 3]>, Vec<[Vec3; 3]>, Vec<[Vec3; 3]>)> = pool.scope(|s| {
             for (ci, c) in instances.chunks(chunk).enumerate() {
                 let base = ci * chunk;
                 s.spawn(async move {
                     let mut ground: Vec<[Vec3; 3]> = Vec::new();
                     let mut walls: Vec<[Vec3; 3]> = Vec::new();
+                    let mut ceilings: Vec<[Vec3; 3]> = Vec::new();
                     for (j, inst) in c.iter().enumerate() {
                         // All-LOD pack: only the default shell contributes collision triangles
                         // (else the ground/wall grids double-count overlapping shells).
@@ -210,38 +232,47 @@ impl GroundGrid {
                                 } else if ny.abs() < WALL_MAX_NY && len * 0.5 >= WALL_MIN_AREA {
                                     // Steep enough to be a wall, big enough to matter. (len = 2·area.)
                                     walls.push([w0, w1, w2]);
+                                } else if with_ceilings && ny < -HORIZ_MIN {
+                                    // Down-facing (undersides of floors, roofs seen from below):
+                                    // irrelevant to the walk capsule but a flying hull hits them.
+                                    ceilings.push([w0, w1, w2]);
                                 }
                             }
                         }
                     }
-                    (ground, walls)
+                    (ground, walls, ceilings)
                 });
             }
         });
 
         // Merge each class.
         let mut ground_tris: Vec<[Vec3; 3]> =
-            Vec::with_capacity(per_thread.iter().map(|(g, _)| g.len()).sum());
+            Vec::with_capacity(per_thread.iter().map(|(g, _, _)| g.len()).sum());
         let mut wall_tris: Vec<[Vec3; 3]> =
-            Vec::with_capacity(per_thread.iter().map(|(_, w)| w.len()).sum());
-        for (g, w) in per_thread {
+            Vec::with_capacity(per_thread.iter().map(|(_, w, _)| w.len()).sum());
+        let mut ceil_tris: Vec<[Vec3; 3]> =
+            Vec::with_capacity(per_thread.iter().map(|(_, _, c)| c.len()).sum());
+        for (g, w, c) in per_thread {
             ground_tris.extend(g);
             wall_tris.extend(w);
+            ceil_tris.extend(c);
         }
 
         let ground = Grid::from_tris(ground_tris);
         let walls = Grid::from_tris(wall_tris);
+        let ceilings = Grid::from_tris(ceil_tris);
         info!(
-            "walk_ground: {} walkable + {} wall tris, ground {}x{} / walls {}x{} cells, built in {:.0}ms",
+            "walk_ground: {} walkable + {} wall + {} ceiling tris, ground {}x{} / walls {}x{} cells, built in {:.0}ms",
             ground.tris.len(),
             walls.tris.len(),
+            ceilings.tris.len(),
             ground.nx,
             ground.nz,
             walls.nx,
             walls.nz,
             t0.elapsed().as_secs_f32() * 1000.0
         );
-        Self { ground, walls }
+        Self { ground, walls, ceilings, has_ceilings: with_ceilings }
     }
 
     /// Highest walkable surface Y at (x,z) that is ≤ `feet_y + step_up`. None = no ground (void).
@@ -316,6 +347,112 @@ impl GroundGrid {
         }
         Vec2::new(px, pz)
     }
+
+    /// Push a sphere (the drone hull) out of any ground/wall/ceiling triangle it penetrates.
+    /// Returns the corrected center and, if there was contact, the summed (normalized) pushout
+    /// normal — the caller uses it to reflect/kill velocity into the surface. Fully 3D (unlike the
+    /// horizontal-only capsule resolve above): a drone hitting a floor must stop falling, a ceiling
+    /// must stop the climb. Triangles are bucketed by XZ footprint, so the 3×3-cell block around the
+    /// sphere covers every triangle within CELL=3 m — plenty for a sub-metre hull.
+    pub fn resolve_sphere(&self, c: Vec3, r: f32) -> (Vec3, Option<Vec3>) {
+        let mut p = c;
+        let mut norm = Vec3::ZERO;
+        let mut hit = false;
+        // Two relaxation passes so corners (floor+wall, wall+wall) settle.
+        for _ in 0..2 {
+            for g in [&self.walls, &self.ground, &self.ceilings] {
+                if g.tris.is_empty() {
+                    continue;
+                }
+                let (cx, cz) = g.cell_of(p.x, p.z);
+                for dz in -1..=1 {
+                    for dx in -1..=1 {
+                        let gx = cx + dx;
+                        let gz = cz + dz;
+                        if gx < 0 || gz < 0 || gx >= g.nx as i64 || gz >= g.nz as i64 {
+                            continue;
+                        }
+                        for &ti in &g.cells[(gz as u32 * g.nx + gx as u32) as usize] {
+                            let t = &g.tris[ti as usize];
+                            let q = closest_point_on_tri(p, t);
+                            let d = p - q;
+                            let dist = d.length();
+                            if dist < r && dist > 1e-5 {
+                                let n = d / dist;
+                                p += n * (r - dist);
+                                norm += n;
+                                hit = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (p, if hit { Some(norm.normalize_or_zero()) } else { None })
+    }
+
+    /// Count geometry crossings of the segment a→b (all three classes: walls, floors, ceilings),
+    /// capped at `cap`. This is the RF-occlusion query for the FPV video-link model: each
+    /// obstruction between the pilot and the drone attenuates the analog signal. Walks the
+    /// segment's XZ cells at half-cell strides, dedups triangle indices per grid, and
+    /// Möller-Trumbore-tests each candidate once. Cost is one call per frame (or per agent obs),
+    /// not per pixel.
+    pub fn segment_crossings(&self, a: Vec3, b: Vec3, cap: u32) -> u32 {
+        let ab = b - a;
+        let len_xz = (ab.x * ab.x + ab.z * ab.z).sqrt();
+        let mut hits = 0u32;
+        for g in [&self.walls, &self.ground, &self.ceilings] {
+            if g.tris.is_empty() {
+                continue;
+            }
+            let steps = ((len_xz * g.inv_cell * 2.0).ceil() as i32).clamp(1, 512);
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for s in 0..=steps {
+                let t = s as f32 / steps as f32;
+                let p = a + ab * t;
+                let (cx, cz) = g.cell_of(p.x, p.z);
+                if cx < 0 || cz < 0 || cx >= g.nx as i64 || cz >= g.nz as i64 {
+                    continue;
+                }
+                for &ti in &g.cells[(cz as u32 * g.nx + cx as u32) as usize] {
+                    if !seen.insert(ti) {
+                        continue;
+                    }
+                    if seg_hits_tri(a, ab, &g.tris[ti as usize]) {
+                        hits += 1;
+                        if hits >= cap {
+                            return cap;
+                        }
+                    }
+                }
+            }
+        }
+        hits
+    }
+}
+
+/// Möller-Trumbore: does the segment origin+dir·t, t∈[0,1], cross triangle `tri`?
+fn seg_hits_tri(orig: Vec3, dir: Vec3, tri: &[Vec3; 3]) -> bool {
+    let e1 = tri[1] - tri[0];
+    let e2 = tri[2] - tri[0];
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-9 {
+        return false; // parallel
+    }
+    let inv = 1.0 / det;
+    let s = orig - tri[0];
+    let u = s.dot(p) * inv;
+    if !(-1e-4..=1.0001).contains(&u) {
+        return false;
+    }
+    let q = s.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < -1e-4 || u + v > 1.0001 {
+        return false;
+    }
+    let t = e2.dot(q) * inv;
+    (0.001..=0.999).contains(&t)
 }
 
 /// Barycentric surface Y of triangle `t` at XZ point (x,z), or None if (x,z) is outside its XZ

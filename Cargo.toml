@@ -25,6 +25,7 @@ bevy = { version = "0.17", default-features = false, features = [
     "bevy_camera",
     "bevy_color",
     "bevy_core_pipeline",
+    "bevy_gilrs",   # gamepad / USB RC-transmitter input for the FPV drone mode
     "bevy_gizmos",
     "bevy_image",
     "bevy_light",

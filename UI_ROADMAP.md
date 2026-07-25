@@ -39,7 +39,18 @@ scroll. State: a `RightPanelTab` enum resource (`Layers | Camera | Tasks | …`)
       so apex height scales linearly with speed -> one scroll juices move + hop together.
 - [x] Sprint (shift) x1.8 in walk mode.
 
-## 2. Visibility tab (icon: eye)
+### 1d. Drone FPV mode + agent link  [DONE]
+- [x] CamMode enum (Fly/Walk/Drone; EFT_CAM=..., EFT_WALK legacy). Drone = honest 5"-quad sim
+      (drone.rs): real 9.81 gravity, thrust-to-weight 4.2, quadratic drag (~27 m/s top speed),
+      first-order motor/attitude response, angle + acro control, sphere collision vs
+      ground/wall/CEILING grids (walk_ground grew a ceiling class + resolve_sphere; resource is
+      now Arc-shared), crash on hard impact. Manual: WASD tilt, RMB mouse-X yaw, Space/Ctrl
+      altitude-assist, R respawn, scroll = FPV cam uptilt.
+- [x] Agent link (agent_link.rs, camera tab / EFT_AGENT=<port>): local-only lockstep TCP JSON
+      protocol (reset/step/obs; seeded, deterministic, ~3k steps/s) driving the same drone sim +
+      a walking ground target (static/waypoints/wander) for tracking tasks; wind/action-noise/
+      latency domain-randomization knobs; spectate + gizmos in-viewer. Spec: docs/AGENT_LINK.md;
+      Gymnasium wrapper: tools/drone_env.py.
 
 - [ ] Move the MAP LAYERS visibility toggles (loot classes, spawns, extracts, hazards,
       minefields, sniper zones, quests, min-value, hide-inactive, search) behind the `eye` tab.
