@@ -27,8 +27,10 @@ use std::sync::Mutex;
 enum GameEvent {
     /// A raid map started loading in the game (atlas map id, already bundle->id resolved).
     MapLoading(String),
-    /// A new screenshot fix: viewer-space position + flattened facing (None if no quaternion).
-    PlayerFix { pos: Vec3, fwd: Option<Vec3> },
+    /// A new screenshot fix: viewer-space position, FLATTENED facing for the map marker, and the
+    /// full 3-D view direction (pitch included) for standing in the player's eyes. Both None when
+    /// the filename carries no quaternion.
+    PlayerFix { pos: Vec3, fwd: Option<Vec3>, look: Option<Vec3> },
     /// Task status push: 10 = started, 11 = failed, 12 = finished.
     Task { id: String, status: i64 },
     /// The raid ended (UserMatchOver) — the last fix is stale.
@@ -58,10 +60,29 @@ fn bundle_to_map(bundle: &str) -> Option<&'static str> {
 // Bevy side
 // ---------------------------------------------------------------------------------------------
 
+/// "Screenshot to locate current position" — shared between the Bevy side (menu toggle) and the
+/// watcher THREAD, which polls it every tick. Seeded from the persisted config at plugin build so
+/// the thread honours the setting from the first poll.
+static SCREENSHOT_LOCATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Read by the watcher thread each tick.
+fn screenshot_locate() -> bool {
+    SCREENSHOT_LOCATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Flip the screenshot-locate setting live (the menu checkbox calls this the moment it changes;
+/// no restart needed).
+pub fn set_screenshot_locate(on: bool) {
+    SCREENSHOT_LOCATE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The latest live player fix, in viewer space.
 pub struct PlayerFixState {
     pub pos: Vec3,
+    /// Flattened heading (y = 0) — what the world marker draws.
     pub fwd: Option<Vec3>,
+    /// Full 3-D view direction including pitch — what the camera adopts.
+    pub look: Option<Vec3>,
     /// `Time::elapsed_secs` when the fix arrived (drives the marker pulse).
     pub at: f32,
 }
@@ -83,6 +104,9 @@ impl Plugin for GameWatchPlugin {
             info!("game link: disabled (EFT_GAME_LINK=0)");
             return;
         }
+        // Seed the shared flag from the persisted menu setting before the thread starts, so a
+        // user who turned screenshot-locate OFF never gets a single poll of the folder.
+        set_screenshot_locate(crate::menu::config_screenshot_locate());
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("eft-game-watch".into())
@@ -111,6 +135,7 @@ fn apply_game_events(
         MessageWriter<crate::pathfind::RouteRequest>,
     )>,
     mut last_route: Local<Option<crate::pathfind::RouteRequest>>,
+    mut cam_cmd: ResMut<crate::CameraCommand>,
     time: Res<Time>,
 ) {
     // Shadow-read every route request the UI sends (readers have independent cursors, so this does
@@ -153,9 +178,20 @@ fn apply_game_events(
                 link.last_auto = Some(id.clone());
                 sw.0 = Some(dir.to_string_lossy().into_owned());
             }
-            GameEvent::PlayerFix { pos, fwd } => {
+            GameEvent::PlayerFix { pos, fwd, look } => {
                 info!("game link: player fix at {:.1},{:.1},{:.1}", pos.x, pos.y, pos.z);
-                link.player = Some(PlayerFixState { pos, fwd, at: time.elapsed_secs() });
+                link.player = Some(PlayerFixState { pos, fwd, look, at: time.elapsed_secs() });
+                // "Screenshot to locate current position": stand in the player's EYES. EFT bakes
+                // the camera position + view quaternion into the filename, and both are already
+                // bridged to viewer space, so this is a 1:1 pose -- no framing, no offset. Without
+                // a facing (an older screenshot name with no quaternion) we keep the current look
+                // direction and only move.
+                if let Some(dir) = look.or(fwd) {
+                    cam_cmd.eye = Some((pos, dir));
+                } else {
+                    // No quaternion in the name (older screenshot): move, keep looking as we were.
+                    cam_cmd.eye = Some((pos, Vec3::ZERO));
+                }
                 // The pathfinder's "you are here" pin: every route (route-here / route tracked /
                 // navigate tab) starts from it when set. Moving it clears any drawn route
                 // (clear_route_on_start_move), so re-issue the last request from the new fix to
@@ -276,8 +312,15 @@ fn watcher_thread(tx: Sender<GameEvent>) {
                 }
             }
         }
-        if let Some(dir) = &shots_dir {
-            scan_screenshots(dir, &mut last_shot, &tx);
+        // "Screenshot to locate current position" (menu toggle). When off we don't read the
+        // folder at all — and we keep the watermark current so re-enabling it doesn't replay
+        // every screenshot taken while it was off; only the NEXT one counts as a fix.
+        if screenshot_locate() {
+            if let Some(dir) = &shots_dir {
+                scan_screenshots(dir, &mut last_shot, &tx);
+            }
+        } else {
+            last_shot = std::time::SystemTime::now();
         }
         std::thread::sleep(std::time::Duration::from_millis(700));
     }
@@ -455,14 +498,24 @@ fn scan_screenshots(dir: &Path, last: &mut std::time::SystemTime, tx: &Sender<Ga
     }
     let (x, y, z) = (f[0], f[1], f[2]);
     let pos = Vec3::new(-x, y, z); // unity -> viewer (the pipeline-wide X-flip)
-    let fwd = (f.len() >= 7).then(|| {
-        // Unity forward = q * (0,0,1), then flatten to a heading and X-flip into viewer space.
+    // Unity forward = q * (0,0,1), X-flipped into viewer space. `fwd` is flattened to a heading
+    // (the marker's arrow); `look` keeps the PITCH so the camera can sit in the player's eyes.
+    let dirs = (f.len() >= 7).then(|| {
         let (qx, qy, qz, qw) = (f[3], f[4], f[5], f[6]);
         let fx = 2.0 * (qx * qz + qw * qy);
+        let fy = 2.0 * (qy * qz - qw * qx);
         let fz = 1.0 - 2.0 * (qx * qx + qy * qy);
-        Vec3::new(-fx, 0.0, fz).normalize_or_zero()
+        (
+            Vec3::new(-fx, 0.0, fz).normalize_or_zero(),
+            Vec3::new(-fx, fy, fz).normalize_or_zero(),
+        )
     });
-    let _ = tx.send(GameEvent::PlayerFix { pos, fwd: fwd.filter(|v| *v != Vec3::ZERO) });
+    let nz = |v: Vec3| (v != Vec3::ZERO).then_some(v);
+    let _ = tx.send(GameEvent::PlayerFix {
+        pos,
+        fwd: dirs.and_then(|(f, _)| nz(f)),
+        look: dirs.and_then(|(_, l)| nz(l)),
+    });
 }
 
 /// All `-?\d+\.\d+` decimals in `s`, in order (no regex dependency).

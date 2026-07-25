@@ -1060,6 +1060,13 @@ pub struct CpuData {
     /// Swing doors (gamedata) the viewer can open on click. Matched to their GPU instance +
     /// animated in `prepare_gpu_buffers` / `animate_doors`.
     doors: Vec<crate::eftpack::LevelDoor>,
+    /// Pack mesh NAME per `mesh_meta` slot (an instance's `ids[0]`). Only doors use it — to
+    /// resolve their part list by the game's own mesh names. Synthetic meshes (grass, sea)
+    /// carry an empty name.
+    mesh_names: Vec<String>,
+    /// LODGroup id per GPU instance (-1 = ungrouped), parallel to `instances`. Doors use it to
+    /// animate EVERY shell of a leaf, not just the one that happens to be resident (AUDIT #4).
+    inst_lod_group: Vec<i32>,
     /// B1 distance-LOD: per-lod_group reference center (already conjugated by the emitter), indexed
     /// by `lod_group` (== manifest.lod_groups order). `cs_cull` mode 1 measures the shell-switch
     /// distance from THIS shared point (via the group id packed in `ids.z` bits 13+), not each
@@ -2068,6 +2075,8 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     let mut index_data: Vec<u32> = Vec::new();
     let mut instances: Vec<InstanceGpuRecord> = Vec::new();
     let mut mesh_meta: Vec<MeshMeta> = Vec::new();
+    let mut mesh_names: Vec<String> = Vec::new();
+    let mut inst_lod_group: Vec<i32> = Vec::new();
     // Blend-pass restructure (Codex review): per-mesh material class + a representative center
     // for back-to-front sorting of the per-mesh blend draws. class: 0=opaque-only, 1=blend-only,
     // 2=mixed (drawn in both passes; fragment class-discard splits it).
@@ -2320,6 +2329,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             let radius = local_r * conservative_radius_scale(lin);
             // Distance-LOD encode into ids.z/ids.w on multi-LOD packs; (0,0) on lean = unchanged.
             let (lz, lw) = if multi_lod { lod_encode(i) } else { (0, 0) };
+            inst_lod_group.push(inst.lod_group);
             instances.push(InstanceGpuRecord {
                 m0: [a[0], a[1], a[2], a[3]],
                 m1: [a[4], a[5], a[6], a[7]],
@@ -2368,6 +2378,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             ));
         }
 
+        mesh_names.push(m.name.clone());
         mesh_meta.push(MeshMeta {
             index_count,
             first_index,
@@ -2509,6 +2520,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             let f = |o: usize| f32::from_le_bytes([ch[o], ch[o + 1], ch[o + 2], ch[o + 3]]);
             let (x, y, z, rot, sc) = (f(0), f(4), f(8), f(12), f(16));
             let (s, c) = rot.sin_cos();
+            inst_lod_group.push(-1); // grass (synthetic, ungrouped)
             instances.push(InstanceGpuRecord {
                 m0: [c * sc, 0.0, s * sc, x],
                 m1: [0.0, sc, 0.0, y],
@@ -2521,6 +2533,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             count += 1;
         }
         inst_cursor += count;
+        mesh_names.push(String::new()); // grass (synthetic)
         mesh_meta.push(MeshMeta {
             index_count: nidx,
             first_index,
@@ -2583,6 +2596,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         }
         index_data.extend_from_slice(&[0, 1, 2, 0, 2, 3]); // shader flips N on back faces, winding-forgiving
         let instance_base = inst_cursor;
+        inst_lod_group.push(-1); // sea (synthetic, ungrouped)
         instances.push(InstanceGpuRecord {
             m0: [1.0, 0.0, 0.0, cx],
             m1: [0.0, 1.0, 0.0, sl],
@@ -2593,6 +2607,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         inst_cursor += 1;
         vtx_cursor += 4;
         idx_cursor += 6;
+        mesh_names.push(String::new()); // sea (synthetic)
         mesh_meta.push(MeshMeta {
             index_count: 6,
             first_index,
@@ -2728,6 +2743,8 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         index_data,
         instances,
         mesh_meta,
+        mesh_names,
+        inst_lod_group,
         materials: materials_gpu,
         albedo_paths,
         normal_paths,
@@ -3444,14 +3461,36 @@ fn prepare_gpu_buffers(
     });
     // DOORS: match each swing door to its GPU instance (the panel sits at the door pivot) so
     // `animate_doors` can rotate it on click. Nearest instance by translation within 1.5 m.
-    // AUDIT #4 (deferred, --alllod only): if a door leaf lands in a MULTI-SHELL LOD group, only this
-    // one nearest shell gets the rotation — when distance-LOD (cs_cull mode 1) hands off to another
-    // shell the door snaps closed. Fix when the alllod pipeline is live (so it can be validated that
-    // doors are actually multi-shell): collect every instance sharing this pivot AND lod_group (plumb
-    // lod_group into CpuData) and animate all of them. On lean packs this collapses to the one shell.
+    // MULTI-SHELL DOORS (was AUDIT #4, now fixed). A door leaf in a multi-shell LODGroup ships one
+    // instance per shell; animating only the resident one made the door SNAP SHUT the moment
+    // distance-LOD handed off. This is live data, not a hypothetical: factory_rework is an all-LOD
+    // pack (17.1% non-default shells, 4,119 multi-shell groups) and distance-LOD now defaults on.
+    // The part list can't cover it — parts match by MESH NAME and the extractor records the leaf's
+    // `..._LOD0`, so a coarse sibling never matches. So after resolving parts by name, pull in every
+    // instance sharing a matched part's LODGroup: shells of one renderer share a group, while the
+    // static frame is its own group, so this adds exactly the door's other shells. Lean packs have
+    // one shell per group and collapse to today's behaviour.
     if !cpu.doors.is_empty() {
+        // Instance lookup by mesh id so a door's PARTS resolve by the game's own mesh names.
+        let mut by_mesh: std::collections::HashMap<&str, Vec<usize>> = std::collections::HashMap::new();
+        for (i, r) in cpu.instances.iter().enumerate() {
+            if let Some(name) = cpu.mesh_names.get(r.ids[0] as usize).filter(|n| !n.is_empty()) {
+                by_mesh.entry(name.as_str()).or_default().push(i);
+            }
+        }
+        // LODGroup -> instances, built ONCE. The naive per-door scan is O(parts x instances)
+        // (~275M iterations on streets) and would show up as load-time stall.
+        let mut by_group: std::collections::HashMap<i32, Vec<usize>> = std::collections::HashMap::new();
+        for (i, g) in cpu.inst_lod_group.iter().enumerate() {
+            if *g >= 0 {
+                by_group.entry(*g).or_default().push(i);
+            }
+        }
         let mut door_insts: Vec<DoorInst> = Vec::new();
+        let mut n_parts = 0usize;
         for d in &cpu.doors {
+            // The PANEL: nearest instance to the hinge. It defines the swing axis (and is the
+            // fallback part set on a pack built before the extractor shipped `parts`).
             let mut best: Option<(usize, f32)> = None;
             for (i, r) in cpu.instances.iter().enumerate() {
                 let t = Vec3::new(r.m0[3], r.m1[3], r.m2[3]);
@@ -3460,30 +3499,92 @@ fn prepare_gpu_buffers(
                     best = Some((i, dist));
                 }
             }
-            if let Some((i, _)) = best {
-                let base = cpu.instances[i];
-                // swing axis = door local-Z in viewer world (= instance affine column 2), normalized.
-                let axis = Vec3::new(base.m0[2], base.m1[2], base.m2[2]).normalize_or_zero();
-                if axis.length_squared() < 0.5 {
+            let Some((panel, _)) = best else { continue };
+            let base = cpu.instances[panel];
+            // swing axis = door local-Z in viewer world (= instance affine column 2), normalized.
+            // Game-verified: an OPEN door's Unity local rotation is exactly `open_angle` about its
+            // local +Z (streets Inside_Door_Wood_23: +94.00 deg vs payload 94.0), and every shut
+            // door sits at local identity — so the pack's baked matrix IS the closed pose.
+            let axis = Vec3::new(base.m0[2], base.m1[2], base.m2[2]).normalize_or_zero();
+            if axis.length_squared() < 0.5 {
+                continue;
+            }
+            // SIGN: the viewer world is an X-MIRROR of Unity's (G = diag(-1,1,1), det<0), and
+            // conjugation maps a rotation to R(G.a, -theta) — a mirror reverses rotational sense.
+            // So the authored Unity angle must be NEGATED here or every door swings the wrong way.
+            let open_rad = -d.open_angle.to_radians();
+            // Collect the parts that swing with the panel. `parts` is the door GameObject's
+            // renderer subtree (game truth); match each to the nearest instance of that MESH so
+            // repeated door prefabs can't cross-match. Always include the panel.
+            let mut idxs = vec![panel];
+            for (mesh, pos) in &d.parts {
+                let Some(cands) = by_mesh.get(mesh.as_str()) else { continue };
+                let mut bi: Option<(usize, f32)> = None;
+                for &i in cands {
+                    let r = &cpu.instances[i];
+                    let t = Vec3::new(r.m0[3], r.m1[3], r.m2[3]);
+                    let dd = t.distance_squared(*pos);
+                    if dd < 1.0 && bi.map(|(_, b)| dd < b).unwrap_or(true) {
+                        bi = Some((i, dd));
+                    }
+                }
+                if let Some((i, _)) = bi {
+                    if !idxs.contains(&i) {
+                        idxs.push(i);
+                    }
+                }
+            }
+            // Sibling SHELLS of everything matched so far (see the multi-shell note above).
+            let mut shells: Vec<usize> = Vec::new();
+            for &i in &idxs {
+                let g = cpu.inst_lod_group.get(i).copied().unwrap_or(-1);
+                if g < 0 {
                     continue;
                 }
-                let locked = d.state.eq_ignore_ascii_case("locked");
-                let start = if d.state.eq_ignore_ascii_case("open") { 1.0 } else { 0.0 };
-                // EFT_DOORS_OPEN=1 opens every unlocked door INSTANTLY at spawn (debug / screenshots).
-                let dbg_open = std::env::var("EFT_DOORS_OPEN").map(|v| v.trim() == "1").unwrap_or(false);
-                let p = if dbg_open && !locked { 1.0 } else { start };
-                door_insts.push(DoorInst {
-                    gpu_idx: i as u32,
-                    base,
-                    axis,
-                    open_rad: d.open_angle.to_radians(),
-                    locked,
-                    progress: p,
-                    target: p,
-                });
+                if let Some(sib) = by_group.get(&g) {
+                    for &j in sib {
+                        if !idxs.contains(&j) && !shells.contains(&j) {
+                            shells.push(j);
+                        }
+                    }
+                }
             }
+            idxs.extend(shells);
+            let locked = d.state.eq_ignore_ascii_case("locked");
+            let shipped_open = d.state.eq_ignore_ascii_case("open");
+            // EFT_DOORS_OPEN=1 opens every unlocked door INSTANTLY at spawn (debug / screenshots).
+            let dbg_open = std::env::var("EFT_DOORS_OPEN").map(|v| v.trim() == "1").unwrap_or(false);
+            let p = if dbg_open && !locked { 1.0 } else { shipped_open as u8 as f32 };
+            // A door authored OPEN ships its OPEN pose baked into the instance matrix, so the
+            // animation base must be that pose rotated BACK to closed — otherwise progress=1
+            // rotated it a second time and it rendered at double the open angle.
+            let parts = idxs
+                .into_iter()
+                .map(|i| DoorPart {
+                    gpu_idx: i as u32,
+                    closed: if shipped_open {
+                        door_record(&cpu.instances[i], d.pivot, axis, -open_rad)
+                    } else {
+                        cpu.instances[i]
+                    },
+                })
+                .collect::<Vec<_>>();
+            n_parts += parts.len();
+            door_insts.push(DoorInst {
+                parts,
+                pivot: d.pivot,
+                axis,
+                open_rad,
+                locked,
+                progress: p,
+                target: p,
+            });
         }
-        eprintln!("[doors] matched {} of {} swing doors to instances", door_insts.len(), cpu.doors.len());
+        eprintln!(
+            "[doors] matched {} of {} swing doors ({n_parts} parts)",
+            door_insts.len(),
+            cpu.doors.len()
+        );
         commands.insert_resource(EftDoors {
             doors: door_insts,
             instances_buf: instances.clone(),
@@ -4982,10 +5083,17 @@ fn update_light_power(
 // matched instance record + re-upload it (like update_light_power, but per instance).
 // ============================================================================
 
-/// One matched, animatable door (render world).
+/// One renderer that swings with a door (panel, its glass, inlays).
+struct DoorPart {
+    gpu_idx: u32,            // index into the instance storage buffer
+    closed: InstanceGpuRecord, // the CLOSED-pose record — the animation base
+}
+
+/// One matched, animatable door (render world). A door is several renderers rotating together
+/// about ONE hinge (see `DoorPart`), so every part shares this record's axis/pivot/angle.
 struct DoorInst {
-    gpu_idx: u32,                 // index into the instance storage buffer
-    base: InstanceGpuRecord,      // authored (closed/initial) record — the animation base
+    parts: Vec<DoorPart>,
+    pivot: Vec3,                  // hinge point (viewer world) — parts rotate ABOUT it, not their own origin
     axis: Vec3,                   // swing axis (door local-Z in viewer world), normalized
     open_rad: f32,                // signed open angle in radians (progress 0->1 sweeps 0->open_rad)
     locked: bool,                 // locked+keyed doors don't swing on a plain click
@@ -5013,21 +5121,32 @@ impl ExtractResource for DoorClick {
     }
 }
 
-/// Rotate a door's base instance record about `axis` through `progress*open_rad`, keeping its
-/// translation (the hinge is at the instance origin). Returns the mutated 80-byte record.
-fn door_record(base: &InstanceGpuRecord, axis: Vec3, open_rad: f32, progress: f32) -> InstanceGpuRecord {
-    let r = Mat3::from_axis_angle(axis, open_rad * progress);
+/// Rotate one door part by `rad` about `axis` THROUGH THE HINGE `pivot`. The panel's own origin
+/// is the hinge, but a part (glass, inlay) can sit anywhere on the leaf, so the translation is
+/// carried around the pivot too — rotating each part about its own origin would tear the door
+/// apart. Returns the mutated 80-byte record.
+fn door_record(base: &InstanceGpuRecord, pivot: Vec3, axis: Vec3, rad: f32) -> InstanceGpuRecord {
+    let r = Mat3::from_axis_angle(axis, rad);
     let base_lin = Mat3::from_cols(
         Vec3::new(base.m0[0], base.m1[0], base.m2[0]),
         Vec3::new(base.m0[1], base.m1[1], base.m2[1]),
         Vec3::new(base.m0[2], base.m1[2], base.m2[2]),
     );
-    let l = r * base_lin; // rotate the linear part about the origin (== the hinge)
+    let l = r * base_lin;
+    let t = Vec3::new(base.m0[3], base.m1[3], base.m2[3]);
+    let t2 = pivot + r * (t - pivot);
     let mut rec = *base;
-    rec.m0[0] = l.x_axis.x; rec.m0[1] = l.y_axis.x; rec.m0[2] = l.z_axis.x;
-    rec.m1[0] = l.x_axis.y; rec.m1[1] = l.y_axis.y; rec.m1[2] = l.z_axis.y;
-    rec.m2[0] = l.x_axis.z; rec.m2[1] = l.y_axis.z; rec.m2[2] = l.z_axis.z;
-    rec // translation (m*[3]) + ids + sphere unchanged
+    rec.m0[0] = l.x_axis.x; rec.m0[1] = l.y_axis.x; rec.m0[2] = l.z_axis.x; rec.m0[3] = t2.x;
+    rec.m1[0] = l.x_axis.y; rec.m1[1] = l.y_axis.y; rec.m1[2] = l.z_axis.y; rec.m1[3] = t2.y;
+    rec.m2[0] = l.x_axis.z; rec.m2[1] = l.y_axis.z; rec.m2[2] = l.z_axis.z; rec.m2[3] = t2.z;
+    // Carry the cull sphere with the part (same rigid motion) — its authored centre would
+    // otherwise stay at the closed pose and cull a wide-open door at grazing angles. Rotation
+    // preserves distances, so the radius is unchanged.
+    let c = pivot + r * (Vec3::new(base.sphere[0], base.sphere[1], base.sphere[2]) - pivot);
+    rec.sphere[0] = c.x;
+    rec.sphere[1] = c.y;
+    rec.sphere[2] = c.z;
+    rec
 }
 
 /// Toggle the nearest door on a click + ease all in-flight doors, re-uploading changed instances.
@@ -5049,8 +5168,7 @@ fn animate_doors(
             if let Some(p) = c.point {
                 let mut best: Option<(usize, f32)> = None;
                 for (i, d) in res.doors.iter().enumerate() {
-                    let t = Vec3::new(d.base.m0[3], d.base.m1[3], d.base.m2[3]);
-                    let dist = t.distance_squared(p);
+                    let dist = d.pivot.distance_squared(p);
                     if dist < 6.25 && best.map(|(_, b)| dist < b).unwrap_or(true) {
                         best = Some((i, dist));
                     }
@@ -5077,10 +5195,12 @@ fn animate_doors(
             d.progress += (d.target - d.progress).signum() * step;
             d.progress = d.progress.clamp(0.0, 1.0);
         }
-        // ease (smoothstep) for a nicer swing
+        // ease (smoothstep) for a nicer swing — every part of the leaf moves together
         let e = d.progress * d.progress * (3.0 - 2.0 * d.progress);
-        let rec = door_record(&d.base, d.axis, d.open_rad, e);
-        render_queue.write_buffer(&buf, d.gpu_idx as u64 * 80, bytemuck::bytes_of(&rec));
+        for part in &d.parts {
+            let rec = door_record(&part.closed, d.pivot, d.axis, d.open_rad * e);
+            render_queue.write_buffer(&buf, part.gpu_idx as u64 * 80, bytemuck::bytes_of(&rec));
+        }
     }
 }
 
