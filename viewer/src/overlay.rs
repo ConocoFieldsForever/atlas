@@ -160,6 +160,13 @@ impl OverlayConfig {
 pub struct OverlayState {
     /// Is the overlay currently summoned?
     pub shown: bool,
+    /// Bumped whenever something asks for the overlay to be brought to the FRONT, even if it is
+    /// already `shown`. Windows can put us behind (or minimise us) without changing `shown` at
+    /// all -- notably when Tarkov takes exclusive fullscreen back after a screenshot -- and
+    /// because `apply_overlay` is change-gated on `shown`, nothing ever re-raised the window.
+    /// The symptom is the overlay being "open but invisible": state says shown, the window
+    /// exists, and the OS is not showing it. Consumers compare against their last seen value.
+    pub raise_nonce: u32,
 }
 
 pub struct OverlayPlugin;
@@ -179,7 +186,7 @@ impl Plugin for OverlayPlugin {
             app.add_systems(PostStartup, || std::env::remove_var("EFT_POSE"));
         }
         app.insert_resource(OverlayConfig::load().sanitized())
-            .insert_resource(OverlayState { shown: summon })
+            .insert_resource(OverlayState { shown: summon, raise_nonce: 0 })
             .add_systems(Update, (toggle_overlay, apply_overlay).chain());
         app.add_systems(bevy_egui::EguiPrimaryContextPass, overlay_return_button);
     }
@@ -217,11 +224,16 @@ fn apply_overlay(
     any_monitor: Query<&bevy::window::Monitor>,
     mut winit: ResMut<bevy::winit::WinitSettings>,
     mut last: Local<Option<bool>>,
+    mut last_nonce: Local<Option<u32>>,
     mut saved: Local<Option<(WindowPosition, Vec2)>>,
 ) {
-    if *last == Some(state.shown) && !cfg.is_changed() {
+    // Re-run on a shown/hidden transition, on a settings change, OR on an explicit re-raise
+    // request (see `OverlayState::raise_nonce`) -- the last one is what makes a second screenshot
+    // pull the window back to the front after the game has taken the foreground.
+    if *last == Some(state.shown) && !cfg.is_changed() && *last_nonce == Some(state.raise_nonce) {
         return;
     }
+    *last_nonce = Some(state.raise_nonce);
     // Whether the overlay was ACTUALLY up before this run. The hide branch below must only touch
     // the window on a real shown->hidden transition: on the first frame (`last` = None) and on
     // every settings tweak (cfg change marks this system dirty) `shown` is simply still false, and
