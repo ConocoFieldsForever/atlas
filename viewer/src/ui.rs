@@ -245,6 +245,7 @@ impl Plugin for UiPlugin {
                 // localization exists; `lang_toggle` was removed rather than lie in-raid.
                 map_loading_indicator,
                 map_load_error_panel,
+                drone_hud,
                 fit_camera_viewport,
             )
                 .chain(),
@@ -1855,9 +1856,12 @@ fn camera_panel(
     menu: Option<Res<crate::menu::MenuState>>,
     mut cam: ResMut<crate::CameraSettings>,
     mut gfx: ResMut<crate::render::GfxSettings>,
+    mut agent: ResMut<crate::agent_link::AgentLinkCtl>,
+    agent_shared: Option<Res<crate::agent_link::AgentShared>>,
 ) {
     use bevy_egui::egui::{self, RichText};
     use crate::ui_theme as theme;
+    use crate::CamMode;
     if menu.is_some() || *tab != RightPanelTab::Camera {
         return;
     }
@@ -1869,8 +1873,15 @@ fn camera_panel(
     // frame (only real edits write back — same discipline as the graphics panel).
     let mut fov = cam.fov_deg;
     let mut fly = cam.fly_speed;
-    let mut walk = cam.walk_mode;
+    let mut mode = cam.mode;
     let mut expo = gfx.grade_exposure;
+    let mut agent_on = agent.enabled;
+    let mut acro = cam.drone_acro;
+    let mut rc_rate = cam.drone_rc_rate;
+    let mut rc_expo = cam.drone_expo;
+    let mut rc_super = cam.drone_super_rate;
+    let mut fpv_noise = cam.fpv_noise;
+    let mut fpv_range = cam.fpv_range;
     egui::SidePanel::right("map_layers")
         .default_width(300.0)
         .frame(theme::panel_frame())
@@ -1890,14 +1901,83 @@ fn camera_panel(
             ui.add(egui::Slider::new(&mut fly, 2.0..=1500.0).logarithmic(true).suffix(" m/s").text(""));
             ui.add_space(10.0);
 
-            ui.checkbox(&mut walk, "Walk mode (ground-follow + jump)");
-            ui.label(
-                RichText::new(
-                    "WASD walk, Space jump, Shift sprint; scroll scales walk speed + jump height",
-                )
-                .color(DIM)
-                .size(10.0),
-            );
+            ui.label(RichText::new("MODE").color(DIM).size(11.0));
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut mode, CamMode::Fly, "Fly");
+                ui.selectable_value(&mut mode, CamMode::Walk, "Walk");
+                ui.selectable_value(&mut mode, CamMode::Drone, "Drone FPV");
+            });
+            let hint = match mode {
+                CamMode::Fly => "WASD + QE fly, RMB look, Shift boost; scroll scales speed",
+                CamMode::Walk => {
+                    "WASD walk, Space jump, Shift sprint; scroll scales walk speed + jump height"
+                }
+                CamMode::Drone => {
+                    "Gamepad / USB RC transmitter: Mode 2 (left = throttle+yaw, right = \
+                     pitch+roll), South = respawn. Keyboard: W/S pitch, A/D roll, RMB mouse-X \
+                     (or Q/E) yaw, Space/Ctrl throttle, R respawn; scroll tilts the FPV cam."
+                }
+            };
+            ui.label(RichText::new(hint).color(DIM).size(10.0));
+            if mode == CamMode::Drone {
+                ui.add_space(6.0);
+                ui.checkbox(&mut acro, "Acro (rates + manual throttle — real FPV)");
+                if acro {
+                    ui.label(RichText::new("RATES (Betaflight)").color(DIM).size(11.0));
+                    ui.add(egui::Slider::new(&mut rc_rate, 0.5..=2.5).text("RC rate"));
+                    ui.add(egui::Slider::new(&mut rc_expo, 0.0..=0.8).text("expo"));
+                    ui.add(egui::Slider::new(&mut rc_super, 0.0..=0.95).text("super"));
+                    let full = crate::drone::bf_rate(1.0, rc_rate, rc_expo, rc_super).to_degrees();
+                    ui.label(
+                        RichText::new(format!("full-stick rate ≈ {full:.0}°/s"))
+                            .color(DIM)
+                            .size(10.0),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Angle: self-leveling + altitude assist (trainer wheels)")
+                            .color(DIM)
+                            .size(10.0),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("ANALOG CAM").color(DIM).size(11.0));
+                ui.add(egui::Slider::new(&mut fpv_noise, 0.0..=1.0).text("noise"));
+                ui.add(
+                    egui::Slider::new(&mut fpv_range, 50.0..=1500.0)
+                        .logarithmic(true)
+                        .suffix(" m")
+                        .text("link range"),
+                );
+                ui.label(
+                    RichText::new(
+                        "5.8G analog feed: RSSI falls with range and every wall between you \
+                         (launch point) and the quad. 0 noise = clean digital cam.",
+                    )
+                    .color(DIM)
+                    .size(10.0),
+                );
+            }
+            ui.add_space(10.0);
+
+            // Agent link: the standardized TCP sim interface (docs/AGENT_LINK.md). Local-only.
+            ui.label(RichText::new("AGENT LINK").color(DIM).size(11.0));
+            ui.checkbox(&mut agent_on, format!("Serve 127.0.0.1:{}", agent.port));
+            ui.label(RichText::new(agent.status.as_str()).color(DIM).size(10.0));
+            if let Some(sh) = &agent_shared {
+                let mut w = sh.0.lock().unwrap();
+                let mut spec = w.spectate;
+                ui.checkbox(&mut spec, "Spectate agent drone (in Drone mode)");
+                if spec != w.spectate {
+                    w.spectate = spec;
+                }
+            } else {
+                ui.label(
+                    RichText::new("Lockstep drone sim for external trainers — see docs/AGENT_LINK.md")
+                        .color(DIM)
+                        .size(10.0),
+                );
+            }
         });
     if fov != cam.fov_deg {
         cam.fov_deg = fov;
@@ -1905,11 +1985,171 @@ fn camera_panel(
     if fly != cam.fly_speed {
         cam.fly_speed = fly;
     }
-    if walk != cam.walk_mode {
-        cam.walk_mode = walk;
+    if mode != cam.mode {
+        cam.mode = mode;
     }
     if expo != gfx.grade_exposure {
         gfx.grade_exposure = expo;
+    }
+    if agent_on != agent.enabled {
+        agent.enabled = agent_on;
+    }
+    if acro != cam.drone_acro {
+        cam.drone_acro = acro;
+    }
+    if rc_rate != cam.drone_rc_rate {
+        cam.drone_rc_rate = rc_rate;
+    }
+    if rc_expo != cam.drone_expo {
+        cam.drone_expo = rc_expo;
+    }
+    if rc_super != cam.drone_super_rate {
+        cam.drone_super_rate = rc_super;
+    }
+    if fpv_noise != cam.fpv_noise {
+        cam.fpv_noise = fpv_noise;
+    }
+    if fpv_range != cam.fpv_range {
+        cam.fpv_range = fpv_range;
+    }
+}
+
+/// FPV OSD (drone mode only): center crosshair, left telemetry column (altitude / ground speed /
+/// climb), right throttle bar + mode line, red CRASHED banner, agent-session banner. Painted on a
+/// foreground egui layer over the free central viewport (panels stay usable).
+#[cfg(feature = "egui")]
+fn drone_hud(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    settings: Res<crate::CameraSettings>,
+    pads: Query<&Gamepad>,
+    agent: Option<Res<crate::agent_link::AgentShared>>,
+    fx: Res<crate::render::fpv_cam::FpvCamFx>,
+    q: Query<&crate::drone::DroneRig, With<crate::render::CullCamera>>,
+) {
+    use bevy_egui::egui::{self, Align2, Color32, FontId, Id, LayerId, Order, Pos2, Rect, Stroke, Vec2 as EVec2};
+    if menu.is_some() || settings.mode != crate::CamMode::Drone {
+        return;
+    }
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return;
+    };
+    // Pull the airframe to display: an active agent session's drone, else the manual rig.
+    let mut agent_live = false;
+    let (pos, vel, thrust, crashed) = {
+        let mut from_agent = None;
+        if let Some(sh) = &agent {
+            let w = sh.0.lock().unwrap();
+            if w.active {
+                agent_live = true;
+                from_agent = Some((w.drone.pos, w.drone.vel, w.drone.thrust, w.drone.crashed));
+            }
+        }
+        match (from_agent, q.single()) {
+            (Some(a), _) => a,
+            (None, Ok(rig)) if rig.live => {
+                (rig.state.pos, rig.state.vel, rig.throttle, rig.state.crashed)
+            }
+            _ => return,
+        }
+    };
+
+    let osd = Color32::from_rgb(190, 235, 190); // pale phosphor green, Betaflight-OSD-ish
+    let dim = Color32::from_rgba_unmultiplied(190, 235, 190, 140);
+    let mono = FontId::monospace(14.0);
+    let painter = ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("fpv_osd")));
+    let view = ctx.available_rect(); // the free central viewport (right rail excluded)
+    let c = view.center();
+
+    // Crosshair: gapped cross + dot, like an FPV cam center mark.
+    let s = Stroke::new(1.5, osd);
+    for (a, b) in [
+        (EVec2::new(-14.0, 0.0), EVec2::new(-5.0, 0.0)),
+        (EVec2::new(5.0, 0.0), EVec2::new(14.0, 0.0)),
+        (EVec2::new(0.0, -14.0), EVec2::new(0.0, -5.0)),
+        (EVec2::new(0.0, 5.0), EVec2::new(0.0, 14.0)),
+    ] {
+        painter.line_segment([c + a, c + b], s);
+    }
+    painter.circle_filled(c, 1.5, osd);
+
+    // Left column: altitude (world Y), ground speed, climb rate.
+    let gs = (vel.x * vel.x + vel.z * vel.z).sqrt();
+    let left = Pos2::new(view.left() + 14.0, c.y - 24.0);
+    // RSSI bar glyphs like a real OSD: ▁▃▅▇ filled by link quality.
+    let rssi = (fx.signal.clamp(0.0, 1.0) * 4.0).round() as usize;
+    let bars: String = ["\u{2581}", "\u{2583}", "\u{2585}", "\u{2587}"]
+        .iter()
+        .enumerate()
+        .map(|(i, g)| if i < rssi { *g } else { " " })
+        .collect();
+    for (i, line) in [
+        format!("ALT {:>6.1} m", pos.y),
+        format!("SPD {:>6.1} m/s", gs),
+        format!("VSI {:>+6.1} m/s", vel.y),
+        format!("RSSI {bars} {:>3.0}%", fx.signal * 100.0),
+    ]
+    .iter()
+    .enumerate()
+    {
+        painter.text(
+            Pos2::new(left.x, left.y + i as f32 * 18.0),
+            Align2::LEFT_TOP,
+            line,
+            mono.clone(),
+            osd,
+        );
+    }
+
+    // Right: vertical throttle bar + flight-mode / input line.
+    let bar = Rect::from_min_size(
+        Pos2::new(view.right() - 30.0, c.y - 50.0),
+        EVec2::new(8.0, 100.0),
+    );
+    painter.rect_stroke(bar, 2.0, Stroke::new(1.0, dim), egui::StrokeKind::Inside);
+    let fill_h = 100.0 * thrust.clamp(0.0, 1.0);
+    painter.rect_filled(
+        Rect::from_min_max(Pos2::new(bar.min.x, bar.max.y - fill_h), bar.max),
+        2.0,
+        osd,
+    );
+    painter.text(
+        Pos2::new(bar.min.x - 6.0, bar.max.y),
+        Align2::RIGHT_BOTTOM,
+        format!("THR {:>3.0}%", thrust * 100.0),
+        mono.clone(),
+        osd,
+    );
+    let mode_line = format!(
+        "{}  {}",
+        if agent_live { "AGENT" } else if settings.drone_acro { "ACRO" } else { "ANGLE" },
+        if pads.iter().next().is_some() { "PAD" } else { "KB" },
+    );
+    painter.text(
+        Pos2::new(bar.min.x - 6.0, bar.min.y),
+        Align2::RIGHT_TOP,
+        mode_line,
+        FontId::monospace(12.0),
+        dim,
+    );
+
+    // Banners.
+    if crashed {
+        painter.text(
+            Pos2::new(c.x, view.top() + 60.0),
+            Align2::CENTER_TOP,
+            if agent_live { "CRASHED" } else { "CRASHED — R to reset" },
+            FontId::monospace(20.0),
+            Color32::from_rgb(255, 90, 70),
+        );
+    } else if agent_live {
+        painter.text(
+            Pos2::new(c.x, view.top() + 60.0),
+            Align2::CENTER_TOP,
+            "AGENT SESSION — spectating",
+            FontId::monospace(13.0),
+            dim,
+        );
     }
 }
 

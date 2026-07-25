@@ -49,6 +49,9 @@ sys-locale = "0.3"
 # Data-parallel column casting in the portable CPU nav baker (nav_bake). Already in the tree as a
 # transitive dep (Bevy/wgpu), so this pins no new version — just makes it a direct dependency.
 rayon = "1"
+# File layer for the persistent viewer log (packs/logs/atlas_viewer.log — GPU-crash forensics on
+# machines we can't repro on). Already in the tree via bevy_log; direct dep adds no new version.
+tracing-subscriber = "0.3"
 
 # Linux has no native folder-picker backend built into rfd; pick GTK3 (synchronous, no portal
 # daemon required, matches the libgtk-3-dev the project already needs for other things).

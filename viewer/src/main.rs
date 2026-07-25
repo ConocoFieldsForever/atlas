@@ -9,6 +9,8 @@
 //! vertex shader — NEVER TRS-decomposed. The GPU-driven compute-cull upgrade is
 //! designed in `render::gpu_driven` (M1).
 
+mod agent_link;
+mod drone;
 mod eftpack;
 mod game_watch;
 mod gpu_lease;
@@ -95,6 +97,17 @@ pub struct CameraCommand {
     pub eye: Option<(Vec3, Vec3)>,
 }
 
+/// Which locomotion model owns the camera. `Fly` = free-fly (WASD+QE), `Walk` = FPV on foot
+/// (ground-follow + jump + collision), `Drone` = FPV quadcopter (drone.rs physics; also the body
+/// the agent link flies).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CamMode {
+    #[default]
+    Fly,
+    Walk,
+    Drone,
+}
+
 /// Camera-tab settings (the toolbar's camera panel edits these; the flycam systems read them).
 /// Decoupled from the private `FlyCam` like `CameraCommand`.
 #[derive(Resource)]
@@ -106,17 +119,48 @@ pub struct CameraSettings {
     /// Base WALK speed (m/s); the scroll wheel scales this in walk mode, and jump height rides
     /// off it (scroll faster -> move faster + jump higher).
     pub walk_speed: f32,
-    /// Walk mode (ground-follow + jump) vs free-fly.
-    pub walk_mode: bool,
+    /// Camera locomotion mode (Fly / Walk / Drone).
+    pub mode: CamMode,
+    /// FPV camera uptilt in drone mode (deg) — real FPV quads mount the camera tilted up so the
+    /// horizon is visible while pitched forward at speed. Scroll adjusts it live in drone mode.
+    pub drone_cam_tilt_deg: f32,
+    /// Drone manual flight: true = ACRO (rates + positional throttle — the real FPV deal),
+    /// false = ANGLE (self-leveling + altitude assist — trainer wheels).
+    pub drone_acro: bool,
+    /// Betaflight-style rate profile for manual acro (RC rate / expo / super rate).
+    pub drone_rc_rate: f32,
+    pub drone_expo: f32,
+    pub drone_super_rate: f32,
+    /// Analog FPV video-link effect master gain (0 = clean digital picture).
+    pub fpv_noise: f32,
+    /// Video-link usable range (m): RSSI hits zero around here in open air; walls shorten it.
+    pub fpv_range: f32,
 }
 
 impl Default for CameraSettings {
     fn default() -> Self {
+        // EFT_CAM=fly|walk|drone picks the start mode; EFT_WALK=1 kept as the legacy walk alias.
+        let mode = match std::env::var("EFT_CAM").as_deref().map(str::trim) {
+            Ok("walk") => CamMode::Walk,
+            Ok("drone") => CamMode::Drone,
+            Ok(_) => CamMode::Fly,
+            Err(_) if std::env::var("EFT_WALK").map(|v| v.trim() == "1").unwrap_or(false) => {
+                CamMode::Walk
+            }
+            Err(_) => CamMode::Fly,
+        };
         Self {
             fov_deg: 60.0,   // Bevy's default PerspectiveProjection fov (0.25π ≈ 45°? no — ~60)
             fly_speed: 40.0, // matches the old FlyCam::default speed
             walk_speed: 5.0, // human-ish
-            walk_mode: std::env::var("EFT_WALK").map(|v| v.trim() == "1").unwrap_or(false),
+            mode,
+            drone_cam_tilt_deg: 18.0,
+            drone_acro: true,
+            drone_rc_rate: 1.0,
+            drone_expo: 0.25,
+            drone_super_rate: 0.7,
+            fpv_noise: 0.7,
+            fpv_range: 350.0,
         }
     }
 }
@@ -133,12 +177,20 @@ fn flycam_scroll(
     }
     // ~1.15x per notch; clamp so it never crawls or teleports.
     let factor = 1.15f32.powf(scroll.delta.y);
-    if settings.walk_mode {
-        // In walk mode the wheel juices walk speed (and jump height rides off it) into a
-        // human-ish band, so a fast scroll makes the walk cam quicker AND jump higher.
-        settings.walk_speed = (settings.walk_speed * factor).clamp(1.5, 12.0);
-    } else {
-        settings.fly_speed = (settings.fly_speed * factor).clamp(2.0, 4000.0);
+    match settings.mode {
+        CamMode::Walk => {
+            // In walk mode the wheel juices walk speed (and jump height rides off it) into a
+            // human-ish band, so a fast scroll makes the walk cam quicker AND jump higher.
+            settings.walk_speed = (settings.walk_speed * factor).clamp(1.5, 12.0);
+        }
+        CamMode::Drone => {
+            // In drone mode the wheel adjusts the FPV camera uptilt (like re-mounting the cam).
+            settings.drone_cam_tilt_deg =
+                (settings.drone_cam_tilt_deg + scroll.delta.y * 2.0).clamp(0.0, 45.0);
+        }
+        CamMode::Fly => {
+            settings.fly_speed = (settings.fly_speed * factor).clamp(2.0, 4000.0);
+        }
     }
 }
 
@@ -404,6 +456,7 @@ fn reset_map_view(
             &mut Projection,
             &mut FlyCam,
             &mut walk_ground::WalkState,
+            &mut drone::DroneRig,
             Option<&mut Skybox>,
         ),
         With<CullCamera>,
@@ -417,7 +470,8 @@ fn reset_map_view(
     }
     let was_first = last.is_none();
     *last = Some(cur);
-    let Ok((cam_entity, mut tf, mut proj, mut fly, mut walk, skybox)) = cam.single_mut() else {
+    let Ok((cam_entity, mut tf, mut proj, mut fly, mut walk, mut rig, skybox)) = cam.single_mut()
+    else {
         return;
     };
     // Skip only if `setup` already framed this pack AND built its skybox (sync path). On the async
@@ -438,8 +492,10 @@ fn reset_map_view(
         }
     }
     // Drop stale ground/velocity from the old map (else the fell-through-world backstop can teleport
-    // the player to a nonexistent old-map Y, and a mid-jump vy carries over).
+    // the player to a nonexistent old-map Y, and a mid-jump vy carries over). Same for the drone —
+    // it respawns at the new camera pose on the next drone-mode frame.
     *walk = walk_ground::WalkState::default();
+    *rig = drone::DroneRig::default();
     // Rebuild the skybox for the new sun. SWAP an existing cubemap (in-place swap / sync path, frees
     // the old image so it doesn't leak each swap) or INSERT one when the camera has none yet (the
     // async cold-load first frame — same params as `setup`'s insert).
@@ -725,6 +781,14 @@ fn main() {
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
+            // Persistent file log (packs/logs/atlas_viewer.log): double-click launches have no
+            // console, so without this a GPU crash on a user's machine (wgpu validation error,
+            // device-lost, TDR) leaves zero evidence. The file layer tees everything the console
+            // gets; a panic hook below routes panic messages through it too.
+            .set(bevy::log::LogPlugin {
+                custom_layer: viewer_file_log_layer,
+                ..default()
+            })
             .set(bevy::render::RenderPlugin {
                 // P0/B1: pin to Vulkan on Windows (see render::allowed_backends). DX12 never worked
                 // for EITHER the GPU-driven or M0 path (it crashes on a Bevy shader regardless of
@@ -829,7 +893,7 @@ fn main() {
     if let Some(g) = grade_lut {
         app.insert_resource(g);
     }
-    app.add_plugins((GradePlugin, render::SsaoPlugin));
+    app.add_plugins((GradePlugin, render::SsaoPlugin, render::FpvCamPlugin));
     // Runtime graphics settings reach the render world on EVERY render path (grade/SSAO install
     // unconditionally, so the extraction can't live inside EftGpuDrivenPlugin — under EFT_RENDER=
     // m0/std the toggles would silently stop reaching the GPU).
@@ -889,14 +953,28 @@ fn main() {
         .init_resource::<PendingMapLoad>() // async in-place pack load (no frame freeze on switch)
         .init_resource::<MapLoadError>() // async load failure -> UI error + back-to-menu (finding 4)
         .init_resource::<ForcedLod>() // graphics-panel LOD selector (meaningful on --alllod packs)
-        .add_systems(Startup, setup)
-        // walk_move runs AFTER flycam_look (orientation resolved) and flycam_move (mutually
-        // exclusive by walk_mode) so they can't race the shared Transform. Disabled in the MENU
+        .init_resource::<agent_link::AgentLinkCtl>() // drone agent link (TCP lockstep sim control)
+        // DoorClick is CONSUMED only by the gpu-driven render path, but pick_system (always-on)
+        // WRITES it unconditionally — on the M0/std paths EftGpuDrivenPlugin (its only init site)
+        // never runs and Bevy 0.17 panics at param validation the first Update tick (field report:
+        // the LLPC auto-fallback exposed this instantly on an RX 7800 XT). Init it here for every
+        // path; on M0 it's a dead-letter box, which is harmless.
+        .init_resource::<render::gpu_driven::DoorClick>()
+        .add_systems(Startup, (setup, log_render_path))
+        // walk_move/drone_move run AFTER flycam_look (orientation resolved) and flycam_move
+        // (mutually exclusive by CamMode) so they can't race the shared Transform; the agent
+        // spectate cam runs last and wins while a session drives the drone. Disabled in the MENU
         // (MenuState present): the backdrop camera stays locked to its composed pose — no WASD /
         // RMB-look / cursor-grab — while the scene itself drifts under the cursor (menu_city_update).
         .add_systems(
             Update,
-            (cursor_grab, flycam_look, flycam_move, walk_move)
+            (
+                cursor_grab,
+                flycam_look,
+                flycam_move,
+                walk_move,
+                drone_move,
+            )
                 .chain()
                 .run_if(not(resource_exists::<menu::MenuState>)),
         )
@@ -904,6 +982,11 @@ fn main() {
         .add_systems(
             Update,
             (apply_gfx_camera, load_map, poll_map_load, clear_map_error_on_new_load, flycam_scroll, apply_camera_fov, build_walk_ground),
+        )
+        .add_systems(
+            Update,
+            (agent_link::agent_sync, agent_link::agent_gizmos)
+                .run_if(not(resource_exists::<menu::MenuState>)),
         )
         // In-place map swap: re-frame the reused camera + rebuild the skybox on a MapEpoch bump.
         .add_systems(Update, reset_map_view.run_if(resource_changed::<render::MapEpoch>));
@@ -951,7 +1034,56 @@ fn main() {
         app.insert_resource(MapSwitch(pack_dir));
     }
 
+    // Panics → atlas_viewer.log (the subscriber exists now that LogPlugin is installed).
+    install_panic_log_hook();
+
     app.run();
+}
+
+/// Startup echo of the resolved render path INTO the file log: the capability probe (incl. the
+/// LLPC driver quirk) runs before the log subscriber exists, so its eprintln is invisible on a
+/// double-click launch — this line is how a user's atlas_viewer.log tells us which path ran.
+fn log_render_path(rp: Res<RenderPath>) {
+    info!("render path: {:?} (auto-probed unless EFT_RENDER was set)", *rp);
+}
+
+/// File layer for the LogPlugin: tee all tracing output (incl. wgpu validation errors and
+/// device-lost messages) to `packs/logs/atlas_viewer.log`, appending across sessions with a
+/// separator line, rotated once past ~5 MB. Returns None (console-only) if the packs dir isn't
+/// writable — logging must never keep the app from starting.
+fn viewer_file_log_layer(_app: &mut App) -> Option<bevy::log::BoxedLayer> {
+    let dir = paths::packs_root().join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("atlas_viewer.log");
+    if std::fs::metadata(&path).map(|m| m.len() > 5_000_000).unwrap_or(false) {
+        let _ = std::fs::rename(&path, dir.join("atlas_viewer.old.log"));
+    }
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+    {
+        use std::io::Write as _;
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut f = &file;
+        let _ = writeln!(f, "\n==== atlas session start (epoch {epoch}, v{}) ====", env!("CARGO_PKG_VERSION"));
+    }
+    Some(Box::new(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file)),
+    ))
+}
+
+/// Route panic messages through tracing so they land in atlas_viewer.log before the process dies
+/// (release builds are panic=abort — the hook still runs first). Chains the default hook so the
+/// console backtrace behavior is unchanged. Installed AFTER LogPlugin so the subscriber exists.
+fn install_panic_log_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        error!("PANIC: {info}");
+        default_hook(info);
+    }));
 }
 
 /// f32 -> IEEE 754 half bits (round-to-nearest-even). Shared by the sky cubemap and the grade
@@ -1168,6 +1300,7 @@ fn setup(
             ..default()
         },
         walk_ground::WalkState::default(), // per-camera walk locomotion state (inert until walk mode)
+        drone::DroneRig::default(), // per-camera drone airframe state (inert until drone mode)
     ));
     // Display chain: the REAL game grade LUT (render::grade — Hejl + film curves + Fahrenheit
     // fit, baked FROM THE GAME and identical on every map) replaces Bevy's tonemapping when
@@ -1261,9 +1394,12 @@ fn flycam_look(
     mouse: Res<ButtonInput<MouseButton>>,
     motion: Res<AccumulatedMouseMotion>,
     pointer_on_ui: Res<inspect::PointerOnUi>,
+    settings: Res<CameraSettings>,
     mut q: Query<(&mut Transform, &mut FlyCam)>,
 ) {
-    if !mouse.pressed(MouseButton::Right) || pointer_on_ui.0 {
+    // Drone mode: the camera is bolted to the airframe — mouse X feeds the drone's yaw stick
+    // (drone::drone_move), never free-look.
+    if !mouse.pressed(MouseButton::Right) || pointer_on_ui.0 || settings.mode == CamMode::Drone {
         return;
     }
     let delta = motion.delta;
@@ -1288,8 +1424,8 @@ fn flycam_move(
     mut q: Query<(&mut Transform, &FlyCam)>,
 ) {
     // Typing 'wasd' into the marker-search box must not fly the camera (Codex review).
-    // In walk mode, walk_move owns locomotion — fly is inert.
-    if ui_kb.0 || settings.walk_mode {
+    // In walk/drone mode, walk_move / drone_move owns locomotion — fly is inert.
+    if ui_kb.0 || settings.mode != CamMode::Fly {
         return;
     }
     let dt = time.delta_secs();
@@ -1327,20 +1463,219 @@ fn flycam_move(
     }
 }
 
-/// Lazily build the walk-mode ground grid the first time walk mode is enabled (fly-only users
-/// never pay the ~250-400 MB + build cost). One-shot: skips once the resource exists.
+/// FPV drone locomotion (CamMode::Drone). Two sources can own the airframe:
+///  - an ACTIVE agent-link session (external trainer stepping the sim over TCP): the camera
+///    spectates that drone's pose (toggleable) and manual input stands down;
+///  - otherwise the manual rig. ACRO (default — the real FPV deal): sticks command body rates
+///    through a Betaflight rate curve, throttle is POSITIONAL (Space/Ctrl ramp it, a gamepad /
+///    USB RC transmitter's left stick sets it directly — Mode 2: left = throttle+yaw, right =
+///    pitch+roll). ANGLE: self-leveling tilt + altitude assist (trainer wheels). R (or gamepad
+///    South) respawns. Physics = drone::step at 1 ms substeps; crash cuts thrust until reset.
+fn drone_move(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    motion: Res<AccumulatedMouseMotion>,
+    pads: Query<&Gamepad>,
+    time: Res<Time>,
+    ui_kb: Res<inspect::UiWantsKeyboard>,
+    settings: Res<CameraSettings>,
+    shared: Option<Res<agent_link::AgentShared>>,
+    grid: Option<Res<walk_ground::GroundGrid>>,
+    mut q: Query<(&mut Transform, &mut FlyCam, &mut drone::DroneRig), With<CullCamera>>,
+) {
+    if settings.mode != CamMode::Drone {
+        // Leaving drone mode: the rig respawns fresh at the camera pose next activation.
+        for (_, _, mut rig) in &mut q {
+            if rig.live {
+                rig.live = false;
+            }
+        }
+        return;
+    }
+    let cam_tilt = settings.drone_cam_tilt_deg.to_radians();
+    let dt = time.delta_secs().min(0.05);
+    let typing = ui_kb.0;
+    for (mut tf, mut cam, mut rig) in &mut q {
+        // Agent session active → spectate its airframe instead of flying the manual rig.
+        if let Some(sh) = &shared {
+            let w = sh.0.lock().unwrap();
+            if w.active {
+                if w.spectate {
+                    tf.translation = w.drone.pos;
+                    tf.rotation = w.drone.quat * Quat::from_rotation_x(w.params.cam_tilt);
+                    let fwd = *tf.forward();
+                    cam.yaw = (-fwd.x).atan2(-fwd.z);
+                    cam.pitch = fwd.y.clamp(-1.0, 1.0).asin();
+                }
+                rig.live = false;
+                continue;
+            }
+        }
+        let p = drone::DroneParams::default();
+        // (Re)spawn the manual rig at the current camera pose.
+        if !rig.live {
+            rig.state = drone::DroneState::spawn(tf.translation, cam.yaw);
+            rig.spawn_pos = tf.translation;
+            rig.spawn_yaw = cam.yaw;
+            rig.kb_stick = Vec3::ZERO;
+            rig.throttle = p.hover_throttle();
+            rig.live = true;
+        }
+        let pad = pads.iter().next();
+        let respawn = (!typing && keys.just_pressed(KeyCode::KeyR))
+            || pad.map(|g| g.just_pressed(GamepadButton::South)).unwrap_or(false)
+            // Fell out of the world (void map edge) → respawn rather than fall forever.
+            || rig.state.pos.y < rig.spawn_pos.y - 400.0;
+        if respawn {
+            rig.state = drone::DroneState::spawn(rig.spawn_pos, rig.spawn_yaw);
+            rig.throttle = p.hover_throttle();
+        }
+
+        // --- Virtual sticks: smoothed keyboard + mouse yaw + raw gamepad (Mode 2) -------------
+        let mut kb = Vec3::ZERO; // (roll, pitch, yaw) targets, ±1
+        if !typing {
+            if keys.pressed(KeyCode::KeyW) {
+                kb.y += 1.0;
+            }
+            if keys.pressed(KeyCode::KeyS) {
+                kb.y -= 1.0;
+            }
+            if keys.pressed(KeyCode::KeyD) {
+                kb.x += 1.0;
+            }
+            if keys.pressed(KeyCode::KeyA) {
+                kb.x -= 1.0;
+            }
+            if keys.pressed(KeyCode::KeyE) {
+                kb.z += 1.0;
+            }
+            if keys.pressed(KeyCode::KeyQ) {
+                kb.z -= 1.0;
+            }
+        }
+        // Keys are square waves; a ~90 ms low-pass turns them into flyable stick ramps.
+        let rise = 1.0 - (-dt / 0.09).exp();
+        let ramp = (kb - rig.kb_stick) * rise;
+        rig.kb_stick += ramp;
+        let mut roll = rig.kb_stick.x;
+        let mut pitch = rig.kb_stick.y;
+        let mut yaw = rig.kb_stick.z;
+        if mouse.pressed(MouseButton::Right) {
+            // Mouse-X is a yaw-rate stick: pixels/frame → normalized, so flick speed = turn rate.
+            yaw += (motion.delta.x * 0.012).clamp(-1.0, 1.0);
+        }
+        // Gamepad / USB RC transmitter (first one found), standard Mode-2 layout with a small
+        // deadzone. Axes ADD to keyboard so either works without a toggle.
+        let mut pad_throttle: Option<f32> = None;
+        if let Some(g) = pad {
+            let dz = |v: f32| if v.abs() < 0.04 { 0.0 } else { v };
+            let rx = dz(g.get(GamepadAxis::RightStickX).unwrap_or(0.0));
+            let ry = dz(g.get(GamepadAxis::RightStickY).unwrap_or(0.0));
+            let lx = dz(g.get(GamepadAxis::LeftStickX).unwrap_or(0.0));
+            let ly = g.get(GamepadAxis::LeftStickY).unwrap_or(0.0);
+            roll += rx;
+            pitch += ry; // stick up = nose forward
+            yaw += lx;
+            if ly.abs() > 0.02 || settings.drone_acro {
+                pad_throttle = Some(((ly + 1.0) * 0.5).clamp(0.0, 1.0));
+            }
+        }
+        roll = roll.clamp(-1.0, 1.0);
+        pitch = pitch.clamp(-1.0, 1.0);
+        yaw = yaw.clamp(-1.0, 1.0);
+
+        let mut act = drone::DroneAction::default();
+        let mode = if settings.drone_acro {
+            // ACRO: Betaflight rate curve → normalized rate command (physical cap = max_rate).
+            let (rc, ex, sr) = (settings.drone_rc_rate, settings.drone_expo, settings.drone_super_rate);
+            act.roll = (drone::bf_rate(roll, rc, ex, sr) / p.max_rate.z).clamp(-1.0, 1.0);
+            act.pitch = (drone::bf_rate(pitch, rc, ex, sr) / p.max_rate.x).clamp(-1.0, 1.0);
+            act.yaw = (drone::bf_rate(yaw, rc, ex, sr) / p.max_rate.y).clamp(-1.0, 1.0);
+            // POSITIONAL throttle: gamepad left-Y sets it, keyboard Space/Ctrl ramp it and it
+            // STAYS where you leave it (that's how a real throttle stick works).
+            if let Some(t) = pad_throttle {
+                rig.throttle = t;
+            } else if !typing {
+                let mut d = 0.0;
+                if keys.pressed(KeyCode::Space) {
+                    d += 1.5;
+                }
+                if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+                    d -= 1.5;
+                }
+                rig.throttle = (rig.throttle + d * dt).clamp(0.0, 1.0);
+            }
+            act.throttle = rig.throttle;
+            drone::ControlMode::Rates
+        } else {
+            // ANGLE (trainer wheels): sticks = tilt, altitude-assist throttle. Tilt compensation
+            // keeps height in banked turns; a vertical-speed P-loop does the rest.
+            act.roll = roll;
+            act.pitch = pitch;
+            act.yaw = yaw;
+            let up_y = (rig.state.quat * Vec3::Y).y.max(0.35);
+            let mut climb = 0.0;
+            if let Some(t) = pad_throttle {
+                climb = (t * 2.0 - 1.0) * 5.0;
+            }
+            if !typing {
+                if keys.pressed(KeyCode::Space) {
+                    climb += 4.0;
+                }
+                if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+                    climb -= 4.0;
+                }
+            }
+            act.throttle =
+                (p.hover_throttle() / up_y + 0.09 * (climb - rig.state.vel.y)).clamp(0.0, 1.0);
+            rig.throttle = act.throttle; // keep the HUD bar honest in angle mode too
+            drone::ControlMode::Angle
+        };
+
+        // --- Physics: real-FPV-sim rate — 1 ms substeps (1 kHz), contact + attitude stable ---
+        let g: Option<&walk_ground::GroundData> = grid.as_ref().map(|r| &*r.0);
+        let n = ((dt / 0.001).ceil() as u32).clamp(1, 64);
+        let sub = dt / n as f32;
+        for _ in 0..n {
+            drone::step(&mut rig.state, &p, act, mode, Vec3::ZERO, g, sub);
+        }
+
+        // --- Camera = airframe + FPV uptilt ---
+        tf.translation = rig.state.pos;
+        tf.rotation = rig.state.quat * Quat::from_rotation_x(cam_tilt);
+        let fwd = *tf.forward();
+        cam.yaw = (-fwd.x).atan2(-fwd.z);
+        cam.pitch = fwd.y.clamp(-1.0, 1.0).asin();
+    }
+}
+
+/// Lazily build the walk/drone collision grid the first time it's needed (fly-only users never
+/// pay the ~250-400 MB + build cost). Walk needs ground+walls; drone mode and the agent link also
+/// need ceilings — if the grid was first built walk-only and a flying consumer appears later, it
+/// is rebuilt once with ceilings.
 fn build_walk_ground(
     mut commands: Commands,
     settings: Res<CameraSettings>,
+    agent: Res<agent_link::AgentLinkCtl>,
     grid: Option<Res<walk_ground::GroundGrid>>,
     pack: Option<Res<LoadedPack>>,
 ) {
-    if !settings.walk_mode || grid.is_some() {
+    let flying = settings.mode == CamMode::Drone || agent.enabled;
+    let needed = flying || settings.mode == CamMode::Walk;
+    if !needed {
         return;
     }
+    if let Some(g) = &grid {
+        if g.has_ceilings || !flying {
+            return; // already sufficient
+        }
+    }
     let Some(pack) = pack else { return };
-    info!("walk_ground: building walkable-surface grid (first walk-mode activation)…");
-    commands.insert_resource(walk_ground::GroundGrid::build(&pack.0));
+    info!(
+        "walk_ground: building collision grid (ceilings: {}) …",
+        flying
+    );
+    commands.insert_resource(walk_ground::GroundGrid::build(&pack.0, flying));
 }
 
 /// Walk locomotion: yaw-only WASD on the ground plane at `walk_speed`, ground-follow (stairs glide),
@@ -1354,7 +1689,7 @@ fn walk_move(
     mut q: Query<(&mut Transform, &FlyCam, &mut walk_ground::WalkState), With<CullCamera>>,
 ) {
     use walk_ground::{EYE_HEIGHT, GRAVITY, KILL_DROP, STEP_UP};
-    if !settings.walk_mode {
+    if settings.mode != CamMode::Walk {
         return;
     }
     let Some(grid) = grid else { return }; // still building
