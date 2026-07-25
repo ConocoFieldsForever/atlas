@@ -185,6 +185,8 @@ pub enum RightPanelTab {
     Navigate,
     /// Level controls: power switches (toggle the lights each one drives).
     Level,
+    /// Netcode position breadcrumbs mined from the game's logs (insights module).
+    Insights,
 }
 
 pub struct UiPlugin;
@@ -202,6 +204,7 @@ impl Plugin for UiPlugin {
                 Ok("tasks") => RightPanelTab::Tasks,
                 Ok("nav") | Ok("route") => RightPanelTab::Navigate,
                 Ok("level") => RightPanelTab::Level,
+                Ok("insights") => RightPanelTab::Insights,
                 _ => RightPanelTab::Visibility,
             })
             // apply_loot_visibility ordered AFTER spawn_loot so a swap-respawn's fresh markers are
@@ -1606,6 +1609,9 @@ fn toolbar_panel(
             // two house icons — the caption is what tells it apart from the top "Menu" one.
             if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Map", "Map \u{00B7} level & power controls") {
                 *tab = RightPanelTab::Level;
+            }
+            if theme::rail_button(ui, cur == RightPanelTab::Insights, 5, "Trail", "Insights \u{00B7} netcode position trail from the game's logs") {
+                *tab = RightPanelTab::Insights;
             }
         });
 }

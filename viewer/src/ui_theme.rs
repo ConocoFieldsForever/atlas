@@ -421,6 +421,15 @@ pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: C
     let ctr = rect.center();
     let s = Stroke::new(1.6, c);
     match kind {
+        5 => {
+            // insights: a breadcrumb trail — three dots rising left-to-right with a pin ring on
+            // the newest (top-right) one
+            let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);
+            painter.circle_filled(p(-8.0, 8.0), 2.0, c);
+            painter.circle_filled(p(-1.0, 2.5), 2.0, c);
+            painter.circle_filled(p(6.0, -4.0), 2.0, c);
+            painter.circle_stroke(p(6.0, -4.0), 5.0, s);
+        }
         3 => {
             // navigation: dashed route from bottom-left up to a location pin at top-right
             let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);

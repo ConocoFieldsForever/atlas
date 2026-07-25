@@ -43,7 +43,7 @@ enum GameEvent {
 
 /// Scene-preset bundle name -> our pack id (TarkovMonitor's MapBundles table, mapped to the atlas
 /// roster). Bundles for maps we don't ship (terminal, icebreaker) are simply absent.
-fn bundle_to_map(bundle: &str) -> Option<&'static str> {
+pub(crate) fn bundle_to_map(bundle: &str) -> Option<&'static str> {
     Some(match bundle {
         "city_preset" => "streets",
         "customs_preset" => "customs",
