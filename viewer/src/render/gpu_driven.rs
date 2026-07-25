@@ -158,12 +158,10 @@ const _: () = assert!(std::mem::size_of::<CullUniform>() == 144);
 
 /// Stride of one indirect draw record, in bytes.
 pub const DRAW_ARG_STRIDE: u64 = 20;
-/// Interleaved draw vertex stride (M3/M3b2): pos f32x3 @0 + normal f32x3 @12 + uv f32x2 @24
-/// + material_index u32 @32 + color f32x4 @36 = 52 bytes. The u32 material index is written
-/// as `f32::from_bits(material_id)` so vertex_data stays a single `Vec<f32>`; the GPU reads
-/// slot @32 as `Uint32` and recovers the id bit-exact (a pure reinterpretation, NOT a numeric
-/// cast which would corrupt large ids). The trailing f32x4 @36 is the per-vertex COLOR_0
-/// vert-paint weight (interpolated); the SoftCutout road/track feather rides on color.a.
+/// The u32 material index is written as `f32::from_bits(material_id)` so vertex_data stays a single
+/// `Vec<f32>`; the GPU reads that slot as `Uint32` and recovers the id bit-exact (a pure
+/// reinterpretation, NOT a numeric cast, which would corrupt large ids). The colour slot is
+/// smuggled the same way. The SoftCutout road/track feather rides on color.a.
 /// GPU vertex stride: pos f32x3 @0, normal **oct-encoded Snorm16x2** @12, uv f32x2 @16,
 /// material Uint32 @24, color **Unorm8x4** @28. The pack stores colour as unorm8x4 already; this used to inflate it to
 /// Float32x4 (stride 52) for no reason, costing 12 B on every one of the map's tens of millions of
@@ -2184,7 +2182,11 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         }
         const GRASS_VERTS: usize = 12; // 3 cross-quads * 4 verts
         const GRASS_IDX: usize = 18; // 3 quads * 6 indices
-        vertex_data.reserve(tot_v * 13 + GRASS_VERTS * 13);
+        // f32 slots per vertex, DERIVED from the stride — a hardcoded count here silently
+        // over-reserved by 12 B/vertex (1.14 GiB on streets) after the stride shrank, and a
+        // Vec never gives that back.
+        const VF: usize = DRAW_VERTEX_STRIDE as usize / 4;
+        vertex_data.reserve((tot_v + GRASS_VERTS) * VF);
         index_data.reserve(tot_i + GRASS_IDX);
         instances.reserve(tot_inst);
         mesh_meta.reserve(tot_mesh + 1);

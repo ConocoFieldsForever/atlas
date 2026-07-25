@@ -1421,7 +1421,9 @@ pub fn build_state() -> MenuState {
         force_cpu_process: config_force_cpu_process(),
         screenshot_locate: config_screenshot_locate(),
         overlay: crate::overlay::OverlayConfig::load().sanitized(),
-        tex_quality: config_f32_pub("textureQuality").unwrap_or(1.0) as u8, // Half (see main.rs)
+        // Clamp: a hand-edited config value outside 0..=2 would leave no button selected while
+        // `set_tex_mip_skip` silently clamped to Quarter.
+        tex_quality: (config_f32_pub("textureQuality").unwrap_or(1.0) as u8).min(2), // Half (see main.rs)
         settings_tab: None,
         reattached: false,
     }
