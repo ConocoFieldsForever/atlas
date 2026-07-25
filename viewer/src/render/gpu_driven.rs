@@ -164,12 +164,39 @@ pub const DRAW_ARG_STRIDE: u64 = 20;
 /// slot @32 as `Uint32` and recovers the id bit-exact (a pure reinterpretation, NOT a numeric
 /// cast which would corrupt large ids). The trailing f32x4 @36 is the per-vertex COLOR_0
 /// vert-paint weight (interpolated); the SoftCutout road/track feather rides on color.a.
-/// GPU vertex stride: pos f32x3 @0, normal f32x3 @12, uv f32x2 @24, material Uint32 @32,
-/// color **Unorm8x4** @36. The pack stores colour as unorm8x4 already; this used to inflate it to
+/// GPU vertex stride: pos f32x3 @0, normal **oct-encoded Snorm16x2** @12, uv f32x2 @16,
+/// material Uint32 @24, color **Unorm8x4** @28. The pack stores colour as unorm8x4 already; this used to inflate it to
 /// Float32x4 (stride 52) for no reason, costing 12 B on every one of the map's tens of millions of
 /// vertices (653 MiB on streets). Unorm8x4 still arrives in the shader as a normalised
 /// `vec4<f32>`, so the WGSL is unchanged and the values are bit-identical to the source data.
-pub const DRAW_VERTEX_STRIDE: u64 = 40;
+pub const DRAW_VERTEX_STRIDE: u64 = 32;
+
+/// Octahedral-encode a unit normal to two snorm components in [-1,1] (Meyer et al. / Cigolle et al.).
+/// 16 bits per component is far past what a normal needs — it is what Bevy uses for meshlet normals —
+/// and it costs 4 B instead of 12 B, i.e. 457 MiB on streets' 57.1M vertices. The shader decodes with
+/// a few add/mul and one normalize (`oct_decode` in gpu_draw.wgsl).
+fn oct_encode(n: Vec3) -> [i16; 2] {
+    let n = n.normalize_or_zero();
+    let d = n.x.abs() + n.y.abs() + n.z.abs();
+    let (mut x, mut y) = if d > 1e-20 { (n.x / d, n.y / d) } else { (0.0, 0.0) };
+    if n.z < 0.0 {
+        // Fold the lower hemisphere out onto the octahedron's outer diamond.
+        let (ax, ay) = (x.abs(), y.abs());
+        let (sx, sy) = (if x >= 0.0 { 1.0 } else { -1.0 }, if y >= 0.0 { 1.0 } else { -1.0 });
+        let (nx, ny) = ((1.0 - ay) * sx, (1.0 - ax) * sy);
+        x = nx;
+        y = ny;
+    }
+    // Round-to-nearest into snorm16; clamp keeps -1.0 exactly representable at -32767.
+    let q = |v: f32| -> i16 { (v.clamp(-1.0, 1.0) * 32767.0).round() as i16 };
+    [q(x), q(y)]
+}
+
+/// Pack an oct-encoded normal into one u32 (low half = x, high = y) for the f32 staging vec.
+fn oct_bits(n: Vec3) -> f32 {
+    let e = oct_encode(n);
+    f32::from_bits((e[0] as u16 as u32) | ((e[1] as u16 as u32) << 16))
+}
 
 /// Per-material GPU record (M3; 80 bytes after Phase 2b normal mapping, 160 bytes after #6 detail maps), 16-aligned. Indexed DIRECTLY by the global
 /// materialId (SubMesh.material_id == materials.json array index for this pack), which the
@@ -2338,10 +2365,10 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             };
             vertex_data.extend_from_slice(&[
                 p[0], p[1], p[2],
-                nrm[0], nrm[1], nrm[2],
+                oct_bits(Vec3::new(nrm[0], nrm[1], nrm[2])), // normal Snorm16x2 @12 (octahedral)
                 uv[0], uv[1],
                 f32::from_bits(vert_mat[k]), // material_index (read as Uint32 on the GPU)
-                f32::from_bits(col_bits),    // color Unorm8x4 @36 (interpolated in the shader)
+                f32::from_bits(col_bits),    // color Unorm8x4 @28 (interpolated in the shader)
             ]);
         }
         vtx_cursor += n as u32;
@@ -2532,9 +2559,10 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             let (s, c) = ang.sin_cos();
             let (dx, dz) = (c * hw, s * hw);
             let b = nverts;
-            let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @36
+            let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @28
+            let up_oct = oct_bits(Vec3::Y);
             let mk = |x: f32, y: f32, z: f32, u: f32, v: f32| {
-                [x, y, z, 0.0, 1.0, 0.0, u, v, mbits, white]
+                [x, y, z, up_oct, u, v, mbits, white]
             };
             for vtx in [
                 mk(-dx, 0.0, -dz, 0.0, 1.0),
@@ -2623,8 +2651,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         let first_index = idx_cursor;
         let mbits = f32::from_bits(sea_mat_id);
         // One quad, +Y normal, local origin at the center (height baked into the instance row).
-        let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @36
-        let mk = |x: f32, z: f32, u: f32, v: f32| [x, 0.0, z, 0.0, 1.0, 0.0, u, v, mbits, white];
+        let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @28
+        let up_oct = oct_bits(Vec3::Y);
+        let mk = |x: f32, z: f32, u: f32, v: f32| [x, 0.0, z, up_oct, u, v, mbits, white];
         for vtx in [
             mk(-hx, -hz, 0.0, 0.0),
             mk(hx, -hz, 1.0, 0.0),
@@ -4122,7 +4151,7 @@ fn prepare_gpu_buffers(
             buffers: vec![VertexBufferLayout {
                 array_stride: DRAW_VERTEX_STRIDE,
                 step_mode: VertexStepMode::Vertex,
-                // pos @0 (loc0), uv @24 (loc2), material @32 (loc3). normal/color are skipped.
+                // pos @0 (loc0), uv @16 (loc2), material @24 (loc3). normal/color are skipped.
                 attributes: vec![
                     VertexAttribute {
                         format: VertexFormat::Float32x3,
@@ -4131,12 +4160,12 @@ fn prepare_gpu_buffers(
                     },
                     VertexAttribute {
                         format: VertexFormat::Float32x2,
-                        offset: 24,
+                        offset: 16,
                         shader_location: 2,
                     },
                     VertexAttribute {
                         format: VertexFormat::Uint32,
-                        offset: 32,
+                        offset: 24,
                         shader_location: 3,
                     },
                 ],
@@ -5843,20 +5872,21 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                             offset: 0,
                             shader_location: 0,
                         },
+                        // Octahedral normal: 2 snorm16 in [-1,1], decoded in the vertex shader.
                         VertexAttribute {
-                            format: VertexFormat::Float32x3,
+                            format: VertexFormat::Snorm16x2,
                             offset: 12,
                             shader_location: 1,
                         },
                         VertexAttribute {
                             format: VertexFormat::Float32x2,
-                            offset: 24,
+                            offset: 16,
                             shader_location: 2,
                         },
-                        // M3: per-vertex material index (read bit-exact as Uint32 @32).
+                        // M3: per-vertex material index (read bit-exact as Uint32 @24).
                         VertexAttribute {
                             format: VertexFormat::Uint32,
-                            offset: 32,
+                            offset: 24,
                             shader_location: 3,
                         },
                         // M3b2: per-vertex COLOR_0 vert-paint weight @36 (SoftCutout coverage
@@ -5864,7 +5894,7 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                         // Unorm8x4: the pack's native format, expanded to vec4<f32> by the fetch.
                         VertexAttribute {
                             format: VertexFormat::Unorm8x4,
-                            offset: 36,
+                            offset: 28,
                             shader_location: 4,
                         },
                     ],

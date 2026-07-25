@@ -634,7 +634,7 @@ fn sun_shadow_visibility(p: vec3<f32>, Ng: vec3<f32>, view_depth: f32) -> f32 {
 
 struct Vertex {
     @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
+    @location(1) normal_oct: vec2<f32>, // octahedral-encoded unit normal (Snorm16x2, [-1,1])
     @location(2) uv: vec2<f32>,
     @location(3) material_index: u32, // Uint32; per-submesh global materialId, tagged in build_cpu_data
     @location(4) color: vec4<f32>,    // M3b2: per-vertex COLOR_0 vert-paint weight (SoftCutout coverage on .a)
@@ -698,6 +698,20 @@ fn detail_xform(base_st: vec4<f32>, det_st: vec4<f32>) -> vec4<f32> {
     );
 }
 
+// Decode an octahedral-encoded unit normal (Cigolle et al. / Meyer et al.). The CPU packs normals
+// as 2x snorm16 instead of 3x f32, saving 8 B per vertex (457 MiB on streets); 16 bits per component
+// is well past visible precision for shading normals. Inverse of `oct_encode` in gpu_driven.rs.
+fn oct_decode(e: vec2<f32>) -> vec3<f32> {
+    var n = vec3<f32>(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) {
+        // Unfold the outer diamond back onto the lower hemisphere.
+        let s = vec2<f32>(select(-1.0, 1.0, n.x >= 0.0), select(-1.0, 1.0, n.y >= 0.0));
+        let xy = (vec2<f32>(1.0) - abs(vec2<f32>(n.y, n.x))) * s;
+        n = vec3<f32>(xy.x, xy.y, n.z);
+    }
+    return normalize(n);
+}
+
 @vertex
 fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     // B5: clamp both indirections (visible[] then instances[]). @builtin(instance_index) is bounded by
@@ -735,7 +749,7 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     // small enough that genuinely-closer geometry (walls, props) still occludes the decal.
     o.clip.z = o.clip.z + 1.0e-3 * o.clip.w;
 #endif
-    o.world_normal = normalize(cofactor(col0, col1, col2) * v.normal);
+    o.world_normal = normalize(cofactor(col0, col1, col2) * oct_decode(v.normal_oct));
     o.uv = v.uv;
     o.material_index = v.material_index;
     o.color = v.color;
