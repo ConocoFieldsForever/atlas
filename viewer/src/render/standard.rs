@@ -252,10 +252,20 @@ fn load_texture(
     let skip = crate::render::gpu_driven::TEX_MIP_SKIP.load(std::sync::atomic::Ordering::Relaxed);
     let handle = match image::open(path) {
         Ok(img) => {
-            let img = if skip > 0 {
-                let (w, h) = (img.width().max(1), img.height().max(1));
-                let (nw, nh) = ((w >> skip).max(1), (h >> skip).max(1));
-                img.resize_exact(nw, nh, image::imageops::FilterType::Triangle)
+            // Back off the skip until the result is still >= 128 px on its longest side, exactly
+            // like the gpu-driven `slice_mips` floor. Without this the two paths disagree on small
+            // textures: an 8x8 mask would collapse to 1x1 here while staying 8x8 there.
+            let (w, h) = (img.width().max(1), img.height().max(1));
+            let mut e = u32::from(skip);
+            while e > 0 && ((w >> e).max(1)).max((h >> e).max(1)) < 128 {
+                e -= 1;
+            }
+            let img = if e > 0 {
+                img.resize_exact(
+                    (w >> e).max(1),
+                    (h >> e).max(1),
+                    image::imageops::FilterType::Triangle,
+                )
             } else {
                 img
             };
