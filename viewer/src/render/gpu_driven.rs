@@ -1058,6 +1058,13 @@ pub struct CpuData {
     /// Bindless albedo indices that are terrain CONTROL maps (blend weights = data, not color):
     /// uploaded LINEAR instead of sRGB so the weights aren't gamma-warped toward one layer.
     ctrl_tex_linear: std::collections::HashSet<u32>,
+    /// Bindless albedo indices whose RESOLUTION is authoritative and must never be reduced by the
+    /// texture-quality setting (terrain blend weights: one texel drives one patch of splat).
+    /// SEPARATE from `ctrl_tex_linear`, which only means "upload linear, don't BC-compress":
+    /// vert-paint coverage masks and parallax heights are linear DATA too, but they are smooth
+    /// masks that downscale fine, and lumping them in here kept them at full res on every quality
+    /// setting (the same class of bug as the Standard path ignoring TEX_MIP_SKIP).
+    no_downscale: std::collections::HashSet<u32>,
     /// Meshes with >=1 BLEND submesh: (mesh index, first-instance world center, pass mask).
     /// The mask separates depth-writing SoftCutout coverage, surface overlays, and true
     /// transparency so coplanar roads never share glass's render state.
@@ -1496,6 +1503,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     // the sRGB decode would gamma-warp blend weights. Declared here (not in the terrain block)
     // because the vp material loop below also registers its heights masks into it.
     let mut ctrl_tex_linear: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut no_downscale: std::collections::HashSet<u32> = std::collections::HashSet::new();
     // Vert-Paint 3-layer splat table (one entry per MAT_FLAG_VP material; GpuMaterial._pad2 indexes it).
     let mut vp_table: Vec<VpGpu> = Vec::new();
     // Pack-wide green-flip convention (DirectX Y-down): OR'd with each material's own flag.
@@ -1949,6 +1957,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                         let idx = add_tex(cn);
                         terrain.ctrl_idx[si * 3 + k] = idx;
                         ctrl_tex_linear.insert(idx); // blend weights -> linear upload
+                        no_downscale.insert(idx); // ...and full res: the texel IS the weight
                     }
                 }
             }
@@ -2767,6 +2776,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         terrain,
         vp_table,
         ctrl_tex_linear,
+        no_downscale,
         blend_meshes,
         sun_dir,
         light_grid,
@@ -3171,6 +3181,11 @@ fn reset_gpu_map_if_epoch_changed(
     commands.remove_resource::<EftShadowConfig>();
     commands.remove_resource::<EftShadowPipeline>();
     commands.remove_resource::<EftShadowResources>();
+    // EftDoors holds its own clone of the OLD pack's instance buffer (and door records keyed to
+    // that pack's instance indices). Without this it survives the swap, stranding the buffer
+    // (13 MiB on streets) and pointing at indices that no longer mean anything — the door swing
+    // would animate whatever instance now sits at that slot. Doorless packs never rebuild it.
+    commands.remove_resource::<EftDoors>();
     // Null the per-pack bindless layouts (keep the invariant fields) so `queue_gpu_driven`'s
     // `material_layout/sh_layout.is_none()` gate blocks specialization until prepare rebuilds them.
     if let Some(d) = draw {
@@ -3284,8 +3299,9 @@ fn prepare_gpu_buffers(
                     let path = path.clone();
                     // Terrain CONTROL maps are blend weights: load LINEAR + never BC (data_linear).
                     let data_linear = cpu.ctrl_tex_linear.contains(&(i as u32));
+                    let no_downscale = cpu.no_downscale.contains(&(i as u32));
                     Some(pool.spawn(async move {
-                        prepare_tex_cpu(path, bc, data_linear, false, [255, 0, 255, 255], mip_skip) // magenta placeholder
+                        prepare_tex_cpu(path, bc, data_linear, no_downscale, false, [255, 0, 255, 255], mip_skip) // magenta placeholder
                     }))
                 })
                 .collect();
@@ -3295,7 +3311,7 @@ fn prepare_gpu_buffers(
                 .map(|path| {
                     let path = path.clone();
                     Some(pool.spawn(async move {
-                        prepare_tex_cpu(path, bc, false, true, [128, 128, 255, 255], mip_skip) // flat-normal placeholder (is_normal: raw linear, never BC)
+                        prepare_tex_cpu(path, bc, false, false, true, [128, 128, 255, 255], mip_skip) // flat-normal placeholder (is_normal: raw linear, never BC)
                     }))
                 })
                 .collect();
@@ -4898,13 +4914,14 @@ fn prepare_tex_cpu(
     path: String,
     bc: bool,
     data_linear: bool,
+    no_downscale: bool,
     is_normal: bool,
     placeholder: [u8; 4],
     mip_skip: u32,
 ) -> TexCpu {
     let tex = prepare_tex_cpu_inner(path, bc, data_linear, is_normal, placeholder);
-    if data_linear {
-        return tex; // terrain control/data maps: the resolution IS the data — never degrade
+    if no_downscale {
+        return tex; // terrain blend weights: the resolution IS the data — never degrade
     }
     slice_mips(tex, mip_skip)
 }
