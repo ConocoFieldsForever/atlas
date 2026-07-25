@@ -747,16 +747,6 @@ def main():
     run(9, total, "stamp fingerprint",
         [PY, os.path.join(HERE, "stamp_fingerprint.py"), pack], VIEWER)
 
-    # Post-build storage dedup: a texture shared by several maps is byte-identical in each dataset's
-    # tex/ (source-identity naming), so it's stored once per map = pure waste. Hardlink the copies to
-    # a single physical file -- transparent (files stay in place) + lossless (no visual/behaviour
-    # change). Best-effort; never fail the build over it. (Re-run each build to re-link overwrites.)
-    try:
-        env = dict(os.environ, EFT_ASSETS_ROOT=ASSETS)
-        subprocess.call([sys.executable, os.path.join(HERE, "dedup_textures.py")], env=env)
-    except Exception as e:
-        print(f"  [dedup] skipped: {e}", flush=True)
-
     # Lighting completeness (finding 3a): a map we KNOW ships realtime lights (any derived
     # light_levels, now including the multi-scene streets/ground_zero) that produced neither a light
     # sidecar NOR an SH bake will render with dark/flat interiors. Don't hide that behind a clean
@@ -773,6 +763,24 @@ def main():
         print(f"[BUILD OK] pack ready (WARNING: no lighting for {m})", flush=True)
     else:
         print("[BUILD OK] pack ready", flush=True)
+
+    # Post-build storage dedup: a texture shared by several maps is byte-identical in each dataset's
+    # tex/ (source-identity naming), so it's stored once per map = pure waste. Hardlink the copies to
+    # one physical file -- transparent + lossless. Pure HOUSEKEEPING, so it runs AFTER [BUILD OK] and
+    # FULLY DETACHED (no wait): sha1-hashing GBs on a slow drive took minutes, and running it before
+    # the OK line kept the UI on "BUILDING" long after the pack was ready (field report). Output goes
+    # to devnull so a late finish can't interleave into the NEXT build's log. Idempotent + per-file
+    # best-effort, so an overlap with a subsequent build or an early process exit is harmless.
+    try:
+        env = dict(os.environ, EFT_ASSETS_ROOT=ASSETS)
+        flags = 0x00000008 | 0x08000000 if os.name == "nt" else 0  # DETACHED | CREATE_NO_WINDOW
+        subprocess.Popen(
+            [sys.executable, os.path.join(HERE, "dedup_textures.py")], env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=flags)
+        print("  [dedup] storage dedup backgrounded (housekeeping; does not block the pack)", flush=True)
+    except Exception as e:
+        print(f"  [dedup] skipped: {e}", flush=True)
 
 
 if __name__ == "__main__":

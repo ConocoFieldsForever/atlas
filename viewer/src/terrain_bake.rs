@@ -58,6 +58,13 @@ struct LayerG {
 }
 
 pub fn run_cli(args: &[String]) -> i32 {
+    // Settings ▸ General ▸ "Force CPU processing": decline the GPU composite entirely — the
+    // Python extractor treats a non-zero exit as "no GPU baker" and falls back to its numpy
+    // CPU composite (slower, identical output).
+    if std::env::var("EFT_BAKE_CPU").map(|v| v.trim() == "1").unwrap_or(false) {
+        eprintln!("bake-terrain: EFT_BAKE_CPU=1 (Force CPU processing) -- declining; extractor uses the numpy CPU composite");
+        return 3;
+    }
     let Some(mpath) = args.first() else {
         eprintln!("usage: atlas bake-terrain <manifest.json>");
         return 2;

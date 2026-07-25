@@ -103,6 +103,8 @@ pub enum K {
     LanguageTip,
     ProcessInBackground,
     ProcessInBackgroundTip,
+    ForceCpuProcess,
+    ForceCpuProcessTip,
     ScreenshotLocate,
     ScreenshotLocateTip,
     OverlayEnable,
@@ -288,6 +290,14 @@ fn pair(k: K) -> [&'static str; 2] {
         ProcessInBackgroundTip => [
             "Builds keep running even if you close Atlas - reopen it later to see the progress or the finished map.",
             "Сборка продолжается, даже если закрыть Atlas - откройте его позже, чтобы увидеть прогресс или готовую карту.",
+        ],
+        ForceCpuProcess => [
+            "Force CPU processing (no GPU bakes)",
+            "Принудительная обработка на CPU (без GPU)",
+        ],
+        ForceCpuProcessTip => [
+            "Map builds bake lighting and terrain on the CPU instead of the GPU. Slower, but avoids GPU driver crashes/hangs during processing. Applies to the next build.",
+            "Сборка карт запекает свет и террейн на CPU вместо GPU. Медленнее, но обходит сбои/зависания драйвера GPU при обработке. Действует со следующей сборки.",
         ],
         ScreenshotLocate => [
             "Screenshot to locate current position",

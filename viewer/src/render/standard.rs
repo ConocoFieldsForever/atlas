@@ -284,25 +284,43 @@ fn load_texture(
 
 /// Map one pack material → a Bevy `StandardMaterial`.
 fn build_material(
+    pack: &Pack,
     m: &PackMaterial,
     images: &mut Assets<Image>,
     tex_cache: &mut HashMap<(String, bool), Option<Handle<Image>>>,
 ) -> StandardMaterial {
-    let base_color_texture = m
-        .albedo
-        .as_deref()
-        .and_then(|p| load_texture(p, true, false, images, tex_cache));
+    // SELF-CONTAINED packs write PACK-RELATIVE texture paths ("tex/foo.png") — they MUST resolve
+    // against the pack root, like every other consumer does via `Pack::resolve_path`. This path
+    // used to open them raw (→ CWD-relative → not found → untextured white), which only legacy
+    // absolute-path packs ever hid (field report: a self-contained icebreaker on the Standard
+    // fallback rendered a white ship).
+    let resolve = |p: &str| pack.resolve_path(p);
+    // vp (vert-paint 3-layer splat) materials: this path has no splat shader — approximate with
+    // the base albedo when present, else layer 0's albedo (better a plausible texture than white).
+    let base_albedo: Option<String> = m.albedo.as_deref().map(&resolve).or_else(|| {
+        m.vp
+            .as_ref()
+            .and_then(|v| v.get("layers"))
+            .and_then(|l| l.get(0))
+            .and_then(|l0| l0.get("albedo"))
+            .and_then(|a| a.as_str())
+            .map(&resolve)
+    });
+    let base_color_texture =
+        base_albedo.as_deref().and_then(|p| load_texture(p, true, false, images, tex_cache));
     let normal_map_texture = m
         .normal
         .as_deref()
-        .and_then(|p| load_texture(p, false, m.normal_green_flip, images, tex_cache));
+        .map(&resolve)
+        .and_then(|p| load_texture(&p, false, m.normal_green_flip, images, tex_cache));
 
     let (emissive, emissive_texture) = match &m.emissive {
         Some(e) => (
             LinearRgba::new(e.factor[0], e.factor[1], e.factor[2], 1.0),
             e.texture
                 .as_deref()
-                .and_then(|p| load_texture(p, true, false, images, tex_cache)),
+                .map(&resolve)
+                .and_then(|p| load_texture(&p, true, false, images, tex_cache)),
         ),
         None => (LinearRgba::BLACK, None),
     };
@@ -366,7 +384,7 @@ fn spawn_standard(
     let mut tex_cache: HashMap<(String, bool), Option<Handle<Image>>> = HashMap::new();
     let mut mat_handles: HashMap<u32, Handle<StandardMaterial>> = HashMap::new();
     for m in &pack.materials {
-        let sm = build_material(m, &mut images, &mut tex_cache);
+        let sm = build_material(pack, m, &mut images, &mut tex_cache);
         mat_handles.insert(m.id, materials.add(sm));
     }
     let n_tex = tex_cache.values().filter(|v| v.is_some()).count();

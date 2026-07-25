@@ -170,6 +170,13 @@ fn spawn_pack_entities(
                 }
             })
             .collect();
+        // All-LOD packs: a mesh referenced ONLY by non-default LOD shells filters to zero
+        // instances here — spawning it anyway creates a 0-byte instance buffer and the draw
+        // panics ("buffer slices can not be empty") on the first frame. Skip it entirely.
+        // (Found by the LLPC auto-fallback exercising M0 in the field for the first time.)
+        if data.is_empty() {
+            continue;
+        }
         total_inst += data.len();
 
         commands.spawn((
@@ -374,6 +381,10 @@ impl<P: PhaseItem> RenderCommand<P> for DrawMeshInstanced {
             return RenderCommandResult::Skip;
         };
         let Some(instance_buffer) = instance_buffer else {
+            return RenderCommandResult::Skip;
+        };
+        // Defensive twin of the spawn-side empty-instance skip: slicing a 0-byte buffer panics.
+        if instance_buffer.length == 0 {
             return RenderCommandResult::Skip;
         };
         let Some(vertex_buffer_slice) =
