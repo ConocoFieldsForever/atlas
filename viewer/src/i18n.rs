@@ -105,6 +105,34 @@ pub enum K {
     ProcessInBackgroundTip,
     ScreenshotLocate,
     ScreenshotLocateTip,
+    OverlayEnable,
+    OverlayEnableTip,
+    Settings,
+    SettingsTabOverlay,
+    SettingsTabLive,
+    SettingsTabGeneral,
+    OverlayKeepAbove,
+    OverlayBorderlessShown,
+    OverlayPanelSize,
+    OverlayPanelPos,
+    OverlayPerf,
+    OverlayIdleHidden,
+    OverlayIdleHiddenTip,
+    OverlayOpenOnShot,
+    OverlayOpenOnShotTip,
+    OverlayReturnFocus,
+    OverlayReturnFocusTip,
+    DeleteShots,
+    DeleteShotsTip,
+    OverlayBorderlessNote,
+    LiveLinkNote,
+    BackToTarkov,
+    OverlayReopenHint,
+    UnbuiltNotProcessed,
+    UnbuiltBody,
+    UnbuiltProcess,
+    UnbuiltProcessTip,
+    UnbuiltCancel,
     BuildDeps,
     DepsReady,
     DepsMissing,
@@ -267,6 +295,93 @@ Check Settings > Controls in Tarkov for your screenshot key. You may need to REB
 
 Проверьте клавишу скриншота в Настройки > Управление вТарков. Возможно, её придётся ПЕРЕНАЗНАЧИТЬ: стандартная клавиша может конфликтовать с «Ножницами» Windows или другой программой скриншотов, которая перехватывает нажатие, и EFT не создаёт файл.",
         ],
+        OverlayEnable => [
+            "Overlay mode (your screenshot key opens the map over the game)",
+            "Режим оверлея (клавиша скриншота открывает карту поверх игры)",
+        ],
+        OverlayEnableTip => [
+            "Take an IN-GAME screenshot and Atlas rises over the game as a borderless always-on-top panel, standing exactly where you are. The big BACK TO TARKOV button (or ~ while Atlas is focused) dismisses it and hands focus back to the game. WASD and the mouse fly the map as usual.
+
+Tarkov MUST be running in BORDERLESS (not exclusive fullscreen) - no window can appear over exclusive fullscreen.
+
+Atlas only reads files the game already wrote; it never touches the game process. Overlaying a game is still your call, so this is off by default.",
+            "Сделайте скриншот В ИГРЕ - и Atlas поднимется поверх игры панелью без рамки, точно там, где вы стоите. Большая кнопка ВЕРНУТЬСЯ В ТАРКОВ (или ~, пока Atlas в фокусе) убирает её и возвращает фокус игре. WASD и мышь управляют картой как обычно.
+
+Тарков ДОЛЖЕН работать в РЕЖИМЕ ОКНА БЕЗ РАМКИ (не в полноэкранном) - поверх полноэкранного режима окно показать нельзя.
+
+Atlas читает только файлы, которые игра уже записала, и не трогает процесс игры. Решение использовать оверлей остаётся за вами, поэтому по умолчанию он выключен.",
+        ],
+        Settings => ["SETTINGS", "НАСТРОЙКИ"],
+        SettingsTabOverlay => ["Overlay", "Оверлей"],
+        SettingsTabLive => ["Live link", "Связь с игрой"],
+        SettingsTabGeneral => ["General", "Общие"],
+        OverlayKeepAbove => ["Keep above the game", "Держать поверх игры"],
+        OverlayBorderlessShown => ["Borderless while shown", "Без рамки, когда показан"],
+        OverlayPanelSize => [
+            "Panel size (fraction of monitor)",
+            "Размер панели (доля монитора)",
+        ],
+        OverlayPanelPos => [
+            "Position (0 = left/top, 1 = right/bottom)",
+            "Положение (0 = слева/сверху, 1 = справа/снизу)",
+        ],
+        OverlayPerf => [
+            "Performance while the game has focus",
+            "Производительность, пока игра в фокусе",
+        ],
+        OverlayIdleHidden => ["Idle when hidden", "Простаивать, когда скрыт"],
+        OverlayIdleHiddenTip => [
+            "Stop redrawing while the overlay is dismissed, so Atlas costs the game nothing.",
+            "Не перерисовывать карту, пока оверлей скрыт, - Atlas не отнимает ресурсы у игры.",
+        ],
+        OverlayOpenOnShot => [
+            "Open on screenshot (recommended)",
+            "Открывать по скриншоту (рекомендуется)",
+        ],
+        OverlayOpenOnShotTip => [
+            "Press your in-game SCREENSHOT key in a raid and Atlas opens here, standing exactly where you are. Tarkov takes its own screenshot - Atlas never intercepts or injects a key; it only reads the file EFT writes.",
+            "Нажмите клавишу СКРИНШОТА в рейде - и Atlas откроется точно там, где вы стоите. Тарков сам делает скриншот: Atlas не перехватывает и не эмулирует клавиши, а только читает файл, который записывает EFT.",
+        ],
+        OverlayReturnFocus => [
+            "Give focus back to the game on close",
+            "Возвращать фокус игре при закрытии",
+        ],
+        OverlayReturnFocusTip => [
+            "Dismissing the overlay minimises Atlas, which makes Windows activate the game behind it - so your keys go back to Tarkov. Off = Atlas stays on the desktop.",
+            "При закрытии оверлея Atlas сворачивается, и Windows активирует игру позади него - клавиши снова идут в Тарков. Выкл = Atlas остаётся на рабочем столе.",
+        ],
+        DeleteShots => [
+            "Delete processed screenshots (recommended)",
+            "Удалять обработанные скриншоты (рекомендуется)",
+        ],
+        DeleteShotsTip => [
+            "EFT writes a full-resolution PNG every time you press the screenshot key and never cleans them up. Atlas deletes ONLY the screenshots it has already read a position out of; anything it could not parse is left alone.",
+            "EFT записывает полноразмерный PNG при каждом нажатии клавиши скриншота и никогда их не удаляет. Atlas удаляет ТОЛЬКО те скриншоты, из которых уже прочитал позицию; всё, что не удалось разобрать, остаётся на месте.",
+        ],
+        OverlayBorderlessNote => [
+            "Tarkov must run BORDERLESS - nothing can draw over exclusive fullscreen.",
+            "Тарков должен работать В РЕЖИМЕ ОКНА БЕЗ РАМКИ - поверх полноэкранного режима ничего показать нельзя.",
+        ],
+        LiveLinkNote => [
+            "Atlas follows your raid from the game's own logs and turns each in-raid screenshot into a position fix. It only reads files the game already wrote.",
+            "Atlas следит за рейдом по логам самой игры и превращает каждый скриншот в рейде в отметку позиции. Он читает только файлы, которые игра уже записала.",
+        ],
+        BackToTarkov => ["\u{2936}  BACK TO TARKOV", "\u{2936}  ВЕРНУТЬСЯ В ТАРКОВ"],
+        OverlayReopenHint => [
+            "Take an in-game screenshot to reopen the overlay",
+            "Чтобы снова открыть оверлей, сделайте скриншот в игре",
+        ],
+        UnbuiltNotProcessed => ["is not processed yet", "ещё не обработана"],
+        UnbuiltBody => [
+            "Your raid is on this map, but Atlas has no pack for it - what you are looking at is NOT where you are.",
+            "Ваш рейд идёт на этой карте, но у Atlas нет её сборки - то, что вы видите, НЕ то место, где вы находитесь.",
+        ],
+        UnbuiltProcess => ["PROCESS THIS MAP", "ОБРАБОТАТЬ КАРТУ"],
+        UnbuiltProcessTip => [
+            "Runs the full build for this map. It takes several minutes and uses the CPU/GPU hard - the bake stays off the GPU while Atlas is rendering, but the game will still feel it. You can keep playing; the build survives closing Atlas.",
+            "Запускает полную сборку карты. Это занимает несколько минут и сильно нагружает CPU/GPU - запекание не трогает GPU, пока Atlas рисует, но игра всё равно это почувствует. Можно продолжать играть: сборка переживёт закрытие Atlas.",
+        ],
+        UnbuiltCancel => ["Cancel", "Отмена"],
         BuildDeps => ["BUILD DEPS", "ЗАВИСИМОСТИ"],
         DepsReady => ["ready", "готово"],
         DepsMissing => [

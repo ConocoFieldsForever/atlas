@@ -120,6 +120,36 @@ pub struct ObjectiveDef {
     pub max_durability: Option<f32>,
 }
 
+
+// tarkov.dev sometimes serialises numbers as STRINGS ("minDurability":"0") — one such field made
+// the whole 499-task file unparseable and the Tasks tab silently empty. Accept number, numeric
+// string, or null everywhere a numeric comes from that API; never let one quirky field kill the file.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LenientNum {
+    F(f64),
+    S(String),
+    Null,
+}
+impl LenientNum {
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            LenientNum::F(f) => Some(*f),
+            LenientNum::S(s) => s.trim().parse().ok(),
+            LenientNum::Null => None,
+        }
+    }
+}
+fn lenient_f32<'de, D: serde::Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+    Ok(LenientNum::deserialize(d)?.as_f64().unwrap_or(0.0) as f32)
+}
+fn lenient_f32_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    Ok(LenientNum::deserialize(d)?.as_f64().map(|f| f as f32))
+}
+fn lenient_i64_opt<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    Ok(LenientNum::deserialize(d)?.as_f64().map(|f| f as i64))
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ItemRef {
@@ -137,6 +167,7 @@ pub struct ItemRef {
 pub struct CompareValue {
     #[serde(rename = "compareMethod")]
     pub compare: Option<String>,
+    #[serde(deserialize_with = "lenient_f32")]
     pub value: f32,
 }
 
@@ -147,6 +178,7 @@ pub struct TraderRequirement {
     #[serde(rename = "type")]
     pub kind: Option<String>,
     pub compare: Option<String>,
+    #[serde(deserialize_with = "lenient_f32")]
     pub value: f32,
 }
 
@@ -154,6 +186,7 @@ pub struct TraderRequirement {
 #[serde(default)]
 pub struct StandingReward {
     pub trader: String,
+    #[serde(deserialize_with = "lenient_f32_opt")]
     pub value: Option<f32>,
 }
 
@@ -161,6 +194,7 @@ pub struct StandingReward {
 #[serde(default)]
 pub struct OfferReward {
     pub trader: String,
+    #[serde(deserialize_with = "lenient_i64_opt")]
     pub level: Option<i64>,
     pub item: Option<String>,
 }
@@ -169,6 +203,7 @@ pub struct OfferReward {
 #[serde(default)]
 pub struct SkillReward {
     pub name: Option<String>,
+    #[serde(deserialize_with = "lenient_f32_opt")]
     pub level: Option<f32>,
 }
 
@@ -297,9 +332,9 @@ struct RawObj {
     shot_type: Option<String>,
     #[serde(default, rename = "timeWindow")]
     time_window: Option<[f32; 2]>,
-    #[serde(default, rename = "minDurability")]
+    #[serde(default, rename = "minDurability", deserialize_with = "lenient_f32_opt")]
     min_durability: Option<f32>,
-    #[serde(default, rename = "maxDurability")]
+    #[serde(default, rename = "maxDurability", deserialize_with = "lenient_f32_opt")]
     max_durability: Option<f32>,
 }
 #[derive(Deserialize)]
@@ -459,16 +494,18 @@ fn load_task_catalog(
         warn!("tasks_panel: no tasks.json found (set EFT_TASKS_JSON or drop it in packs/shared) — Tasks tab empty");
         return;
     };
-    match std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<RawFile>(&s).ok())
-    {
-        Some(rf) => {
-            cat.source = rf.source.unwrap_or_else(|| "tarkov.dev".into());
-            cat.tasks = rf.tasks.into_iter().map(convert_task).collect();
-            info!("tasks_panel: {} tasks loaded from {}", cat.tasks.len(), path.display());
-        }
-        None => warn!("tasks_panel: failed to parse {}", path.display()),
+    // Never swallow the reason: a bare "failed to parse" once cost a whole debugging session —
+    // serde's error carries the exact line/column and mismatched field.
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match serde_json::from_str::<RawFile>(&s) {
+            Ok(rf) => {
+                cat.source = rf.source.unwrap_or_else(|| "tarkov.dev".into());
+                cat.tasks = rf.tasks.into_iter().map(convert_task).collect();
+                info!("tasks_panel: {} tasks loaded from {}", cat.tasks.len(), path.display());
+            }
+            Err(e) => warn!("tasks_panel: failed to parse {}: {e}", path.display()),
+        },
+        Err(e) => warn!("tasks_panel: failed to read {}: {e}", path.display()),
     }
 }
 
@@ -1390,4 +1427,26 @@ fn titlecase_key(key: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression: tarkov.dev string-typed numbers ("minDurability":"0") once made the whole
+    /// 499-task file unparseable — and the Tasks tab silently empty. Parses the real synced file
+    /// when one is present (skips cleanly on machines that never ran a sync).
+    #[test]
+    fn shared_tasks_json_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("packs")
+            .join("shared")
+            .join("tasks.json");
+        if !path.is_file() {
+            return;
+        }
+        let s = std::fs::read_to_string(&path).unwrap();
+        let rf: super::RawFile = serde_json::from_str(&s).expect("tasks.json must parse");
+        assert!(!rf.tasks.is_empty(), "parsed but zero tasks");
+    }
 }
