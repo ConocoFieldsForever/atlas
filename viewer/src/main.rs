@@ -12,6 +12,7 @@
 mod eftpack;
 mod game_watch;
 mod gpu_lease;
+mod insights;
 mod overlay;
 mod i18n;
 mod inspect;
@@ -866,6 +867,7 @@ fn main() {
         .add_plugins(pick::PickPlugin) // double-LEFT-click raycast-vs-pack-data debug pick
         .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
         .add_plugins(overlay::OverlayPlugin) // in-game screenshot summons the map over the game (same window)
+        .add_plugins(insights::InsightsPlugin) // netcode position breadcrumbs mined from the logs
         .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
         .add_plugins(inspect::InspectPlugin) // left-click a marker -> floating info card (\u{2715} to close)
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
