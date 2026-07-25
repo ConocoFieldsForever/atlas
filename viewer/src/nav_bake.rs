@@ -50,12 +50,17 @@ use std::time::Instant;
 // ---- constants (match bake_nav.py) ------------------------------------------------------------
 const NY_MIN: f32 = 0.5; // up-facing = slope <= 60deg
 const HEADROOM: f32 = 1.8; // a floor is walkable only with >= this clearance above it
-const CLIMB: f32 = 1.2;
+// DERIVED FROM THE GAME, not hand-picked: EFT ships `NavMeshProjectSettings` whose agent
+// descriptors use climb 0.25-0.38 m and slope 43-48 deg. Ours were 1.2 m / 60 deg -- roughly 3x
+// and 1.3x more permissive than anything the game itself considers walkable, which is why routes
+// scaled ledges no player can step onto. Take the loosest agent BSG ships (0.38 / 48) rather than
+// the tightest, since these are bot descriptors and the human stepOffset was not recovered.
+const CLIMB: f32 = 0.38;
 const DROP_MAX: f32 = 2.0;
 const VAULT: f32 = 1.2;
 const MISS: f32 = -1.0e9;
 const MISS_HALF: f32 = MISS * 0.5;
-const SLOPE_MAX_DEG: i32 = 60;
+const SLOPE_MAX_DEG: i32 = 48;
 const Y_HIGH_FLOOR: f32 = 90.0; // ray origin height floor (bake_nav Y_HIGH); raised for taller maps
 const PAD: f32 = 6.0; // grid padding beyond the geometry (metres)
 /// Below this XZ-projected parallelogram area a triangle is treated as a vertical wall (a vertical
@@ -770,8 +775,14 @@ fn capsule_blocked(
     for &o in &CAP_OFF {
         let (ox, oz) = (px * o, pz * o);
         for &hy in &CAP_H {
+            // HORIZONTAL at the SOURCE floor. This used to rise with the ramp (`fy1 + hy`), which
+            // made the test blind to every riser the router would actually permit: a riser of
+            // height u at edge fraction t is only hit when hy <= u*(1-t), so with the lowest
+            // sample at 0.55 a mid-edge riser needed u >= 1.10 m -- above the router's own 1.0 m
+            // cap. No permitted up-step was ever blockable, so routes climbed waist-high ledges,
+            // barriers and crates. Cast flat and let step_up/climb alone decide what is steppable.
             let p0 = Vec3::new(cx + ox, fy0 + hy, cz + oz);
-            let p1 = Vec3::new(ncx + ox, fy1 + hy, ncz + oz);
+            let p1 = Vec3::new(ncx + ox, fy0 + hy, ncz + oz);
             if bvh.segment_hit(p0, p1, stack) {
                 return true;
             }
