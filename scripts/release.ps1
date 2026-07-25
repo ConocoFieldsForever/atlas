@@ -33,19 +33,14 @@ $sha = (git rev-parse --short HEAD).Trim()
 $name = "atlas-$ver-$sha-win64"
 Write-Host "[release] $name"
 
-# 2. Build (locked deps for reproducibility).
+# 2. Build (locked deps for reproducibility) — ALWAYS through build-clean.ps1, which remaps the
+#    build machine's cargo-registry + workspace prefixes out of the binary. release.ps1 used to
+#    call plain `cargo build` here, so LOCALLY-built zips shipped panic Location strings containing
+#    the builder's C:\Users\<name>\.cargo\... paths (caught in a user's crash log — CI already
+#    routed through build-clean; local was the leak).
 if (-not $SkipBuild) {
-    $before = (Get-Item "target\release\atlas.exe" -ErrorAction SilentlyContinue).LastWriteTime
-    # cmd does the stderr merge: PS 5.1's own 2>&1 on native exes wraps stderr lines in
-    # ErrorRecords and $ErrorActionPreference=Stop turns cargo WARNINGS into a fatal throw.
-    $buildOut = cmd /c "cargo build --release --locked 2>&1" | Out-String
-    if ($LASTEXITCODE -ne 0) { Write-Host $buildOut; throw "cargo build failed ($LASTEXITCODE)" }
-    # Only demand a fresh mtime when cargo actually recompiled the bin (an up-to-date build
-    # legitimately leaves it untouched; the locked-exe trap is caught by the step-0 check).
-    if ($buildOut -match "Compiling atlas") {
-        $after = (Get-Item "target\release\atlas.exe").LastWriteTime
-        if ($before -and $after -le $before) { throw "binary mtime did not advance - stale build?" }
-    }
+    & "$PSScriptRoot\build-clean.ps1" -Locked
+    if ($LASTEXITCODE -ne 0) { throw "build-clean.ps1 failed ($LASTEXITCODE)" }
 }
 
 # 3. Version smoke (works on GPU-less machines; the only CI-safe check).
@@ -60,7 +55,10 @@ New-Item -ItemType Directory -Force "$dist\packs\shared" | Out-Null
 Copy-Item "target\release\atlas.exe" $dist
 # wired shaders only (instanced/sh_gi/splat are dead - provenance audit)
 New-Item -ItemType Directory -Force "$dist\assets\shaders" | Out-Null
-foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","grade.wgsl","instancing_m0.wgsl") {
+foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","grade.wgsl","instancing_m0.wgsl","fpv_cam.wgsl") {
+    # Fail closed: a shader the binary loads at runtime but missing from this allowlist ships a
+    # broken feature (fpv_cam.wgsl was caught ONLY by a user's log — bevy_asset 404s at runtime).
+    if (-not (Test-Path "viewer\assets\shaders\$sh")) { throw "release: shader $sh missing from workspace" }
     Copy-Item "viewer\assets\shaders\$sh" "$dist\assets\shaders\"
 }
 # README.md is the friendly non-dev guide (first-run + SmartScreen "Run anyway" steps);

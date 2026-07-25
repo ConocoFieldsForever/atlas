@@ -163,6 +163,13 @@ impl BuildJob {
         if let Ok(exe) = std::env::current_exe() {
             cmd.env("EFT_ATLAS_EXE", exe);
         }
+        // Settings ▸ General ▸ "Force CPU processing": the env var inherits through python down to
+        // every `atlas bake-*` child — sh bake takes the rayon path, the terrain composite declines
+        // so the extractor uses its numpy fallback. Read from config at spawn time so the latest
+        // setting always applies without re-plumbing state through the job system.
+        if config_force_cpu_process() {
+            cmd.env("EFT_BAKE_CPU", "1");
+        }
         if key_as_args {
             cmd.args(key.split([',', ' ']).filter(|s| !s.is_empty()));
         }
@@ -758,6 +765,9 @@ pub struct MenuState {
     /// "Process in background" toggle (default ON): a MAP build detaches + logs to a file so it keeps
     /// running even if Atlas is closed. Persisted in atlas.config.json; the footer checkbox flips it.
     pub process_in_background: bool,
+    /// "Force CPU processing" (default OFF): map builds bake lighting/terrain on the CPU instead of
+    /// the GPU (spawner exports EFT_BAKE_CPU=1). For machines whose GPU driver dies in the bakes.
+    pub force_cpu_process: bool,
     /// "Screenshot to locate current position" — poll the EFT screenshot folder and move the
     /// camera onto each new position fix (see `config_screenshot_locate`).
     pub screenshot_locate: bool,
@@ -1069,6 +1079,17 @@ pub fn save_config_process_in_background(on: bool) -> bool {
 /// screenshot filename, so a screenshot taken in raid is a free position fix — Atlas puts the
 /// camera exactly where the player stands, looking the same way. Off = the folder is never read.
 /// Persisted in atlas.config.json under `screenshotLocate`.
+/// "Force CPU processing" (default OFF): map builds bake lighting + terrain on the CPU — the
+/// spawner exports EFT_BAKE_CPU=1 into the build child's environment. The override for machines
+/// whose GPU driver crashes or TDRs inside the compute bakes (e.g. a bad Vulkan ICD). Persisted
+/// in atlas.config.json under `forceCpuProcessing`.
+pub fn config_force_cpu_process() -> bool {
+    config_bool("forceCpuProcessing").unwrap_or(false)
+}
+pub fn save_config_force_cpu_process(on: bool) -> bool {
+    save_config_bool("forceCpuProcessing", on)
+}
+
 pub fn config_screenshot_locate() -> bool {
     config_bool("screenshotLocate").unwrap_or(true)
 }
@@ -1397,6 +1418,7 @@ pub fn build_state() -> MenuState {
         autobuild,
         config_err: None,
         process_in_background: config_process_in_background(),
+        force_cpu_process: config_force_cpu_process(),
         screenshot_locate: config_screenshot_locate(),
         overlay: crate::overlay::OverlayConfig::load().sanitized(),
         tex_quality: config_f32_pub("textureQuality").unwrap_or(0.0) as u8,
@@ -2286,6 +2308,23 @@ pub fn menu_ui(
                         {
                             state.process_in_background = bg;
                             let _ = save_config_process_in_background(bg);
+                        }
+                        ui.add_space(6.0);
+                        // FORCE CPU PROCESSING — bake lighting/terrain on the CPU (EFT_BAKE_CPU=1
+                        // exported to the build child). The escape hatch for GPUs whose driver
+                        // crashes/TDRs in the compute bakes (e.g. a broken Vulkan ICD).
+                        let mut cpu = state.force_cpu_process;
+                        if ui
+                            .checkbox(&mut cpu, RichText::new(t(lg, K::ForceCpuProcess)).size(11.0))
+                            .on_hover_text(t(lg, K::ForceCpuProcessTip))
+                            .changed()
+                        {
+                            state.force_cpu_process = cpu;
+                            if !save_config_force_cpu_process(cpu) {
+                                state.config_err = Some(
+                                    "settings could not be saved (read-only folder?)".to_string(),
+                                );
+                            }
                         }
                         ui.add_space(10.0);
                         // TEXTURE QUALITY — the one VRAM lever that matters (docs/VRAM_AUDIT.md:

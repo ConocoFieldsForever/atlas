@@ -16,6 +16,7 @@
 
 use bevy::prelude::Resource;
 
+pub mod fpv_cam;
 pub mod gpu_driven;
 pub mod grade;
 pub mod instancing;
@@ -28,6 +29,7 @@ pub mod standard;
 /// while retaining the game's extracted LUT rather than replacing it with a hand grade.
 pub const DEFAULT_GRADE_EXPOSURE: f32 = 1.35;
 
+pub use fpv_cam::FpvCamPlugin;
 pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin, GpuLoadSignal};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
@@ -218,17 +220,7 @@ impl RenderPath {
             Some(ref s) if s == "m0" || s == "instanced" => RenderPath::M0Instanced,
             Some(ref s) if s == "std" || s == "standard" || s == "pbr" => RenderPath::Standard,
             Some(ref s) if s == "gpu" || s == "gpu-driven" => RenderPath::GpuDriven,
-            _ => {
-                if gpu_driven_supported() {
-                    RenderPath::GpuDriven
-                } else {
-                    eprintln!(
-                        "render path: GPU lacks MULTI_DRAW_INDIRECT / bindless features - \
-                         auto-selecting the M0 instanced path (override with EFT_RENDER=gpu)"
-                    );
-                    RenderPath::M0Instanced
-                }
-            }
+            _ => probe_render_path(),
         }
     }
 }
@@ -276,7 +268,15 @@ pub fn has_usable_adapter() -> bool {
     .is_ok()
 }
 
-fn gpu_driven_supported() -> bool {
+/// Auto-select the render path from the adapter (the `_ =>` arm of `RenderPath::from_env_or`;
+/// an explicit `EFT_RENDER=` skips this entirely):
+///  * features present, sane driver → GpuDriven (the full renderer);
+///  * LLPC driver quirk → **Standard** — textured via Bevy's stock PBR pipelines, which that
+///    compiler handles fine (field report: RX 7800 XT on an AMDVLK-lineage ICD device-loses on
+///    the first frame of the gpu-driven bindless/indirect pipelines, and the M0 fallback's
+///    untextured look was the immediate next complaint — Standard gives them real textures);
+///  * features missing / probe error → M0 (the safest, lightest path for weak adapters).
+fn probe_render_path() -> RenderPath {
     use bevy::render::settings::WgpuFeatures;
     let need = WgpuFeatures::MULTI_DRAW_INDIRECT
         | WgpuFeatures::INDIRECT_FIRST_INSTANCE
@@ -293,17 +293,42 @@ fn gpu_driven_supported() -> bool {
     }));
     match adapter {
         Ok(a) => {
-            let ok = a.features().contains(need);
             let info = a.get_info();
+            // Driver quirk (field report: RX 7800 XT, driver_info "26.2.2 (LLPC)"): the LLPC
+            // shader-compiler stack (AMDVLK-lineage Vulkan ICD, not the standard Adrenalin
+            // compiler) device-loses on the FIRST FRAME of the gpu-driven path's bindless/
+            // indirect pipelines — the app dies at swapchain acquire right after "GPU buffers +
+            // bind groups built". The feature bits all report supported, so only the driver
+            // string identifies it. Bevy's standard PBR pipelines (the menu, and the Standard
+            // path) run fine there → fall back to Standard, which keeps textures.
+            if info.driver_info.contains("LLPC") {
+                eprintln!(
+                    "gpu probe: {} uses an LLPC Vulkan compiler ({}) — known to crash the \
+                     gpu-driven pipelines; auto-selecting the Standard (Bevy PBR) path. Install \
+                     the standard AMD Adrenalin driver for the full renderer, or force with \
+                     EFT_RENDER=gpu / EFT_RENDER=m0.",
+                    info.name, info.driver_info
+                );
+                return RenderPath::Standard;
+            }
+            let ok = a.features().contains(need);
             eprintln!(
                 "gpu probe: {} ({:?}/{:?}) gpu-driven={}",
                 info.name, info.device_type, info.backend, ok
             );
-            ok
+            if ok {
+                RenderPath::GpuDriven
+            } else {
+                eprintln!(
+                    "render path: GPU lacks MULTI_DRAW_INDIRECT / bindless features - \
+                     auto-selecting the M0 instanced path (override with EFT_RENDER=gpu)"
+                );
+                RenderPath::M0Instanced
+            }
         }
         Err(e) => {
             eprintln!("gpu probe: adapter request failed ({e}) - treating GPU-driven as UNSUPPORTED, using M0");
-            false
+            RenderPath::M0Instanced
         }
     }
 }

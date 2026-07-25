@@ -745,7 +745,14 @@ pub fn run_cli(args: &[String]) -> i32 {
     // not just ours. So when a viewer holds the interactive-GPU lease we take the CPU path by
     // default (minutes, not seconds, but it cannot take the viewer down). An explicit
     // `--backend gpu` still overrides. See viewer/src/gpu_lease.rs.
-    let mut backend = if crate::gpu_lease::busy() {
+    // Settings ▸ General ▸ "Force CPU processing": the build spawner exports EFT_BAKE_CPU=1 and it
+    // inherits down to every bake child. Same escape hatch as an explicit `--backend cpu` — for
+    // machines whose GPU driver crashes/TDRs on the compute bake (an explicit --backend flag on the
+    // command line still overrides, same as the lease rule below).
+    let mut backend = if std::env::var("EFT_BAKE_CPU").map(|v| v.trim() == "1").unwrap_or(false) {
+        eprintln!("  bake-sh: EFT_BAKE_CPU=1 (Force CPU processing) -- using the CPU backend");
+        Backend::Cpu
+    } else if crate::gpu_lease::busy() {
         eprintln!("  bake-sh: a viewer holds the GPU -- using the CPU backend (pass --backend gpu to override)");
         Backend::Cpu
     } else {
