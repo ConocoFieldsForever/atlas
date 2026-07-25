@@ -635,8 +635,12 @@ fn apply_camera_command(mut cmd: ResMut<CameraCommand>, mut q: Query<(&mut Trans
 fn main() {
     // Texture-quality (0 full / 1 half / 2 quarter) is read by the render world at map build;
     // seed it from the persisted setting before anything can load a pack.
+    // DEFAULT = 1 (Half). Full-resolution textures are ~5 GB on streets alone, which is more
+    // than the whole budget of a mid-range card; Half is visually near-identical (one mip down)
+    // and cuts that to ~1.3 GB. Users who have explicitly chosen a quality keep their choice --
+    // this only changes the default for someone who has never touched the setting.
     render::gpu_driven::set_tex_mip_skip(
-        menu::config_f32_pub("textureQuality").unwrap_or(0.0) as u8,
+        menu::config_f32_pub("textureQuality").unwrap_or(1.0) as u8,
     );
     // Headless nav baker BEFORE any Bevy/GPU init: `atlas bake-nav <pack_dir> [--res R] [--layers K]`
     // bakes the routing grid on the CPU (portable — AMD/NVIDIA/no-GPU) and exits, so the map-build
