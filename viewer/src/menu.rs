@@ -758,6 +758,9 @@ pub struct MenuState {
     /// "Process in background" toggle (default ON): a MAP build detaches + logs to a file so it keeps
     /// running even if Atlas is closed. Persisted in atlas.config.json; the footer checkbox flips it.
     pub process_in_background: bool,
+    /// "Screenshot to locate current position" — poll the EFT screenshot folder and move the
+    /// camera onto each new position fix (see `config_screenshot_locate`).
+    pub screenshot_locate: bool,
     /// One-shot guard: on the first menu frame we scan for detached builds a previous run left running
     /// and reattach/surface them. Set true after that scan so it never re-runs.
     pub reattached: bool,
@@ -1017,6 +1020,18 @@ pub fn config_process_in_background() -> bool {
 }
 pub fn save_config_process_in_background(on: bool) -> bool {
     save_config_bool("processInBackground", on)
+}
+
+/// "Screenshot to locate current position" (default ON): whether the game link POLLS the EFT
+/// screenshot folder. EFT writes the player's world position + view quaternion into every
+/// screenshot filename, so a screenshot taken in raid is a free position fix — Atlas puts the
+/// camera exactly where the player stands, looking the same way. Off = the folder is never read.
+/// Persisted in atlas.config.json under `screenshotLocate`.
+pub fn config_screenshot_locate() -> bool {
+    config_bool("screenshotLocate").unwrap_or(true)
+}
+pub fn save_config_screenshot_locate(on: bool) -> bool {
+    save_config_bool("screenshotLocate", on)
 }
 
 /// True once the user (or an env var) has chosen where extracted datasets live — drives the
@@ -1340,6 +1355,7 @@ pub fn build_state() -> MenuState {
         autobuild,
         config_err: None,
         process_in_background: config_process_in_background(),
+        screenshot_locate: config_screenshot_locate(),
         reattached: false,
     }
 }
@@ -1765,6 +1781,27 @@ pub fn menu_ui(
                     state.config_err = (!save_config_process_in_background(bg))
                         .then(|| "settings could not be saved (read-only folder?)".to_string());
                 }
+            });
+            // "Screenshot to locate current position" (default ON): poll the EFT screenshot folder
+            // and put the camera on each new fix. The ⓘ carries the one thing users trip over —
+            // the in-game screenshot key being swallowed by the Windows Snipping Tool.
+            ui.horizontal(|ui| {
+                let mut loc = state.screenshot_locate;
+                if ui
+                    .checkbox(
+                        &mut loc,
+                        RichText::new(t(lg, K::ScreenshotLocate)).color(BONE).size(11.0),
+                    )
+                    .on_hover_text(t(lg, K::ScreenshotLocateTip))
+                    .changed()
+                {
+                    state.screenshot_locate = loc;
+                    crate::game_watch::set_screenshot_locate(loc);
+                    state.config_err = (!save_config_screenshot_locate(loc))
+                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                }
+                ui.label(RichText::new("\u{24d8}").color(DIM).size(12.0))
+                    .on_hover_text(t(lg, K::ScreenshotLocateTip));
             });
             // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
             // (venv + pip) from here without closing the app; progress streams into the panel above.

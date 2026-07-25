@@ -740,7 +740,17 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
 /// Handle the headless `bake-sh` subcommand. Returns a process exit code (0 = ok). Never panics.
 pub fn run_cli(args: &[String]) -> i32 {
     let mut pack_dir: Option<String> = None;
-    let mut backend = Backend::Auto;
+    // WORKER/RENDERER COORDINATION: heavy GPU compute next to an interactive renderer risks a
+    // Windows TDR (~2 s/dispatch), and a TDR resets the ADAPTER — losing the viewer's device too,
+    // not just ours. So when a viewer holds the interactive-GPU lease we take the CPU path by
+    // default (minutes, not seconds, but it cannot take the viewer down). An explicit
+    // `--backend gpu` still overrides. See viewer/src/gpu_lease.rs.
+    let mut backend = if crate::gpu_lease::busy() {
+        eprintln!("  bake-sh: a viewer holds the GPU -- using the CPU backend (pass --backend gpu to override)");
+        Backend::Cpu
+    } else {
+        Backend::Auto
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {

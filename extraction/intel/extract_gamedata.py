@@ -446,6 +446,8 @@ def scan_level(lv, sink):
         return monoscript_index(os.path.join(DATA, base)).get(pid)
 
     go_obj, tr_obj, col_obj = {}, {}, {}
+    mf_obj = {}                                   # GameObject pid -> its MeshFilter (door parts)
+    mr_go = {}                                    # GameObject pid -> its MeshRenderer (door parts)
     mbs = []
     for o in objs:
         tn = o.type.name
@@ -455,6 +457,16 @@ def scan_level(lv, sink):
             tr_obj[o.path_id] = o
         elif tn == "BoxCollider":
             col_obj[o.path_id] = o
+        elif tn == "MeshFilter":
+            try:
+                mf_obj[o.read(check_read=False).m_GameObject.path_id] = o
+            except Exception:
+                pass
+        elif tn == "MeshRenderer":
+            try:
+                mr_go[o.read(check_read=False).m_GameObject.path_id] = o
+            except Exception:
+                pass
         elif tn == "MonoBehaviour":
             mbs.append(o)
 
@@ -539,6 +551,62 @@ def scan_level(lv, sink):
                 if d:
                     cols.append(d)
         return gd.get("m_Name"), tpid, cols
+
+    _mesh_name = {}
+    _drawn_cache = {}
+
+    def _drawn(gpid):
+        """Does this GameObject's MeshRenderer actually DRAW? Same Unity-visibility rule the
+        geometry extractor culls by (ShadowsOnly cast==3 / renderer disabled): a door's subtree
+        also holds invisible BALLISTIC panels (Icebreaker's Box001..Box016) which are never in
+        the pack, and whose 3ds-max-default names ('Box001') could otherwise false-match an
+        unrelated instance a metre away."""
+        if gpid not in _drawn_cache:
+            ok = False
+            mr = mr_go.get(gpid)
+            if mr is not None:
+                try:
+                    d = mr.read_typetree()
+                    ok = bool(d.get("m_Enabled", 1)) and d.get("m_CastShadows", 1) != 3
+                except Exception:
+                    ok = True                     # unreadable -> keep (match still needs name+pos)
+            _drawn_cache[gpid] = ok
+        return _drawn_cache[gpid]
+
+    def door_parts(tpid, depth=0):
+        """Every RENDERER in a door's transform SUBTREE, as [mesh name, bridged world pos].
+
+        A door is not one mesh: the Door component sits on the swinging LEAF GameObject, whose
+        subtree holds the panel, its glass, wood/metal inlays and the shadow proxy — while the
+        FRAME is a SIBLING that must stay put (verified on streets Inside_Door_Wood_23: leaf
+        subtree = door_L_LOD0 + door_L_glass_LOD0 + door_L_wood_LOD0; siblings = the frame
+        `_LOD0` and its own `_glass_LOD0`). The viewer matched only the ONE nearest instance to
+        the pivot, so a door's glass stayed behind when the panel swung. Shipping the subtree
+        makes the part set the GAME's own grouping instead of a proximity guess. Mesh names
+        match the pack's (the exporter sanitizes the same Unity mesh name)."""
+        out = []
+        d = tt(tpid, tr_obj)
+        if not d:
+            return out
+        gpid = (d.get("m_GameObject") or {}).get("m_PathID")
+        # A door part must actually RENDER: ballistic/collision proxies carry a MeshFilter with
+        # no MeshRenderer (Icebreaker's Box001..Box016) and would only add noise to the match.
+        mf = mf_obj.get(gpid) if _drawn(gpid) else None
+        if mf is not None:
+            if gpid not in _mesh_name:
+                try:
+                    _mesh_name[gpid] = mf.read(check_read=False).m_Mesh.read().m_Name
+                except Exception:
+                    _mesh_name[gpid] = None
+            nm = _mesh_name[gpid]
+            if nm:
+                out.append([nm, bridge(world_mat(tpid)[:3, 3])])
+        if depth < 6:
+            for ch in d.get("m_Children", []) or []:
+                cp = ch.get("m_PathID") if isinstance(ch, dict) else None
+                if cp in tr_obj:
+                    out.extend(door_parts(cp, depth + 1))
+        return out
 
     def footprint(M, col):
         """4 world bottom-face corners of a BoxCollider under world matrix M, bridged.
@@ -652,6 +720,12 @@ def scan_level(lv, sink):
                 rec["swing"] = True
                 if ang is not None:
                     rec["open_angle"] = ang
+                # The parts that swing WITH the panel (glass/inlays) — the game's own subtree,
+                # so the viewer stops guessing by proximity. See `door_parts`.
+                if tpid:
+                    parts = door_parts(tpid)
+                    if parts:
+                        rec["parts"] = parts
             # Trigger-hash links (newer maps): the trailing digit-hash of each trigger name joins
             # this door to the Switch interactable that drives it (build_map's stage-6 merge turns
             # the join into switch->door target edges). Omitted when absent -> classic maps' output
