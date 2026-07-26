@@ -394,6 +394,16 @@ Anyone picking this up should start by finding the block header at byte 18652 (r
   exist only for lighting/culling scenes, and those maps have exactly **one** AI scene — so
   spawns/patrols are TOD-invariant. TOD-dependent spawn logic is folklore w.r.t. the client assets.
 - **No lightmaps or light probes shipped.**
+- **Some window geometry is NOT in the scene files (streets, verified 2026-07).** Zmeiskiy 1's
+  upper-floor courtyard windows: the pack was suspected of dropping them (see-through facade,
+  un-raycastable openings, the cell tower visible through the building). Full audit chain —
+  pack meshes == dataset meshes == **Unity level 304's own GameObjects** (only air conditioners
+  + window fences exist in those openings; ground-floor `Window_plastic/wood_*` units ARE
+  serialized, upper floors are NOT), and every City level is extracted (the one absent level,
+  394, is the empty `City_Grass.unity`). The game builds those windows at RUNTIME (streamed /
+  pooled prefab content, same class as loose loot). Any fix means a NEW extraction source
+  (bundle-level prefab placements), not a pipeline change — the viewer already matches the
+  client's scene data exactly.
 
 ---
 
