@@ -41,23 +41,13 @@ enum GameEvent {
     RaidEnd,
 }
 
-/// Scene-preset bundle name -> our pack id (TarkovMonitor's MapBundles table, mapped to the atlas
-/// roster). Bundles for maps we don't ship (terminal, icebreaker) are simply absent.
+/// Scene-preset bundle name -> our pack id. GAME-DERIVED via the embedded manifest
+/// (`maps::bundle_to_id`): gen_maps reads each `maps/*.bundle`'s own scene list and joins its
+/// location folder to the roster. Replaces the hardcoded TarkovMonitor MapBundles copy that
+/// lived here — which had silently omitted `icebreaker.bundle`, so Icebreaker raids never
+/// auto-detected. Bundles for locations we don't ship (terminal, arena) aren't in the roster.
 pub(crate) fn bundle_to_map(bundle: &str) -> Option<&'static str> {
-    Some(match bundle {
-        "city_preset" => "streets",
-        "customs_preset" => "customs",
-        "factory_day_preset" | "factory_night_preset" => "factory_rework",
-        "laboratory_preset" | "laboratory_dark_preset" => "labs",
-        "labyrinth_preset" => "labyrinth",
-        "lighthouse_preset" => "lighthouse",
-        "rezerv_base_preset" => "reserve",
-        "sandbox_preset" | "sandbox_high_preset" => "ground_zero",
-        "shopping_mall" => "interchange",
-        "shoreline_preset" => "shoreline",
-        "woods_preset" => "woods",
-        _ => return None,
-    })
+    crate::maps::bundle_to_id(bundle)
 }
 
 // ---------------------------------------------------------------------------------------------
