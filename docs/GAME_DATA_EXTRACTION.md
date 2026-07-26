@@ -29,8 +29,8 @@ fences; "does it span height?" was right.
 |---|---|
 | Game install | `C:\Battlestate Games\Escape from Tarkov` (assets under `EscapeFromTarkov_Data`) |
 | Game logs | `<install>\Logs\log_<date>_<version>\` — note logs sit **beside the exe**, not under `..._Data` |
-| Extracted datasets | `C:\Users\nhaum\beamng_blender_pipeline\eft_assets\<dataset>` |
-| tarkmap dir | `C:\Users\nhaum\beamng_blender_pipeline\tarkmap` (holds `maps/` + `out/`) |
+| Extracted datasets | `<workspace>\beamng_blender_pipeline\eft_assets\<dataset>` |
+| tarkmap dir | `<workspace>\beamng_blender_pipeline\tarkmap` (holds `maps/` + `out/`) |
 | Python with UnityPy | the repo venv: `.\venv\Scripts\python.exe` |
 | tarkov.dev data | **json.tarkov.dev static catalogs ONLY** via `extraction/intel/tarkov_static.py` (ETag cache; offline = last snapshot). Never `api.tarkov.dev/graphql` — it 503s for hours; the static dumps are the feed tarkov.dev's own apps consume. Bonus: `maps_en`/`maps_ru` carry `Zone*`/`BotZone*` translations ("ZoneWoodCutter" → "Lumber Mill") — the exact table boss `spawnLocations` names render from. |
 
