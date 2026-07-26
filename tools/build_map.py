@@ -306,10 +306,43 @@ def derive_sea_level(dataset):
         b[2] = min(b[2], wz[0])
         b[3] = max(b[3], wz[1])
         b[4] = max(b[4], y_surf)
+    # QUALIFY THE SEA STRUCTURALLY, not by size.
+    #
+    # Size alone cannot separate an ocean from a lake: woods' lake clears any sane area bar (it
+    # derived a 7.454 m "sea level" and the viewer flooded the whole map with a horizon quad).
+    # The real, geometric difference is CONTAINMENT:
+    #   * an ocean is UNBOUNDED — it runs out to the edge of the built scene and past it, so its
+    #     footprint reaches the scene's own XZ boundary;
+    #   * a lake/pond/river is ENCLOSED — terrain wraps all the way around it, so its footprint
+    #     stops well short of the boundary on every side.
+    # So: require the water to touch the scene AABB on at least one side. That is derived from the
+    # game's own geometry, needs no per-map constant, and does not care how big the lake is.
+    #
+    # `scene_*` come from instance TRANSLATIONS, so sea tiles contribute to the bounds they are
+    # then tested against. That is not circular in the failing direction: a sea that defines the
+    # edge trivially touches it (correct), while a lake sitting inside the terrain footprint does
+    # not (also correct).
+    sx_min, sx_max = min(sx), max(sx)
+    sz_min, sz_max = min(sz), max(sz)
+    span_x = max(1.0, sx_max - sx_min)
+    span_z = max(1.0, sz_max - sz_min)
+    EDGE_FRAC = 0.02          # "touching" = within 2% of the scene span of that side
+    MIN_AREA_FRAC = 0.10      # still require map-scale: a puddle at the map edge is not an ocean
+
     best = None
     for b in bins.values():
         area = (b[1] - b[0]) * (b[3] - b[2])
-        if area >= 0.10 * scene_area and (best is None or area > best[0]):
+        if area < MIN_AREA_FRAC * scene_area:
+            continue
+        touches = (
+            b[0] <= sx_min + EDGE_FRAC * span_x      # reaches the -X edge
+            or b[1] >= sx_max - EDGE_FRAC * span_x   # +X
+            or b[2] <= sz_min + EDGE_FRAC * span_z   # -Z
+            or b[3] >= sz_max - EDGE_FRAC * span_z   # +Z
+        )
+        if not touches:
+            continue                                  # enclosed water: a lake, not the sea
+        if best is None or area > best[0]:
             best = (area, b[4])
     if best is None:
         return None
