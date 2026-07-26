@@ -748,6 +748,34 @@ fn sync_gfx_shadow_toggle(
     }
 }
 
+/// Bumped whenever GPU instance records are rewritten mid-session (door swings) so the shadow
+/// cascade cache re-renders that frame — see `EftShadowCache`.
+#[derive(Resource, Default)]
+struct EftDynamicNonce(u64);
+
+/// #5b cascade CACHE. The sun is static and the world is static, so a cascade whose fitted
+/// view-proj is BIT-IDENTICAL to what its atlas layer already holds does not need re-rendering.
+/// Texel snapping makes any real camera motion change the fit (the snap quantum is a shadow
+/// texel, ~1–6 cm), so this is precisely a "camera at rest" cache — the dominant state of a
+/// map viewer — and it is artifact-free: at rest the camera cull the shadow pass reuses is
+/// unchanged too. Measured before the cache: the two 2048² cascades were 9.9 ms of
+/// interchange's 18.5 ms overview frame (docs/PERF_BENCHMARKS.md).
+///
+/// `vp[c]` = the fit the CURRENT atlas content was rendered with (None = layer invalid, e.g.
+/// while shadows are disabled); `render[c]` = this frame's instruction to `EftShadowNode`.
+/// Invalidation beyond a vp change: door swings (`EftDynamicNonce`), geometry/pack rebuilds
+/// (`EftGpuBuffers` change), and any GfxSettings change (LOD sliders alter the draw set).
+#[derive(Resource)]
+struct EftShadowCache {
+    vp: [Option<[[f32; 4]; 4]>; SHADOW_CASCADES],
+    render: [bool; SHADOW_CASCADES],
+}
+impl Default for EftShadowCache {
+    fn default() -> Self {
+        Self { vp: [None; SHADOW_CASCADES], render: [false; SHADOW_CASCADES] }
+    }
+}
+
 /// The queued shadow depth pipeline + its group(1) cascade-uniform layout.
 #[derive(Resource)]
 struct EftShadowPipeline {
@@ -1315,6 +1343,8 @@ impl Plugin for EftGpuDrivenPlugin {
             .insert_resource(fallback) // render world raises it in init_gpu_pipelines on a guard miss
             .add_render_command::<Transparent3d, DrawGpuDriven>()
             .init_resource::<SpecializedRenderPipelines<EftDrawPipeline>>()
+            .init_resource::<EftShadowCache>()
+            .init_resource::<EftDynamicNonce>()
             .add_systems(RenderStartup, init_gpu_pipelines)
             .add_systems(
                 Render,
@@ -1353,9 +1383,12 @@ impl Plugin for EftGpuDrivenPlugin {
                         .after(prepare_gpu_buffers),
                     // Door click-to-open: toggle the nearest door + ease in-flight swings, mutating
                     // the matched instance record (no-op until a door is clicked).
+                    // Ordered before the shadow prepare so a swing invalidates the cascade
+                    // cache the SAME frame (EftDynamicNonce).
                     animate_doors
                         .in_set(RenderSystems::PrepareResources)
-                        .after(prepare_gpu_buffers),
+                        .after(prepare_gpu_buffers)
+                        .before(prepare_shadow_uniforms),
                     queue_gpu_driven.in_set(RenderSystems::QueueMeshes),
                 ),
             )
@@ -5379,6 +5412,7 @@ fn animate_doors(
     doors: Option<ResMut<EftDoors>>,
     click: Option<Res<DoorClick>>,
     mut last_gen: Local<u64>,
+    mut nonce: ResMut<EftDynamicNonce>,
 ) {
     let Some(mut res) = doors else { return };
     // First frame for this map's doors: write every door's initial-pose record so already-open
@@ -5409,11 +5443,13 @@ fn animate_doors(
     let step = (time.delta_secs() / 0.35).clamp(0.0, 1.0); // ~0.35 s open/close
     // Split the borrow: read buffer handle, then mutate doors.
     let buf = res.instances_buf.clone();
+    let mut wrote_any = false;
     for d in res.doors.iter_mut() {
         let moving = (d.progress - d.target).abs() >= 1.0e-4;
         if !moving && !force_all {
             continue;
         }
+        wrote_any = true;
         if moving {
             d.progress += (d.target - d.progress).signum() * step;
             d.progress = d.progress.clamp(0.0, 1.0);
@@ -5425,6 +5461,10 @@ fn animate_doors(
             render_queue.write_buffer(&buf, part.gpu_idx as u64 * 80, bytemuck::bytes_of(&rec));
         }
     }
+    // A moving door rewrote instance records — the cached shadow cascades are stale.
+    if wrote_any {
+        nonce.0 = nonce.0.wrapping_add(1);
+    }
 }
 
 fn prepare_shadow_uniforms(
@@ -5433,10 +5473,19 @@ fn prepare_shadow_uniforms(
     resources: Option<Res<EftShadowResources>>,
     settings: Option<Res<crate::render::GfxSettings>>,
     views: Query<&ExtractedView, With<CullCamera>>,
+    mut cache: ResMut<EftShadowCache>,
+    nonce: Res<EftDynamicNonce>,
+    buffers: Option<Res<EftGpuBuffers>>,
 ) {
     let (Some(config), Some(res)) = (config, resources) else {
         return;
     };
+    // Cascade-cache force conditions beyond a view-proj change: door swings rewrote instance
+    // records, the pack/geometry rebuilt, or any GfxSettings change (LOD sliders and cull
+    // thresholds alter the indirect draw set the shadow pass replays).
+    let force = nonce.is_changed()
+        || buffers.as_ref().is_some_and(|b| b.is_changed())
+        || settings.as_ref().is_some_and(|s| s.is_changed());
     let Some(view) = views.iter().next() else {
         return;
     };
@@ -5559,6 +5608,21 @@ fn prepare_shadow_uniforms(
         );
         let view_proj = proj * light_view;
         let vp_cols = view_proj.to_cols_array_2d();
+
+        // #5b cascade cache: identical fit == identical content (static sun, static world,
+        // unchanged camera cull) -> tell the node to skip this cascade's render pass. While
+        // shadows are OFF the atlas content goes stale/undefined, so the cache is voided and
+        // re-enabling re-renders both layers.
+        if shadows_on {
+            let dirty = force || cache.vp[c] != Some(vp_cols);
+            cache.render[c] = dirty;
+            if dirty {
+                cache.vp[c] = Some(vp_cols);
+            }
+        } else {
+            cache.render[c] = false;
+            cache.vp[c] = None;
+        }
 
         main.view_proj[c] = vp_cols;
         main.texel_world[c] = world_texel;
@@ -6058,9 +6122,17 @@ impl Node for EftShadowNode {
             return Ok(()); // shadow pipeline still compiling
         };
 
+        // #5b cascade cache: prepare_shadow_uniforms marked which layers actually need
+        // re-rendering this frame (camera at rest + static world = none; see EftShadowCache).
+        let cache = world.get_resource::<EftShadowCache>();
         // One depth-only render pass per cascade layer: clear to 1.0, then the SAME multidraw the
         // main pass uses (indirect buffer READ-ONLY — never reset/reculled here).
         for c in 0..SHADOW_CASCADES {
+            if let Some(cache) = cache {
+                if !cache.render[c] {
+                    continue; // atlas layer already holds this exact fit
+                }
+            }
             let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
                 label: Some("eft_shadow_cascade"),
                 color_attachments: &[],
