@@ -808,7 +808,16 @@ fn main() {
             .set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "Atlas".into(),
-                    resolution: (1600u32, 1000u32).into(),
+                    // EFT_WIN=WxH overrides for benches (resolution scaling splits
+                    // fragment-bound from CPU/fixed cost); default 1600x1000.
+                    resolution: std::env::var("EFT_WIN")
+                        .ok()
+                        .and_then(|s| {
+                            let (w, h) = s.trim().split_once('x')?;
+                            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+                        })
+                        .unwrap_or((1600u32, 1000u32))
+                        .into(),
                     present_mode,
                     // EFT_HIDDEN=1: render without showing a window (headless EFT_SHOT
                     // verification runs — GPU screenshot capture works on an invisible
@@ -982,7 +991,12 @@ fn main() {
                 .chain()
                 .run_if(not(resource_exists::<menu::MenuState>)),
         )
-        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change))
+        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change, bench_stats))
+        // Bench cameras override the fly-cam AFTER Update, before transforms propagate.
+        .add_systems(
+            PostUpdate,
+            debug_bench_camera.before(bevy::transform::TransformSystems::Propagate),
+        )
         .add_systems(
             Update,
             (apply_gfx_camera, load_map, poll_map_load, clear_map_error_on_new_load, flycam_scroll, apply_camera_fov, build_walk_ground),
@@ -1841,6 +1855,94 @@ fn auto_screenshot(
     commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path.clone()));
     info!("auto-screenshot -> {path} (frame {})", *frames);
     *done = true;
+}
+
+/// EFT_BENCH=<seconds>: benchmark mode. After the pack load settles (same gate as
+/// `auto_screenshot`), record EVERY frame's CPU delta for the given window, print a one-line
+/// stats dump (avg/p50/p95/p99/max ms + fps) and exit 0 so scripted runs end cleanly. Pair
+/// with EFT_UNCAPPED=1 (vsync off) and EFT_POSE / EFT_ORBIT / EFT_FLY for repeatable scenarios.
+fn bench_stats(
+    time: Res<Time>,
+    pending: Res<PendingMapLoad>,
+    gpu_load: Option<Res<render::GpuLoadSignal>>,
+    pack: Option<Res<LoadedPack>>,
+    mut samples: Local<Vec<f32>>,
+    mut settle: Local<i32>,
+) {
+    let Some(secs) = std::env::var("EFT_BENCH").ok().and_then(|s| s.trim().parse::<f32>().ok())
+    else {
+        return;
+    };
+    let loaded = pack.is_some()
+        && pending.loading().is_none()
+        && gpu_load.as_ref().map(|s| !s.in_progress()).unwrap_or(true);
+    if !loaded {
+        *settle = 0;
+        return;
+    }
+    // Let steady state establish after the load (texcache warm-up, first-frame compiles).
+    *settle += 1;
+    if *settle <= 90 {
+        return;
+    }
+    samples.push(time.delta_secs() * 1000.0);
+    let total: f32 = samples.iter().sum::<f32>() / 1000.0;
+    if total >= secs {
+        let mut s = samples.clone();
+        s.sort_by(|a, b| a.total_cmp(b));
+        let n = s.len();
+        let pct = |p: f32| s[(((n - 1) as f32) * p) as usize];
+        let avg = s.iter().sum::<f32>() / n as f32;
+        let line = format!(
+            "[bench] frames={n} secs={total:.1} avg={avg:.3}ms fps={:.1} p50={:.3} p95={:.3} p99={:.3} max={:.3}",
+            1000.0 / avg,
+            pct(0.50),
+            pct(0.95),
+            pct(0.99),
+            pct(1.0)
+        );
+        info!("{line}");
+        eprintln!("{line}"); // bypass the subscriber too — the run exits immediately after
+        std::process::exit(0);
+    }
+}
+
+/// Scripted benchmark cameras (moving-camera load: culling churn / LOD swaps / uploads).
+///   EFT_ORBIT="cx,cy,cz,radius,height,degps" — circle the target point, looking at it.
+///   EFT_FLY="x1,y1,z1>x2,y2,z2@secs"         — ping-pong a straight path, looking forward.
+/// Runs in PostUpdate before transform propagation so it deterministically overrides the
+/// fly-cam's Update-stage writes.
+fn debug_bench_camera(
+    time: Res<Time>,
+    mut q: Query<&mut Transform, With<render::CullCamera>>,
+) {
+    let Ok(mut tf) = q.single_mut() else { return };
+    if let Ok(spec) = std::env::var("EFT_ORBIT") {
+        let v: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        if v.len() == 6 {
+            let ang = (time.elapsed_secs() * v[5]).to_radians();
+            let target = Vec3::new(v[0], v[1], v[2]);
+            let pos = target + Vec3::new(v[3] * ang.cos(), v[4], v[3] * ang.sin());
+            *tf = Transform::from_translation(pos).looking_at(target, Vec3::Y);
+            return;
+        }
+    }
+    if let Ok(spec) = std::env::var("EFT_FLY") {
+        if let Some((ab, secs)) = spec.rsplit_once('@') {
+            if let Some((a, b)) = ab.split_once('>') {
+                let pa: Vec<f32> = a.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                let pb: Vec<f32> = b.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                let dur: f32 = secs.trim().parse().unwrap_or(10.0);
+                if pa.len() == 3 && pb.len() == 3 && dur > 0.0 {
+                    let (a, b) = (Vec3::from_slice(&pa), Vec3::from_slice(&pb));
+                    let t = time.elapsed_secs() / dur;
+                    let (from, to) = if (t as i32) % 2 == 0 { (a, b) } else { (b, a) };
+                    let p = from.lerp(to, t.fract());
+                    *tf = Transform::from_translation(p).looking_at(to, Vec3::Y);
+                }
+            }
+        }
+    }
 }
 
 /// Headless soak-test hook for the in-place map swap: `EFT_SWITCH="dir@frame;dir@frame;..."` fires
