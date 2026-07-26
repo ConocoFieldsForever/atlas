@@ -72,6 +72,13 @@ pub struct MarkerValue(pub i64);
 #[derive(Component)]
 pub struct DenseMarker;
 
+/// A PLAYER raid start (side pmc/all) — as opposed to an AI-PMC bot spawn point on the same
+/// layer. Players scatter within minutes, so these are EXCLUDED from the router's "avoid
+/// PMCs" danger fields (which would otherwise fence off empty spawn grass all raid) and from
+/// any other "where are enemies" logic; AI-PMC points remain fair game.
+#[derive(Component)]
+pub struct PlayerStart;
+
 /// A spawn marker's serialized SphereCollider radius (m). Drawn as a ground circle ONLY while
 /// the marker's card is open (inspect::draw_open_card_radii) — gives the card's "Radius N m"
 /// line a shape without permanent clutter. Player-side markers don't get one (their collider
@@ -1691,6 +1698,9 @@ fn spawn_pois(
     }
     // Off-palette marker materials (same emissive formula as the layer mats): faction-tinted
     // extracts + violet keycard locks. PMC extracts keep the layer's default extract green.
+    // AI-PMC bot spawns share the PMC layer but must READ apart from player raid starts at a
+    // glance (bright red = a player begins here; dull maroon = a bot anchors here).
+    let ai_pmc_mat = mk(&mut materials, Color::srgb(0.60, 0.19, 0.30));
     let ex_scav = mk(&mut materials, extract_faction_color("scav"));
     let ex_shared = mk(&mut materials, extract_faction_color("shared"));
     let ex_secret = mk(&mut materials, extract_faction_color("secret"));
@@ -2384,9 +2394,15 @@ fn spawn_pois(
         for s in &gd.spawn_points {
             let Some(layer) = gd_spawn_layer(s) else { continue };
             let zd = zone_disp(s.zone.as_deref());
-            let e = spawn(&mut commands, layer, s.pos, gd_spawn_info(s, layer, zd.as_deref()), None);
-            commands.entity(e).insert(DenseMarker);
             let player_side = matches!(s.side.as_deref(), Some("pmc") | Some("all"));
+            // Player raid starts keep the layer's bright red; AI-PMC bot anchors on the same
+            // layer render dull maroon so the two never read as the same thing.
+            let mat = (layer == PoiLayer::PmcSpawn && !player_side).then(|| ai_pmc_mat.clone());
+            let e = spawn(&mut commands, layer, s.pos, gd_spawn_info(s, layer, zd.as_deref()), mat);
+            commands.entity(e).insert(DenseMarker);
+            if layer == PoiLayer::PmcSpawn && player_side {
+                commands.entity(e).insert(PlayerStart);
+            }
             if let Some(r) = s.radius.filter(|r| *r > 0.0 && !player_side) {
                 commands.entity(e).insert(SpawnRadius(r));
             }

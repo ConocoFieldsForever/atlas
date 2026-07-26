@@ -174,7 +174,13 @@ fn dispatch_plan(
     locks: Query<(&GlobalTransform, &crate::poi::LockKeys)>,
     progress: Res<crate::progress::PlayerProgress>,
     all_marks: Query<
-        (&crate::poi::PoiLayer, &GlobalTransform, &crate::inspect::MarkerInfo, Option<&crate::poi::SceneInactive>),
+        (
+            &crate::poi::PoiLayer,
+            &GlobalTransform,
+            &crate::inspect::MarkerInfo,
+            Option<&crate::poi::SceneInactive>,
+            Option<&crate::poi::PlayerStart>,
+        ),
         Without<crate::poi::ZoneWall>,
     >,
     mut task: ResMut<PlanTask>,
@@ -233,8 +239,8 @@ fn dispatch_plan(
     // ---- extract candidates (active only) — the run must END somewhere safe.
     let extracts: Vec<(String, Vec3)> = all_marks
         .iter()
-        .filter(|(l, _, _, inactive)| **l == crate::poi::PoiLayer::Extract && inactive.is_none())
-        .map(|(_, gt, info, _)| (info.title.clone(), gt.translation()))
+        .filter(|(l, _, _, inactive, _)| **l == crate::poi::PoiLayer::Extract && inactive.is_none())
+        .map(|(_, gt, info, _, _)| (info.title.clone(), gt.translation()))
         .collect();
     if extracts.is_empty() {
         plan.status = PlanStatus::Error("no active extracts on this map".into());
@@ -244,10 +250,12 @@ fn dispatch_plan(
     // ---- avoid field (same options as normal routing) ----
     let mut avoid_pts: Vec<(Vec3, f32)> = Vec::new();
     if opts.avoid_boss || opts.avoid_pmc || opts.avoid_scav {
-        for (l, gt, _, _) in &all_marks {
+        for (l, gt, _, _, player_start) in &all_marks {
             let r = match l {
                 crate::poi::PoiLayer::Boss if opts.avoid_boss => 45.0,
-                crate::poi::PoiLayer::PmcSpawn if opts.avoid_pmc => 32.0,
+                // Player raid starts excluded (players scatter within minutes) — only AI-PMC
+                // bot anchors on the PMC layer repel. Same rule as pathfind's avoid field.
+                crate::poi::PoiLayer::PmcSpawn if opts.avoid_pmc && player_start.is_none() => 32.0,
                 crate::poi::PoiLayer::ScavSpawn if opts.avoid_scav => 24.0,
                 _ => continue,
             };
