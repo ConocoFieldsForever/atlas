@@ -2797,9 +2797,21 @@ fn apply_quest_visibility(
 /// at the platform, not draped to the ground far below (DEFECT 2 fix). The `draped` flag stays true
 /// (the ground group is still draped), so the token 0.05 lift is right for both. Zones inactive in
 /// the scene follow the panel's "hide inactive" filter like their markers.
-fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles: Res<LayerToggles>) {
+fn draw_gamedata_outlines(
+    mut gizmos: Gizmos,
+    zones: Res<GameDataZones>,
+    toggles: Res<LayerToggles>,
+    cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
+) {
     let lift = Vec3::new(0.0, if zones.draped { 0.05 } else { 0.4 }, 0.0);
     let hide_inactive = toggles.hide_inactive;
+    // Gizmos are IMMEDIATE MODE — every dash, dot and chevron below is re-tessellated each
+    // frame (interchange: 261 waypoint dots + ~1.5k draped hull verts). Beyond these ranges
+    // that detail is sub-pixel, so it collapses to plain lines / nothing instead of lagging
+    // the frame when several layers are up at once.
+    let cam_pos = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    const DOT_RANGE: f32 = 350.0; // waypoint dots + chevrons
+    const DASH_RANGE: f32 = 550.0; // hull dashes (farther edges draw one solid line)
     let mut ring = |outline: &Vec<Vec3>, color: Color| {
         gizmos.linestrip(
             outline
@@ -2847,6 +2859,7 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
         let c = poi_look(PoiLayer::BotZone).0;
         const DASH: f32 = 1.4;
         const GAP: f32 = 0.9;
+        let c_far = c.with_alpha(0.55); // distant edges: one solid faint line, not dashes
         for (outline, active) in &zones.bot_zones {
             if hide_inactive && !active {
                 continue;
@@ -2856,6 +2869,10 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
                 let b = outline[(i + 1) % outline.len()] + lift;
                 let len = a.distance(b);
                 if len < 1e-3 {
+                    continue;
+                }
+                if a.distance_squared(cam_pos) > DASH_RANGE * DASH_RANGE {
+                    gizmos.line(a, b, c_far);
                     continue;
                 }
                 let dir = (b - a) / len;
@@ -2883,10 +2900,10 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
                 let (a, b) = (line[i] + lift, line[i + 1] + lift);
                 gizmos.line(a, b, col);
                 // Chevron at the segment midpoint pointing DOWN-ROUTE (serialized order made
-                // explicit, not just implied by the fade). Short segments skip it.
+                // explicit, not just implied by the fade). Short or DISTANT segments skip it.
                 let seg = b - a;
                 let len = seg.length();
-                if len >= 3.5 {
+                if len >= 3.5 && a.distance_squared(cam_pos) < DOT_RANGE * DOT_RANGE {
                     let dir = seg / len;
                     let perp = Vec3::new(-dir.z, 0.0, dir.x);
                     let tip = a + seg * 0.5 + dir * 0.4;
@@ -2895,8 +2912,15 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
                 }
             }
             for (i, p) in line.iter().enumerate() {
+                // Dots are sub-pixel past a few hundred metres — the connectors carry the
+                // shape at range; a low-resolution circle carries it up close.
+                if p.distance_squared(cam_pos) > DOT_RANGE * DOT_RANGE {
+                    continue;
+                }
                 let r = if i == 0 { 0.55 } else { 0.35 };
-                gizmos.circle(bevy::math::Isometry3d::new(*p + lift, flat), r, c);
+                gizmos
+                    .circle(bevy::math::Isometry3d::new(*p + lift, flat), r, c)
+                    .resolution(10);
             }
         }
     }
