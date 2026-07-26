@@ -154,6 +154,7 @@ fn apply_game_events(
     menu: Option<Res<crate::menu::MenuState>>,
     mut sw: ResMut<crate::MapSwitch>,
     mut cam_settings: ResMut<crate::CameraSettings>,
+    mut toggles: ResMut<crate::ui::LayerToggles>,
     time: Res<Time>,
 ) {
     // Shadow-read every route request the UI sends (readers have independent cursors, so this does
@@ -242,6 +243,9 @@ with the overlay up"
                         }
                     }
                 }
+                // A fresh screenshot fix is an explicit "locate me" — turn the player marker on
+                // (it defaults OFF so stale fixes from past raids don't haunt the map).
+                toggles.player_marker = true;
                 if let Some(dir) = look.or(fwd) {
                     cam_cmd.eye = Some((pos, dir));
                 } else {
@@ -309,7 +313,17 @@ with the overlay up"
 
 /// Draw the live player marker: pulsing ground ring + facing arrow + a vertical beacon so the
 /// player is findable from any camera height. Gizmos = immediate mode, nothing to clean up.
-fn draw_player_marker(link: Res<GameLink>, mut gizmos: Gizmos, time: Res<Time>) {
+/// Gated by the panel's "Player marker (game link)" toggle (default OFF — a fix can outlive its
+/// raid, and a stale green beacon otherwise haunts the map).
+fn draw_player_marker(
+    link: Res<GameLink>,
+    toggles: Res<crate::ui::LayerToggles>,
+    mut gizmos: Gizmos,
+    time: Res<Time>,
+) {
+    if !toggles.player_marker {
+        return;
+    }
     let Some(fix) = &link.player else { return };
     let p = fix.pos;
     let t = time.elapsed_secs();

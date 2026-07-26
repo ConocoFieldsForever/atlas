@@ -340,7 +340,10 @@ fn dispatch_route(
     start_pt: Res<StartPoint>,
     opts: Res<RouteOpts>,
     cam: Query<&GlobalTransform, With<CullCamera>>,
-    spawns: Query<(&crate::poi::PoiLayer, &GlobalTransform), Without<crate::poi::ZoneWall>>,
+    spawns: Query<
+        (&crate::poi::PoiLayer, &GlobalTransform, Option<&crate::poi::PlayerStart>),
+        Without<crate::poi::ZoneWall>,
+    >,
     mut task: ResMut<PathfindTask>,
     mut result: ResMut<RouteResult>,
 ) {
@@ -370,10 +373,13 @@ fn dispatch_route(
     let mut avoid_pts: Vec<(Vec3, f32)> = Vec::new();
     if opts.avoid_boss || opts.avoid_pmc || opts.avoid_scav {
         use crate::poi::PoiLayer;
-        for (l, gt) in &spawns {
+        for (l, gt, player_start) in &spawns {
             let r = match l {
                 PoiLayer::Boss if opts.avoid_boss => AVOID_R_BOSS,
-                PoiLayer::PmcSpawn if opts.avoid_pmc => AVOID_R_PMC,
+                // PLAYER raid starts are excluded: players scatter within minutes, and a 32 m
+                // no-go bubble on every empty spawn would warp routes all raid. AI-PMC bot
+                // anchors (same layer, no PlayerStart tag) still repel.
+                PoiLayer::PmcSpawn if opts.avoid_pmc && player_start.is_none() => AVOID_R_PMC,
                 PoiLayer::ScavSpawn if opts.avoid_scav => AVOID_R_SCAV,
                 _ => continue,
             };
