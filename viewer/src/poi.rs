@@ -2816,18 +2816,36 @@ struct PatrolContours {
     epoch: u64,
     with_nav: bool,
     n_ways: usize,
-    ways: Vec<Vec<(Vec3, f32)>>,
+    /// Per way: contour verts as (pos, route-fraction t, cumulative arc metres) + total arc.
+    /// t drives the order fade; arc drives the marching arrows + the comet pulse.
+    ways: Vec<(Vec<(Vec3, f32, f32)>, f32)>,
 }
 
 fn build_patrol_contours(
     ways: &[Vec<Vec3>],
     nav: Option<&crate::nav::NavGrid>,
-) -> Vec<Vec<(Vec3, f32)>> {
+) -> Vec<(Vec<(Vec3, f32, f32)>, f32)> {
     let mut scratch = nav.map(|g| crate::nav::pooled_scratch(g.nodes()));
     ways.iter()
         .map(|way| {
             let n = way.len();
             let mut out: Vec<(Vec3, f32)> = Vec::new();
+            let finish = |verts: Vec<(Vec3, f32)>| -> (Vec<(Vec3, f32, f32)>, f32) {
+                // Stamp cumulative arc metres (animation parameter) over the finished contour.
+                let mut arc = 0.0f32;
+                let mut prev: Option<Vec3> = None;
+                let stamped: Vec<(Vec3, f32, f32)> = verts
+                    .into_iter()
+                    .map(|(p, t)| {
+                        if let Some(q) = prev {
+                            arc += q.distance(p);
+                        }
+                        prev = Some(p);
+                        (p, t, arc)
+                    })
+                    .collect();
+                (stamped, arc)
+            };
             for i in 0..n.saturating_sub(1) {
                 let (a, b) = (way[i], way[i + 1]);
                 let t0 = i as f32 / (n - 1).max(1) as f32;
@@ -2873,7 +2891,7 @@ fn build_patrol_contours(
                     out.push((*p, t0 + (t1 - t0) * (acc / total)));
                 }
             }
-            out
+            finish(out)
         })
         .collect()
 }
@@ -2885,6 +2903,7 @@ fn draw_gamedata_outlines(
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     nav: Option<Res<crate::pathfind::Nav>>,
     epoch: Res<crate::render::MapEpoch>,
+    time: Res<Time>,
     mut contours: Local<PatrolContours>,
 ) {
     let lift = Vec3::new(0.0, if zones.draped { 0.05 } else { 0.4 }, 0.0);
@@ -2986,43 +3005,80 @@ fn draw_gamedata_outlines(
             contours.with_nav = nav_grid.is_some();
             contours.ways = build_patrol_contours(&zones.patrols, nav_grid);
         }
-        let c = poi_look(PoiLayer::Patrol).0;
+        // ---- ANIMATED patrol flow: HDR-boosted colors bloom into a glow (the in-raid camera
+        // runs Bloom), arrows MARCH down-route at bot-walk pace, and a bright comet pulse
+        // periodically runs the whole path. All parameters are arc-length driven off the
+        // contour cache, so the animation hugs stairs and floors exactly like the line does.
+        let base = poi_look(PoiLayer::Patrol).0.to_linear();
+        let hdr = |boost: f32, alpha: f32| -> Color {
+            Color::LinearRgba(bevy::color::LinearRgba {
+                red: base.red * boost,
+                green: base.green * boost,
+                blue: base.blue * boost,
+                alpha,
+            })
+        };
+        let t_now = time.elapsed_secs();
+        const ARROW_SPACING: f32 = 8.0; // metres between marching arrows
+        const ARROW_SPEED: f32 = 3.0; //   m/s — reads as a walking bot
+        const PULSE_SPEED: f32 = 26.0; //  m/s comet
+        const PULSE_LEN: f32 = 7.0; //     metres of glowing tail
+        const PULSE_GAP: f32 = 45.0; //    dead time (in metres) between comets
         let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
         for (wi, line) in zones.patrols.iter().enumerate() {
-            // Connectors: the contoured polyline (walkable route / floor-snapped fallback),
-            // faded bright->faint by each vert's route fraction.
-            if let Some(cw) = contours.ways.get(wi) {
-                let mut arc = 0.0f32; // chevron spacing along the CONTOUR (~every 9 m)
+            if let Some((cw, total)) = contours.ways.get(wi) {
+                let arrow_phase = (t_now * ARROW_SPEED) % ARROW_SPACING;
+                // Stagger comets per way so the map doesn't strobe in unison.
+                let cycle = total + PULSE_GAP;
+                let head = (t_now * PULSE_SPEED + wi as f32 * 13.7) % cycle;
                 for w in cw.windows(2) {
-                    let (a, ta) = (w[0].0 + lift, w[0].1);
-                    let b = w[1].0 + lift;
-                    let col = c.with_alpha(0.9 - 0.65 * ta);
-                    gizmos.line(a, b, col);
-                    // Chevrons ride the contour so they hug stairs/floors like the line does.
-                    let seg = b - a;
-                    let len = seg.length();
-                    if len > 1e-3 && a.distance_squared(cam_pos) < DOT_RANGE * DOT_RANGE {
-                        arc += len;
-                        if arc >= 9.0 {
-                            arc = 0.0;
-                            let dir = seg / len;
-                            let perp = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
-                            let tip = a + seg * 0.5 + dir * 0.4;
-                            gizmos.line(tip, tip - dir * 0.8 + perp * 0.45, col);
-                            gizmos.line(tip, tip - dir * 0.8 - perp * 0.45, col);
+                    let (a, ta, arc0) = (w[0].0 + lift, w[0].1, w[0].2);
+                    let (b, arc1) = (w[1].0 + lift, w[1].2);
+                    // Base line: gentle HDR lift so the path itself has a soft neon presence,
+                    // still faded bright->faint by serialized order.
+                    gizmos.line(a, b, hdr(1.6, 0.85 - 0.60 * ta));
+                    // Comet: segments inside [head-PULSE_LEN, head] get an intensity that
+                    // rises toward the head — a glowing pulse racing down the route.
+                    let mid = 0.5 * (arc0 + arc1);
+                    if mid <= head && head - mid <= PULSE_LEN {
+                        let k = 1.0 - (head - mid) / PULSE_LEN; // 0 tail .. 1 head
+                        gizmos.line(a, b, hdr(2.0 + 6.0 * k * k, 0.9));
+                    }
+                    // Marching arrows: emitted wherever this segment crosses an animated
+                    // arc-grid position (phase + n·spacing). Near-camera only — sub-pixel far.
+                    if a.distance_squared(cam_pos) < DOT_RANGE * DOT_RANGE {
+                        let seg = b - a;
+                        let len = (arc1 - arc0).max(1e-3);
+                        let dir = seg / seg.length().max(1e-3);
+                        let perp = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
+                        let mut m = (((arc0 - arrow_phase) / ARROW_SPACING).ceil()) * ARROW_SPACING
+                            + arrow_phase;
+                        while m < arc1 {
+                            if m >= arc0 {
+                                let f = (m - arc0) / len;
+                                let tip = a + seg * f + dir * 0.45;
+                                let glow = hdr(5.0, 0.95);
+                                gizmos.line(tip, tip - dir * 0.9 + perp * 0.5, glow);
+                                gizmos.line(tip, tip - dir * 0.9 - perp * 0.5, glow);
+                            }
+                            m += ARROW_SPACING;
                         }
                     }
                 }
             }
             for (i, p) in line.iter().enumerate() {
                 // Dots stay on the REAL serialized PatrolPoints (never synthetic verts) and
-                // are sub-pixel past a few hundred metres.
+                // are sub-pixel past a few hundred metres. The START dot breathes.
                 if p.distance_squared(cam_pos) > DOT_RANGE * DOT_RANGE {
                     continue;
                 }
-                let r = if i == 0 { 0.55 } else { 0.35 };
+                let (r, boost) = if i == 0 {
+                    (0.5 + 0.12 * (t_now * 2.2).sin(), 3.0)
+                } else {
+                    (0.35, 1.6)
+                };
                 gizmos
-                    .circle(bevy::math::Isometry3d::new(*p + lift, flat), r, c)
+                    .circle(bevy::math::Isometry3d::new(*p + lift, flat), r, hdr(boost, 0.95))
                     .resolution(10);
             }
         }
