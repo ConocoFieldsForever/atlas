@@ -2685,6 +2685,7 @@ fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
+    mut last_cam: Local<Vec3>,
     mut q: Query<
         (
             &PoiLayer,
@@ -2697,12 +2698,16 @@ fn apply_poi_visibility(
         Without<QuestMarkerTask>,
     >,
 ) {
-    // Re-apply on a toggle change OR a map swap (fresh markers spawn Hidden; the swap didn't touch
-    // the toggles, so without the epoch trigger they'd stay invisible).
-    if !toggles.cluster_dense && !toggles.is_changed() && !epoch.is_changed() {
+    // Re-apply on a toggle change, a map swap (fresh markers spawn Hidden; the swap didn't touch
+    // the toggles) or — with clustering on — when the camera has actually MOVED: the distance-
+    // graded clustering is camera-relative, so a static camera with stable toggles produces
+    // bit-identical results and the whole pass (5k+ markers on streets) can be skipped.
+    let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    let moved = camera.distance_squared(*last_cam) > 0.25;
+    if !toggles.is_changed() && !epoch.is_changed() && !(toggles.cluster_dense && moved) {
         return;
     }
-    let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    *last_cam = camera;
     let mut occupied = std::collections::HashSet::new();
     for (l, val, inactive, gt, dense, mut vis) in &mut q {
         let show = match l {
@@ -2740,11 +2745,13 @@ fn apply_poi_visibility(
                 show = occupied.insert((*l as u8, (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
             }
         }
-        *vis = if show {
-            Visibility::Visible
-        } else {
-            Visibility::Hidden
-        };
+        // Write ONLY on a real flip: an unconditional `*vis = ...` marks the component changed
+        // every frame for EVERY marker, and Bevy's visibility/extraction systems re-walk all of
+        // them (measured churn source with thousands of markers up).
+        let new = if show { Visibility::Visible } else { Visibility::Hidden };
+        if *vis != new {
+            *vis = new;
+        }
     }
 }
 

@@ -570,6 +570,7 @@ fn apply_loot_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
+    mut last_cam: Local<Vec3>,
     mut q: Query<(
         &LootClass,
         Option<&crate::poi::MarkerValue>,
@@ -578,12 +579,15 @@ fn apply_loot_visibility(
         &mut Visibility,
     )>,
 ) {
-    // Re-apply on a toggle change OR a map swap (fresh markers spawn Hidden and the swap didn't
-    // touch the toggles).
-    if !toggles.cluster_dense && !toggles.is_changed() && !epoch.is_changed() {
+    // Re-apply on a toggle change, a map swap (fresh markers spawn Hidden and the swap didn't
+    // touch the toggles) or — with clustering on — when the camera actually MOVED; a static
+    // camera with stable toggles recomputes an identical result, so skip the whole pass.
+    let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    let moved = camera.distance_squared(*last_cam) > 0.25;
+    if !toggles.is_changed() && !epoch.is_changed() && !(toggles.cluster_dense && moved) {
         return;
     }
-    let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
+    *last_cam = camera;
     let mut occupied = std::collections::HashSet::new();
     for (cls, val, gt, dense, mut vis) in &mut q {
         let mut shown = vis_for(&toggles, &cls.0, val) == Visibility::Visible;
@@ -592,10 +596,20 @@ fn apply_loot_visibility(
             let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
             let cell = if distance > 320.0 { 35.0 } else if distance > 140.0 { 14.0 } else { 0.0 };
             if cell > 0.0 {
-                shown = occupied.insert((cls.0.clone(), (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
+                // Hash the class NAME instead of cloning it — the old `cls.0.clone()` allocated
+                // a String per marker per frame (1.3k/frame on streets) just to key this set.
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                cls.0.hash(&mut h);
+                shown = occupied.insert((h.finish(), (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
             }
         }
-        *vis = if shown { Visibility::Visible } else { Visibility::Hidden };
+        // Write only on a real flip — unconditional writes mark every marker changed every
+        // frame and Bevy's visibility systems re-walk all of them.
+        let new = if shown { Visibility::Visible } else { Visibility::Hidden };
+        if *vis != new {
+            *vis = new;
+        }
     }
 }
 
