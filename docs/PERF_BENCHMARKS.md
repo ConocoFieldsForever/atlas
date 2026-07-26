@@ -38,12 +38,17 @@ session scratchpad (`bench.ps1` pattern — trivially recreatable from this tabl
 
 ## Ranked improvement opportunities (quantified)
 
-1. **Sun-shadow cascade caching — up to 9.9 ms on interchange-class maps (54→116 fps).**
-   The sun is STATIC and the world is STATIC; the 2×2048² cascades still re-render every frame.
-   Cache each cascade and re-render only when its snapped origin moves (camera crossing a snap
-   cell) — static views pay ~0, moving views amortize to a fraction. This is the single biggest
-   win in the entire viewer. Fallback option: drop to 1 cascade / 1024² when the camera is high
-   (map-overview mode) — overview shadows don't need contact detail.
+1. **Sun-shadow cascade caching — DONE (same day). Interchange overview static: 18.82 →
+   8.88 ms (53 → 113 fps) with shadows visually unchanged** — the full 9.9 ms ablation delta,
+   recovered. Implementation (`EftShadowCache`, gpu_driven.rs): a cascade whose fitted
+   view-proj is bit-identical to what its atlas layer holds skips its render pass; texel
+   snapping makes any real camera motion change the fit, so this is a "camera at rest" cache
+   and artifact-free (the reused camera cull is also unchanged at rest). Invalidation: door
+   swings (EftDynamicNonce), pack/geometry rebuilds, GfxSettings changes, shadow re-enable.
+   Moving-camera cost unchanged (orbit deltas within the ~4% late-session thermal drift that
+   the no-shadow streets control showed equally). Follow-up available if motion cost ever
+   matters: half-rate far cascade while in motion (needs uniform/content consistency care),
+   or 1 cascade / 1024² above overview altitude.
 2. **Adaptive screen-size cull — 2.0–3.2 ms everywhere (−17..23%).** `cull_px` 1.5→4 px is
    visually invisible from overview height (those instances subtend <4 px) but pays on every
    map. Make the threshold scale with camera altitude instead of a global constant.
