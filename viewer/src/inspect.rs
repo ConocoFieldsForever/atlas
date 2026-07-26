@@ -142,6 +142,26 @@ pub struct PointerOnUi(pub bool);
 #[derive(Resource, Default)]
 pub struct UiWantsKeyboard(pub bool);
 
+/// While a spawn marker's card is open, draw its serialized SphereCollider radius as a ground
+/// circle in the layer colour — the card's "Radius N m" line gets a shape, with zero clutter
+/// when no card is up. The marker floats `lift` above the ground, so the circle drops back down.
+fn draw_open_card_radii(
+    mut gizmos: bevy::prelude::Gizmos,
+    open: Res<OpenCards>,
+    q: Query<(&GlobalTransform, &crate::poi::SpawnRadius, &crate::poi::PoiLayer)>,
+) {
+    let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+    for e in &open.0 {
+        if let Ok((gt, r, l)) = q.get(*e) {
+            let (c, _, marker_lift) = crate::poi::poi_look(*l);
+            let p = gt.translation() - Vec3::Y * (marker_lift - 0.2);
+            gizmos
+                .circle(bevy::math::Isometry3d::new(p, flat), r.0, c)
+                .resolution(64);
+        }
+    }
+}
+
 pub struct InspectPlugin;
 
 impl Plugin for InspectPlugin {
@@ -149,7 +169,7 @@ impl Plugin for InspectPlugin {
         app.init_resource::<OpenCards>()
             .init_resource::<PointerOnUi>()
             .init_resource::<UiWantsKeyboard>()
-            .add_systems(Update, pick_markers)
+            .add_systems(Update, (pick_markers, draw_open_card_radii))
             // In-place map swap: drop open cards (their Entity ids point at despawned old-map
             // markers; a recycled id would bind a card to the wrong new marker).
             .add_systems(
