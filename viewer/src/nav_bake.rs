@@ -75,8 +75,15 @@ const LEAF_MAX: usize = 4;
 // ---- FIX 1: thin-wall edge mask (nav_blk.bin) — reuse walk_ground's player-capsule wall model ---
 /// A face with |normal.y| below this is a WALL (collision), matching `walk_ground::WALL_MAX_NY`.
 const WALL_MAX_NY: f32 = 0.38;
-/// Wall triangles smaller than this (m²) are clutter/railings — skipped (matches `WALL_MIN_AREA`).
+/// Wall triangles smaller than this (m²) are clutter — skipped, UNLESS they are tall (see
+/// `WALL_MIN_SPAN_Y`). Area alone is the wrong test for a barrier: measured on streets, 95-100% of
+/// every fence/railing's vertical triangles fall under 0.04 m² because a bar or slat is thin, so
+/// the whole fence was dropped from the wall set and pathfinding walked straight through it.
 const WALL_MIN_AREA: f32 = 0.04;
+/// ...so ALSO keep any near-vertical triangle spanning at least this much height (m), whatever its
+/// area. A fence bar, railing upright or palisade slat is thin but TALL; genuine clutter (bolts,
+/// trim, small props) is small in every dimension. This is what makes fences block.
+const WALL_MIN_SPAN_Y: f32 = 0.40;
 /// Player capsule half-width (m) — matches `walk_ground::PLAYER_RADIUS`. The ±R fan blocks a gap
 /// narrower than 2·R = 0.64 m even when a centre ray would thread it.
 const PLAYER_RADIUS: f32 = 0.32;
@@ -94,7 +101,11 @@ const SLOPE_TAN_NAV: f32 = 1.0;
 /// open a wall-wide gap the player can't actually pass.
 const DOOR_FOOTPRINT_MAX: f32 = 1.5;
 /// Capsule perpendicular offsets (−R, 0, +R) across the edge.
-const CAP_OFF: [f32; 3] = [-PLAYER_RADIUS, 0.0, PLAYER_RADIUS];
+/// Five samples, not three: with only (-R, 0, +R) a fence with ~0.3 m bar spacing could be
+/// threaded -- every sample landing in a gap -- which is exactly how routes crossed railings even
+/// when the bars WERE in the wall set. The player is a solid 0.64 m-wide capsule; sampling it
+/// densely is the cheap approximation of sweeping it.
+const CAP_OFF: [f32; 5] = [-PLAYER_RADIUS, -PLAYER_RADIUS * 0.5, 0.0, PLAYER_RADIUS * 0.5, PLAYER_RADIUS];
 /// Body sample heights above the floor (shins / waist / head) — start above STEP_UP so low curbs
 /// aren't over-blocked; matches `walk_ground::resolve_walls`'s capsule samples.
 const CAP_H: [f32; 3] = [STEP_UP_NAV + 0.1, 1.0, PLAYER_HEIGHT_NAV - 0.15];
@@ -332,7 +343,11 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
                 }
                 // WALL: near-vertical + big enough, and NOT a (small) door panel. `|ny|` so the
                 // mirror flip is immaterial. area = 0.5·|e1×e2| = 0.5·nlen.
-                if !door && ny.abs() < WALL_MAX_NY && 0.5 * nlen >= WALL_MIN_AREA {
+                let span_y = a.y.max(b.y).max(c.y) - a.y.min(b.y).min(c.y);
+                if !door
+                    && ny.abs() < WALL_MAX_NY
+                    && (0.5 * nlen >= WALL_MIN_AREA || span_y >= WALL_MIN_SPAN_Y)
+                {
                     walls.push(Tri { a, b, c, ny, door: false, mat });
                 }
                 // Column BVH input — UNCHANGED: drop only the vertical faces (XZ projection ~ a

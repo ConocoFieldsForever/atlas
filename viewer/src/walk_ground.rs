@@ -48,6 +48,10 @@ const WALL_MAX_NY: f32 = 0.38;
 /// Skip wall triangles smaller than this (m²): trims tiny clutter/railings so the wall grid stays
 /// affordable; real walls/fences/barriers are large quads and survive.
 const WALL_MIN_AREA: f32 = 0.04;
+/// ...but keep any steep triangle that spans at least this much HEIGHT regardless of area: fence
+/// bars and railings are thin (95-100% of their tris are under WALL_MIN_AREA, measured on streets)
+/// yet very much solid. Without this the walk camera strolls through fences.
+const WALL_MIN_SPAN_Y: f32 = 0.40;
 /// Player collision radius (m) — horizontal half-width of the body capsule.
 pub const PLAYER_RADIUS: f32 = 0.32;
 /// If the camera falls this far below the last known ground, treat as fell-through-world.
@@ -229,7 +233,11 @@ impl GroundData {
                                 let ny = n.y / len;
                                 if ny > HORIZ_MIN {
                                     ground.push([w0, w1, w2]);
-                                } else if ny.abs() < WALL_MAX_NY && len * 0.5 >= WALL_MIN_AREA {
+                                } else if ny.abs() < WALL_MAX_NY
+                                    && (len * 0.5 >= WALL_MIN_AREA
+                                        || (w0.y.max(w1.y).max(w2.y) - w0.y.min(w1.y).min(w2.y))
+                                            >= WALL_MIN_SPAN_Y)
+                                {
                                     // Steep enough to be a wall, big enough to matter. (len = 2·area.)
                                     walls.push([w0, w1, w2]);
                                 } else if with_ceilings && ny < -HORIZ_MIN {
