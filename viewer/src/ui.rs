@@ -57,6 +57,10 @@ pub struct LayerToggles {
     pub bot_zones: bool,
     /// PatrolWay polylines + waypoint dots.
     pub patrols: bool,
+    /// AirdropPoint candidate landing spots (Scripts scene).
+    pub airdrops: bool,
+    /// CultistSignEffect event ritual signs (AI scene).
+    pub rituals: bool,
     // ---- QUESTS (tasks.json) ----
     pub quests: bool,
 }
@@ -93,6 +97,8 @@ impl Default for LayerToggles {
             sniper_zones: has("sniper"),
             bot_zones: has("botzone"),
             patrols: has("patrol"),
+            airdrops: has("airdrop"),
+            rituals: has("ritual"),
             quests: has("quest"),
         }
     }
@@ -742,7 +748,7 @@ fn layers_panel(
 
     // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
     // dim number after each row so the planner can gauge density without enabling the layer.
-    let mut poi_counts = [0usize; 18];
+    let mut poi_counts = [0usize; 20];
     for l in &poi_q {
         poi_counts[*l as usize] += 1;
     }
@@ -1228,7 +1234,9 @@ fn layers_panel(
                         + poi_counts[PoiLayer::Stationary as usize]
                         + poi_counts[PoiLayer::LooseLoot as usize]
                         + poi_counts[PoiLayer::Minefield as usize]
-                        + poi_counts[PoiLayer::SniperZone as usize];
+                        + poi_counts[PoiLayer::SniperZone as usize]
+                        + poi_counts[PoiLayer::Airdrop as usize]
+                        + poi_counts[PoiLayer::Ritual as usize];
                     CollapsingHeader::new(section_hdr("Map Intel", intel_total))
                         .id_salt("sec_intel")
                         .default_open(false)
@@ -1243,6 +1251,10 @@ fn layers_panel(
                             poi_row(ui, &mut toggles.transits, "Transits", PoiLayer::Transit, &poi_counts);
                             poi_row(ui, &mut toggles.stationary, "Stationary guns", PoiLayer::Stationary, &poi_counts);
                             poi_row(ui, &mut toggles.loose, "Loose loot", PoiLayer::LooseLoot, &poi_counts);
+                            // Service-scene intel (gamedata.json): airdrop candidates +
+                            // event cultist ritual signs.
+                            poi_row(ui, &mut toggles.airdrops, "Airdrops", PoiLayer::Airdrop, &poi_counts);
+                            poi_row(ui, &mut toggles.rituals, "Cultist signs", PoiLayer::Ritual, &poi_counts);
 
                             // ---- KEYS FOR THIS MAP (aggregated from the lock markers, price desc;
                             // poi::KeyCatalog). Click a key -> locks layer on + fly to a lock it opens.
@@ -2221,6 +2233,8 @@ fn hide_all(t: &mut LayerToggles) {
     t.sniper_zones = false;
     t.bot_zones = false;
     t.patrols = false;
+    t.airdrops = false;
+    t.rituals = false;
     t.quests = false;
 }
 
@@ -2247,6 +2261,8 @@ fn layer_toggle_mut(t: &mut LayerToggles, l: crate::poi::PoiLayer) -> &mut bool 
         P::SniperZone => &mut t.sniper_zones,
         P::BotZone => &mut t.bot_zones,
         P::Patrol => &mut t.patrols,
+        P::Airdrop => &mut t.airdrops,
+        P::Ritual => &mut t.rituals,
     }
 }
 
@@ -2258,7 +2274,7 @@ fn poi_row(
     on: &mut bool,
     label: &str,
     l: crate::poi::PoiLayer,
-    counts: &[usize; 18],
+    counts: &[usize; 20],
 ) {
     ui.horizontal(|ui| {
         ui.add_space(crate::ui_theme::SP_XS);

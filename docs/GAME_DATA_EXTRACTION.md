@@ -226,23 +226,47 @@ traversal edges for the nav graph.
 
 ---
 
-## 5. Other scenes worth opening
+## 5. Other scenes worth opening — **all EXTRACTED 2026-07 (second audit)** except where noted
 
 - **`*_Scripts.unity`** (Interchange level 53): `AirdropPoint` ×186 (position from Transform,
-  payload empty), `IndoorTrigger` ×35 (indoor/outdoor volumes — useful for roof culling and floor
-  picking), `TOD_Sky` (carries latitude/longitude/date → a real sun model), `WeatherController`.
-- **`*_Culling.unity`** (Interchange level 521): `LevelBorder` — the real playable-area polygon
-  (37 vertices at fixed Y). `PerfectCullingAdaptiveGrid` references
-  `StreamingAssets/Culling_Data/<guid>_packed_cull.bytes` (461 MB across 15 files) — the game's own
-  PVS. Format undocumented; **unverified**.
-- **`maps/*_preset.bundle`** ×21 → `ScenesPreset.ServerName` (`Interchange`, `bigmap`,
-  `factory4_day`, `RezervBase`, …). This is the derived replacement for the hardcoded
-  `bundle_to_map()` table in `viewer/src/game_watch.rs` (~line 46), whose comment admits it was
-  copied from TarkovMonitor. **Trivial win.**
-- **Room semantics:** `BaseSpatialRoom` ×346 (names like `ServerRoom_LW_1st_KibaStore`),
-  `ServerSpatialPortal` ×977, mirrored in the `*_Sound.unity` scene as `SpatialAudioRoom` ×369 /
-  `SpatialAudioPortal` ×1101. A named room-and-doorway graph: room labels, indoor tests, and a
-  coarse portal graph for pathfinding.
+  payload empty → `airdrop_points` sink + viewer Airdrops layer), `IndoorTrigger` ×35
+  (BoxCollider volumes → `indoor_volumes` sink; roof culling / floor picking later),
+  `TOD_Sky` → **decoded**: `[5 ints][f Hour @20][i Day][i Month][i Year][f Lat][f Lon]`
+  (interchange: 6.4 h, 1/8/2018, 46.0 N 84.0 E) → top-level `sun` — drive the viewer sun with
+  the log's `hourOfDay`. `WeatherController` = 2.9 kB of config curves, skipped.
+- **`*_Culling.unity`** (Interchange level 521): `LevelBorder` → **decoded**: `u32 N + N×float3`
+  (37 verts at fixed Y) → top-level `level_border` (terrain-draped; the viewer draws it as an
+  always-on dim boundary ring). `PerfectCullingAdaptiveGrid` PVS bytes still **unverified**.
+- **`maps/*_preset.bundle`** → DONE (dominant-location-folder join; see §2).
+- **Room semantics:** the `*_Sound.unity` mirror is extracted: `SpatialAudioRoom` ×369 →
+  `rooms` (name + BoxCollider footprint), `SpatialAudioPortal` ×1101 → `room_portals` with the
+  edge PARSED FROM THE GO NAME (`AudioPortal_FROM_<room>_TO_<room>` — no payload decode
+  needed). File-only for now: room labels + portal-aware pathfinding are viewer follow-ups.
+  (`BaseSpatialRoom`/`ServerSpatialPortal` live in geometry scenes and stay untapped — the
+  Sound mirror is a superset.)
+- **`NavMeshDoorLink`** ×219 (AI scene) → **decoded**: `u32 id + door_… id string + float3 A/B`
+  → `door_links` sink — traversal edges keyed to gamedata's own door ids, for the nav graph.
+- **`AICorePoint`** ×28 (AI scene) → `core_points` {id, cg, pos}: id/CG match the GO name
+  (`AICore ID:14 CG:27`); interchange has 8 connectivity groups, main island 19 points —
+  nav-island ground truth for `nav_bake.rs` validation.
+- **`AIPlaceInfo`** ×106 → `ai_places` {string id @4, name (`Home_zone1`), BoxCollider
+  footprint} — bot anchor volumes, file-only.
+
+### Cultists (2026-07 hunt)
+
+- **`CultistSignEffect`** — a TYPED component in the AI scenes (interchange ×92, woods ×27; GOs
+  `HalloweenCultisSign` / `EventSectants`): the event ritual-sign spots. Extracted →
+  `cultist_signs` sink + viewer "Cultist signs" layer. These GOs are the same placeholder
+  quads §4.1 warns would pollute geometry — take the transforms, never the meshes.
+- **Cultist SPAWNS are the boss system**, nothing separate: the static catalog's
+  `sectantPriest` spawnLocations are internal zone ids we already extract with hulls —
+  customs `ZoneScavBase`, woods `ZoneMiniHouse`/`ZoneBrokenVill`, shoreline
+  `ZoneSanatorium1/2`/`ZoneForestSpawn`, night-factory `BotZone`, ground-zero-21
+  `ZoneSandbox`. No Cursed/Sectant category bit exists in SpawnPointMarker masks (§4.2) —
+  cultist placement is server-side bot typing over these zones.
+- NOTE: the static dump's boss `spawnLocations.name` are INTERNAL zone ids ("ZoneScavBase"),
+  while the old GraphQL loot.json carried friendly names ("Stronghold"). The viewer's
+  two-pass boss join (exact `en`, then substring on the internal id) handles both vintages.
 
 ---
 
@@ -345,6 +369,9 @@ BattlEye. Not recommended.**
 3. `groupMatchRaidSettings` side/hour → auto-select faction layers, match the sun. (Remember
    both §7 traps: session-absent field, capital-S `Side` decoy.)
 4. ~~Patrol ways + bot zones~~ — folded into 2.
-5. Room graph (`BaseSpatialRoom` + portals) → room labels and portal-aware pathfinding.
-6. `LevelBorder`, `AirdropPoint`, `IndoorTrigger` → three cheap layers.
-7. `AIVoxelesData` / `AICorePoint CG:` → validate nav reachability (needs decode work).
+5. ~~Room graph extraction~~ **DONE** (Sound-scene mirror → `rooms`/`room_portals`); the viewer
+   follow-up (room labels, portal-aware pathfinding) remains.
+6. ~~`LevelBorder`, `AirdropPoint`, `IndoorTrigger`~~ **DONE** (+ `TOD_Sky` sun, `door_links`,
+   `core_points`, `ai_places`, `cultist_signs`).
+7. `AIVoxelesData` decode (non-uniform stride — column-stats project); consume `core_points`
+   CGs in nav_bake island validation; drive the viewer sun from `sun` × log `hourOfDay`.

@@ -45,6 +45,10 @@ pub enum PoiLayer {
     /// PatrolWay polyline + waypoint dots. Bots treat a way as a POINT SET, not a strict
     /// loop (routes zig-zag spatially), so it reads "patrol area", never "circuit".
     Patrol,
+    /// AirdropPoint (Scripts scene) — a candidate airdrop landing spot.
+    Airdrop,
+    /// CultistSignEffect (AI scene) — event ritual sign location (EventSectants).
+    Ritual,
 }
 
 /// The owning task id carried by every Quest marker, so the tracker (`ui::QuestTracker`) can
@@ -260,6 +264,8 @@ pub struct GameDataZones {
     pub patrols: Vec<Vec<Vec3>>,
     /// First-party SpawnPointMarkers own the PMC/Scav spawn layers (footer provenance).
     pub spawns_live: bool,
+    /// The game's own playable-area polygon (LevelBorder) — always-on dim boundary ring.
+    pub border: Vec<Vec3>,
 }
 
 pub struct PoiPlugin;
@@ -314,6 +320,8 @@ pub fn poi_look(l: PoiLayer) -> (Color, f32, f32) {
         PoiLayer::SniperZone => (Color::srgb(0.95, 0.60, 0.15), 0.9, 1.1),
         PoiLayer::BotZone => (Color::srgb(0.30, 0.60, 0.95), 1.4, 1.5),
         PoiLayer::Patrol => (Color::srgb(0.95, 0.42, 0.62), 0.5, 0.7),
+        PoiLayer::Airdrop => (Color::srgb(0.45, 0.78, 0.98), 0.8, 1.0),
+        PoiLayer::Ritual => (Color::srgb(0.78, 0.12, 0.38), 0.6, 0.8),
     }
 }
 
@@ -665,6 +673,25 @@ struct GameDataFile {
     /// snap onto the matching zone centroid.
     #[serde(default)]
     bot_zones: Vec<GdBotZone>,
+    /// AirdropPoint transforms (Scripts scene) — candidate airdrop landing spots.
+    #[serde(default)]
+    airdrop_points: Vec<GdPoint>,
+    /// CultistSignEffect transforms (AI scene) — event ritual sign spots (EventSectants).
+    #[serde(default)]
+    cultist_signs: Vec<GdPoint>,
+    /// The game's own playable-area polygon (LevelBorder, Culling scene) — terrain-draped
+    /// at extraction; drawn as an always-on dim boundary ring.
+    #[serde(default)]
+    level_border: Vec<[f32; 3]>,
+}
+/// A bare typed point (airdrop candidates / cultist signs): Transform position + GO name.
+#[derive(Deserialize)]
+struct GdPoint {
+    pos: [f32; 3],
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default = "default_true")]
+    active: bool,
 }
 fn default_true() -> bool {
     true
@@ -1645,6 +1672,8 @@ fn spawn_pois(
         PoiLayer::SniperZone,
         PoiLayer::BotZone,
         PoiLayer::Patrol,
+        PoiLayer::Airdrop,
+        PoiLayer::Ritual,
     ];
     let mk = |materials: &mut Assets<StandardMaterial>, c: Color| {
         let lin = c.to_linear();
@@ -2455,6 +2484,47 @@ fn spawn_pois(
                 gd.patrol_ways.len()
             );
         }
+        // ---- Airdrop candidates + event cultist signs (typed points; own toggles). ----
+        for a in &gd.airdrop_points {
+            let e = spawn(&mut commands, PoiLayer::Airdrop, a.pos, MarkerInfo {
+                title: "Airdrop point".into(),
+                subtitle: "Candidate landing spot \u{00B7} game files".into(),
+                detail: Vec::new(),
+                accent: poi_look(PoiLayer::Airdrop).0,
+            }, None);
+            commands.entity(e).insert(DenseMarker);
+        }
+        for s in &gd.cultist_signs {
+            let mut detail = vec!["Event ritual sign (EventSectants)".into()];
+            if let Some(n) = s.name.as_deref().filter(|n| !n.is_empty()) {
+                detail.push(prettify(n));
+            }
+            let e = spawn(&mut commands, PoiLayer::Ritual, s.pos, MarkerInfo {
+                title: "Cultist sign".into(),
+                subtitle: "Ritual spot \u{00B7} game files".into(),
+                detail,
+                accent: poi_look(PoiLayer::Ritual).0,
+            }, None);
+            commands.entity(e).insert(DenseMarker);
+            if !s.active {
+                commands.entity(e).insert(SceneInactive);
+            }
+        }
+        // The playable-area boundary (LevelBorder) — always-on dim ring, no toggle: it is
+        // the map's edge, not an intel layer.
+        if gd.level_border.len() >= 3 {
+            gd_zones.border = gd.level_border.iter().copied().map(Vec3::from).collect();
+        }
+        if !gd.airdrop_points.is_empty() || !gd.cultist_signs.is_empty()
+            || !gd.level_border.is_empty()
+        {
+            info!(
+                "poi: {} airdrop points, {} cultist signs, level border {} verts",
+                gd.airdrop_points.len(),
+                gd.cultist_signs.len(),
+                gd.level_border.len()
+            );
+        }
         info!(
             "poi: gamedata live — {} exfils, {} minefields, {} sniper zones, {} mine zones, \
              {} quest triggers, {} special zones, {} transit footprints",
@@ -2653,6 +2723,8 @@ fn apply_poi_visibility(
             PoiLayer::SniperZone => toggles.sniper_zones,
             PoiLayer::BotZone => toggles.bot_zones,
             PoiLayer::Patrol => toggles.patrols,
+            PoiLayer::Airdrop => toggles.airdrops,
+            PoiLayer::Ritual => toggles.rituals,
         };
         // Value-tagged markers (loose loot) additionally pass the panel's min-value filter,
         // and scene-inactive markers the global "hide inactive" filter — both COMPOSE with
@@ -2762,6 +2834,11 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
             }
             ring(outline, color);
         }
+    }
+    // The playable-area boundary (LevelBorder): always on, no toggle — it is the map's edge.
+    // Dim slate so it reads as chrome, not intel.
+    if zones.border.len() >= 3 {
+        ring(&zones.border, Color::srgba(0.55, 0.62, 0.70, 0.55));
     }
     // Bot-zone hulls: DASHED ring — this footprint is DERIVED (convex hull of the zone's spawn
     // markers + patrol points), not an authored boundary, and bots are not fenced inside it.
