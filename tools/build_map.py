@@ -349,6 +349,116 @@ def derive_sea_level(dataset):
     return round(best[1] + 0.05, 3)
 
 
+def merge_gamedata_interactables(gd_path, dataset_dir, switch_levels=None):
+    """Stage-6 gamedata ENRICHMENT, callable standalone. A freshly extracted gamedata.json
+    lacks the pack's merged `switches` array, power tags and switch->door links — so any tool
+    ADOPTING a re-extracted file into an already-built pack must run this first (a raw copy
+    silently drops the Level Controls data; that regression is why this is a function).
+
+    Folds the dataset's interact_<lv>.json records (stage 2) + gamedata's own typed point
+    interactables (CardReader / RaidDialogEntryPoint) into `switches` — every interactable
+    (power lever + alarms + buttons + water + triggers) with a `kind` (power|switch) — then
+    tags POWER-GATED extracts, wires trigger-hash switch->door edges, and resolves requirement
+    item names via the cached static dump (offline-safe). Mutates gd_path IN PLACE only when
+    there is something to merge. switch_levels=None -> every interact_*.json in dataset_dir."""
+    try:
+        data = json.load(open(gd_path, encoding="utf-8"))
+        if switch_levels is None:
+            switch_levels = sorted(
+                int(mm.group(1)) for f in os.listdir(dataset_dir)
+                if (mm := re.fullmatch(r"interact_(\d+)\.json", f)))
+        sw = []
+        for lv in switch_levels:
+            p = os.path.join(dataset_dir, f"interact_{lv}.json")
+            if os.path.isfile(p):
+                sw.extend(json.load(open(p, encoding="utf-8")))
+        # gamedata's own typed POINT-interactables ride the same `switches` array: identical
+        # record shape (kind tags them), so the LEVEL CONTROLS panel + click pipeline pick them
+        # up with zero viewer plumbing. gamedata pos is viewer-bridged; the switch world_pos
+        # contract is RAW Unity, so the X-flip is undone here.
+        def _disp(n):
+            s = re.sub(r"^(INTERACTIVE_|SBG_|Node_)", "", str(n or ""))
+            s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s).replace("_", " ").strip()
+            return (s[:1].upper() + s[1:]) if s else "Interactable"
+        for key, kind in (("card_readers", "card_reader"), ("dialogs", "dialog")):
+            for i, r in enumerate(data.get(key) or []):
+                p = r.get("pos") or [0.0, 0.0, 0.0]
+                rec = {"id": f"gd:{r.get('lv')}:{kind}:{i}", "level": r.get("lv"),
+                       "kind": kind, "world_pos": [-p[0], p[1], p[2]],
+                       "label": _disp(r.get("name")), "count": 0, "targets": []}
+                names = [it["n"] for it in r.get("items") or [] if it.get("n")]
+                ids = ([it["id"] for it in r.get("items") or [] if it.get("id")]
+                       or r.get("item_ids") or [])
+                if ids:
+                    rec["item_id"] = ids[0]
+                    rec["item_ids"] = ids
+                if names:
+                    rec["item_name"] = names[0]
+                    rec["item_names"] = names
+                sw.append(rec)
+        if sw:
+            data["switches"] = sw
+            # Tag POWER-GATED extracts: a switch's exfil target (by GameObject name) means
+            # that extract "requires power". Feeds the viewer's "Requires switch" card line.
+            ex_by_go = {e.get("go"): e for e in data.get("exfils", []) if e.get("go")}
+            n_tag = 0
+            for s in sw:
+                for t in s.get("targets", []):
+                    if "Exfil" in t.get("type", "") and t.get("name") in ex_by_go:
+                        ex_by_go[t["name"]]["requires_power"] = True
+                        n_tag += 1
+            # Wire switch->door edges via the serialized TRIGGER-HASH link (newer maps):
+            # a Switch's trigger "Open_01_<hash>" and the door it drives carry the SAME
+            # digit hash (extract_interact `link` <-> extract_gamedata door `links`) —
+            # byte-derived on both sides, zero name matching. The door also learns which
+            # interactable controls it (`controlled_by` = the switch label).
+            door_by_link = {}
+            for dr in data.get("doors", []):
+                for L in dr.get("links", []):
+                    door_by_link.setdefault(L, []).append(dr)
+            n_link = 0
+            for s in sw:
+                for dr in door_by_link.get(s.get("link") or "", []):
+                    s.setdefault("targets", []).append({
+                        "type": "EFT.Interactive.Door",
+                        "name": dr.get("id") or dr.get("name"),
+                        "world_pos": dr.get("pos"), "via": "trigger-link"})
+                    dr["controlled_by"] = s.get("label")
+                    n_link += 1
+            # Requirement ITEMS: a switch payload can serialize a required 24-hex item
+            # template id (extract_interact `item_id` — e.g. the frozen hatch wants the
+            # cutting torch). Resolve display names via the cached tarkov.dev static dump
+            # (offline-safe: disk cache or skip) so the viewer can show the requirement
+            # with its icon — stage 7 caches the PNG under the same name slug.
+            iids = sorted({s["item_id"] for s in sw if s.get("item_id")})
+            if iids:
+                try:
+                    _intel = os.path.join(VIEWER, "extraction", "intel")
+                    if _intel not in sys.path:
+                        sys.path.insert(0, _intel)
+                    import tarkov_static
+                    got = {it["id"]: it["name"]
+                           for it in tarkov_static.load_static_items(ids=iids).get("items") or []
+                           if it.get("id") and it.get("name")}
+                    n_nm = 0
+                    for s in sw:
+                        nm = got.get(s.get("item_id") or "")
+                        if nm:
+                            s["item_name"] = nm
+                            n_nm += 1
+                    print(f"  resolved {n_nm} switch requirement item name(s) "
+                          f"({len(iids)} id(s))", flush=True)
+                except Exception as e:
+                    print(f"  note: switch item-name resolution skipped ({e})", flush=True)
+            json.dump(data, open(gd_path, "w", encoding="utf-8"))
+            npow = sum(1 for s in sw if s.get("kind") == "power")
+            print(f"  merged {len(sw)} interactable(s) [{npow} power] into gamedata.json "
+                  f"({n_tag} power-gated extract(s) tagged, {n_link} switch->door "
+                  f"link(s))", flush=True)
+    except Exception as e:
+        print(f"  note: could not merge interactables into gamedata.json ({e})", flush=True)
+
+
 def find_atlas_exe():
     """Locate the built viewer binary that hosts `bake-nav` (the PORTABLE CPU nav baker). Order:
     EFT_ATLAS_EXE (the viewer hands its own running exe path when it launches a build) > the cargo
@@ -651,104 +761,7 @@ def main():
            VIEWER, optional=True):
         gd = os.path.join(out_dir, "gamedata.json")
         if os.path.isfile(gd):
-            # Fold the interactable records (interact_<lv>.json, written by stage 2) into gamedata's
-            # `switches` array so they ride the existing pack copy with no manifest/assembler change.
-            # This now carries EVERY interactable (power lever + alarms + buttons + water + triggers),
-            # each with a `kind` (power|switch); the viewer renders the power one with its light toggle
-            # and the rest as typed interactable markers.
-            try:
-                data = json.load(open(gd, encoding="utf-8"))
-                sw = []
-                for lv in switch_levels:
-                    p = os.path.join(dataset, f"interact_{lv}.json")
-                    if os.path.isfile(p):
-                        sw.extend(json.load(open(p, encoding="utf-8")))
-                # Fold gamedata's own typed POINT-interactables (CardReader keycard readers,
-                # RaidDialogEntryPoint dialogs) into the same `switches` array: identical record
-                # shape (kind tags them), so the LEVEL CONTROLS panel + click pipeline pick them
-                # up with zero viewer plumbing. gamedata pos is viewer-bridged; the switch
-                # world_pos contract is RAW Unity, so the X-flip is undone here.
-                def _disp(n):
-                    s = re.sub(r"^(INTERACTIVE_|SBG_|Node_)", "", str(n or ""))
-                    s = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s).replace("_", " ").strip()
-                    return (s[:1].upper() + s[1:]) if s else "Interactable"
-                for key, kind in (("card_readers", "card_reader"), ("dialogs", "dialog")):
-                    for i, r in enumerate(data.get(key) or []):
-                        p = r.get("pos") or [0.0, 0.0, 0.0]
-                        rec = {"id": f"gd:{r.get('lv')}:{kind}:{i}", "level": r.get("lv"),
-                               "kind": kind, "world_pos": [-p[0], p[1], p[2]],
-                               "label": _disp(r.get("name")), "count": 0, "targets": []}
-                        names = [it["n"] for it in r.get("items") or [] if it.get("n")]
-                        ids = ([it["id"] for it in r.get("items") or [] if it.get("id")]
-                               or r.get("item_ids") or [])
-                        if ids:
-                            rec["item_id"] = ids[0]
-                            rec["item_ids"] = ids
-                        if names:
-                            rec["item_name"] = names[0]
-                            rec["item_names"] = names
-                        sw.append(rec)
-                if sw:
-                    data["switches"] = sw
-                    # Tag POWER-GATED extracts: a switch's exfil target (by GameObject name) means
-                    # that extract "requires power". Feeds the viewer's "Requires switch" card line.
-                    ex_by_go = {e.get("go"): e for e in data.get("exfils", []) if e.get("go")}
-                    n_tag = 0
-                    for s in sw:
-                        for t in s.get("targets", []):
-                            if "Exfil" in t.get("type", "") and t.get("name") in ex_by_go:
-                                ex_by_go[t["name"]]["requires_power"] = True
-                                n_tag += 1
-                    # Wire switch->door edges via the serialized TRIGGER-HASH link (newer maps):
-                    # a Switch's trigger "Open_01_<hash>" and the door it drives carry the SAME
-                    # digit hash (extract_interact `link` <-> extract_gamedata door `links`) —
-                    # byte-derived on both sides, zero name matching. The door also learns which
-                    # interactable controls it (`controlled_by` = the switch label).
-                    door_by_link = {}
-                    for dr in data.get("doors", []):
-                        for L in dr.get("links", []):
-                            door_by_link.setdefault(L, []).append(dr)
-                    n_link = 0
-                    for s in sw:
-                        for dr in door_by_link.get(s.get("link") or "", []):
-                            s.setdefault("targets", []).append({
-                                "type": "EFT.Interactive.Door",
-                                "name": dr.get("id") or dr.get("name"),
-                                "world_pos": dr.get("pos"), "via": "trigger-link"})
-                            dr["controlled_by"] = s.get("label")
-                            n_link += 1
-                    # Requirement ITEMS: a switch payload can serialize a required 24-hex item
-                    # template id (extract_interact `item_id` — e.g. the frozen hatch wants the
-                    # cutting torch). Resolve display names via the cached tarkov.dev static dump
-                    # (offline-safe: disk cache or skip) so the viewer can show the requirement
-                    # with its icon — stage 7 caches the PNG under the same name slug.
-                    iids = sorted({s["item_id"] for s in sw if s.get("item_id")})
-                    if iids:
-                        try:
-                            _intel = os.path.join(VIEWER, "extraction", "intel")
-                            if _intel not in sys.path:
-                                sys.path.insert(0, _intel)
-                            import tarkov_static
-                            got = {it["id"]: it["name"]
-                                   for it in tarkov_static.load_static_items(ids=iids).get("items") or []
-                                   if it.get("id") and it.get("name")}
-                            n_nm = 0
-                            for s in sw:
-                                nm = got.get(s.get("item_id") or "")
-                                if nm:
-                                    s["item_name"] = nm
-                                    n_nm += 1
-                            print(f"  resolved {n_nm} switch requirement item name(s) "
-                                  f"({len(iids)} id(s))", flush=True)
-                        except Exception as e:
-                            print(f"  note: switch item-name resolution skipped ({e})", flush=True)
-                    json.dump(data, open(gd, "w", encoding="utf-8"))
-                    npow = sum(1 for s in sw if s.get("kind") == "power")
-                    print(f"  merged {len(sw)} interactable(s) [{npow} power] into gamedata.json "
-                          f"({n_tag} power-gated extract(s) tagged, {n_link} switch->door "
-                          f"link(s))", flush=True)
-            except Exception as e:
-                print(f"  note: could not merge interactables into gamedata.json ({e})", flush=True)
+            merge_gamedata_interactables(gd, dataset, switch_levels)
             shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
             print("  gamedata.json -> pack", flush=True)
 
