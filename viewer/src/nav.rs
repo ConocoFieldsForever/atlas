@@ -341,6 +341,28 @@ impl NavGrid {
         }
     }
 
+    /// Floor height at (x,z) CLOSEST to `near_y` across the cell's K layers, or None when the
+    /// point is off-grid or the cell has no floor. Multi-floor aware — the reference Y picks the
+    /// mall's 2nd storey over the ground beneath it. Used to CONTOUR overlay polylines (patrol
+    /// connectors) to the walkable surface; never a routing primitive.
+    pub fn floor_near(&self, x: f32, z: f32, near_y: f32) -> Option<f32> {
+        let c = self.cell_of(x, z);
+        if c < 0 {
+            return None;
+        }
+        let mut best: Option<f32> = None;
+        for l in 0..self.k {
+            let h = self.h_lay(c as usize, l);
+            if h == self.miss {
+                continue;
+            }
+            if best.map_or(true, |b: f32| (h - near_y).abs() < (b - near_y).abs()) {
+                best = Some(h);
+            }
+        }
+        best
+    }
+
     #[inline]
     fn h_lay(&self, c: usize, l: usize) -> f32 {
         self.h[c * self.k + l]
