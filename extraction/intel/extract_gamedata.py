@@ -49,7 +49,7 @@ top-level "draped" flag so the viewer can drop its own lift.
       (requires EFT_TARKMAP_ROOT; levels default to the map config's source.levels;
        default output <EFT_TARKMAP_ROOT>/out/<map>/gamedata.json)
 """
-import os, sys, json, gc, time, math, struct, functools
+import os, re, sys, json, gc, time, math, struct, functools
 from collections import Counter
 
 import numpy as np
@@ -340,6 +340,51 @@ def hull_xz(pts):
         hi.append(p)
     ring = lo[:-1] + hi[:-1]
     return [[x, y, z] for x, z, y in ring] if len(ring) >= 3 else []
+
+
+def dec_tod_sky(pl):
+    """TOD_Sky (the *_Scripts scene's sun model): [5 ints][f Hour @20][i Day][i Month][i Year]
+    [f Latitude][f Longitude] ... Validated on interchange level53 (6.4 h, 1/8/2018, 46.0 N
+    84.0 E). Every field range-checked; anything implausible -> None."""
+    if len(pl) < 44:
+        return None
+    hour = struct.unpack_from("<f", pl, 20)[0]
+    day, month, year = struct.unpack_from("<3i", pl, 24)
+    lat, lon = struct.unpack_from("<2f", pl, 36)
+    ok = (math.isfinite(hour) and 0.0 <= hour < 24.0 and 1 <= day <= 31 and 1 <= month <= 12
+          and 2000 <= year <= 2100 and math.isfinite(lat) and abs(lat) <= 90.0
+          and math.isfinite(lon) and abs(lon) <= 180.0)
+    return ({"hour": round(hour, 2), "day": day, "month": month, "year": year,
+             "lat": round(float(lat), 3), "lon": round(float(lon), 3)} if ok else None)
+
+
+def dec_level_border(pl):
+    """LevelBorder (the *_Culling scene): u32 N then N x float3 Unity verts — the game's own
+    playable-area polygon (interchange: 37 verts at fixed Y). Bridged; vert order reversed
+    after the X-flip so the ring stays CCW like every other outline."""
+    if len(pl) < 16:
+        return None
+    n = int.from_bytes(pl[0:4], "little")
+    if not 3 <= n <= 4096 or 4 + 12 * n > len(pl):
+        return None
+    v = struct.unpack_from(f"<{3 * n}f", pl, 4)
+    if not all(math.isfinite(x) and abs(x) < 1e5 for x in v):
+        return None
+    return [bridge(v[i * 3:i * 3 + 3]) for i in range(n)][::-1]
+
+
+def dec_door_link(pl):
+    """NavMeshDoorLink (AI scene): u32 link id, door id string (the SAME door_… id gamedata's
+    doors[] carry), 12B zeros, float3 A, float3 B (then B again). Free nav-graph traversal
+    edges keyed to already-extracted doors; validated on interchange x219."""
+    did, e = read_cstr(pl, 4)
+    if not did or e + 36 > len(pl):
+        return None
+    a = struct.unpack_from("<3f", pl, e + 12)
+    b = struct.unpack_from("<3f", pl, e + 24)
+    if not all(math.isfinite(x) and abs(x) < 1e5 for x in a + b):
+        return None
+    return did, a, b
 
 
 def read_cstr_strict(buf, off):
@@ -806,7 +851,10 @@ def scan_level(lv, sink, ai=False):
                 "SpawnPointMarker", "MineDirectional", "LootPoint", "LootPointsGroup",
                 "LighthouseTraderZone", "BufferGateSwitcher", "LootableContainer",
                 "CardReader", "RaidDialogEntryPoint",
-                "BotZone", "PatrolWay", "PatrolWayWithName", "PatrolWayWithConditions") \
+                "BotZone", "PatrolWay", "PatrolWayWithName", "PatrolWayWithConditions",
+                "AirdropPoint", "IndoorTrigger", "TOD_Sky", "LevelBorder",
+                "NavMeshDoorLink", "AICorePoint", "AIPlaceInfo", "CultistSignEffect",
+                "SpatialAudioRoom", "SpatialAudioPortal") \
                 and cls not in BUFFER_ZONE_CLASSES and cls not in DAMAGE_ZONE_CLASSES:
             continue
         go_pid = (hdr.get("m_GameObject") or {}).get("m_PathID")
@@ -952,6 +1000,61 @@ def scan_level(lv, sink, ai=False):
             ways_raw.append((o.path_id, cls, name, pl))
         elif cls == "BotZone":
             zones_raw.append((o.path_id, name, pl))
+        # ---- service-scene singles (Scripts / Culling / Sound; see the aux scan in main) ----
+        elif cls == "AirdropPoint":
+            # payload is empty — the Transform IS the data.
+            sink["airdrop_points"].append({"pos": tpos, "name": name, "lv": lv})
+        elif cls == "IndoorTrigger":
+            box = cols[0] if cols else None
+            sink["indoor_volumes"].append({
+                "pos": col_center(M, box) if box else tpos, "name": name,
+                "outline": footprint(M, box) if box else [], "lv": lv,
+            })
+        elif cls == "TOD_Sky":
+            sink["_sun"].append(dec_tod_sky(pl))
+        elif cls == "LevelBorder":
+            lb = dec_level_border(pl)
+            if lb:
+                sink["_level_border"].append(lb)
+        elif cls == "NavMeshDoorLink":
+            d = dec_door_link(pl)
+            if d:
+                did, a, b = d
+                sink["door_links"].append({"door": did, "a": bridge(a), "b": bridge(b), "lv": lv})
+        elif cls == "AICorePoint":
+            # id + connectivity group also sit in the GO name ("AICore ID:14 CG:27") — the
+            # payload ints are the same values, byte-derived. CG = the game's own reachability
+            # partition (nav-island ground truth).
+            cid = int.from_bytes(pl[0:4], "little") if len(pl) >= 8 else None
+            cg = int.from_bytes(pl[4:8], "little") if len(pl) >= 8 else None
+            sink["core_points"].append({"pos": tpos, "id": cid, "cg": cg, "lv": lv})
+        elif cls == "AIPlaceInfo":
+            aid, _ = read_cstr(pl, 4)
+            box = cols[0] if cols else None
+            sink["ai_places"].append({
+                "pos": col_center(M, box) if box else tpos, "id": (aid or "").strip() or None,
+                "name": name, "outline": footprint(M, box) if box else [], "lv": lv,
+            })
+        elif cls == "CultistSignEffect":
+            # Event ritual signs (HalloweenCultisSign / EventSectants GOs) — typed, so no name
+            # guessing; interchange ships 92, woods 27. Position from the Transform.
+            sink["cultist_signs"].append({"pos": tpos, "name": name, "active": active, "lv": lv})
+        elif cls == "SpatialAudioRoom":
+            box = cols[0] if cols else None
+            sink["rooms"].append({
+                "pos": col_center(M, box) if box else tpos, "name": name,
+                "outline": footprint(M, box) if box else [], "lv": lv,
+            })
+        elif cls == "SpatialAudioPortal":
+            # The edge is IN the GO name ("AudioPortal_FROM_<room>_TO_<room>") — no payload
+            # decode needed for the room-and-doorway graph.
+            mm = re.match(r"AudioPortal_FROM_(.+?)_TO_(.+)$", name or "")
+            rec = {"pos": tpos, "lv": lv}
+            if mm:
+                rec["from"], rec["to"] = mm.group(1), mm.group(2)
+            else:
+                rec["name"] = name
+            sink["room_portals"].append(rec)
         elif cls == "MineDirectional":
             # blast/trigger zone = the largest CHILD BoxCollider footprint (the mine GO itself
             # has none). Kind from the child name ("MON-50_MineTrigger" -> "MON-50").
@@ -1226,6 +1329,10 @@ def drape_zones(sink):
             before += len(hl)
             r["hull"] = drape_outline(hl, field)
             after += len(r["hull"])
+    # The LevelBorder polygon sits at ONE fixed authored Y (interchange: 14.9 across the whole
+    # 1 km map) — drape it so the boundary ring rides the terrain instead of underground.
+    sink["_level_border"] = [drape_outline(v, field) if len(v) >= 3 else v
+                             for v in sink["_level_border"]]
     # Elevated collider zones: FLATTEN each outline to the collider center height (`pos` Y), which
     # is exactly where the marker sphere sits, so the ring/wall/marker all read at the platform
     # level. NO terrain sampling, NO subdivision (the footprint is already a horizontal rectangle).
@@ -1443,18 +1550,20 @@ def sibling_levels(scanned):
         return []
 
 
-def ai_levels():
-    """AI-scene level indices for this map: every BuildSettings scene in the config's
-    `source.unity_location` folder whose basename has an `ai` underscore-token
-    (Shopping_Mall_AI = level 66). The geometry configs exclude these ON PURPOSE (placeholder
-    cubes / cultist-sign quads — gen_maps SERVICE_TOKENS), so they are scanned IN ADDITION to
-    LEVELS, never merged into them. Duplicate BuildSettings rows (Terminal_AI at 635 AND 687
-    — same scene path) collapse to the first; genuine VARIANT scenes (Sandbox_AI +
-    Sandbox_AI_high = Ground Zero 21+, Laboratory_dark_AI = event Labs) ALL scan — the spawn
-    Id dedupe unions them and each record's `lv` keeps the variant it came from."""
+def service_levels(*tokens):
+    """SERVICE-scene level indices for this map: every BuildSettings scene in the config's
+    `source.unity_location` folder whose basename has one of `tokens` as an underscore-token
+    (Shopping_Mall_AI = level 66, Shopping_Mall_Scripts = 53, Shopping_Mall_Culling = 521).
+    The geometry configs exclude these ON PURPOSE (placeholder cubes / cultist-sign quads —
+    gen_maps SERVICE_TOKENS), so they are scanned IN ADDITION to LEVELS, never merged into
+    them. Duplicate BuildSettings rows (Terminal_AI at 635 AND 687 — same scene path) collapse
+    to the first; genuine VARIANT scenes (Sandbox_AI + Sandbox_AI_high = Ground Zero 21+,
+    Laboratory_dark_AI = event Labs) ALL scan — the spawn Id dedupe unions them and each
+    record's `lv` keeps the variant it came from."""
     folder = ((_cfg.get("source") or {}).get("unity_location") or "").lower()
     if not folder:
         return []
+    want = {t.lower() for t in tokens}
     try:
         env = UnityPy.load(os.path.join(DATA, "globalgamemanagers"))
         scenes = []
@@ -1473,13 +1582,13 @@ def ai_levels():
             rest = p[j + len(marker):]
             f = rest.split("/", 1)[0] if "/" in rest else rest.rsplit(".", 1)[0]
             base = os.path.basename(p).rsplit(".", 1)[0]
-            if (f.lower() == folder and "ai" in [t.lower() for t in base.split("_")]
+            if (f.lower() == folder and want & {t.lower() for t in base.split("_")}
                     and i not in LEVELS and p not in seen):
                 seen.add(p)
                 out.append(i)
         return out
     except Exception as ex:
-        print(f"[ai-levels] failed: {type(ex).__name__}: {ex}")
+        print(f"[service-levels] failed: {type(ex).__name__}: {ex}")
         return []
 
 
@@ -1495,19 +1604,38 @@ def main():
                             "containers", "damage_zones", "card_readers", "dialogs",
                             # AI-scene additions (spawn/patrol audit): _zones_reg is internal
                             # (name registry per scan), consumed by the bot_zones build below.
-                            "patrol_ways", "bot_zones", "_zones_reg")}
+                            "patrol_ways", "bot_zones", "_zones_reg",
+                            # service-scene additions (2026-07 second audit): airdrop landing
+                            # candidates + indoor volumes + door-traversal nav links + AI core
+                            # graph + bot home zones + event cultist signs + the audio room
+                            # graph. _sun/_level_border collapse to top-level scalars below.
+                            "airdrop_points", "indoor_volumes", "door_links", "core_points",
+                            "ai_places", "cultist_signs", "rooms", "room_portals",
+                            "_sun", "_level_border")}
     t0 = time.time()
     scanned = list(LEVELS)
     for lv in LEVELS:
         scan_level(lv, sink)
     # the AI scene (scav/boss spawn markers, patrol ways, bot zones) is a SERVICE scene the
     # geometry level list excludes — scan it additionally (0.1-0.4 s per scene).
-    ai = ai_levels()
+    ai = service_levels("ai")
     if ai:
         print(f"[ai-levels] scanning AI scene(s): {ai}")
     for lv in ai:
         scan_level(lv, sink, ai=True)
     scanned += ai
+    # More service scenes, same rule: Scripts (airdrop points / indoor volumes / TOD_Sky sun
+    # model), Culling (LevelBorder playable-area polygon), Sound (audio room graph — SOME
+    # configs already list the Sound scene as a geometry level; the `not in LEVELS` filter
+    # inside service_levels keeps those from double-scanning).
+    aux = (service_levels("scripts") + service_levels("culling", "levelborders")
+           + service_levels("sound"))
+    aux = [lv for lv in aux if lv not in scanned]
+    if aux:
+        print(f"[aux-levels] scanning service scene(s): {aux}")
+    for lv in aux:
+        scan_level(lv, sink)
+    scanned += aux
     # the logic scene (the one carrying the exfil MBs) may sit outside the config's
     # geometry-level list — probe the sibling scenes for it.
     if not sink["exfils"]:
@@ -1532,6 +1660,14 @@ def main():
     sink["patrol_ways"] = dedupe(sink["patrol_ways"],
                                  lambda r: (r.get("name"), r.get("zone"),
                                             tuple(tuple(p) for p in r["points"])))
+    for k in ("airdrop_points", "indoor_volumes", "cultist_signs", "rooms", "ai_places"):
+        sink[k] = dedupe(sink[k], lambda r: (r.get("name"), tuple(r["pos"])))
+    sink["door_links"] = dedupe(sink["door_links"], lambda r: (r["door"], tuple(r["a"])))
+    sink["core_points"] = dedupe(sink["core_points"],
+                                 lambda r: (r.get("id"), r.get("cg"), tuple(r["pos"])))
+    sink["room_portals"] = dedupe(
+        sink["room_portals"],
+        lambda r: (r.get("from"), r.get("to"), r.get("name"), tuple(r["pos"])))
     # ---- bot zones: names registered per scan; counts/hulls/centroid rebuilt HERE, after the
     # Id dedupe, so a zone spanning two variant AI scenes gets the UNION of its members. The
     # hull is the convex hull of the zone's spawn markers + patrol points (BotZone itself has
@@ -1581,13 +1717,25 @@ def main():
     # New sinks are dropped entirely (data AND count) when empty: a map without them keeps a
     # byte-identical gamedata.json across this extractor change.
     NEW_SINKS = ("containers", "damage_zones", "card_readers", "dialogs",
-                 "patrol_ways", "bot_zones")
+                 "patrol_ways", "bot_zones",
+                 "airdrop_points", "indoor_volumes", "door_links", "core_points",
+                 "ai_places", "cultist_signs", "rooms", "room_portals")
+    # Top-level scalars from the service scenes (omitted entirely when absent).
+    sun = next((s for s in sink.pop("_sun") if s), None)
+    borders = [v for v in sink.pop("_level_border") if v]
     ship = {k: v for k, v in sink.items() if v or k not in NEW_SINKS}
     counts = {k: len(v) for k, v in ship.items()}
     counts["exfils_by_faction"] = dict(Counter(e["faction"] for e in sink["exfils"]))
     counts["doors_with_key"] = sum(1 for d in sink["doors"] if d.get("key_id"))
     out = {"map": MAP, "generated_levels": scanned, "logic_levels": logic_levels,
            "draped": draped, "counts": counts, **ship}
+    if sun:
+        out["sun"] = sun
+        print(f"  sun: {sun['hour']:.1f}h {sun['day']}/{sun['month']}/{sun['year']} "
+              f"lat {sun['lat']} lon {sun['lon']}")
+    if borders:
+        out["level_border"] = max(borders, key=len)   # variant scenes: keep the fullest ring
+        counts["level_border"] = len(out["level_border"])
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     json.dump(out, open(OUT, "w"), separators=(",", ":"))
     print(f"\n[out] {OUT}  ({os.path.getsize(OUT)/1e3:.0f} kB, {time.time()-t0:.0f}s)")
@@ -1623,6 +1771,11 @@ def main():
               f"pts={sum(len(w['points']) for w in sink['patrol_ways'])}")
     sc_ai = Counter((s.get("side"), bool(s.get("ai"))) for s in sink["spawn_points"])
     print(f"  spawn_points: {len(sink['spawn_points'])} by (side, ai): {dict(sc_ai)}")
+    aux_counts = {k: len(sink[k]) for k in
+                  ("airdrop_points", "indoor_volumes", "door_links", "core_points",
+                   "ai_places", "cultist_signs", "rooms", "room_portals") if sink[k]}
+    if aux_counts:
+        print(f"  service-scene intel: {aux_counts}")
     st = Counter(d["state"] for d in sink["doors"])
     print(f"  doors: {len(sink['doors'])} states={dict(st)} with_key={counts['doors_with_key']}")
     mk = Counter(m.get("kind") for m in sink["mines_directional"])
