@@ -285,7 +285,7 @@ fn solve(
     // ---- phase 0: ONE bounded Dijkstra flood from the start prunes unreachable candidates
     // up front. Without this, every shelf/roof loot point that isn't on the nav mesh cost a
     // full EXHAUSTIVE failed A* during threading (seconds each — the planner looked hung).
-    let mut field_s = Scratch::new(grid.nodes());
+    let mut field_s = crate::nav::pooled_scratch(grid.nodes());
     let walk_budget_m = ((budget - EXTRACT_BUFFER_S).max(60.0) * WALK_MPS).max(200.0);
     if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
         return Err("start is off the walkable mesh".into());
@@ -381,7 +381,7 @@ fn solve(
     }
 
     // ---- phase 3: real legs (A* threading) + budget repair ----
-    let mut s = Scratch::new(grid.nodes());
+    let mut s = crate::nav::pooled_scratch(grid.nodes());
     for _repair in 0..6 {
         if tour.is_empty() {
             return Err("no reachable loot within the budget".into());

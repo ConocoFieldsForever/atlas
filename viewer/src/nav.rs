@@ -66,6 +66,9 @@ pub struct NavGrid {
     h: Vec<f32>,
     /// nx*nz door bits.
     door: Vec<u8>,
+    /// Lazily-computed connected-component label per node (see `comps`). OnceLock so the ~1 s
+    /// flood fill is paid on the first route only, and never for a session that never routes.
+    comp: std::sync::OnceLock<Vec<u32>>,
     /// nx*nz*K 8-dir edge-block masks.
     blk: Vec<u8>,
     /// nx*nz: true when the cell is within ~1 cell of a blocked edge. A small enter-penalty on
@@ -89,7 +92,63 @@ pub struct Scratch {
     heap: Vec<u32>,
 }
 
+/// Pool of A* scratch buffers, keyed by node count.
+///
+/// `Scratch` is ~16 B per node: 174 MB on interchange at 1 m, and 295 MB on streets at 0.5 m --
+/// allocated AND zeroed on every single route request, which is both a hitch and a memory spike.
+/// The arrays are generation-stamped (`gen`), so a reused buffer needs no clearing whatsoever;
+/// there was never a reason to reallocate. Borrow from here instead.
+static SCRATCH_POOL: std::sync::Mutex<Vec<Scratch>> = std::sync::Mutex::new(Vec::new());
+/// Keep at most this many buffers alive between requests (routing is effectively serial; the
+/// planner briefly holds two).
+const SCRATCH_POOL_MAX: usize = 3;
+
+/// A `Scratch` borrowed from [`SCRATCH_POOL`], returned automatically on drop.
+pub struct PooledScratch(Option<Scratch>);
+
+impl std::ops::Deref for PooledScratch {
+    type Target = Scratch;
+    fn deref(&self) -> &Scratch {
+        self.0.as_ref().expect("scratch taken")
+    }
+}
+impl std::ops::DerefMut for PooledScratch {
+    fn deref_mut(&mut self) -> &mut Scratch {
+        self.0.as_mut().expect("scratch taken")
+    }
+}
+impl Drop for PooledScratch {
+    fn drop(&mut self) {
+        if let Some(s) = self.0.take() {
+            // A poisoned lock still holds usable buffers — recover rather than leak the pool.
+            let mut p = SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+            if p.len() < SCRATCH_POOL_MAX {
+                p.push(s);
+            }
+        }
+    }
+}
+
+/// Borrow a scratch sized for `nodes`, reusing a pooled one when the size matches (it always does
+/// within a map; a map switch changes the node count and simply allocates once more).
+pub fn pooled_scratch(nodes: usize) -> PooledScratch {
+    {
+        let mut p = SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = p.iter().position(|s| s.nodes() == nodes) {
+            return PooledScratch(Some(p.swap_remove(i)));
+        }
+        // Different map: the old buffers are the wrong size and will never match again.
+        p.clear();
+    }
+    PooledScratch(Some(Scratch::new(nodes)))
+}
+
 impl Scratch {
+    /// Node count this buffer was sized for (pool matching).
+    pub fn nodes(&self) -> usize {
+        self.g.len()
+    }
+
     pub fn new(m: usize) -> Self {
         Self {
             gen: 0,
@@ -170,6 +229,7 @@ impl NavGrid {
         Some(NavGrid {
             min_x, min_z, res, nx, nz, k, miss, climb, drop_max, step_up, slope_tan, h, door, blk,
             near_wall, wall_cell,
+            comp: std::sync::OnceLock::new(),
         })
     }
 
@@ -371,6 +431,140 @@ impl NavGrid {
     /// unreachable. Uses generation-stamped scratch (no O(grid) clears). `avoid` adds a per-cell
     /// soft penalty (danger zones) — heuristic stays the plain distance, which remains admissible
     /// (penalties only ADD cost), so the path is still optimal under the penalised metric.
+    /// Is the edge from node (`c`,`l`) in direction `d` traversable? EXACTLY the rule `astar` uses
+    /// for expansion — extracted so the connectivity pass below cannot drift from the router. On
+    /// success returns the neighbour node id.
+    #[inline]
+    fn step_to(&self, c: usize, l: usize, d: usize) -> Option<usize> {
+        let (nx, nz) = (self.nx as i64, self.nz as i64);
+        let (ix, iz) = ((c % self.nx) as i64, (c / self.nx) as i64);
+        let (dx, dz) = (NB[d].0 as i64, NB[d].1 as i64);
+        let (jx, jz) = (ix + dx, iz + dz);
+        if jx < 0 || jz < 0 || jx >= nx || jz >= nz {
+            return None;
+        }
+        let nc = (jz * nx + jx) as usize;
+        let h_cur = self.h_lay(c, l);
+        let nl = self.best_layer(nc, h_cur);
+        if nl < 0 {
+            return None;
+        }
+        let nl = nl as usize;
+        let up = self.h_lay(nc, nl) - h_cur;
+        let forced = self.door[c] == 1 || self.door[nc] == 1;
+        if !forced && (self.blk[c * self.k + l] >> d) & 1 != 0 {
+            return None;
+        }
+        let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+        if !self.walkable_step(up, horiz, forced) {
+            return None;
+        }
+        if dx != 0 && dz != 0 && !forced && !self.diag_ok(ix, iz, h_cur, self.blk[c * self.k + l], d) {
+            return None;
+        }
+        Some(nc * self.k + nl)
+    }
+
+    /// Connected-component label per node, computed once on demand (BFS over `step_to`).
+    ///
+    /// The 1 m grid over-blocks: the capsule fan seals any edge within a player radius of a wall,
+    /// which shatters dense interiors into many disconnected islands (streets: ~47% of cells are
+    /// wall cells). If the player happens to stand in one of those islands, EVERY destination is
+    /// unreachable and the panel just says "no walkable path found" — which is what a user hit
+    /// standing at -130,-50 on streets with all 20 extracts failing. Labelling components lets the
+    /// snap step out of a stranded pocket instead of failing (see `snap_start_in`).
+    fn comps(&self) -> &Vec<u32> {
+        self.comp.get_or_init(|| {
+            let n = self.nx * self.nz * self.k;
+            let mut lab = vec![u32::MAX; n];
+            let mut next = 0u32;
+            let mut stack: Vec<usize> = Vec::new();
+            for c in 0..self.nx * self.nz {
+                for l in 0..self.k {
+                    if self.h[c * self.k + l] <= self.miss * 0.5 {
+                        break; // layers ascend; `miss` sinks to the end
+                    }
+                    let node = c * self.k + l;
+                    if lab[node] != u32::MAX {
+                        continue;
+                    }
+                    let id = next;
+                    next = next.wrapping_add(1);
+                    lab[node] = id;
+                    stack.push(node);
+                    while let Some(cur) = stack.pop() {
+                        let (cc, cl) = (cur / self.k, cur % self.k);
+                        for d in 0..8 {
+                            if let Some(nn) = self.step_to(cc, cl, d) {
+                                if lab[nn] == u32::MAX {
+                                    lab[nn] = id;
+                                    stack.push(nn);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            lab
+        })
+    }
+
+    /// Like `snap_start`, but only accepts nodes in component `want` (when given). This is what
+    /// rescues a start placed inside an over-blocked pocket: rather than snapping to the closest
+    /// floor and then failing to route, step out to the closest floor that is actually connected
+    /// to the destination.
+    fn snap_start_in(
+        &self,
+        x: f32,
+        y: f32,
+        z: f32,
+        max_cells: i64,
+        want: Option<u32>,
+    ) -> Option<(usize, usize)> {
+        let Some(want) = want else {
+            return self.snap_start(x, y, z, max_cells);
+        };
+        let comps = self.comps();
+        let mut cix = ((x - self.min_x) / self.res).round() as i64;
+        let mut ciz = ((z - self.min_z) / self.res).round() as i64;
+        cix = cix.clamp(0, self.nx as i64 - 1);
+        ciz = ciz.clamp(0, self.nz as i64 - 1);
+        for rad in 0..=max_cells {
+            let (mut bc, mut bl, mut bd) = (-1i64, -1i64, f64::MAX);
+            for dz in -rad..=rad {
+                for dx in -rad..=rad {
+                    if rad > 0 && dx.abs().max(dz.abs()) != rad {
+                        continue;
+                    }
+                    let (jx, jz) = (cix + dx, ciz + dz);
+                    if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                        continue;
+                    }
+                    let c = (jz * self.nx as i64 + jx) as usize;
+                    for l in 0..self.k {
+                        let hh = self.h[c * self.k + l];
+                        if hh <= self.miss * 0.5 {
+                            break;
+                        }
+                        if comps[c * self.k + l] != want {
+                            continue; // right place, wrong island
+                        }
+                        let d = (hh - y).abs() as f64 + rad as f64 * 0.5;
+                        if d < bd {
+                            bd = d;
+                            bc = c as i64;
+                            bl = l as i64;
+                        }
+                    }
+                }
+            }
+            if bc >= 0 {
+                return Some((bc as usize, bl as usize));
+            }
+        }
+        None
+    }
+
     fn astar(
         &self,
         sc: usize,
@@ -844,13 +1038,37 @@ impl NavGrid {
             dc = ciz * self.nx as i64 + cix;
         }
         let dc = dc as usize;
-        for dl in self.layers_by_height(dc, b.y) {
+        // ISLAND RESCUE: the 1 m grid over-blocks (a capsule fan seals every edge within a player
+        // radius of a wall), so a start can land in a sealed pocket from which NOTHING is
+        // reachable -- the user sees "no walkable path found" for every destination at once. If the
+        // plain start cannot reach a dest layer, re-snap the start to the nearest cell that is
+        // actually in that layer's component and retry, rather than reporting failure.
+        let dls = self.layers_by_height(dc, b.y);
+        for &dl in &dls {
             if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, &mut None) {
                 // Report the length of the SIMPLIFIED polyline (what actually gets drawn + walked),
                 // not the raw 8-connected staircase: the staircase over-measures a diagonal-ish leg
                 // by the grid metrication error (~up to 8%). Simplifying first makes the displayed
                 // metres match the drawn line and the true walked distance. The wall-aware pull
                 // guarantees the drawn chords never cut through a wall the cell path avoided.
+                let simp = self.simplify_route(&path);
+                let dist = polyline_len(&simp);
+                return Some((simp, dist));
+            }
+        }
+        // Second pass: step the start out of its island into the destination's component.
+        let comps = self.comps();
+        for &dl in &dls {
+            let want = comps[dc * self.k + dl];
+            if want == comps[sc * self.k + sl] {
+                continue; // same component and A* already failed -- genuinely blocked
+            }
+            // 24 cells ~ 24 m at 1 m res: enough to leave a pocket, small enough that the start
+            // never teleports across the map.
+            let Some((sc2, sl2)) = self.snap_start_in(a.x, a.y, a.z, 24, Some(want)) else {
+                continue;
+            };
+            if let Some(path) = self.astar(sc2, sl2, dc, dl, s, avoid, &mut None) {
                 let simp = self.simplify_route(&path);
                 let dist = polyline_len(&simp);
                 return Some((simp, dist));
