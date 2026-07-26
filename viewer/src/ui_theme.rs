@@ -384,8 +384,7 @@ pub fn color32(color: bevy::prelude::Color) -> Color32 {
 /// active-beige / idle-muted color, and returns true on click. `kind`: 0 = eye (visibility),
 /// 1 = camera, 2 = tasks/checklist, 3 = navigation (route pin).
 pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, label: &str, tip: &str) -> bool {
-    // The button is a 32px icon with a small caption UNDER it (so the two near-identical house icons
-    // — "Menu" and "Map" — read apart at a glance, not just on hover). Full rail width so the caption
+    // The button is a 32px icon with a small caption UNDER it. Full rail width so the caption
     // can center under the icon and the whole cell is one click target.
     let w = ui.available_width().max(32.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 44.0), egui::Sense::click());
@@ -415,8 +414,9 @@ pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, label: &str, tip: 
 }
 
 /// Vector icon inside `rect`: 0 = eye, 1 = camera, 2 = tasks/checklist, 3 = navigation (a location
-/// pin with a dashed route leading to it). Painter primitives only (no image assets — keeps the
-/// shippable exe free of game-derived art).
+/// pin with a dashed route leading to it), 4 = house (back-to-menu — the ONLY house on the rail),
+/// 5 = breadcrumb trail (insights), 6 = folded map (level/power controls). Painter primitives only
+/// (no image assets — keeps the shippable exe free of game-derived art).
 pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: Color32) {
     let ctr = rect.center();
     let s = Stroke::new(1.6, c);
@@ -429,6 +429,26 @@ pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: C
             painter.circle_filled(p(-1.0, 2.5), 2.0, c);
             painter.circle_filled(p(6.0, -4.0), 2.0, c);
             painter.circle_stroke(p(6.0, -4.0), 5.0, s);
+        }
+        6 => {
+            // map: a folded tri-panel map (zigzag outline + fold creases) with a small
+            // location dot — the Level/power tab's OWN glyph (it used to share the house
+            // icon with "Menu", which read as two home buttons).
+            let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);
+            let top = -6.0f32;
+            let bot = 7.0f32;
+            // Outer zigzag: left panel leans out, middle leans in, right leans out.
+            let pts = vec![
+                p(-9.0, top + 1.5), p(-3.0, top), p(3.0, top + 1.5), p(9.0, top),
+                p(9.0, bot - 1.5), p(3.0, bot), p(-3.0, bot - 1.5), p(-9.0, bot),
+            ];
+            painter.add(egui::Shape::closed_line(pts, s));
+            // Fold creases.
+            painter.line_segment([p(-3.0, top), p(-3.0, bot - 1.5)], s);
+            painter.line_segment([p(3.0, top + 1.5), p(3.0, bot)], s);
+            // A marked spot on the middle panel.
+            painter.circle_filled(p(0.0, 0.5), 1.6, c);
+            return;
         }
         3 => {
             // navigation: dashed route from bottom-left up to a location pin at top-right

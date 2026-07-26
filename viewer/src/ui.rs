@@ -61,6 +61,9 @@ pub struct LayerToggles {
     pub airdrops: bool,
     /// CultistSignEffect event ritual signs (AI scene).
     pub rituals: bool,
+    /// The game-link player marker (green ring + facing arrow + beacon from screenshot fixes).
+    /// OFF by default — opt in when actively using the screenshot-position flow.
+    pub player_marker: bool,
     // ---- QUESTS (tasks.json) ----
     pub quests: bool,
 }
@@ -99,6 +102,7 @@ impl Default for LayerToggles {
             patrols: has("patrol"),
             airdrops: has("airdrop"),
             rituals: has("ritual"),
+            player_marker: has("player"),
             quests: has("quest"),
         }
     }
@@ -1238,6 +1242,13 @@ fn layers_panel(
                             // boxes/safes); mixes real lootables with decorative twins, so it
                             // reads "props", not "interactables".
                             poi_row(ui, &mut toggles.interactables, "Loot props", PoiLayer::Interactable, &poi_counts);
+                            // Game-link "you are here" (screenshot fixes): hidden unless you're
+                            // actively using the position flow — a stale green beacon from a
+                            // previous raid otherwise haunts the map.
+                            ui.horizontal(|ui| {
+                                ui.add_space(crate::ui_theme::SP_XS);
+                                ui.checkbox(&mut toggles.player_marker, "Player marker (game link)");
+                            });
                         });
 
                     // ===== MAP INTEL =====
@@ -1675,9 +1686,9 @@ fn toolbar_panel(
             if theme::rail_button(ui, cur == RightPanelTab::Navigate, 3, "Nav", "Navigation \u{00B7} routes") {
                 *tab = RightPanelTab::Navigate;
             }
-            // Bottom house = "Map": map-specific controls (level / power switches). The second of the
-            // two house icons — the caption is what tells it apart from the top "Menu" one.
-            if theme::rail_button(ui, cur == RightPanelTab::Level, 4, "Map", "Map \u{00B7} level & power controls") {
+            // "Map": map-specific controls (level / power switches) — its own folded-map glyph
+            // (this used to reuse the house icon and read as a second "home" button).
+            if theme::rail_button(ui, cur == RightPanelTab::Level, 6, "Map", "Map \u{00B7} level & power controls") {
                 *tab = RightPanelTab::Level;
             }
             if theme::rail_button(ui, cur == RightPanelTab::Insights, 5, "Trail", "Insights \u{00B7} netcode position trail from the game's logs") {
@@ -2276,6 +2287,7 @@ fn hide_all(t: &mut LayerToggles) {
     t.patrols = false;
     t.airdrops = false;
     t.rituals = false;
+    t.player_marker = false;
     t.quests = false;
 }
 
