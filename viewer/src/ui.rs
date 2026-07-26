@@ -1313,6 +1313,33 @@ fn layers_panel(
                     // (Pathfinding moved to its own Navigation tab — navigate_panel.rs. Position
                     // placement + the extract table + route status all live there now.)
 
+                    // ===== LEGEND: what every line style on the map MEANS. Painted samples so
+                    // the semantics (authored vs derived, route vs area) survive without docs. =====
+                    CollapsingHeader::new(section_hdr("Legend", 0))
+                        .id_salt("sec_legend")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            legend_row(ui, LegendGlyph::Solid, theme::poi_color(PoiLayer::Minefield),
+                                       "solid ring — authored zone collider (mines, snipers, extracts)");
+                            legend_row(ui, LegendGlyph::Wall, theme::poi_color(PoiLayer::Extract),
+                                       "translucent wall — same zone, extruded 1.5 m for visibility");
+                            legend_row(ui, LegendGlyph::Dashed, theme::poi_color(PoiLayer::BotZone),
+                                       "dashed ring — bot zone hull, DERIVED from its spawns + patrols");
+                            legend_row(ui, LegendGlyph::Route, theme::poi_color(PoiLayer::Patrol),
+                                       "dots + fading arrows — patrol waypoints in serialized order \
+                                        (an area bots pick from, not a fixed circuit)");
+                            legend_row(ui, LegendGlyph::Solid, Color32::from_rgb(140, 158, 178),
+                                       "dim outer ring — the game's playable-area border");
+                            legend_row(ui, LegendGlyph::Circle, theme::poi_color(PoiLayer::ScavSpawn),
+                                       "ground circle — a spawn's radius, shown while its card is open");
+                            ui.label(
+                                RichText::new("solid = the game authored that shape \u{2022} \
+                                               dashed/derived = we computed it from game data")
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        });
+
                     // ---- Graphics (experimental): live toggles for the render features. ----
                     // Edits go through a local copy so change-detection only fires on a real
                     // tweak (a bare &mut through ResMut would mark the resource changed every
@@ -2269,6 +2296,75 @@ fn layer_toggle_mut(t: &mut LayerToggles, l: crate::poi::PoiLayer) -> &mut bool 
 /// One POI toggle row: colour swatch + checkbox + a right-aligned dim marker count. Uses the shared
 /// theme swatch (colour from `poi::poi_look`, matching the on-map marker) + count tag.
 #[cfg(feature = "egui")]
+/// Line-style sample glyphs for the panel's Legend section.
+#[cfg(feature = "egui")]
+enum LegendGlyph {
+    Solid,
+    Dashed,
+    Wall,
+    Route,
+    Circle,
+}
+
+/// One legend row: a painted 44x16 line-style sample + a small caption. The samples mirror
+/// the ACTUAL map rendering (poi::draw_gamedata_outlines): solid = authored collider,
+/// dashed = derived hull, dots+arrows = patrol order, circle = on-card spawn radius.
+#[cfg(feature = "egui")]
+fn legend_row(
+    ui: &mut bevy_egui::egui::Ui,
+    glyph: LegendGlyph,
+    color: bevy_egui::egui::Color32,
+    text: &str,
+) {
+    use bevy_egui::egui::{self, pos2, vec2, RichText, Stroke};
+    ui.horizontal(|ui| {
+        ui.add_space(crate::ui_theme::SP_XS);
+        let (resp, p) = ui.allocate_painter(vec2(44.0, 16.0), egui::Sense::hover());
+        let r = resp.rect;
+        let y = r.center().y;
+        let st = Stroke::new(2.0, color);
+        match glyph {
+            LegendGlyph::Solid => {
+                p.line_segment([pos2(r.left() + 2.0, y), pos2(r.right() - 2.0, y)], st);
+            }
+            LegendGlyph::Dashed => {
+                let mut x = r.left() + 2.0;
+                while x < r.right() - 2.0 {
+                    p.line_segment([pos2(x, y), pos2((x + 6.0).min(r.right() - 2.0), y)], st);
+                    x += 10.0;
+                }
+            }
+            LegendGlyph::Wall => {
+                p.rect_filled(
+                    egui::Rect::from_min_max(pos2(r.left() + 2.0, r.top() + 2.0),
+                                             pos2(r.right() - 2.0, y)),
+                    0.0,
+                    color.linear_multiply(0.30),
+                );
+                p.line_segment([pos2(r.left() + 2.0, y), pos2(r.right() - 2.0, y)], st);
+            }
+            LegendGlyph::Route => {
+                let xs = [r.left() + 5.0, r.center().x, r.right() - 5.0];
+                for (i, w) in xs.windows(2).enumerate() {
+                    let c2 = color.linear_multiply(1.0 - 0.4 * i as f32);
+                    p.line_segment([pos2(w[0], y), pos2(w[1], y)], Stroke::new(2.0, c2));
+                }
+                for (i, x) in xs.iter().enumerate() {
+                    p.circle_filled(pos2(*x, y), if i == 0 { 3.0 } else { 2.0 }, color);
+                }
+                let cx = (xs[0] + xs[1]) * 0.5 + 1.5;
+                p.line_segment([pos2(cx, y), pos2(cx - 3.0, y - 3.0)], st);
+                p.line_segment([pos2(cx, y), pos2(cx - 3.0, y + 3.0)], st);
+            }
+            LegendGlyph::Circle => {
+                p.circle_stroke(r.center(), 6.0, st);
+                p.circle_filled(r.center(), 1.8, color);
+            }
+        }
+        ui.label(RichText::new(text).size(10.0));
+    });
+}
+
 fn poi_row(
     ui: &mut bevy_egui::egui::Ui,
     on: &mut bool,
