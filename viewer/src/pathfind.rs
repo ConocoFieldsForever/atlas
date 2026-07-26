@@ -391,7 +391,7 @@ fn dispatch_route(
     result.stop_count = if nearest_of { 1 } else { dests.len() };
     // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
     let t = AsyncComputeTaskPool::get().spawn(async move {
-        let mut s = Scratch::new(grid.nodes());
+        let mut s = crate::nav::pooled_scratch(grid.nodes());
         let lbl = |i: usize| labels.get(i).cloned();
         // One variant under a given avoid field. Multi-stop queries (chain/tour) stay single-plan;
         // single-dest + nearest-of get the full Direct/Cautious/Wide-berth comparison.
