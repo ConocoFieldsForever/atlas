@@ -68,6 +68,13 @@ pub struct MarkerValue(pub i64);
 #[derive(Component)]
 pub struct DenseMarker;
 
+/// A spawn marker's serialized SphereCollider radius (m). Drawn as a ground circle ONLY while
+/// the marker's card is open (inspect::draw_open_card_radii) — gives the card's "Radius N m"
+/// line a shape without permanent clutter. Player-side markers don't get one (their collider
+/// is a uniform 50 m default, not authored intel).
+#[derive(Component)]
+pub struct SpawnRadius(pub f32);
+
 /// Possible high-value loose spawn; its price is useful upside, not guaranteed EV.
 #[derive(Component)]
 pub struct LootJackpot;
@@ -2350,6 +2357,10 @@ fn spawn_pois(
             let zd = zone_disp(s.zone.as_deref());
             let e = spawn(&mut commands, layer, s.pos, gd_spawn_info(s, layer, zd.as_deref()), None);
             commands.entity(e).insert(DenseMarker);
+            let player_side = matches!(s.side.as_deref(), Some("pmc") | Some("all"));
+            if let Some(r) = s.radius.filter(|r| *r > 0.0 && !player_side) {
+                commands.entity(e).insert(SpawnRadius(r));
+            }
         }
         if gd_pmc_spawns + gd_scav_spawns > 0 {
             gd_zones.spawns_live = true;
@@ -2791,7 +2802,20 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
             let n = line.len();
             for i in 0..n.saturating_sub(1) {
                 let t = i as f32 / (n - 1).max(1) as f32;
-                gizmos.line(line[i] + lift, line[i + 1] + lift, c.with_alpha(0.9 - 0.65 * t));
+                let col = c.with_alpha(0.9 - 0.65 * t);
+                let (a, b) = (line[i] + lift, line[i + 1] + lift);
+                gizmos.line(a, b, col);
+                // Chevron at the segment midpoint pointing DOWN-ROUTE (serialized order made
+                // explicit, not just implied by the fade). Short segments skip it.
+                let seg = b - a;
+                let len = seg.length();
+                if len >= 3.5 {
+                    let dir = seg / len;
+                    let perp = Vec3::new(-dir.z, 0.0, dir.x);
+                    let tip = a + seg * 0.5 + dir * 0.4;
+                    gizmos.line(tip, tip - dir * 0.8 + perp * 0.45, col);
+                    gizmos.line(tip, tip - dir * 0.8 - perp * 0.45, col);
+                }
             }
             for (i, p) in line.iter().enumerate() {
                 let r = if i == 0 { 0.55 } else { 0.35 };
