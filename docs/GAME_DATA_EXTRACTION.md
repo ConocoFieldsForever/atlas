@@ -289,26 +289,62 @@ Anyone picking this up should start by finding the block header at byte 18652 (r
   (37 verts at fixed Y) → top-level `level_border` (terrain-draped; the viewer draws it as an
   always-on dim boundary ring).
 
-  **PerfectCulling PVS — the bytes are NOT in the scene (CONFIRMED 2026-07).** Chasing the
-  `PerfectCullingAdaptiveGrid` payload is a dead end by itself: it is only 48 B —
-  `{u32 5, u32 2, u32 0, 32-char GUID}`. The actual precomputed-visibility bake ships as a
-  **separate file**: `StreamingAssets/Culling_Data/<guid>_packed_cull.bytes`. 15 files,
-  **4.6 GB total**; interchange's grid GUID `3f8c141e1ca84602a218c54bf4429508` matches its file
-  name exactly, so the scene→file join is direct and needs no heuristic. Sizes run 8 MB
-  (factory-ish) to 649 MB. File header begins `u32 7 | u32 16 | <16-byte GUID> | u32 16 | …` — a
-  count followed by a length-prefixed GUID table, presumably the cross-scene groups
-  (`PerfectCullingCrossSceneGroup` ×6, `PerfectCullingCrossSceneVolume` ×8 carry matching
-  32-char GUIDs). **Undecoded beyond the header.**
+  **PerfectCulling PVS — container format DECODED (2026-07). Reader: `tools/pvs_probe.py`.**
 
-  Also in that scene and directly useful: `CullingGridPreProcess` (112 kB) decodes as a plain
-  cell list — `u32 count = 4679` near the head, then float3 position + float3 extents per cell
-  (~9.95 m cubes), stride 24. That is the PVS query grid; it is readable NOW even if the
-  visibility payload is not.
+  The bytes are not in the scene. `PerfectCullingAdaptiveGrid` is only a 48 B stub —
+  `{u32 5, u32 2, u32 0, 32-char GUID}` — and the bake ships separately as
+  `StreamingAssets/Culling_Data/<guid>_packed_cull.bytes`: **15 files, 4.6 GB**, one per
+  location. The GUID in the stub matches the filename exactly, **15/15 with no unmatched
+  files**, so the scene→file join needs no heuristic (`pvs_probe.py list`).
 
-  Why this matters beyond data collection: the viewer has no occlusion culling (Hi-Z was scoped
-  and deferred as a large lift), and this is the game's own baked solution for the exact
-  geometry Atlas renders. It would cut both frame time and resident VRAM — but 4.6 GB of source
-  data and an undecoded format make it a research project, not a task.
+  ```
+  u32   nScenes
+  nScenes x { u32 16 ; byte[16] sceneGuid }
+  <cell records, contiguous>
+  u32   cellOffset[nCells]        # absolute byte offset of each cell
+  u32   nCells                    # LAST dword in the file
+
+  cell:   float3 centre ; float3 size ; float4 rotation ; u32 clen ; byte[clen] zlib
+  payload (inflated):
+          u8 nBlocks                                   # <= nScenes
+          nBlocks x { u8 sceneIdx ; u16 nVisible ; u16 dataLen ; byte[dataLen] }
+  ```
+
+  Read the index table first (EOF−4 gives `nCells`, then back `4*nCells`) and **random-access**
+  cells. Do not walk sequentially — it is slower and one bad block costs the rest of the file.
+
+  Validated on **all 15 files** (`pvs_probe.py verify`): offsets strictly increasing,
+  `offsets[0] == header_end`, the last cell ending exactly at the index table, every sampled
+  cell's sub-block walk landing exactly on the payload end, every rotation a unit quaternion,
+  every `sceneIdx` in range. Cell counts run 8,431 (sandbox_sl) to 300,044 (woods); interchange
+  has 296,708 in 440 MB. Cells are genuinely adaptive — 3.0 m at the coarsest, subdividing to
+  ~0.7 m. Decoded bounds match the maps (interchange x −434..649, z −462..448).
+
+  **Producer quirk:** ~0.7% of cells in factory_rework day/night carry a zlib stream missing its
+  final marker/Adler-32. Strict `zlib.decompress` throws "incomplete or truncated stream" on data
+  that is fine; `decompressobj` returns it. The offset table proves our framing is right there
+  (`next_offset − offset − 44 == clen` exactly), so it is their bug, not our misparse.
+
+  **NOT decoded: the innermost `data`.** The vendor documents it as *"variable bit length
+  encoding"*, which matches measurement — 3.8–5.5 bits per entry, and the size depends on the
+  VALUES not just the count (two blocks with `nVisible=17` encode to 8 and 10 bytes). So it is an
+  entropy/varint code over renderer indices; finishing it needs the library's bit reader, **not
+  another stride guess**.
+
+  **Second blocker, independent of the codec:** even fully decoded, the indices are positions in
+  a scene's renderer list, and the pack does not preserve renderer identity through assembly —
+  the same gap `EXTRACTABLES_AUDIT` flagged for door animation. Consuming the PVS means solving
+  that first.
+
+  Also decodable now: `CullingGridPreProcess` (112 kB) — `u32 count = 4679` at +12, then float3
+  position + float3 extents per cell, stride 24, uniform 9.95 m cubes. That is the coarse query
+  grid, not the adaptive one. Left unextracted deliberately: with all cells identical, the whole
+  grid is described by {bounds, cell size, count}, and nothing consumes it.
+
+  Why it matters: the viewer has no occlusion culling (Hi-Z was scoped and deferred), and this is
+  the game's own baked solution for the exact geometry Atlas renders — it would cut frame time
+  and resident VRAM together. The container is no longer the obstacle; the codec and the renderer
+  join are.
 - **`maps/*_preset.bundle`** → DONE (dominant-location-folder join; see §2).
 - **Room semantics:** the `*_Sound.unity` mirror is extracted: `SpatialAudioRoom` ×369 →
   `rooms` (name + BoxCollider footprint), `SpatialAudioPortal` ×1101 → `room_portals` with the
@@ -449,8 +485,14 @@ BattlEye. Not recommended.**
    `*_DesignStuff` loot population is extracted. **Only interchange has been re-extracted**;
    reserve / streets / customs / shoreline / labs / lighthouse still carry stale gamedata and
    need a stage-6 re-run each.
-8. `AIVoxelesData` decode (§4.5 has the column hypothesis); consume `core_points` CGs in nav_bake
-   island validation; drive the viewer sun from `sun` × log `hourOfDay`.
+8. ~~PerfectCulling PVS container~~ **DECODED 2026-07** (§5, `tools/pvs_probe.py`, all 15 files
+   verified). Two things still stand between it and a working occlusion cull, in this order:
+   **(a)** preserve renderer identity through pack assembly — needed by door animation too, so it
+   pays for itself twice; **(b)** the variable-bit-length index codec. Do (a) first: without it a
+   decoded codec has nothing to point at.
+9. `AIVoxelesData` decode (§4.5 — a fixed stride is refuted; start at the record-#333 boundary);
+   consume `core_points` CGs in nav_bake island validation; drive the viewer sun from `sun` ×
+   log `hourOfDay`.
 
 ### 10.1 Extracted but NOT consumed by the viewer
 
