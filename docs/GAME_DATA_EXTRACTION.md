@@ -32,6 +32,7 @@ fences; "does it span height?" was right.
 | Extracted datasets | `C:\Users\nhaum\beamng_blender_pipeline\eft_assets\<dataset>` |
 | tarkmap dir | `C:\Users\nhaum\beamng_blender_pipeline\tarkmap` (holds `maps/` + `out/`) |
 | Python with UnityPy | the repo venv: `.\venv\Scripts\python.exe` |
+| tarkov.dev data | **json.tarkov.dev static catalogs ONLY** via `extraction/intel/tarkov_static.py` (ETag cache; offline = last snapshot). Never `api.tarkov.dev/graphql` — it 503s for hours; the static dumps are the feed tarkov.dev's own apps consume. Bonus: `maps_en`/`maps_ru` carry `Zone*`/`BotZone*` translations ("ZoneWoodCutter" → "Lumber Mill") — the exact table boss `spawnLocations` names render from. |
 
 `EFT_ASSETS_ROOT` / `EFT_TARKMAP_ROOT` are **not set** in the shell by default — export them or pass
 them explicitly. `tools/build_map.py` derives sane defaults if they are absent.
@@ -46,9 +47,25 @@ Read `ARCHITECTURE.md` for the `.eftpack` format and the extraction skill
 - **Geometry / materials / terrain layers / lights / grass density / SH volume inputs** —
   `extraction/unity/eft_extract_v2.py`, consumed by `eft_pipeline/assemble_bevy.py`.
 - **`gamedata.json`** — `extraction/intel/extract_gamedata.py`: exfils, typed doors (with `key_id`
-  and `state`), minefields, sniper zones, quest triggers, loose-loot points, containers, **player
-  spawn points** (177 on Interchange, from level 520), transit points, switches/interactables.
+  and `state`), minefields, sniper zones, quest triggers, loose-loot points, containers, transit
+  points, switches/interactables, and (2026-07, this audit) **the full spawn system**: every
+  `SpawnPointMarker` with GUID / zone / collider radius / categories (player scenes + AI scenes),
+  `patrol_ways` (ordered PatrolWay polylines) and `bot_zones` (centroid + draped convex hull +
+  friendly `en` name). The viewer routes markers to the PMC/Scav/Boss layers by side+mask
+  (`poi.rs::gd_spawn_layer`), suppresses tarkov.dev's clustered spawn nodes when first-party
+  markers exist, and snaps boss nodes onto zone centroids (exact `en` join, substring+nearest
+  fallback).
 - **`NavMeshProjectSettings`** — the agent climb/slope/cellSize values now used by the nav baker.
+
+  **Adoption trap:** the `gamedata.json` inside a PACK is not the raw extractor output — build_map
+  stage 6 MERGES the dataset's `interact_<lv>.json` into a `switches` array, tags power-gated
+  extracts and wires switch→door links before copying. Never copy a fresh extraction straight
+  into a pack; run `build_map.merge_gamedata_interactables(gd_path, dataset_dir)` first (the
+  merge was lifted into that function precisely so adoption can reuse it).
+- **Scene-preset bundle → map id** — `gen_maps.derive_bundles()` reads each
+  `StreamingAssets/Windows/maps/*.bundle` and joins its dominant location folder to the roster;
+  `manifest.json` ships the stems and `maps.rs::bundle_to_id` replaced the hardcoded
+  `bundle_to_map()` table (which had silently omitted `icebreaker.bundle`).
 
 The viewer reads these via `viewer/src/eftpack.rs` and surfaces them in `viewer/src/poi.rs`.
 
@@ -109,7 +126,16 @@ categories.
 
 **Sides:** AI-scene markers are `4` (Savage) on 1625/1628 sampled; level-520 player spawns are `3`
 (PMC). So the AI scene is the **scav + bot + boss** set and *complements* the PMC spawns already
-extracted — it does not duplicate them.
+extracted — it does not duplicate them. Some maps also ship side `7` (All) player markers
+(ground_zero ×100, labs ×75 — any-faction raid starts).
+
+**Tail decode CONFIRMED at scale (2026-07 implementation):** the layout above validated on
+interchange 102/102 AI markers (collider radius == every `rad:` token) AND 177/177 lv520 player
+markers (null BotZone PPtr, default 50 m collider, `Infiltration` set, float 4.0). The trailing
+16 B constant is `0,1,0,1` floats everywhere. Both PPtrs are always in-scene (fid 0). lv520 cats
+histogram: `{1:130, 40:24, 24:22, 8:1}` — a **bare bit-8 exists**, so 8/16/32 are independent
+mode bits. One lv520 pair (`spawns_coop (21)`/`(22)`) shares a GUID at the same position —
+authoring copy-paste; Id-dedupe correctly collapses it (177 → 176).
 
 **Two traps:**
 
@@ -157,11 +183,34 @@ Only ~8% of `PatrolPoint`s are referenced by a way (Interchange 261/3088, Street
 390/4213); the remainder are `SubPoint_N` children used as cover/look slots. **Ship only the
 referenced points.**
 
+Implementation findings (2026-07):
+
+- **1-point ways are real data**: `Patrol_Killa_alarm1..6` (WithName, n=1) are alarm-response
+  POSTS, not routes — keep them, render as a dot.
+- **Read the trailing name with the STRICT printable reader** (`read_cstr_strict`), not the
+  lenient one: `PatrolWayWithConditions` serializes condition state after the sentinel, and the
+  lenient read shipped a `"\x12"` name on labs. With the strict read all 28 labs conditional
+  ways decode cleanly via the same sentinel anchor.
+- **Serialized route id ≠ GameObject name**: the six alarm posts all serialize
+  `KILLA_PATROL_ALT` while their GO names stay distinct (`Patrol_Killa_alarm1..6`) — ship both
+  (`name` + `go`).
+- Per-map way counts: interchange 30, customs 49 (1 unzoned), woods 27, labs 34 (28
+  conditional), ground_zero 3.
+
 ### 4.4 Zones
 
 - **`BotZone`** has **no collider** (verified on all 12 Interchange zones). Derive a footprint as the
-  convex hull of its spawn markers + patrol points. Its payload holds two PPtr arrays (its
-  PatrolWays, then its SpawnPointMarkers) plus tuning floats.
+  convex hull of its spawn markers + patrol points. Payload layout (CONFIRMED on all 12
+  interchange zones): `f32 1.0 @0 | i32 zone-id @4 | 0xFFFFFFFF @8 | i32 | i32`, then **@20 the
+  PatrolWay PPtr array (`u32 N` + N×12 B) immediately followed by the SpawnPointMarker array**,
+  then tuning floats. The extractor still LOCATES the arrays by walking
+  (`locate_pptr_arrays`) so a per-map layout wobble degrades instead of shipping garbage.
+- **Friendly zone names come from json.tarkov.dev's `maps_en`** (`Zone*`/`BotZone*` keys:
+  `ZoneCenterBot` → "Center", `ZoneWoodCutter` → "Lumber Mill"). This is the table tarkov.dev's
+  boss `spawnLocations` names render from, so the boss→zone join is an EXACT match on it —
+  substring matching both missed ZoneWoodCutter and was ambiguous on interchange's
+  ZoneCenter/ZoneCenterBot pair (only the bot zone carries a translation, which resolves it).
+  Only boss-relevant zones are translated (interchange 5/12) — exactly the ones that need it.
 - **`AIPlaceInfo`** (×106) *does* carry a BoxCollider — 100×12×100 "Home_zone" volumes with an
   integer id. Usable directly via the existing `footprint()` helper.
 - **`AICorePoint`** records carry a `CG:` **connectivity group** id — the game's own reachability
@@ -270,23 +319,32 @@ BattlEye. Not recommended.**
 ## 9. Known per-map gotchas
 
 - **Ground Zero** has two AI scenes: `Sandbox_AI` (508) and `Sandbox_AI_high` (512, the level-25+
-  variant).
-- **Terminal**'s `Terminal_AI` appears **twice** in BuildSettings (635 and 687). Dedupe by spawn
-  `Id` — the existing `dedupe()` keys on name+position and should be switched to `Id`.
-- **Customs** has 5 legacy markers named `p1 (N)` with `sides` 0 or 3; fall back to the BotZone PPtr
-  for their zone.
-- Every playable location has an AI scene; none are missing.
+  variant). They are a REAL fork: 83 markers shared (byte-identical), 9 only in 508, 10 only in
+  512 — union by Id, `lv` keeps the variant. **Trap:** the hand-curated ground_zero config lists
+  512 as a *geometry* level, so its markers arrive without the `ai` flag — the flag is
+  informational only; the viewer routes by side+mask, never by `ai`.
+- **Labs** has `Laboratory_AI` (113) AND `Laboratory_dark_AI` (710, event variant) in the same
+  folder — both scan, Id-dedupe unions them.
+- **Terminal**'s `Terminal_AI` appears **twice** in BuildSettings (635 and 687 — same scene
+  path). `ai_levels()` dedupes by path; spawn `Id` dedupe (now implemented) covers the rest.
+- **Customs** has legacy markers named `p1 (N)` / `Sandbox_BP (N)` with `sides` 0 or 3 and empty
+  masks — the viewer's side+mask router sends them nowhere (correct: they're authoring residue).
+- Every playable location has an AI scene; none are missing. `Sandbox_SL_AI` (596) belongs to the
+  tutorial folder `Sandbox_StartLocation` and is excluded by the folder scope automatically.
 
 ---
 
 ## 10. Suggested order of work
 
-1. `ScenesPreset.ServerName` → delete the hardcoded `bundle_to_map()` table. Trivial, pure principle.
-2. AI-scene spawn markers → replaces the **online** PMC/Scav spawn layers with game truth.
-3. `groupMatchRaidSettings` side/hour → auto-select faction layers, match the sun.
-4. Patrol ways + bot zones → new layers nothing online offers.
+1. ~~`ScenesPreset` bundles → delete the hardcoded `bundle_to_map()` table.~~ **DONE 2026-07**
+   (via dominant location folder, not ServerName — no editorial join needed; found the missing
+   icebreaker bundle).
+2. ~~AI-scene spawn markers → replaces the **online** PMC/Scav spawn layers with game truth.~~
+   **DONE 2026-07** (`spawn_points` extended, `patrol_ways` + `bot_zones` sinks, viewer layers
+   `BotZone`/`Patrol`, side+mask routing, boss snap on the `en` zone join).
+3. `groupMatchRaidSettings` side/hour → auto-select faction layers, match the sun. (Remember
+   both §7 traps: session-absent field, capital-S `Side` decoy.)
+4. ~~Patrol ways + bot zones~~ — folded into 2.
 5. Room graph (`BaseSpatialRoom` + portals) → room labels and portal-aware pathfinding.
 6. `LevelBorder`, `AirdropPoint`, `IndoorTrigger` → three cheap layers.
 7. `AIVoxelesData` / `AICorePoint CG:` → validate nav reachability (needs decode work).
-
-Estimated effort for items 1–2 with schema and viewer changes: **~2.5–3 days.**
