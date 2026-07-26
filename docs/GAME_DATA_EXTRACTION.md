@@ -399,11 +399,17 @@ Anyone picking this up should start by finding the block header at byte 18652 (r
   un-raycastable openings, the cell tower visible through the building). Full audit chain —
   pack meshes == dataset meshes == **Unity level 304's own GameObjects** (only air conditioners
   + window fences exist in those openings; ground-floor `Window_plastic/wood_*` units ARE
-  serialized, upper floors are NOT), and every City level is extracted (the one absent level,
-  394, is the empty `City_Grass.unity`). The game builds those windows at RUNTIME (streamed /
-  pooled prefab content, same class as loose loot). Any fix means a NEW extraction source
-  (bundle-level prefab placements), not a pipeline change — the viewer already matches the
-  client's scene data exactly.
+  serialized, upper floors are NOT). All four City scenes the geometry pipeline skips were then
+  probed directly: `City_Scripts` 211 (DryPlane rain quads; its `WindowBreakerManager` points
+  only at `BrokenWindowPieceTemplate` shatter-VFX pieces), `City_AI` 212 (zero window-named GOs
+  in 16k), `City_Grass` 394 (empty), `City_Quests` 395 (triggers). The scene-preset bundle's
+  249 referenced scenes ALL resolve to BuildSettings levels — no streamed scene bundles exist.
+  So the client necessarily instantiates those windows at RUNTIME from prefab bundles
+  (`StreamingAssets/Windows/assets/content/…`), placements baked in the bundle-side prefabs,
+  not in any scene. Any fix means a NEW extraction source (bundle prefab transforms diffed
+  against the scene instance), not a pipeline change — the viewer already matches the client's
+  scene data exactly. TRAP for future audits: `gen_maps --levels-for <folder>` lists GEOMETRY
+  levels only; "every level extracted" claims must separately account for the service scenes.
 
 ---
 
