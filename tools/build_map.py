@@ -756,9 +756,18 @@ def main():
 
     # 6: typed gameplay zones (exfils/mines/snipers/doors/loose loot). The extractor writes
     # to tarkmap/out/<map>/gamedata.json and only PRINTS the copy step - do the copy here.
-    if run(6, total, "gameplay zones",
-           [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_gamedata.py"), m],
-           VIEWER, optional=True):
+    #
+    # Pass the DERIVED level list, same as geometry (stage 1) and grass (stage 5). Without it the
+    # extractor falls back to the hand-curated config.source.levels, which omits the *_DesignStuff
+    # scene on every map but woods/factory_rework -- and DesignStuff is where the loot lives
+    # (interchange lv52: 902 LootableContainer + 63 LootPoint; reserve lv116: 992; streets' twelve
+    # City_*_DesignStuff scenes: 1278). Geometry already scanned those levels, so the props were
+    # RENDERED while their typed records were missing: 5 of 907 containers on interchange, 0 of 992
+    # on reserve. Same drift the dataset_levels() docstring calls out, one stage later.
+    gd_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_gamedata.py"), m]
+    if geom_levels:                                   # already derived for stage 2; don't re-shell
+        gd_cmd.append("--levels=" + ",".join(str(lv) for lv in geom_levels))
+    if run(6, total, "gameplay zones", gd_cmd, VIEWER, optional=True):
         gd = os.path.join(out_dir, "gamedata.json")
         if os.path.isfile(gd):
             merge_gamedata_interactables(gd, dataset, switch_levels)
