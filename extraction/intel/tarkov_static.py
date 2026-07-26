@@ -243,6 +243,84 @@ def load_static_stationary():
     return {"weapons": weapons, "maps": per_map}
 
 
+def load_static_item_index(ids):
+    """{template id: {'n','s','pr','cat'}} for extract_gamedata's loose-loot pools. Real items
+    resolve from the items dump (names via items_en, prices real); ids that are CATEGORY
+    templates ('Food and drink' pool slots) resolve from itemCategories with cat=1 (display
+    name prettified from normalizedName — the static dump carries no category translations)."""
+    wanted = {str(i) for i in ids if i}
+    if not wanted:
+        return {}
+    I = _get("items")["data"]
+    ien = _get("items_en").get("data", {})
+    out = {}
+    for it in _list(I["items"]):
+        iid = str(it.get("id") or "")
+        if iid in wanted:
+            out[iid] = {"n": ien.get(it.get("name")) or it.get("normalizedName"),
+                        "s": ien.get(it.get("shortName")), "pr": it.get("avg24hPrice"), "cat": 0}
+    for c in _list(I.get("itemCategories") or {}):
+        cid = str(c.get("id") or "")
+        if cid in wanted and cid not in out:
+            nm = _display_name(c, [ien])
+            if nm:
+                out[cid] = {"n": nm, "s": None, "pr": None, "cat": 1}
+    return out
+
+
+def load_static_loose(display_name):
+    """One map's lootLoose rows ([{'position', 'items': [{'name','shortName','avg24hPrice'}]}])
+    from the static maps dump — the JSON replacement for extract_gamedata's per-map GraphQL
+    lootLoose query. Selected by display name (via the EN table) or by normalizedName slug."""
+    D = _get("maps")["data"]
+    I = _get("items")["data"]
+    men = _get("maps_en").get("data", {})
+    ien = _get("items_en").get("data", {})
+    slug = map_slug(display_name)
+    m = next((m for m in _list(D["maps"])
+              if m.get("normalizedName") == slug
+              or (men.get(m.get("name")) or "").lower() == str(display_name).lower()), None)
+    if not m:
+        return []
+    item_by = {it["id"]: it for it in _list(I["items"])}
+    out = []
+    for p in (m.get("lootLoose") or []):
+        items = []
+        for iid in (p.get("items") or []):
+            it = item_by.get(iid)
+            if it:
+                items.append({"name": ien.get(it.get("name")) or it.get("normalizedName"),
+                              "shortName": ien.get(it.get("shortName")),
+                              "avg24hPrice": it.get("avg24hPrice")})
+        out.append({"position": p.get("position"), "items": items})
+    return out
+
+
+def load_static_zone_names():
+    """{internal zone key: EN display} — the maps_en table's Zone*/BotZone* rows
+    ('ZoneCenterBot' -> 'Center', 'ZoneWoodCutter' -> 'Lumber Mill'). This is the SAME table
+    tarkov.dev renders its bosses' spawnLocations names from, so a boss loc name joins a
+    first-party BotZone EXACTLY through it (substring matching misses ZoneWoodCutter)."""
+    men = _get("maps_en").get("data", {})
+    return {k: v for k, v in men.items()
+            if isinstance(v, str) and (k.startswith("Zone") or k.startswith("BotZone"))}
+
+
+def load_static_map_names():
+    """{normalizedName: (en, ru)} for gen_maps' roster display names — maps + maps_en +
+    maps_ru catalogs (ru degrades to en when its table lacks the key)."""
+    D = _get("maps")["data"]
+    men = _get("maps_en").get("data", {})
+    mru = _get("maps_ru").get("data", {})
+    out = {}
+    for m in _list(D["maps"]):
+        nn = m.get("normalizedName")
+        en = men.get(m.get("name")) or nn
+        if nn and en:
+            out[nn] = (en, mru.get(m.get("name")) or en)
+    return out
+
+
 def load_static_maps():
     """Rebuild the build_loot.py QUERY response ({'maps': [...]}) from the static dumps.
 
