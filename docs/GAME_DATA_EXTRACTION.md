@@ -62,6 +62,37 @@ Read `ARCHITECTURE.md` for the `.eftpack` format and the extraction skill
   extracts and wires switch→door links before copying. Never copy a fresh extraction straight
   into a pack; run `build_map.merge_gamedata_interactables(gd_path, dataset_dir)` first (the
   merge was lifted into that function precisely so adoption can reuse it).
+  A raw extraction therefore reports `switches: 0` — that is the missing merge, NOT a regression.
+  Never diff raw extractor output against a pack's gamedata without merging first.
+
+### 2.1 SCAN-SCOPE TRAP: the level list is per-stage, and one stage had the wrong one (fixed 2026-07)
+
+`extract_gamedata.py` defaults `LEVELS` to the **hand-curated `config.source.levels`**, while
+geometry/interactables/grass all use `build_map.dataset_levels()` — the list DERIVED live from
+BuildSettings. Those two disagree on almost every map, because the config omits the
+`*_DesignStuff` scene and **DesignStuff is where the loot lives**:
+
+| map | DesignStuff lv | in derived? | in config? | containers there |
+|---|---:|---|---|---:|
+| interchange | 52 | yes | **no** | 902 |
+| reserve | 116 | yes | **no** | 992 |
+| streets | 384-391, 454-457 | yes | **no** | 1278 |
+| customs | 8 | yes | **no** | 552 |
+| shoreline | 31 | yes | **no** | 761 |
+| labs | 115 | yes | **no** | 319 |
+| lighthouse | 189 | yes | **no** | 534 |
+| woods | 166 | yes | yes | 431 |
+
+Woods and factory_rework only worked by accident of their hand-written configs. Because geometry
+DID scan those levels, the loot props were **rendered on screen while their typed records were
+missing** — interchange shipped 5 of 907 containers, reserve 0 of 992, and customs 0 loose-loot
+points. Fixed by passing `--levels=` at the stage-6 call site (`build_map.py`, "6: typed gameplay
+zones"); interchange re-extracted to 907 containers / 112 loose points, confirmed.
+
+**The general rule: if you add a new extractor, take the level list from `dataset_levels()`, never
+from `config.source.levels`.** The config is authored, so by §0 it is the wrong source; it exists
+only as a union fallback. Any per-stage level list is a place this bug can recur silently — the
+symptom is plausible-but-small counts, never an error.
 - **Scene-preset bundle → map id** — `gen_maps.derive_bundles()` reads each
   `StreamingAssets/Windows/maps/*.bundle` and joins its dominant location folder to the roster;
   `manifest.json` ships the stems and `maps.rs::bundle_to_id` replaced the hardcoded
@@ -218,11 +249,31 @@ Implementation findings (2026-07):
 
 ### 4.5 Other AI-scene data (CONFIRMED present, decode unverified)
 
-`AIVoxelesData` (38,016 records / 2.2 MB, xyz + column index) and `AICoversData` (12,256 records,
-position + facing normal) are the game's own walkability and cover sets. The record stride is
-**non-uniform** (2,217,692 B / 38,016 is not an integer), so decoding needs column-statistics work.
-`NavMeshDoorLink` ×219 is keyed by **the same `door_…` ids already in `gamedata.json`** — free
-traversal edges for the nav graph.
+`AIVoxelesData` (38,016 records / 2.2 MB) and `AICoversData` (12,256 records, position + facing
+normal) are the game's own walkability and cover sets — the most valuable un-decoded thing left,
+since nav is where this project has had the most bugs. `NavMeshDoorLink` ×219 is keyed by **the
+same `door_…` ids already in `gamedata.json`** — free traversal edges for the nav graph, and
+already extracted (§5).
+
+**AIVoxelesData (2026-07 probe): `u32 count = 38016` at payload+0 is CONFIRMED; a fixed stride is
+REFUTED — do not start from one.**
+
+What holds up: the data really is **vertical columns**. The first records share an XZ and step Y
+by exactly 5.0 m — `(-393.43, 15.71, -415.49) → (…, 20.71, …) → (…, 25.71, …)` — and within clean
+runs the only Y deltas seen are 0.0 and 5.0. So the sample lattice is 5 m vertical.
+
+What does NOT hold up: **stride 56**. It looks right on the first ~300 records and on a 2000-record
+spot check (79% plausible), which is exactly the trap. Tested against the full 38,016 it gives
+29,560/38,016 plausible and **breaks first at record #333**, after which clean runs come in
+irregular lengths (333, 371, 386, 1, 391, …). A uniform stride cannot produce a run of length 1.
+The dead giveaway that the alignment is drifting rather than the data being odd: 2,359 of the
+in-column Y deltas are **0.0** — consecutive "samples" at an identical XZ *and* Y, i.e. the reader
+re-reading the same bytes at a wrong offset.
+
+So the record is **variable-length or block-structured** (4 + 38016×56 also leaves 88,796 trailing
+bytes, whose head decodes as another plausible float3 — likely a second section, not padding).
+Anyone picking this up should start by finding the block header at byte 18652 (record #333),
+**not** by fitting a stride. Budget it as a real reverse-engineering task.
 
 ---
 
@@ -236,7 +287,28 @@ traversal edges for the nav graph.
   the log's `hourOfDay`. `WeatherController` = 2.9 kB of config curves, skipped.
 - **`*_Culling.unity`** (Interchange level 521): `LevelBorder` → **decoded**: `u32 N + N×float3`
   (37 verts at fixed Y) → top-level `level_border` (terrain-draped; the viewer draws it as an
-  always-on dim boundary ring). `PerfectCullingAdaptiveGrid` PVS bytes still **unverified**.
+  always-on dim boundary ring).
+
+  **PerfectCulling PVS — the bytes are NOT in the scene (CONFIRMED 2026-07).** Chasing the
+  `PerfectCullingAdaptiveGrid` payload is a dead end by itself: it is only 48 B —
+  `{u32 5, u32 2, u32 0, 32-char GUID}`. The actual precomputed-visibility bake ships as a
+  **separate file**: `StreamingAssets/Culling_Data/<guid>_packed_cull.bytes`. 15 files,
+  **4.6 GB total**; interchange's grid GUID `3f8c141e1ca84602a218c54bf4429508` matches its file
+  name exactly, so the scene→file join is direct and needs no heuristic. Sizes run 8 MB
+  (factory-ish) to 649 MB. File header begins `u32 7 | u32 16 | <16-byte GUID> | u32 16 | …` — a
+  count followed by a length-prefixed GUID table, presumably the cross-scene groups
+  (`PerfectCullingCrossSceneGroup` ×6, `PerfectCullingCrossSceneVolume` ×8 carry matching
+  32-char GUIDs). **Undecoded beyond the header.**
+
+  Also in that scene and directly useful: `CullingGridPreProcess` (112 kB) decodes as a plain
+  cell list — `u32 count = 4679` near the head, then float3 position + float3 extents per cell
+  (~9.95 m cubes), stride 24. That is the PVS query grid; it is readable NOW even if the
+  visibility payload is not.
+
+  Why this matters beyond data collection: the viewer has no occlusion culling (Hi-Z was scoped
+  and deferred as a large lift), and this is the game's own baked solution for the exact
+  geometry Atlas renders. It would cut both frame time and resident VRAM — but 4.6 GB of source
+  data and an undecoded format make it a research project, not a task.
 - **`maps/*_preset.bundle`** → DONE (dominant-location-folder join; see §2).
 - **Room semantics:** the `*_Sound.unity` mirror is extracted: `SpatialAudioRoom` ×369 →
   `rooms` (name + BoxCollider footprint), `SpatialAudioPortal` ×1101 → `room_portals` with the
@@ -373,5 +445,27 @@ BattlEye. Not recommended.**
    follow-up (room labels, portal-aware pathfinding) remains.
 6. ~~`LevelBorder`, `AirdropPoint`, `IndoorTrigger`~~ **DONE** (+ `TOD_Sky` sun, `door_links`,
    `core_points`, `ai_places`, `cultist_signs`).
-7. `AIVoxelesData` decode (non-uniform stride — column-stats project); consume `core_points`
-   CGs in nav_bake island validation; drive the viewer sun from `sun` × log `hourOfDay`.
+7. ~~Scan-scope fix~~ **DONE 2026-07** (§2.1) — stage 6 now takes the derived level list, so the
+   `*_DesignStuff` loot population is extracted. **Only interchange has been re-extracted**;
+   reserve / streets / customs / shoreline / labs / lighthouse still carry stale gamedata and
+   need a stage-6 re-run each.
+8. `AIVoxelesData` decode (§4.5 has the column hypothesis); consume `core_points` CGs in nav_bake
+   island validation; drive the viewer sun from `sun` × log `hourOfDay`.
+
+### 10.1 Extracted but NOT consumed by the viewer
+
+These sinks ship in every pack and nothing reads them. That is deliberate ("file-only"), but it
+means the data is unvalidated — a decode bug in any of them would be invisible today, so treat
+their contents as unproven until something renders or asserts on them.
+
+| sink | interchange | streets | intended use |
+|---|---:|---:|---|
+| `rooms` / `room_portals` | 369 / 1101 | 1224 / 3458 | room labels, portal-aware pathfinding |
+| `door_links` | 219 | 723 | nav traversal edges (keyed to existing door ids) |
+| `ai_places` | 106 | 220 | bot anchor volumes |
+| `indoor_volumes` | 35 | 329 | roof culling / floor picking |
+| `core_points` | 28 | 26 | nav-island ground truth |
+| `sun` | 1 | 1 | drive the viewer sun with the log's `hourOfDay` |
+
+Cost is ~192 kB of interchange's 898 kB `gamedata.json` and ~618 kB of streets' 1.9 MB — a third
+of the file. Not enough to act on for size alone, but worth knowing before adding more sinks.

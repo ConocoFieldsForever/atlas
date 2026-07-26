@@ -33,6 +33,12 @@ grass_density_*.bin
 # transient build/staging dirs
 *.building/
 *.old/
+# ad-hoc test-worktree scratch (throwaway probe scripts, timing logs, trial packs + the
+# tarkov.dev json caches they pull). 1.8 GB; the *.eftpack rules above already catch most of
+# it, so without this the leftovers look small and committable when they are not source.
+_tw/
+# Blender addon workspace (binary rigs/animations, 30 MB) — not part of the viewer build.
+.blender-toolkit/
 
 # local config & secrets
 atlas.config.json
@@ -52,3 +58,16 @@ venv/
 *.log
 .vscode/
 .idea/
+
+# working notes: per-investigation audits/plans/specs dropped at the repo root. They go stale the
+# moment the work lands and then read as current guidance, so they stay local. Anything durable
+# belongs in docs/ (see docs/GAME_DATA_EXTRACTION.md) or in a code comment next to the thing it
+# explains. Root-anchored so docs/ and the tracked top-level READMEs are unaffected.
+/*_AUDIT.md
+/*_PLAN.md
+/*_SPEC.md
+/*_BRIEF.md
+/*_FINDINGS.md
+/*_DESIGN.md
+# one-off probe scripts (the repo's leading-underscore = scratch convention)
+tools/_*
