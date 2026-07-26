@@ -2804,11 +2804,88 @@ fn apply_quest_visibility(
 /// at the platform, not draped to the ground far below (DEFECT 2 fix). The `draped` flag stays true
 /// (the ground group is still draped), so the token 0.05 lift is right for both. Zones inactive in
 /// the scene follow the panel's "hide inactive" filter like their markers.
+/// Lazily-built, per-map cache of patrol connectors CONTOURED to the walkable world. Each leg
+/// between consecutive PatrolPoints is routed through the nav grid (multi-floor: mall storeys,
+/// stairs, around walls); a leg with no route — or one whose route detours absurdly (nav is
+/// WORK IN PROGRESS, see README) — falls back to the straight line height-snapped every ~2 m
+/// onto the nearest floor layer (`NavGrid::floor_near`). Built on the first patrol draw once
+/// the nav grid is up (straight lines until then; `with_nav` triggers a one-time rebuild when
+/// it arrives). Verts carry their route-fraction t so the bright→faint order fade survives.
+#[derive(Default)]
+struct PatrolContours {
+    epoch: u64,
+    with_nav: bool,
+    n_ways: usize,
+    ways: Vec<Vec<(Vec3, f32)>>,
+}
+
+fn build_patrol_contours(
+    ways: &[Vec<Vec3>],
+    nav: Option<&crate::nav::NavGrid>,
+) -> Vec<Vec<(Vec3, f32)>> {
+    let mut scratch = nav.map(|g| crate::nav::pooled_scratch(g.nodes()));
+    ways.iter()
+        .map(|way| {
+            let n = way.len();
+            let mut out: Vec<(Vec3, f32)> = Vec::new();
+            for i in 0..n.saturating_sub(1) {
+                let (a, b) = (way[i], way[i + 1]);
+                let t0 = i as f32 / (n - 1).max(1) as f32;
+                let t1 = (i + 1) as f32 / (n - 1).max(1) as f32;
+                let straight = a.distance(b);
+                // Preferred: the real walkable route for this leg (how a bot would move).
+                let mut leg: Option<Vec<Vec3>> = None;
+                if let (Some(g), Some(s)) = (nav, scratch.as_deref_mut()) {
+                    if let Some((pts, dist)) = g.path(a, b, s, None) {
+                        // Sanity bound: a WIP-router detour 3x the crow-flies leg (or +15 m on
+                        // short hops) would misrepresent the patrol — fall back instead.
+                        if pts.len() >= 2 && dist <= (straight * 3.0).max(straight + 15.0) {
+                            leg = Some(pts);
+                        }
+                    }
+                }
+                // Fallback: straight leg, height-contoured onto the nearest floor layer.
+                let leg = leg.unwrap_or_else(|| {
+                    let steps = (straight / 2.0).ceil().max(1.0) as usize;
+                    (0..=steps)
+                        .map(|k| {
+                            let p = a.lerp(b, k as f32 / steps as f32);
+                            let y = nav
+                                .and_then(|g| g.floor_near(p.x, p.z, p.y))
+                                .map(|h| h + 0.1)
+                                .unwrap_or(p.y);
+                            Vec3::new(p.x, y, p.z)
+                        })
+                        .collect()
+                });
+                // Distribute the order-fade t by arc length within the leg; skip the shared
+                // vertex so consecutive legs don't double it.
+                let total: f32 =
+                    leg.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>().max(1e-3);
+                let mut acc = 0.0;
+                for (j, p) in leg.iter().enumerate() {
+                    if j > 0 {
+                        acc += leg[j - 1].distance(*p);
+                    }
+                    if i > 0 && j == 0 {
+                        continue;
+                    }
+                    out.push((*p, t0 + (t1 - t0) * (acc / total)));
+                }
+            }
+            out
+        })
+        .collect()
+}
+
 fn draw_gamedata_outlines(
     mut gizmos: Gizmos,
     zones: Res<GameDataZones>,
     toggles: Res<LayerToggles>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
+    nav: Option<Res<crate::pathfind::Nav>>,
+    epoch: Res<crate::render::MapEpoch>,
+    mut contours: Local<PatrolContours>,
 ) {
     let lift = Vec3::new(0.0, if zones.draped { 0.05 } else { 0.4 }, 0.0);
     let hide_inactive = toggles.hide_inactive;
@@ -2897,30 +2974,49 @@ fn draw_gamedata_outlines(
     // instead of drawing a solid "circuit" — bots treat a way as a point set, not a fixed loop.
     // The start dot is larger (it also carries the clickable marker).
     if toggles.patrols {
+        // Contoured-connector cache: (re)build on a map swap, when the patrol set arrives
+        // after us on the swap frame, or once the nav grid finishes loading.
+        let nav_grid = nav.as_ref().and_then(|n| n.0.as_deref());
+        if contours.epoch != epoch.0
+            || contours.n_ways != zones.patrols.len()
+            || (!contours.with_nav && nav_grid.is_some())
+        {
+            contours.epoch = epoch.0;
+            contours.n_ways = zones.patrols.len();
+            contours.with_nav = nav_grid.is_some();
+            contours.ways = build_patrol_contours(&zones.patrols, nav_grid);
+        }
         let c = poi_look(PoiLayer::Patrol).0;
         let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
-        for line in &zones.patrols {
-            let n = line.len();
-            for i in 0..n.saturating_sub(1) {
-                let t = i as f32 / (n - 1).max(1) as f32;
-                let col = c.with_alpha(0.9 - 0.65 * t);
-                let (a, b) = (line[i] + lift, line[i + 1] + lift);
-                gizmos.line(a, b, col);
-                // Chevron at the segment midpoint pointing DOWN-ROUTE (serialized order made
-                // explicit, not just implied by the fade). Short or DISTANT segments skip it.
-                let seg = b - a;
-                let len = seg.length();
-                if len >= 3.5 && a.distance_squared(cam_pos) < DOT_RANGE * DOT_RANGE {
-                    let dir = seg / len;
-                    let perp = Vec3::new(-dir.z, 0.0, dir.x);
-                    let tip = a + seg * 0.5 + dir * 0.4;
-                    gizmos.line(tip, tip - dir * 0.8 + perp * 0.45, col);
-                    gizmos.line(tip, tip - dir * 0.8 - perp * 0.45, col);
+        for (wi, line) in zones.patrols.iter().enumerate() {
+            // Connectors: the contoured polyline (walkable route / floor-snapped fallback),
+            // faded bright->faint by each vert's route fraction.
+            if let Some(cw) = contours.ways.get(wi) {
+                let mut arc = 0.0f32; // chevron spacing along the CONTOUR (~every 9 m)
+                for w in cw.windows(2) {
+                    let (a, ta) = (w[0].0 + lift, w[0].1);
+                    let b = w[1].0 + lift;
+                    let col = c.with_alpha(0.9 - 0.65 * ta);
+                    gizmos.line(a, b, col);
+                    // Chevrons ride the contour so they hug stairs/floors like the line does.
+                    let seg = b - a;
+                    let len = seg.length();
+                    if len > 1e-3 && a.distance_squared(cam_pos) < DOT_RANGE * DOT_RANGE {
+                        arc += len;
+                        if arc >= 9.0 {
+                            arc = 0.0;
+                            let dir = seg / len;
+                            let perp = Vec3::new(-dir.z, 0.0, dir.x).normalize_or_zero();
+                            let tip = a + seg * 0.5 + dir * 0.4;
+                            gizmos.line(tip, tip - dir * 0.8 + perp * 0.45, col);
+                            gizmos.line(tip, tip - dir * 0.8 - perp * 0.45, col);
+                        }
+                    }
                 }
             }
             for (i, p) in line.iter().enumerate() {
-                // Dots are sub-pixel past a few hundred metres — the connectors carry the
-                // shape at range; a low-resolution circle carries it up close.
+                // Dots stay on the REAL serialized PatrolPoints (never synthetic verts) and
+                // are sub-pixel past a few hundred metres.
                 if p.distance_squared(cam_pos) > DOT_RANGE * DOT_RANGE {
                     continue;
                 }
