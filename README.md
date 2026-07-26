@@ -2,21 +2,55 @@
 
 ![Atlas rendering the Lighthouse map in its native 3D viewer](docs/img/lighthouse.jpg)
 
-A fast, native **map viewer and raid planner for Escape from Tarkov**. It renders
-each map in 3D and overlays the things you actually plan around — extracts, loot,
-keys, hazards, quest objectives — with search and point-to-point routing on top.
+A fast, native **map viewer and raid planner for Escape from Tarkov**, for
+**Windows and Linux**. It renders each map in real 3D and overlays the things you
+actually plan around — extracts, loot, keys, hazards, spawns, patrols, quest
+objectives — with search and experimental point-to-point routing on top.
 
 It's a normal desktop app: double-click and go. No browser, no account, no
 internet required to use it.
 
+## ✨ What it does
+
+- **The real map, in 3D.** Geometry, terrain, and materials extracted from *your
+  own* game files, rendered natively (GPU-driven renderer, the game's actual light
+  placements, baked global illumination, cached sun shadows). Fly anywhere; nothing
+  is a hand-drawn approximation.
+- **First-party spawn intel.** Exact PMC and scav spawn points, **bot zones** with
+  their real footprints, and **bot patrol routes** — read from the game's own AI
+  data, not community guesses. Boss markers sit on their true zones, with spawn
+  odds and escorts from [tarkov.dev](https://tarkov.dev).
+- **Raid-planning layers.** Extracts by faction (with their activation zones and
+  power/switch requirements), typed doors with the exact key that opens them,
+  minefields and sniper zones with real boundaries, stationary weapons, transits,
+  airdrop landing spots, even the event cultist ritual sites.
+- **Loot that's worth your time.** Containers and loose-loot spawns with live
+  prices, filterable by class and minimum value, plus quest objectives with full
+  task tracking.
+- **A legend that explains itself.** Every line style on the map (solid = authored
+  by the game, dashed = derived, dots + arrows = patrol order) is documented right
+  in the layers panel.
+- **Live game link.** Atlas watches your game's logs and screenshots: it detects
+  which raid you're in, places you on the map from a screenshot, and can summon
+  itself as an overlay on your screenshot key.
+- **Routing — ⚠️ work in progress.** Click a destination and Atlas computes a
+  walkable route. **Treat every route as a rough draft**: see
+  [Pathfinding is a work in progress](#pathfinding-is-a-work-in-progress) below
+  before trusting it with your kit.
+- **Offline and yours.** Maps are per-map packs on your disk. Viewing needs no
+  internet, no account, no background services.
+
 ## ⬇️ Download & run
 
 **[Download Atlas for Windows (portable `.zip`)](https://github.com/ConocoFieldsForever/atlas/releases)**
-
-Unzip it anywhere (your Desktop is fine) and **double-click `atlas.exe`** — that's
+— unzip it anywhere (your Desktop is fine) and **double-click `atlas.exe`** — that's
 it. No installer, no account, and no internet needed to view maps. On first launch
 the map manager opens; build a map once from your own game files, then hit **Play**.
 (Full walkthrough in [Getting started](#getting-started-2-minutes) below.)
+
+**On Linux?** Atlas runs natively (Vulkan) — including building maps from a
+Wine/Proton/Lutris EFT install. There's no prebuilt binary yet, so build it from
+source in about two commands: see **[Linux](#linux)** below.
 
 ![The Atlas map manager — build each map once from your own game files, then play](docs/img/map-manager.png)
 
@@ -32,14 +66,15 @@ the map manager opens; build a map once from your own game files, then hit **Pla
 
 You need:
 
-- **Windows 10 or 11** (64-bit)
+- **Windows 10 or 11** (64-bit), or **Linux** (built from source — see
+  [Linux](#linux); tested on Ubuntu with NVIDIA + Vulkan)
 - **A graphics card from roughly the last 10 years** (anything that supports
   Vulkan or DirectX 12 — basically any modern laptop or desktop GPU)
 - **About 1 GB of free space** for the app, plus **1–10 GB per map** you install
 
 You do **not** need to install Python, a runtime, or anything else just to run
-Atlas and view maps. The Visual C++ runtime is built into the app, so there's
-nothing extra to install.
+Atlas and view maps on Windows. The Visual C++ runtime is built into the app, so
+there's nothing extra to install.
 
 ---
 
@@ -125,7 +160,30 @@ Then:
 | **House icon** (top-left) | go back to the map menu |
 
 The panel on the right has layers (loot, extracts, quests…), search, and routing.
-Click a destination to get a walkable route to it.
+Click a destination to get a walkable route to it — but read the next section first.
+
+---
+
+## Pathfinding is a WORK IN PROGRESS
+
+Atlas can compute point-to-point walking routes on a navigation grid baked from
+the real map geometry — and it's the **least finished feature in the app**. It is
+under active development. Right now you should expect:
+
+- **Routes that are wrong.** A path may hug walls oddly, take a long way around,
+  climb something a player can't, or thread a gap a player can't fit through.
+- **Doors and obstacles are only partially understood.** Locked doors, breachable
+  doors, and one-way drops aren't all modeled yet — a route may confidently walk
+  you through a door your key won't open.
+- **Unreachable islands.** Some spots (rooftops, ledges, water edges) aren't
+  connected to the walkable graph yet, and routing to or from them can fail
+  outright or snap to a nearby point you didn't pick.
+- **No danger awareness.** Routes don't avoid minefields, sniper zones, or open
+  sightlines — the overlays show those; the router doesn't read them yet.
+
+**Treat every route as a sketch, not a promise.** Cross-check it against the
+layers before you commit your kit to it. If a route does something absurd,
+that's expected at this stage — the nav bake and the router are being reworked.
 
 ---
 
@@ -180,13 +238,15 @@ cargo run --release -p atlas -- .\packs\interchange.eftpack   # open a pack dire
 Needs stable Rust 1.88+. A fuller list of environment toggles is in
 [README_DIST.md](README_DIST.md).
 
-### Linux (experimental)
+### Linux
 
-The viewer builds and runs natively on Linux (tested on Ubuntu 26.04 + an NVIDIA RTX 3090 via
-Vulkan). The extraction pipeline (Option B, building maps from your own game files) also works,
-including through a Wine/Proton/Lutris install of EFT — you just need to point **GAME INSTALL**
-at the right `EscapeFromTarkov_Data` folder by hand, since the auto-detect (Windows registry +
-drive-letter probing) is Windows-only.
+Atlas supports Linux natively — the viewer builds and runs out of the box (tested on Ubuntu
+26.04 + an NVIDIA RTX 3090 via Vulkan; no Wine needed for Atlas itself). The extraction
+pipeline (Option B, building maps from your own game files) also works, including through a
+Wine/Proton/Lutris install of EFT — you just need to point **GAME INSTALL** at the right
+`EscapeFromTarkov_Data` folder by hand, since the auto-detect (Windows registry + drive-letter
+probing) is Windows-only. There's no prebuilt Linux binary yet — build from source below (two
+commands once the system packages are in).
 
 Install Rust and the system libraries Bevy needs to open a window and talk to the GPU:
 
