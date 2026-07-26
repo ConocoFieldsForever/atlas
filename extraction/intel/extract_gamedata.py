@@ -49,7 +49,7 @@ top-level "draped" flag so the viewer can drop its own lift.
       (requires EFT_TARKMAP_ROOT; levels default to the map config's source.levels;
        default output <EFT_TARKMAP_ROOT>/out/<map>/gamedata.json)
 """
-import os, sys, json, gc, time, math, struct, functools, urllib.request
+import os, sys, json, gc, time, math, struct, functools
 from collections import Counter
 
 import numpy as np
@@ -108,6 +108,14 @@ SWING_DOOR_CLASSES = {"Door", "KeycardDoor", "DoorSwitch"}
 DOOR_STATE = {0: "none", 1: "locked", 2: "shut", 4: "open", 8: "interacting", 16: "breach"}
 # EPlayerSideMask
 SIDE_MASK = {1: "usec", 2: "bear", 3: "pmc", 4: "savage", 5: "usec+savage", 6: "bear+savage", 7: "all"}
+# SpawnPointMarker Categories mask. 1/2/4/64 CONFIRMED (AI-scene audit); bits 8/16/32 appear only
+# on player-scene markers (lv520 masks 8/24/40 — coop/group/op is PLAUSIBLE but unproven), so they
+# decode to neutral bitN tokens and the RAW mask always ships alongside.
+CAT_BITS = {1: "player", 2: "bot", 4: "boss", 64: "botpmc"}
+
+
+def cat_names(mask):
+    return [CAT_BITS.get(b, f"bit{b}") for b in (1, 2, 4, 8, 16, 32, 64) if mask & b]
 # quest/visit trigger MonoBehaviours ("anything with a zone gets extracted"): each carries its
 # BoxCollider on the SAME GameObject and serializes the quest ZONE ID as the first script
 # field (validated: lighthouse level524 x110, factory level68 x42).
@@ -225,7 +233,12 @@ def dec_door(pl):
 
 
 def dec_spawn(pl):
-    """Id str, Name str, Vector3 pos, Quaternion rot, Sides mask, Categories mask, Infil str."""
+    """Id str, Name str, Vector3 pos, Quaternion rot, Sides mask, Categories mask, Infil str,
+    then (AI-scene audit): PPtr BotZone | f32 (40.0 AI scenes / 4.0 player scenes) | i32
+    CorePointId | PPtr SphereCollider | 16B const. Tail validated on interchange level66
+    (102/102, collider radius == every `rad:` name token) and level520 (177/177, null BotZone,
+    default 50 m collider). Both PPtrs are always in-scene (fid 0); a short payload or an
+    external fid degrades the tail to Nones instead of shipping garbage."""
     sid, off = read_cstr(pl, 0)
     name, off = read_cstr(pl, off)
     if name is None or off + 36 > len(pl):
@@ -233,10 +246,100 @@ def dec_spawn(pl):
     pos = struct.unpack_from("<3f", pl, off)
     sides = int.from_bytes(pl[off + 28:off + 32], "little")
     cats = int.from_bytes(pl[off + 32:off + 36], "little")
-    inf, _ = read_cstr(pl, off + 36)
+    inf, end = read_cstr(pl, off + 36)
     if not all(math.isfinite(v) and abs(v) < 1e5 for v in pos):
         return None
-    return sid, name, pos, sides, cats, inf
+    bz_pid = core = sph_pid = None
+    if inf is not None and end + 32 <= len(pl):
+        f0, p0 = struct.unpack_from("<iq", pl, end)           # PPtr BotZone
+        core = int.from_bytes(pl[end + 16:end + 20], "little", signed=True)
+        f1, p1 = struct.unpack_from("<iq", pl, end + 20)      # PPtr SphereCollider
+        if f0 == 0 and p0:
+            bz_pid = p0
+        if f1 == 0 and p1:
+            sph_pid = p1
+    return sid, name, pos, sides, cats, inf, bz_pid, core, sph_pid
+
+
+def dec_patrol_way(pl):
+    """PatrolWay / PatrolWayWithName / PatrolWayWithConditions: u32 type @0, u32 N @4, then
+    N x 12B PPtr PatrolPoint IN ROUTE ORDER (the trailing index in each point's GameObject
+    name matches its array index), 0xFFFFFFFF sentinel, 1.0f, then the route name string
+    (WithName only). Validated on interchange level66: 30/30 ways, every PPtr an in-scene
+    PatrolPoint, sentinel on all. Returns (point_pids, name) or None when the shape doesn't
+    hold (WithConditions variants that serialize extra state degrade here, not to garbage)."""
+    if len(pl) < 16:
+        return None
+    n = int.from_bytes(pl[4:8], "little")
+    if n == 0 or n > 4096 or 8 + 12 * n + 8 > len(pl):
+        return None
+    pids, off = [], 8
+    for _ in range(n):
+        fid = int.from_bytes(pl[off:off + 4], "little", signed=True)
+        pid = int.from_bytes(pl[off + 4:off + 12], "little", signed=True)
+        if fid != 0 or not pid:
+            return None
+        pids.append(pid)
+        off += 12
+    if pl[off:off + 4] != b"\xff\xff\xff\xff":
+        return None
+    # STRICT read: WithConditions serializes condition state after the sentinel, and the
+    # lenient reader turned it into a "\x12" name on labs. Printable-or-nothing.
+    name, _ = read_cstr_strict(pl, off + 8)
+    return pids, (name or "").strip() or None
+
+
+def locate_pptr_arrays(pl, targets):
+    """[(kind, [pids])] for every [u32 N][N x 12B in-scene PPtr] run in `pl` whose pids ALL
+    fall inside one of the `targets` pid-sets ({kind: set}). BotZone serializes its PatrolWay
+    array @20 immediately followed by its SpawnPointMarker array (validated on every
+    interchange zone), but WALKING the <400 B payload is cheap and survives a per-map layout
+    wobble — an array that doesn't validate simply isn't found, and the caller degrades."""
+    out, off, ln = [], 0, len(pl or b"")
+    while off + 4 <= ln:
+        n = int.from_bytes(pl[off:off + 4], "little")
+        if 0 < n <= 2000 and off + 4 + 12 * n <= ln:
+            pids = []
+            for i in range(n):
+                base = off + 4 + 12 * i
+                fid = int.from_bytes(pl[base:base + 4], "little", signed=True)
+                pid = int.from_bytes(pl[base + 4:base + 12], "little", signed=True)
+                if fid != 0 or not pid:
+                    pids = None
+                    break
+                pids.append(pid)
+            if pids:
+                kind = next((k for k, ts in targets.items() if all(p in ts for p in pids)), None)
+                if kind:
+                    out.append((kind, pids))
+                    off += 4 + 12 * n
+                    continue
+        off += 4
+    return out
+
+
+def hull_xz(pts):
+    """Convex hull (monotone chain) over the XZ plane; each hull vert keeps its own Y (member
+    points already sit at ground height). [] when fewer than 3 distinct XZ positions or the
+    set is collinear — a 1-marker zone has no footprint, only its `pos`."""
+    uniq = sorted(set((round(p[0], 2), round(p[2], 2), round(p[1], 2)) for p in pts))
+    if len(uniq) < 3:
+        return []
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lo, hi = [], []
+    for p in uniq:
+        while len(lo) >= 2 and cross(lo[-2], lo[-1], p) <= 0:
+            lo.pop()
+        lo.append(p)
+    for p in reversed(uniq):
+        while len(hi) >= 2 and cross(hi[-2], hi[-1], p) <= 0:
+            hi.pop()
+        hi.append(p)
+    ring = lo[:-1] + hi[:-1]
+    return [[x, y, z] for x, z, y in ring] if len(ring) >= 3 else []
 
 
 def read_cstr_strict(buf, off):
@@ -417,7 +520,7 @@ def monoscript_index(path):
     return _ms_idx[path]
 
 
-def scan_level(lv, sink):
+def scan_level(lv, sink, ai=False):
     p = os.path.join(DATA, f"level{lv}")
     if not os.path.exists(p):
         print(f"[level{lv}] missing - skip")
@@ -446,6 +549,8 @@ def scan_level(lv, sink):
         return monoscript_index(os.path.join(DATA, base)).get(pid)
 
     go_obj, tr_obj, col_obj = {}, {}, {}
+    sph_obj = {}                                  # SphereCollider pid -> obj (spawn radii)
+    mb_obj = {}                                   # MonoBehaviour pid -> obj (PPtr resolution)
     mf_obj = {}                                   # GameObject pid -> its MeshFilter (door parts)
     mr_go = {}                                    # GameObject pid -> its MeshRenderer (door parts)
     mbs = []
@@ -457,6 +562,8 @@ def scan_level(lv, sink):
             tr_obj[o.path_id] = o
         elif tn == "BoxCollider":
             col_obj[o.path_id] = o
+        elif tn == "SphereCollider":
+            sph_obj[o.path_id] = o
         elif tn == "MeshFilter":
             try:
                 mf_obj[o.read(check_read=False).m_GameObject.path_id] = o
@@ -469,6 +576,7 @@ def scan_level(lv, sink):
                 pass
         elif tn == "MonoBehaviour":
             mbs.append(o)
+            mb_obj[o.path_id] = o
 
     # lazy per-object typetree caches (engine types — typetrees intact)
     tt_cache = {}
@@ -551,6 +659,30 @@ def scan_level(lv, sink):
                 if d:
                     cols.append(d)
         return gd.get("m_Name"), tpid, cols
+
+    # ---- AI-scene helpers (SpawnPointMarker tail + patrol ways; see dec_spawn) ----
+    def mb_hdr(pid):
+        o = mb_obj.get(pid)
+        try:
+            return o.read_typetree(check_read=False) if o else None
+        except Exception:
+            return None
+
+    def mb_go_name(pid):
+        """A MonoBehaviour PPtr -> its GameObject's name (BotZone pid -> "ZoneTagilla")."""
+        h = mb_hdr(pid) if pid else None
+        return go_info((h.get("m_GameObject") or {}).get("m_PathID"))[0] if h else None
+
+    def sphere_radius(pid):
+        """SphereCollider m_Radius (raw — it matched every `rad:` name token; the marker
+        transforms carry unit scale). None when the PPtr doesn't land on a sphere."""
+        o = sph_obj.get(pid) if pid else None
+        try:
+            r = o.read_typetree().get("m_Radius") if o else None
+        except Exception:
+            r = None
+        ok = isinstance(r, (int, float)) and math.isfinite(r) and 0.0 < r < 1e4
+        return round(float(r), 2) if ok else None
 
     _mesh_name = {}
     _drawn_cache = {}
@@ -657,6 +789,7 @@ def scan_level(lv, sink):
         return (best[1], best[2], best[3]) if best else (None, None, None)
 
     n_hit = 0
+    ways_raw, zones_raw = [], []      # AI-scene raws, resolved in the post-pass below
     for o in mbs:
         try:
             hdr = o.read_typetree(check_read=False)
@@ -672,7 +805,8 @@ def scan_level(lv, sink):
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
                 "SpawnPointMarker", "MineDirectional", "LootPoint", "LootPointsGroup",
                 "LighthouseTraderZone", "BufferGateSwitcher", "LootableContainer",
-                "CardReader", "RaidDialogEntryPoint") \
+                "CardReader", "RaidDialogEntryPoint",
+                "BotZone", "PatrolWay", "PatrolWayWithName", "PatrolWayWithConditions") \
                 and cls not in BUFFER_ZONE_CLASSES and cls not in DAMAGE_ZONE_CLASSES:
             continue
         go_pid = (hdr.get("m_GameObject") or {}).get("m_PathID")
@@ -786,14 +920,38 @@ def scan_level(lv, sink):
         elif cls == "SpawnPointMarker":
             d = dec_spawn(pl)
             if d:
-                sid, sname, pos, sides, cats, inf = d
-                sink["spawn_points"].append({
+                sid, sname, pos, sides, cats, inf, bz_pid, core, sph_pid = d
+                rec = {
                     "pos": bridge(pos), "name": sname, "side": SIDE_MASK.get(sides, str(sides)),
                     "categories_mask": cats, "infiltration": inf or None, "lv": lv,
-                })
+                }
+                # AI-scene tail fields, all omitted when absent so pre-audit consumers and
+                # payloads that failed the defensive tail read see the classic record.
+                if sid:
+                    rec["id"] = sid
+                if cats:
+                    rec["categories"] = cat_names(cats)
+                zone = mb_go_name(bz_pid)
+                if zone:
+                    rec["zone"] = zone
+                r = sphere_radius(sph_pid)
+                if r is not None:
+                    rec["radius"] = r
+                if core:
+                    rec["core"] = core
+                if ai:
+                    rec["ai"] = True
+                sink["spawn_points"].append(rec)
             else:
-                sink["spawn_points"].append({"pos": tpos, "name": name, "side": None,
-                                             "categories_mask": None, "infiltration": None, "lv": lv})
+                rec = {"pos": tpos, "name": name, "side": None,
+                       "categories_mask": None, "infiltration": None, "lv": lv}
+                if ai:
+                    rec["ai"] = True
+                sink["spawn_points"].append(rec)
+        elif cls in ("PatrolWay", "PatrolWayWithName", "PatrolWayWithConditions"):
+            ways_raw.append((o.path_id, cls, name, pl))
+        elif cls == "BotZone":
+            zones_raw.append((o.path_id, name, pl))
         elif cls == "MineDirectional":
             # blast/trigger zone = the largest CHILD BoxCollider footprint (the mine GO itself
             # has none). Kind from the child name ("MON-50_MineTrigger" -> "MON-50").
@@ -843,6 +1001,53 @@ def scan_level(lv, sink):
                     "pos": tpos, "name": name, "guid": guid, "templates": tps,
                     "active": active, "lv": lv,
                 })
+
+    # ---- AI-scene post-pass: patrol ways + the bot-zone registry -----------------------------
+    # PatrolPoint payloads are all zero — each point's POSITION is its Transform. A way's zone
+    # comes from the BotZone side (its serialized PatrolWay array); a MARKER's zone came from
+    # its own BotZone PPtr above. Counts/hulls are rebuilt in main() AFTER the Id dedupe so
+    # variant AI scenes (Sandbox_AI + _high) union instead of first-scene-wins.
+    if ways_raw or zones_raw:
+        def point_pos(pid):
+            h = mb_hdr(pid)
+            if not h:
+                return None
+            _, ptp, _ = go_info((h.get("m_GameObject") or {}).get("m_PathID"))
+            return bridge(world_mat(ptp)[:3, 3]) if ptp else None
+
+        parsed, n_bad = {}, 0
+        for wpid, wcls, gname, wpl in ways_raw:
+            d = dec_patrol_way(wpl)
+            pts = [p for p in (point_pos(pp) for pp in d[0])] if d else []
+            pts = [p for p in pts if p]
+            # 1-point ways are REAL data (Patrol_Killa_alarm1..6 — alarm response posts, not
+            # routes); the viewer renders them as a dot with no polyline.
+            if not d or not pts:
+                n_bad += 1
+                continue
+            rec = {
+                "name": d[1] or gname,
+                "kind": {"PatrolWay": "patrol", "PatrolWayWithName": "named",
+                         "PatrolWayWithConditions": "conditional"}[wcls],
+                "points": pts, "lv": lv,
+            }
+            # The serialized route id repeats (KILLA_PATROL_ALT x6 alarm posts) while the GO
+            # name stays distinct (Patrol_Killa_alarm1..6) — ship both when they differ.
+            if d[1] and gname and gname != d[1]:
+                rec["go"] = gname
+            parsed[wpid] = rec
+        way_zone = {}
+        way_pids = {w[0] for w in ways_raw}
+        for _zpid, zname, zpl in zones_raw:
+            for kind, pids in locate_pptr_arrays(zpl, {"ways": way_pids}):
+                for wp in pids:
+                    way_zone[wp] = zname
+            sink["_zones_reg"].append({"name": zname, "lv": lv})
+        for wpid, rec in parsed.items():
+            rec["zone"] = way_zone.get(wpid)
+            sink["patrol_ways"].append(rec)
+        if n_bad:
+            print(f"[level{lv}] {n_bad} patrol way(s) failed the defensive decode - skipped")
 
     print(f"[level{lv}] {len(objs)} objs, {len(mbs)} MBs -> {n_hit} typed hits ({time.time()-t0:.0f}s)")
     del env, objs, go_obj, tr_obj, col_obj, mbs, tt_cache, go_tt_cache, wm_cache
@@ -1011,6 +1216,16 @@ def drape_zones(sink):
             before += len(ol)
             r["outline"] = drape_outline(ol, field)
             after += len(r["outline"])
+    # Bot-zone hulls are SYNTHETIC boundaries (convex hull of spawn markers + patrol points,
+    # all at ground height) — drape them so a long hull edge follows the terrain instead of
+    # cutting through a hill. Patrol way POINTS are the game's own ordered route verts and are
+    # deliberately NOT draped/subdivided (synthetic verts would masquerade as real points).
+    for r in sink["bot_zones"]:
+        hl = r.get("hull") or []
+        if len(hl) >= 3:
+            before += len(hl)
+            r["hull"] = drape_outline(hl, field)
+            after += len(r["hull"])
     # Elevated collider zones: FLATTEN each outline to the collider center height (`pos` Y), which
     # is exactly where the marker sphere sits, so the ring/wall/marker all read at the platform
     # level. NO terrain sampling, NO subdivision (the footprint is already a horizontal rectangle).
@@ -1032,55 +1247,30 @@ def drape_zones(sink):
 
 # ---------------------------------------------------------------------------
 # tarkov.dev RESOLUTION + lootLoose JOIN (loose_points) — all failures degrade to offline.
+# Source is json.tarkov.dev's pre-generated catalogs via tarkov_static (ETag disk cache),
+# NOT the GraphQL API — GraphQL 503s routinely and the static dumps are the supported feed
+# tarkov.dev's own apps consume.
 # ---------------------------------------------------------------------------
-DEV_API = "https://api.tarkov.dev/graphql"
-# tarkov.dev display name for the per-map lootLoose query (same per-map fetch pattern as
-# build_loot.py — the all-maps query 503s). Unlisted maps fall back to a title-cased key.
+# tarkov.dev display name for the per-map lootLoose lookup. Unlisted maps fall back to a
+# title-cased key (tarkov_static matches display name OR its normalizedName slug).
 DEV_NAME = {"lighthouse": "Lighthouse", "factory": "Factory", "factory_rework": "Factory",
             "labs": "The Lab",
             "streets": "Streets of Tarkov", "ground_zero": "Ground Zero", "labyrinth": "The Labyrinth"}
 
 
-def gql(q, tries=3):
-    req = urllib.request.Request(DEV_API, data=json.dumps({"query": q}).encode(),
-                                 headers={"Content-Type": "application/json",
-                                          "User-Agent": "eft-native-viewer-gamedata/1.0"})
-    last = None
-    for i in range(tries):
-        try:
-            r = json.load(urllib.request.urlopen(req, timeout=60))
-            if "errors" in r:
-                raise RuntimeError("tarkov.dev errors: " + json.dumps(r["errors"][:2])[:300])
-            return r["data"]
-        except Exception as ex:                                  # 503/timeout/offline
-            last = ex
-            time.sleep(1.5 * (i + 1))
-    raise RuntimeError(f"tarkov.dev unreachable: {last}")
-
-
 def resolve_templates(loose):
-    """template id -> {'n','s','pr','cat'} via tarkov.dev items(ids) + itemCategories.
+    """template id -> {'n','s','pr','cat'} via the static items catalog (items + itemCategories).
     cat=1 marks a CATEGORY template ('Food and drink' pool slot, no price/icon)."""
     ids = sorted({t for r in loose for t in r["templates"]})
     if not ids or os.environ.get("EFT_GAMEDATA_OFFLINE"):
         return {}
     idx = {}
     try:
-        lst = ",".join('"%s"' % i for i in ids)
-        d = gql("{ items(ids: [%s]) { id name shortName avg24hPrice } }" % lst)
-        for it in d.get("items") or []:
-            idx[it["id"]] = {"n": it.get("name"), "s": it.get("shortName"),
-                             "pr": it.get("avg24hPrice"), "cat": 0}
-        left = [i for i in ids if i not in idx]
-        if left:
-            cd = gql("{ itemCategories { id name } }")
-            cidx = {c["id"]: c["name"] for c in cd.get("itemCategories") or []}
-            for i in left:
-                if i in cidx:
-                    idx[i] = {"n": cidx[i], "s": None, "pr": None, "cat": 1}
-        print(f"[loose] resolved {len(idx)}/{len(ids)} template ids via tarkov.dev "
+        import tarkov_static
+        idx = tarkov_static.load_static_item_index(ids)
+        print(f"[loose] resolved {len(idx)}/{len(ids)} template ids via json.tarkov.dev "
               f"({sum(1 for v in idx.values() if v['cat'])} categories)")
-    except RuntimeError as ex:
+    except (SystemExit, Exception) as ex:                        # no cache + no network
         print(f"[loose] template resolution OFFLINE ({ex}) - shipping raw template ids")
     return idx
 
@@ -1092,11 +1282,9 @@ def join_dev_loose(loose):
         return
     name = DEV_NAME.get(MAP, MAP.replace("_", " ").title())
     try:
-        d = gql('{ maps(name:"%s"){ lootLoose { position { x y z } '
-                'items { name shortName avg24hPrice } } } }' % name)
-        ms = d.get("maps") or []
-        rows = (ms[0].get("lootLoose") or []) if ms else []
-    except RuntimeError as ex:
+        import tarkov_static
+        rows = tarkov_static.load_static_loose(name)
+    except (SystemExit, Exception) as ex:
         print(f"[loose] lootLoose join OFFLINE ({ex})")
         return
     pts = []
@@ -1255,6 +1443,46 @@ def sibling_levels(scanned):
         return []
 
 
+def ai_levels():
+    """AI-scene level indices for this map: every BuildSettings scene in the config's
+    `source.unity_location` folder whose basename has an `ai` underscore-token
+    (Shopping_Mall_AI = level 66). The geometry configs exclude these ON PURPOSE (placeholder
+    cubes / cultist-sign quads — gen_maps SERVICE_TOKENS), so they are scanned IN ADDITION to
+    LEVELS, never merged into them. Duplicate BuildSettings rows (Terminal_AI at 635 AND 687
+    — same scene path) collapse to the first; genuine VARIANT scenes (Sandbox_AI +
+    Sandbox_AI_high = Ground Zero 21+, Laboratory_dark_AI = event Labs) ALL scan — the spawn
+    Id dedupe unions them and each record's `lv` keeps the variant it came from."""
+    folder = ((_cfg.get("source") or {}).get("unity_location") or "").lower()
+    if not folder:
+        return []
+    try:
+        env = UnityPy.load(os.path.join(DATA, "globalgamemanagers"))
+        scenes = []
+        for o in env.objects:
+            if o.type.name == "BuildSettings":
+                d = o.read_typetree()
+                scenes = d.get("scenes") or d.get("m_Scenes") or []
+                break
+        marker = "Assets/Content/Locations/"
+        out, seen = [], set()
+        for i, s in enumerate(scenes):
+            p = s.replace("\\", "/")
+            j = p.find(marker)
+            if j < 0:
+                continue
+            rest = p[j + len(marker):]
+            f = rest.split("/", 1)[0] if "/" in rest else rest.rsplit(".", 1)[0]
+            base = os.path.basename(p).rsplit(".", 1)[0]
+            if (f.lower() == folder and "ai" in [t.lower() for t in base.split("_")]
+                    and i not in LEVELS and p not in seen):
+                seen.add(p)
+                out.append(i)
+        return out
+    except Exception as ex:
+        print(f"[ai-levels] failed: {type(ex).__name__}: {ex}")
+        return []
+
+
 def main():
     print(f"[cfg] map={MAP} levels={LEVELS} G3={G3.round(2).tolist()}")
     sink = {k: [] for k in ("exfils", "minefields", "sniper_zones", "doors",
@@ -1264,11 +1492,22 @@ def main():
                             "buffer_zones", "loot_groups",
                             # typed additions (2026-07 audit); OMITTED from the output when
                             # empty so maps without them keep byte-identical gamedata.json.
-                            "containers", "damage_zones", "card_readers", "dialogs")}
+                            "containers", "damage_zones", "card_readers", "dialogs",
+                            # AI-scene additions (spawn/patrol audit): _zones_reg is internal
+                            # (name registry per scan), consumed by the bot_zones build below.
+                            "patrol_ways", "bot_zones", "_zones_reg")}
     t0 = time.time()
     scanned = list(LEVELS)
     for lv in LEVELS:
         scan_level(lv, sink)
+    # the AI scene (scav/boss spawn markers, patrol ways, bot zones) is a SERVICE scene the
+    # geometry level list excludes — scan it additionally (0.1-0.4 s per scene).
+    ai = ai_levels()
+    if ai:
+        print(f"[ai-levels] scanning AI scene(s): {ai}")
+    for lv in ai:
+        scan_level(lv, sink, ai=True)
+    scanned += ai
     # the logic scene (the one carrying the exfil MBs) may sit outside the config's
     # geometry-level list — probe the sibling scenes for it.
     if not sink["exfils"]:
@@ -1286,7 +1525,48 @@ def main():
     # containers re-serialize across scene variants; the Id string is the stable key.
     sink["containers"] = dedupe(sink["containers"],
                                 lambda r: r.get("id") or (r.get("name"), tuple(r["pos"])))
-    sink["spawn_points"] = dedupe(sink["spawn_points"], lambda r: (r.get("name"), tuple(r["pos"])))
+    # spawn markers: the serialized GUID is the stable key (Terminal's AI scene sits TWICE in
+    # BuildSettings; Ground Zero ships two variant AI scenes sharing 83 of ~100 markers).
+    sink["spawn_points"] = dedupe(sink["spawn_points"],
+                                  lambda r: r.get("id") or (r.get("name"), tuple(r["pos"])))
+    sink["patrol_ways"] = dedupe(sink["patrol_ways"],
+                                 lambda r: (r.get("name"), r.get("zone"),
+                                            tuple(tuple(p) for p in r["points"])))
+    # ---- bot zones: names registered per scan; counts/hulls/centroid rebuilt HERE, after the
+    # Id dedupe, so a zone spanning two variant AI scenes gets the UNION of its members. The
+    # hull is the convex hull of the zone's spawn markers + patrol points (BotZone itself has
+    # no collider — verified on all 12 interchange zones).
+    reg = {}
+    for z in sink.pop("_zones_reg"):
+        reg.setdefault(z["name"], z)
+    for name in sorted(reg):
+        zs = [s for s in sink["spawn_points"] if s.get("zone") == name]
+        zw = [w for w in sink["patrol_ways"] if w.get("zone") == name]
+        pts = [tuple(s["pos"]) for s in zs] + [tuple(p) for w in zw for p in w["points"]]
+        if not pts:
+            continue   # a zone with no members has no anchor to show
+        cen = [round(sum(p[i] for p in pts) / len(pts), 2) for i in range(3)]
+        sink["bot_zones"].append({
+            "name": name, "pos": cen, "hull": hull_xz(pts),
+            "n_spawns": len(zs), "n_ways": len(zw), "lv": reg[name]["lv"],
+        })
+    # Friendly zone display names from the static maps_en catalog — the SAME table tarkov.dev
+    # renders its bosses' spawnLocations from ("ZoneCenterBot" -> "Center", "ZoneWoodCutter" ->
+    # "Lumber Mill"), so the viewer's boss->zone join becomes an EXACT string match instead of
+    # a substring heuristic. Omitted when offline with no cache; everything degrades.
+    if sink["bot_zones"] and not os.environ.get("EFT_GAMEDATA_OFFLINE"):
+        try:
+            import tarkov_static
+            zen = tarkov_static.load_static_zone_names()
+            hit = 0
+            for z in sink["bot_zones"]:
+                en = zen.get(z["name"])
+                if en:
+                    z["en"] = en
+                    hit += 1
+            print(f"[zones] {hit}/{len(sink['bot_zones'])} bot zones named via json.tarkov.dev")
+        except (SystemExit, Exception) as ex:
+            print(f"[zones] zone names OFFLINE ({ex}) - raw ids only")
     # display names for the typed additions (static dumps; degrades to raw ids offline).
     resolve_new_intel(sink)
 
@@ -1300,7 +1580,8 @@ def main():
     logic_levels = sorted({e["lv"] for e in sink["exfils"]})
     # New sinks are dropped entirely (data AND count) when empty: a map without them keeps a
     # byte-identical gamedata.json across this extractor change.
-    NEW_SINKS = ("containers", "damage_zones", "card_readers", "dialogs")
+    NEW_SINKS = ("containers", "damage_zones", "card_readers", "dialogs",
+                 "patrol_ways", "bot_zones")
     ship = {k: v for k, v in sink.items() if v or k not in NEW_SINKS}
     counts = {k: len(v) for k, v in ship.items()}
     counts["exfils_by_faction"] = dict(Counter(e["faction"] for e in sink["exfils"]))
@@ -1331,6 +1612,17 @@ def main():
         print(f"  card_reader {r['name']} pos={r['pos']} accepts={cards}")
     for r in sink["dialogs"]:
         print(f"  dialog {r['name']} pos={r['pos']} id={r.get('id')}")
+    if sink["bot_zones"]:
+        print(f"  bot_zones: {len(sink['bot_zones'])}  " + "  ".join(
+            f"{z['name']}({z['n_spawns']}s/{z['n_ways']}w{'' if z['hull'] else ',no-hull'})"
+            for z in sink["bot_zones"]))
+    if sink["patrol_ways"]:
+        pk = Counter(w["kind"] for w in sink["patrol_ways"])
+        zoned = sum(1 for w in sink["patrol_ways"] if w.get("zone"))
+        print(f"  patrol_ways: {len(sink['patrol_ways'])} kinds={dict(pk)} zoned={zoned} "
+              f"pts={sum(len(w['points']) for w in sink['patrol_ways'])}")
+    sc_ai = Counter((s.get("side"), bool(s.get("ai"))) for s in sink["spawn_points"])
+    print(f"  spawn_points: {len(sink['spawn_points'])} by (side, ai): {dict(sc_ai)}")
     st = Counter(d["state"] for d in sink["doors"])
     print(f"  doors: {len(sink['doors'])} states={dict(st)} with_key={counts['doors_with_key']}")
     mk = Counter(m.get("kind") for m in sink["mines_directional"])
