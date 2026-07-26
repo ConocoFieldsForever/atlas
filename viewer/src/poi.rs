@@ -39,6 +39,12 @@ pub enum PoiLayer {
     // ---- TYPED GAME DATA (gamedata.json — extract_gamedata.py) ----
     Minefield,
     SniperZone,
+    /// BotZone hull + centroid marker (AI-scene audit): the game's own bot-spawn zone,
+    /// footprint = convex hull of its spawn markers + patrol points.
+    BotZone,
+    /// PatrolWay polyline + waypoint dots. Bots treat a way as a POINT SET, not a strict
+    /// loop (routes zig-zag spatially), so it reads "patrol area", never "circuit".
+    Patrol,
 }
 
 /// The owning task id carried by every Quest marker, so the tracker (`ui::QuestTracker`) can
@@ -240,6 +246,13 @@ pub struct GameDataZones {
     pub hazard_zones: Vec<(Vec<Vec3>, bool)>,
     /// Typed transit footprints — Transits toggle.
     pub transits: Vec<(Vec<Vec3>, bool)>,
+    /// BotZone convex hulls (terrain-draped at extraction) — Bot zones toggle.
+    pub bot_zones: Vec<(Vec<Vec3>, bool)>,
+    /// Ordered patrol-way polylines (OPEN — a way is a point set, never closed into a loop)
+    /// — Patrols toggle. Verts are the game's real PatrolPoint transforms, undraped.
+    pub patrols: Vec<Vec<Vec3>>,
+    /// First-party SpawnPointMarkers own the PMC/Scav spawn layers (footer provenance).
+    pub spawns_live: bool,
 }
 
 pub struct PoiPlugin;
@@ -292,6 +305,8 @@ pub fn poi_look(l: PoiLayer) -> (Color, f32, f32) {
         PoiLayer::Quest => (Color::srgb(0.52, 0.48, 0.96), 0.85, 1.0),
         PoiLayer::Minefield => (Color::srgb(0.95, 0.26, 0.20), 0.9, 1.0),
         PoiLayer::SniperZone => (Color::srgb(0.95, 0.60, 0.15), 0.9, 1.1),
+        PoiLayer::BotZone => (Color::srgb(0.30, 0.60, 0.95), 1.4, 1.5),
+        PoiLayer::Patrol => (Color::srgb(0.95, 0.42, 0.62), 0.5, 0.7),
     }
 }
 
@@ -631,9 +646,190 @@ struct GameDataFile {
     /// Typed damage-trigger zones (FlameDamageTrigger gas fires / furnaces) — Hazard layer.
     #[serde(default)]
     damage_zones: Vec<GdZone>,
+    /// Typed SpawnPointMarkers (player scenes + AI scenes). When present they OWN the
+    /// PMC/Scav spawn layers and the tarkov.dev clustered nodes stay home. Old packs lack
+    /// the array -> serde default -> tarkov.dev path unchanged.
+    #[serde(default)]
+    spawn_points: Vec<GdSpawn>,
+    /// Ordered PatrolWay polylines (AI scenes) — own layer, nothing online offers these.
+    #[serde(default)]
+    patrol_ways: Vec<GdPatrolWay>,
+    /// BotZones: centroid + convex hull of each zone's members — own layer; boss nodes
+    /// snap onto the matching zone centroid.
+    #[serde(default)]
+    bot_zones: Vec<GdBotZone>,
 }
 fn default_true() -> bool {
     true
+}
+/// A typed SpawnPointMarker (gamedata.json `spawn_points`). Player-scene markers carry side
+/// "pmc"/"all" + an infiltration zone; AI-scene markers carry side "savage", the owning
+/// BotZone name and the SphereCollider radius. `categories_mask` bits: 1 player / 2 bot /
+/// 4 boss / 64 botpmc (CONFIRMED); 8/16/32 are co-op-mode bits with unproven names, which is
+/// why the raw mask ships instead of only decoded strings.
+#[derive(Deserialize)]
+struct GdSpawn {
+    pos: [f32; 3],
+    #[serde(default)]
+    side: Option<String>,
+    #[serde(default)]
+    categories_mask: Option<u32>,
+    #[serde(default)]
+    infiltration: Option<String>,
+    /// Owning BotZone's GameObject name ("ZoneTagilla") — AI markers only.
+    #[serde(default)]
+    zone: Option<String>,
+    /// SphereCollider radius (m) on the marker.
+    #[serde(default)]
+    radius: Option<f32>,
+    /// Record came from an `*_AI` scene. INFORMATIONAL ONLY — ground_zero's config scans
+    /// Sandbox_AI_high as a geometry level, so its AI markers arrive with `ai` unset; layer
+    /// routing must key on side+mask (`gd_spawn_layer`), never on this flag.
+    #[serde(default)]
+    ai: bool,
+}
+/// An ordered PatrolWay (gamedata.json `patrol_ways`). Points are the game's own
+/// PatrolPoint transforms IN SERIALIZED ROUTE ORDER — but bots treat a way as a point set,
+/// so it renders as "patrol area", never "circuit". 1-point ways are response posts.
+#[derive(Deserialize)]
+struct GdPatrolWay {
+    #[serde(default)]
+    name: Option<String>,
+    /// GameObject name when it differs from the serialized route id (KILLA_PATROL_ALT x6
+    /// share one id; their GO names Patrol_Killa_alarm1..6 stay distinct).
+    #[serde(default)]
+    go: Option<String>,
+    #[serde(default)]
+    zone: Option<String>,
+    /// "patrol" | "named" | "conditional" (PatrolWayWithConditions — event/alarm gated).
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    points: Vec<[f32; 3]>,
+}
+/// A BotZone (gamedata.json `bot_zones`): centroid + terrain-draped convex hull of its
+/// spawn markers and patrol points (the component itself has no collider).
+#[derive(Deserialize)]
+struct GdBotZone {
+    #[serde(default)]
+    name: String,
+    pos: [f32; 3],
+    #[serde(default)]
+    hull: Vec<[f32; 3]>,
+    #[serde(default)]
+    n_spawns: u32,
+    #[serde(default)]
+    n_ways: u32,
+    /// Friendly display name from tarkov.dev's own zone-translation table ("ZoneCenterBot" ->
+    /// "Center", "ZoneWoodCutter" -> "Lumber Mill") — stamped at extraction; absent offline.
+    /// Boss `spawnLocations` names render from the SAME table, so when present the boss snap
+    /// joins EXACTLY on it.
+    #[serde(default)]
+    en: Option<String>,
+}
+
+/// First-party spawn-marker layer routing. By SIDE + CATEGORY MASK only (the `ai` flag is
+/// unreliable — see `GdSpawn::ai`): sides "pmc"/"all" are player raid starts; savage-side
+/// markers route bot(2)->Scav (player-scav starts carry player|bot), else botpmc(64)->PMC
+/// (AI PMCs fight like players — same convention as tarkov.dev's pmc category), else
+/// boss(4)->Boss. Legacy junk (customs `p1 (N)`, side "0", mask 0) routes nowhere.
+fn gd_spawn_layer(s: &GdSpawn) -> Option<PoiLayer> {
+    let m = s.categories_mask.unwrap_or(0);
+    match s.side.as_deref() {
+        Some("pmc") | Some("all") => Some(PoiLayer::PmcSpawn),
+        Some("savage") | Some("usec+savage") | Some("bear+savage") => {
+            if m & 2 != 0 {
+                Some(PoiLayer::ScavSpawn)
+            } else if m & 64 != 0 {
+                Some(PoiLayer::PmcSpawn)
+            } else if m & 4 != 0 {
+                Some(PoiLayer::Boss)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Card for a first-party spawn marker. `zone_disp` is the friendly zone name when the
+/// pack carries one ("Center"), else the raw internal id.
+fn gd_spawn_info(s: &GdSpawn, layer: PoiLayer, zone_disp: Option<&str>) -> MarkerInfo {
+    let m = s.categories_mask.unwrap_or(0);
+    let player_side = matches!(s.side.as_deref(), Some("pmc") | Some("all"));
+    let mut detail = Vec::new();
+    if let Some(z) = zone_disp.filter(|z| !z.is_empty()) {
+        detail.push(format!("Zone  {z}"));
+    }
+    if let Some(r) = s.radius.filter(|r| *r > 0.0 && !player_side) {
+        detail.push(format!("Radius  {r:.0} m"));
+    }
+    if let Some(inf) = s.infiltration.as_deref().filter(|i| !i.is_empty()) {
+        detail.push(format!("Infil zone  {inf}"));
+    }
+    if layer == PoiLayer::ScavSpawn && m & 4 != 0 {
+        detail.push("Boss-capable spawn point".into());
+    }
+    if layer == PoiLayer::ScavSpawn && m & 1 != 0 {
+        detail.push("Player-scav start".into());
+    }
+    if player_side && m != 0 && m & 1 == 0 {
+        // 8/16/32 are the co-op/group-mode bits (names unproven — raw mask on the card).
+        detail.push(format!("Co-op / group mode spawn (mask {m})"));
+    }
+    if s.side.as_deref() == Some("all") {
+        detail.push("Any faction".into());
+    }
+    let title = match layer {
+        PoiLayer::PmcSpawn if !player_side => "AI PMC spawn".to_string(),
+        PoiLayer::PmcSpawn => "PMC spawn".to_string(),
+        PoiLayer::Boss => "Boss spawn point".to_string(),
+        _ => "Scav spawn".to_string(),
+    };
+    MarkerInfo {
+        title,
+        subtitle: "Spawn point \u{00B7} game files".into(),
+        detail,
+        accent: poi_look(layer).0,
+    }
+}
+
+/// Snap a tarkov.dev boss node onto its FIRST-PARTY BotZone centroid. Two passes per
+/// spawnLocations name:
+///   1. EXACT match against the zone's `en` display name — bosses' spawnLocations render
+///      from the same tarkov.dev translation table the extractor stamps `en` from, so this
+///      is a true join ("Lumber Mill" == ZoneWoodCutter.en, which substring matching missed).
+///   2. Substring against the internal id (old packs / offline extractions without `en`).
+/// One friendly name can hit SEVERAL zones (interchange "Center" -> ZoneCenter AND
+/// ZoneCenterBot, both plausibly translated "Center"), so among candidates the one NEAREST
+/// the tarkov.dev position wins (dev's own position came from that zone's boss spawns:
+/// Killa lands 8 m from ZoneCenterBot, 40 m from ZoneCenter), with a 250 m sanity bound.
+/// No match keeps the dev position. `zones`: (internal name lower, en lower, centroid).
+fn snap_boss_pos(nd: &Node, zones: &[(String, Option<String>, Vec3)]) -> Option<[f32; 3]> {
+    let dev = Vec3::from(nd.pos);
+    let pick = |cands: Vec<&(String, Option<String>, Vec3)>| {
+        cands
+            .into_iter()
+            .min_by(|a, b| a.2.distance_squared(dev).total_cmp(&b.2.distance_squared(dev)))
+            .filter(|(_, _, p)| p.distance(dev) < 250.0)
+            .map(|(_, _, p)| [p.x, p.y, p.z])
+    };
+    for l in &nd.locs {
+        let loc = l.name.to_ascii_lowercase();
+        if loc.is_empty() {
+            continue;
+        }
+        if let Some(p) =
+            pick(zones.iter().filter(|(_, en, _)| en.as_deref() == Some(loc.as_str())).collect())
+        {
+            return Some(p);
+        }
+        let key = loc.replace(' ', "");
+        if let Some(p) = pick(zones.iter().filter(|(zn, _, _)| zn.contains(&key)).collect()) {
+            return Some(p);
+        }
+    }
+    None
 }
 /// A typed extract: faction comes from the COMPONENT TYPE (ExfiltrationPoint = pmc,
 /// ScavExfiltrationPoint = scav, Shared… = shared, Secret… = secret).
@@ -1440,6 +1636,8 @@ fn spawn_pois(
         PoiLayer::Quest,
         PoiLayer::Minefield,
         PoiLayer::SniperZone,
+        PoiLayer::BotZone,
+        PoiLayer::Patrol,
     ];
     let mk = |materials: &mut Assets<StandardMaterial>, c: Color| {
         let lin = c.to_linear();
@@ -1569,6 +1767,39 @@ fn spawn_pois(
                 .collect()
         })
         .unwrap_or_default();
+    // First-party SpawnPointMarkers, known BEFORE the loot.json pass: when the pack ships
+    // player-routed / scav-routed markers, the matching tarkov.dev CLUSTERED node layer stays
+    // home (exact + un-clustered beats a snapshot centroid). Counted through the same router
+    // that later spawns them so the gate and the markers can never disagree.
+    let (gd_pmc_spawns, gd_scav_spawns) = gamedata
+        .as_ref()
+        .map(|g| {
+            let mut n = (0usize, 0usize);
+            for s in &g.spawn_points {
+                match gd_spawn_layer(s) {
+                    Some(PoiLayer::PmcSpawn) => n.0 += 1,
+                    Some(PoiLayer::ScavSpawn) => n.1 += 1,
+                    _ => {}
+                }
+            }
+            n
+        })
+        .unwrap_or((0, 0));
+    // First-party BotZone centroids (internal name lower, en display lower, position) —
+    // boss nodes snap onto these (exact join on `en`, substring fallback on the id).
+    let gd_zone_cents: Vec<(String, Option<String>, Vec3)> = gamedata
+        .as_ref()
+        .map(|g| {
+            g.bot_zones
+                .iter()
+                .map(|z| {
+                    (z.name.to_ascii_lowercase(),
+                     z.en.as_deref().map(str::to_ascii_lowercase),
+                     Vec3::from(z.pos))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     // ---- spawns + map intel from loot.json (pmc/scav/boss nodes, locks, hazards, ...) ----
     // Set when loot.json ships clean faction-tagged extracts; those supersede the semantics
@@ -1604,16 +1835,39 @@ fn spawn_pois(
             raid_minutes: mn.meta.raid_minutes,
             players: mn.meta.players.clone(),
         };
-        for nd in &mn.pmc_nodes {
-            let e = spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd), None);
-            commands.entity(e).insert(DenseMarker);
+        // Clustered tarkov.dev spawn nodes only when the pack ships no first-party markers
+        // for that layer (old packs / a map whose AI scene yielded nothing).
+        if gd_pmc_spawns == 0 {
+            for nd in &mn.pmc_nodes {
+                let e = spawn(&mut commands, PoiLayer::PmcSpawn, nd.pos, node_info(PoiLayer::PmcSpawn, nd), None);
+                commands.entity(e).insert(DenseMarker);
+            }
         }
-        for nd in &mn.scav_nodes {
-            let e = spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd), None);
-            commands.entity(e).insert(DenseMarker);
+        if gd_scav_spawns == 0 {
+            for nd in &mn.scav_nodes {
+                let e = spawn(&mut commands, PoiLayer::ScavSpawn, nd.pos, node_info(PoiLayer::ScavSpawn, nd), None);
+                commands.entity(e).insert(DenseMarker);
+            }
         }
+        // Boss markers STAY tarkov.dev (spawn chance / escorts / timing are server-side and
+        // have no client-asset equivalent) but SNAP onto the first-party zone centroid when
+        // the spawnLocations name joins one — exact geometry under the dev-only intel.
+        let mut snapped = 0usize;
         for nd in &mn.boss_nodes {
-            spawn(&mut commands, PoiLayer::Boss, nd.pos, node_info(PoiLayer::Boss, nd), None);
+            let pos = match snap_boss_pos(nd, &gd_zone_cents) {
+                Some(p) => {
+                    snapped += 1;
+                    p
+                }
+                None => nd.pos,
+            };
+            spawn(&mut commands, PoiLayer::Boss, pos, node_info(PoiLayer::Boss, nd), None);
+        }
+        if snapped > 0 {
+            info!(
+                "poi: {snapped}/{} boss nodes snapped to first-party bot-zone centroids",
+                mn.boss_nodes.len()
+            );
         }
         // ---- map intel ----
         for lk in &mn.locks {
@@ -2080,6 +2334,116 @@ fn spawn_pois(
                 }
             }
         }
+        // ---- FIRST-PARTY spawn markers: exact SpawnPointMarker transforms own the PMC /
+        // Scav layers (the clustered tarkov.dev nodes were gated above). Routing + cards:
+        // `gd_spawn_layer` / `gd_spawn_info`.
+        // Friendly zone display names (from the zones' `en`) for the spawn/patrol cards.
+        let zone_en: HashMap<&str, &str> = gd
+            .bot_zones
+            .iter()
+            .filter_map(|z| z.en.as_deref().map(|e| (z.name.as_str(), e)))
+            .collect();
+        let zone_disp =
+            |z: Option<&str>| z.map(|z| zone_en.get(z).copied().unwrap_or(z).to_string());
+        for s in &gd.spawn_points {
+            let Some(layer) = gd_spawn_layer(s) else { continue };
+            let zd = zone_disp(s.zone.as_deref());
+            let e = spawn(&mut commands, layer, s.pos, gd_spawn_info(s, layer, zd.as_deref()), None);
+            commands.entity(e).insert(DenseMarker);
+        }
+        if gd_pmc_spawns + gd_scav_spawns > 0 {
+            gd_zones.spawns_live = true;
+            info!(
+                "poi: {} first-party spawn markers ({} pmc, {} scav) — tarkov.dev spawn nodes suppressed",
+                gd.spawn_points.len(),
+                gd_pmc_spawns,
+                gd_scav_spawns
+            );
+        }
+        // ---- Bot zones: centroid marker + terrain-draped hull (wall + outline). ----
+        for z in &gd.bot_zones {
+            let mut detail = vec![
+                format!(
+                    "{} spawn point{} \u{00B7} {} patrol way{}",
+                    z.n_spawns,
+                    if z.n_spawns == 1 { "" } else { "s" },
+                    z.n_ways,
+                    if z.n_ways == 1 { "" } else { "s" }
+                ),
+                // Say what the dashed ring IS so nobody reads it as an authored boundary.
+                "Approximate area \u{2014} hull of its spawn & patrol points".into(),
+            ];
+            if z.en.is_some() {
+                detail.push(z.name.clone()); // raw internal id under the friendly title
+            }
+            spawn(
+                &mut commands,
+                PoiLayer::BotZone,
+                z.pos,
+                MarkerInfo {
+                    title: z.en.clone().unwrap_or_else(|| z.name.clone()),
+                    subtitle: "Bot zone \u{00B7} game files".into(),
+                    detail,
+                    accent: poi_look(PoiLayer::BotZone).0,
+                },
+                None,
+            );
+            if z.hull.len() >= 3 {
+                let pts: Vec<Vec3> = z.hull.iter().copied().map(Vec3::from).collect();
+                wall(&mut commands, &mut meshes, PoiLayer::BotZone, &pts,
+                     poi_look(PoiLayer::BotZone).0, true);
+                gd_zones.bot_zones.push((pts, true));
+            }
+        }
+        // ---- Patrol ways: one marker at the route START + the open polyline/dots (drawn in
+        // `draw_gamedata_outlines`). "Patrol area", never "circuit" — the serialized order is
+        // real but bots treat a way as a point set.
+        for w in &gd.patrol_ways {
+            let Some(&start) = w.points.first() else { continue };
+            let title = w
+                .name
+                .clone()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Patrol".into());
+            let mut detail = Vec::new();
+            if let Some(g) = w.go.as_deref().filter(|g| !g.is_empty()) {
+                detail.push(prettify(g));
+            }
+            if let Some(z) = zone_disp(w.zone.as_deref()).filter(|z| !z.is_empty()) {
+                detail.push(format!("Zone  {z}"));
+            }
+            detail.push(match w.points.len() {
+                1 => "Response post (single point)".into(),
+                n => format!("{n} waypoints \u{00B7} area, not a fixed circuit"),
+            });
+            if w.kind == "conditional" {
+                detail.push("Conditional route (event/alarm gated)".into());
+            }
+            let e = spawn(
+                &mut commands,
+                PoiLayer::Patrol,
+                start,
+                MarkerInfo {
+                    title,
+                    subtitle: "Bot patrol area \u{00B7} game files".into(),
+                    detail,
+                    accent: poi_look(PoiLayer::Patrol).0,
+                },
+                None,
+            );
+            commands.entity(e).insert(DenseMarker);
+            if w.points.len() >= 2 {
+                gd_zones.patrols.push(w.points.iter().copied().map(Vec3::from).collect());
+            }
+        }
+        if !gd.bot_zones.is_empty() || !gd.patrol_ways.is_empty() {
+            info!(
+                "poi: {} bot zones ({} hulls), {} patrol ways",
+                gd.bot_zones.len(),
+                gd_zones.bot_zones.len(),
+                gd.patrol_ways.len()
+            );
+        }
         info!(
             "poi: gamedata live — {} exfils, {} minefields, {} sniper zones, {} mine zones, \
              {} quest triggers, {} special zones, {} transit footprints",
@@ -2276,6 +2640,8 @@ fn apply_poi_visibility(
             PoiLayer::Quest => toggles.quests, // unreachable here (filtered out), kept exhaustive
             PoiLayer::Minefield => toggles.minefields,
             PoiLayer::SniperZone => toggles.sniper_zones,
+            PoiLayer::BotZone => toggles.bot_zones,
+            PoiLayer::Patrol => toggles.patrols,
         };
         // Value-tagged markers (loose loot) additionally pass the panel's min-value filter,
         // and scene-inactive markers the global "hide inactive" filter — both COMPOSE with
@@ -2368,7 +2734,8 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
             ring(outline, extract_faction_color(fac));
         }
     }
-    // Toggle-driven baseline groups (crisp line under each zone's translucent wall).
+    // Toggle-driven baseline groups (crisp line under each zone's translucent wall). These are
+    // SOLID rings: every outline here is a real collider footprint the game authored.
     for (on, list, color) in [
         (toggles.minefields, &zones.minefields, poi_look(PoiLayer::Minefield).0),
         (toggles.sniper_zones, &zones.sniper_zones, poi_look(PoiLayer::SniperZone).0),
@@ -2383,6 +2750,53 @@ fn draw_gamedata_outlines(mut gizmos: Gizmos, zones: Res<GameDataZones>, toggles
                 continue;
             }
             ring(outline, color);
+        }
+    }
+    // Bot-zone hulls: DASHED ring — this footprint is DERIVED (convex hull of the zone's spawn
+    // markers + patrol points), not an authored boundary, and bots are not fenced inside it.
+    // Dashes read "approximate area" and keep it apart from the solid collider-true zones above.
+    if toggles.bot_zones {
+        let c = poi_look(PoiLayer::BotZone).0;
+        const DASH: f32 = 1.4;
+        const GAP: f32 = 0.9;
+        for (outline, active) in &zones.bot_zones {
+            if hide_inactive && !active {
+                continue;
+            }
+            for i in 0..outline.len() {
+                let a = outline[i] + lift;
+                let b = outline[(i + 1) % outline.len()] + lift;
+                let len = a.distance(b);
+                if len < 1e-3 {
+                    continue;
+                }
+                let dir = (b - a) / len;
+                let mut s = 0.0;
+                while s < len {
+                    let e = (s + DASH).min(len);
+                    gizmos.line(a + dir * s, a + dir * e, c);
+                    s = e + GAP;
+                }
+            }
+        }
+    }
+    // Patrol ways: the DOTS are the data (real PatrolPoint transforms, no synthetic verts); the
+    // connectors only hint at the serialized order, so they FADE bright->faint along the way
+    // instead of drawing a solid "circuit" — bots treat a way as a point set, not a fixed loop.
+    // The start dot is larger (it also carries the clickable marker).
+    if toggles.patrols {
+        let c = poi_look(PoiLayer::Patrol).0;
+        let flat = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
+        for line in &zones.patrols {
+            let n = line.len();
+            for i in 0..n.saturating_sub(1) {
+                let t = i as f32 / (n - 1).max(1) as f32;
+                gizmos.line(line[i] + lift, line[i + 1] + lift, c.with_alpha(0.9 - 0.65 * t));
+            }
+            for (i, p) in line.iter().enumerate() {
+                let r = if i == 0 { 0.55 } else { 0.35 };
+                gizmos.circle(bevy::math::Isometry3d::new(*p + lift, flat), r, c);
+            }
         }
     }
 }

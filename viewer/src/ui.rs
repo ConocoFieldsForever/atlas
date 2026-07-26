@@ -53,6 +53,10 @@ pub struct LayerToggles {
     // ---- TYPED GAME DATA (gamedata.json) ----
     pub minefields: bool,
     pub sniper_zones: bool,
+    /// BotZone hulls + centroid markers (AI-scene audit).
+    pub bot_zones: bool,
+    /// PatrolWay polylines + waypoint dots.
+    pub patrols: bool,
     // ---- QUESTS (tasks.json) ----
     pub quests: bool,
 }
@@ -87,6 +91,8 @@ impl Default for LayerToggles {
             loose: has("loose"),
             minefields: has("minefield"),
             sniper_zones: has("sniper"),
+            bot_zones: has("botzone"),
+            patrols: has("patrol"),
             quests: has("quest"),
         }
     }
@@ -736,7 +742,7 @@ fn layers_panel(
 
     // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
     // dim number after each row so the planner can gauge density without enabling the layer.
-    let mut poi_counts = [0usize; 16];
+    let mut poi_counts = [0usize; 18];
     for l in &poi_q {
         poi_counts[*l as usize] += 1;
     }
@@ -1190,6 +1196,8 @@ fn layers_panel(
                     let spawn_total = poi_counts[PoiLayer::PmcSpawn as usize]
                         + poi_counts[PoiLayer::ScavSpawn as usize]
                         + poi_counts[PoiLayer::Boss as usize]
+                        + poi_counts[PoiLayer::BotZone as usize]
+                        + poi_counts[PoiLayer::Patrol as usize]
                         + poi_counts[PoiLayer::Extract as usize]
                         + poi_counts[PoiLayer::Door as usize]
                         + poi_counts[PoiLayer::Interactable as usize];
@@ -1200,6 +1208,10 @@ fn layers_panel(
                             poi_row(ui, &mut toggles.pmc_spawns, "PMC spawns", PoiLayer::PmcSpawn, &poi_counts);
                             poi_row(ui, &mut toggles.scav_spawns, "Scav spawns", PoiLayer::ScavSpawn, &poi_counts);
                             poi_row(ui, &mut toggles.bosses, "Bosses", PoiLayer::Boss, &poi_counts);
+                            // TYPED AI-scene layers (gamedata.json): zone hulls + ordered
+                            // patrol polylines (poi::draw_gamedata_outlines).
+                            poi_row(ui, &mut toggles.bot_zones, "Bot zones", PoiLayer::BotZone, &poi_counts);
+                            poi_row(ui, &mut toggles.patrols, "Patrol areas", PoiLayer::Patrol, &poi_counts);
                             poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract, &poi_counts);
                             poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door, &poi_counts);
                             // Name-classified props from the game files (jackets/weapon
@@ -1452,7 +1464,11 @@ fn layers_panel(
                     // are TYPED data read from the game's own scene MonoBehaviours; otherwise the
                     // extracts fall back to tarkov.dev (extracts_dev) and doors to the name
                     // classifier.
-                    let provenance = if gfx_ui.gamedata.live {
+                    let provenance = if gfx_ui.gamedata.live && gfx_ui.gamedata.spawns_live {
+                        // AI-scene audit: spawn markers / bot zones / patrols are first-party
+                        // too — only boss odds & the priced intel still come from tarkov.dev.
+                        "exfils/mines/spawns/patrols: game files  \u{2022}  boss odds/intel: tarkov.dev"
+                    } else if gfx_ui.gamedata.live {
                         "exfils/mines/snipers: game files  \u{2022}  spawns/intel: tarkov.dev"
                     } else {
                         "spawns/extracts/intel: tarkov.dev  \u{2022}  doors/props: game files"
@@ -2203,6 +2219,8 @@ fn hide_all(t: &mut LayerToggles) {
     t.loose = false;
     t.minefields = false;
     t.sniper_zones = false;
+    t.bot_zones = false;
+    t.patrols = false;
     t.quests = false;
 }
 
@@ -2227,6 +2245,8 @@ fn layer_toggle_mut(t: &mut LayerToggles, l: crate::poi::PoiLayer) -> &mut bool 
         P::Quest => &mut t.quests,
         P::Minefield => &mut t.minefields,
         P::SniperZone => &mut t.sniper_zones,
+        P::BotZone => &mut t.bot_zones,
+        P::Patrol => &mut t.patrols,
     }
 }
 
@@ -2238,7 +2258,7 @@ fn poi_row(
     on: &mut bool,
     label: &str,
     l: crate::poi::PoiLayer,
-    counts: &[usize; 16],
+    counts: &[usize; 18],
 ) {
     ui.horizontal(|ui| {
         ui.add_space(crate::ui_theme::SP_XS);
