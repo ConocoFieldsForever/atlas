@@ -33,8 +33,6 @@ Env: EFT_GAME_DATA overrides the game data dir.
 import json
 import os
 import sys
-import urllib.error
-import urllib.request
 from collections import OrderedDict, namedtuple
 
 import UnityPy
@@ -45,7 +43,6 @@ MAPS_DIR = os.path.join(REPO, "extraction", "maps")
 GAME = os.environ.get(
     "EFT_GAME_DATA", r"C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data"
 )
-API = "https://api.tarkov.dev/graphql"
 
 # --- Editorial residue: the ONLY hand-authored per-map data (see module docstring for why). --------
 # One row per KNOWN game location folder.
@@ -200,6 +197,45 @@ def select_light_levels(light_scenes, night=False):
     return sorted(i for i, _ in light_scenes)
 
 
+def derive_bundles():
+    """{location folder (lower): [bundle stems]} from the game's scene-preset bundles
+    (`StreamingAssets/Windows/maps/*.bundle`). Each bundle's ScenesPreset MonoBehaviours name
+    the scenes it loads; the DOMINANT `Assets/Content/Locations/<Folder>/` in the bundle's raw
+    payloads IS its location (IL2CPP: no typetree, so the folder is regex-harvested — verified
+    against all 19 shipped bundles, every folder unambiguous; customs shows a 58:2 majority
+    over a stray Lighthouse reference). Replaces the hardcoded bundle->map table in
+    viewer/src/game_watch.rs, which was copied from TarkovMonitor and silently omitted the
+    `icebreaker` bundle. Derived + local: no network, no editorial."""
+    import re
+    mdir = os.path.join(GAME, "StreamingAssets", "Windows", "maps")
+    out = {}
+    if not os.path.isdir(mdir):
+        print(f"[gen_maps] WARNING: no preset-bundle dir at {mdir} -- bundles omitted")
+        return out
+    for fn in sorted(os.listdir(mdir)):
+        if not fn.endswith(".bundle"):
+            continue
+        from collections import Counter
+        folders = Counter()
+        try:
+            env = UnityPy.load(os.path.join(mdir, fn))
+            for o in env.objects:
+                try:
+                    raw = o.get_raw_data()
+                except Exception:
+                    continue
+                for m in re.finditer(rb"Assets/Content/Locations/([A-Za-z0-9_]+)[/.]", raw):
+                    if m.group(1) != b"_Presets":
+                        folders[m.group(1).decode()] += 1
+            del env
+        except Exception as ex:
+            print(f"[gen_maps] WARNING: preset bundle {fn}: {type(ex).__name__}: {ex}")
+            continue
+        if folders:
+            out.setdefault(folders.most_common(1)[0][0].lower(), []).append(fn[:-len(".bundle")])
+    return out
+
+
 def config_levels(map_id):
     p = os.path.join(MAPS_DIR, map_id, "config.json")
     if not os.path.isfile(p):
@@ -209,25 +245,16 @@ def config_levels(map_id):
 
 
 def fetch_names():
-    """{normalizedName: (en, ru)} from tarkov.dev, or None if unreachable (caller uses the offline
-    fallback). RU comes from the `maps(lang: ru)` locale; EN from the default query."""
-    def query(lang=None):
-        arg = f"(lang: {lang})" if lang else ""
-        body = json.dumps({"query": "{ maps%s { name normalizedName } }" % arg}).encode()
-        req = urllib.request.Request(
-            API, data=body,
-            headers={"Content-Type": "application/json", "User-Agent": "gen_maps/1.0"})
-        r = json.load(urllib.request.urlopen(req, timeout=30))
-        if r.get("errors"):
-            raise RuntimeError(f"tarkov.dev errors: {r['errors'][:2]}")
-        return {m["normalizedName"]: m["name"] for m in (r.get("data", {}).get("maps") or [])}
-
+    """{normalizedName: (en, ru)} from json.tarkov.dev's static maps/maps_en/maps_ru catalogs
+    (tarkov_static — ETag disk cache, offline falls back to the last snapshot), or None when
+    neither network nor cache exists (caller uses the offline fallback table). The GraphQL API
+    is no longer queried: it 503s routinely; the static dumps are the supported feed."""
+    sys.path.insert(0, os.path.join(REPO, "extraction", "intel"))
     try:
-        en = query()
-        ru = query("ru")
-        return {nn: (en[nn], ru.get(nn, en[nn])) for nn in en}
-    except (urllib.error.URLError, OSError, RuntimeError, KeyError, ValueError) as e:
-        print(f"[gen_maps] tarkov.dev unreachable ({e}) -- using offline fallback names")
+        import tarkov_static
+        return tarkov_static.load_static_map_names() or None
+    except (SystemExit, Exception) as e:
+        print(f"[gen_maps] json.tarkov.dev unreachable ({e}) -- using offline fallback names")
         return None
 
 
@@ -268,6 +295,11 @@ def main():
     api_names = fetch_names()
     print(f"[gen_maps] names: {'tarkov.dev' if api_names else 'OFFLINE fallback'}\n")
 
+    # --- scene-preset bundles: derived bundle->location join (viewer raid detection) ---
+    bundles = derive_bundles()
+    n_b = sum(len(v) for v in bundles.values())
+    print(f"[gen_maps] preset bundles: {n_b} across {len(bundles)} locations")
+
     # --- discovery: every BuildSettings location folder must be classified in ROSTER ---
     known = {e.folder.lower() for e in ROSTER}
     seen = OrderedDict()
@@ -293,7 +325,10 @@ def main():
         derived = derive_levels(scenes, e.folder)
         light = select_light_levels(derive_light_scenes(scenes, e.folder), night=e.night)
         maps.append({"id": e.id, "en": en, "ru": ru, "folder": e.folder, "dev": e.dev,
-                     "light_levels": light, "derived_levels": derived})
+                     "light_levels": light, "derived_levels": derived,
+                     # scene-preset bundle stems (game logs say `scene preset path:maps/
+                     # <stem>.bundle` when a raid loads) — viewer maps.rs::bundle_to_id.
+                     "bundles": sorted(bundles.get(e.folder.lower(), []))})
 
         cfg = config_levels(e.id)
         if cfg is None:

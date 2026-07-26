@@ -37,6 +37,9 @@
         208,
         404,
         524
+      ],
+      "bundles": [
+        "lighthouse_preset"
       ]
     },
     {
@@ -64,6 +67,9 @@
         65,
         403,
         520
+      ],
+      "bundles": [
+        "shopping_mall"
       ]
     },
     {
@@ -87,6 +93,10 @@
         534,
         537,
         541
+      ],
+      "bundles": [
+        "factory_day_preset",
+        "factory_night_preset"
       ]
     },
     {
@@ -125,6 +135,9 @@
         176,
         511,
         514
+      ],
+      "bundles": [
+        "customs_preset"
       ]
     },
     {
@@ -143,6 +156,9 @@
         167,
         399,
         522
+      ],
+      "bundles": [
+        "woods_preset"
       ]
     },
     {
@@ -172,6 +188,9 @@
         40,
         41,
         402
+      ],
+      "bundles": [
+        "shoreline_preset"
       ]
     },
     {
@@ -230,6 +249,9 @@
         169,
         401,
         518
+      ],
+      "bundles": [
+        "rezerv_base_preset"
       ]
     },
     {
@@ -290,6 +312,10 @@
         516,
         711,
         712
+      ],
+      "bundles": [
+        "laboratory_dark_preset",
+        "laboratory_preset"
       ]
     },
     {
@@ -350,6 +376,10 @@
         504,
         505,
         509
+      ],
+      "bundles": [
+        "sandbox_high_preset",
+        "sandbox_preset"
       ]
     },
     {
@@ -617,6 +647,9 @@
         462,
         463,
         464
+      ],
+      "bundles": [
+        "city_preset"
       ]
     },
     {
@@ -639,6 +672,9 @@
         552,
         553,
         556
+      ],
+      "bundles": [
+        "labyrinth_preset"
       ]
     },
     {
@@ -659,6 +695,9 @@
         704,
         705,
         707
+      ],
+      "bundles": [
+        "icebreaker"
       ]
     }
   ]
