@@ -76,6 +76,12 @@ struct Baked {
     sun_dir: [f32; 3],
     /// nx*ny*nz*12 f16 halfs (as u16), probe-major.
     halfs: Vec<u16>,
+    /// PER-PROBE VALIDITY, probe-major, 0 = the probe is buried in geometry, 255 = fully open.
+    /// Unity's Adaptive Probe Volumes call this "probe validity" and derive it from the fraction of
+    /// sampling rays that hit a BACKFACE (a probe inside a wall sees the wall's inside). The viewer
+    /// weights its trilinear taps by it, which is what stops a probe sealed inside a wall from
+    /// bleeding its (near-black, or wrongly-lit) value onto the surfaces around it.
+    validity: Vec<u8>,
     inside_solid: usize,
     /// diffuse bounces baked in (0 = direct only, 1 = one bounce).
     bounces: usize,
@@ -243,6 +249,33 @@ fn ray_hit(bvh: &Bvh, o: Vec3, d: Vec3, t_max: f32, stack: &mut Vec<u32>) -> Opt
         }
     }
     best_face.map(|f| (best_t, f))
+}
+
+/// Fraction of `dirs` that hit a BACKFACE from `o` — Unity APV's probe-validity metric.
+///
+/// A probe floating in open space sees front faces (or sky); a probe buried inside a wall or under
+/// terrain sees that geometry's INSIDE, i.e. triangles whose geometric normal points the same way
+/// as the ray. Unity marks a probe invalid past ~25% backfaces and then weights interpolation by
+/// validity ("Validity and Normal Based" leak reduction). We store the continuous ratio and let the
+/// shader weight with it, which degrades more gracefully than a hard flag.
+fn backface_ratio(bvh: &Bvh, o: Vec3, dirs: &[(Vec3, [f32; 4])], stride: usize, stack: &mut Vec<u32>) -> f32 {
+    let mut hit = 0u32;
+    let mut back = 0u32;
+    let mut i = 0;
+    while i < dirs.len() {
+        let d = dirs[i].0;
+        if let Some((_, fi)) = ray_hit(bvh, o, d, f32::INFINITY, stack) {
+            hit += 1;
+            let t = &bvh.tris[fi];
+            // geometric normal from the winding; a hit is a BACKFACE when it faces along the ray
+            let n = (t.b - t.a).cross(t.c - t.a);
+            if n.dot(d) > 0.0 {
+                back += 1;
+            }
+        }
+        i += stride;
+    }
+    if hit == 0 { 0.0 } else { back as f32 / hit as f32 }
 }
 
 // ---- grid + bake ------------------------------------------------------------------------------
@@ -564,6 +597,35 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         inside_solid
     );
 
+    // ================= PROBE VALIDITY (Unity APV) ==================================================
+    // Per-probe backface ratio -> validity. Runs for BOTH pass-A backends (the GPU path does not
+    // count it), on a strided subset of the sky directions: validity is a low-frequency "am I inside
+    // a solid" signal, so ~1/4 of the rays resolves it and keeps the cost off the critical path.
+    let t_v = Instant::now();
+    let v_stride = (n_dir / 64).max(1); // ~64 probe rays regardless of the sky-ray budget
+    let mut validity: Vec<u8> = vec![255; n_probe];
+    validity
+        .par_iter_mut()
+        .enumerate()
+        .for_each_init(
+            || Vec::<u32>::with_capacity(64),
+            |stack, (pi, out)| {
+                let o = probe_o(pi, nx, ny, gmin, spacing);
+                let r = backface_ratio(&bvh, o, &dirs, v_stride, stack);
+                // Unity treats >=25% backfaces as invalid. Ramp to zero over that range instead of a
+                // hard cut so a probe near a wall fades out of the interpolation rather than popping.
+                let v = (1.0 - (r / 0.25)).clamp(0.0, 1.0);
+                *out = (v * 255.0 + 0.5) as u8;
+            },
+        );
+    let n_invalid = validity.iter().filter(|&&v| v < 128).count();
+    eprintln!(
+        "  sh-bake: validity {n_probe} probes in {:.2}s ({} invalid / in-geometry, {:.1}%)",
+        t_v.elapsed().as_secs_f32(),
+        n_invalid,
+        100.0 * n_invalid as f32 / n_probe.max(1) as f32
+    );
+
     // ================= PASS B — one diffuse bounce (M3) =============================================
     // Re-cast a Fibonacci sphere; at each NEAREST surface hit, gather irradiance E(hit,n) from the
     // pass-A grid (trilinear + cosine convolution) and re-emit albedo/pi * E + emissive back into the
@@ -673,6 +735,7 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         spacing,
         sun_dir,
         halfs,
+        validity,
         inside_solid,
         bounces,
         direct: !indirect_only,
@@ -717,6 +780,10 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
     let bin: &[u8] = bytemuck::cast_slice(&b.halfs);
     std::fs::write(dir.join("volume.bin"), bin)
         .with_context(|| format!("writing {}", dir.join("volume.bin").display()))?;
+    // Validity is a SEPARATE file, not appended to volume.bin: an older viewer keeps loading the
+    // volume byte-for-byte as before and simply renders without leak reduction.
+    std::fs::write(dir.join("volume_valid.bin"), &b.validity)
+        .with_context(|| format!("writing {}", dir.join("volume_valid.bin").display()))?;
     let meta = serde_json::json!({
         "min": b.min, "max": b.max,
         "dims": [b.dims[0], b.dims[1], b.dims[2]],
@@ -728,7 +795,12 @@ fn write_volume(b: &Baked, dir: &Path) -> Result<()> {
         // false = INDIRECT-ONLY (practicals excluded; the viewer renders them real-time). The viewer
         // auto-enables the realtime light grid when this is present and false (direct/indirect split).
         "direct": b.direct,
-        "baker": "atlas-cpu-sh (sh_bake.rs, M3: sky-visibility + shadow-tested practicals + diffuse bounce)",
+        // Per-probe validity (Unity APV): u8 per probe, probe-major, SAME index as volume.bin.
+        // 255 = open space, 0 = buried in geometry. The viewer weights its trilinear taps by this so
+        // probes sealed inside walls stop bleeding onto the surfaces around them.
+        "validity": "volume_valid.bin",
+        "validity_layout": "u8 per probe, probe-major, same index as volume.bin; 255=valid/open, 0=inside geometry (backface ratio >= 0.25)",
+        "baker": "atlas-cpu-sh (sh_bake.rs, M3: sky-visibility + shadow-tested practicals + diffuse bounce; APV-style probe validity)",
     });
     std::fs::write(dir.join("volume.json"), serde_json::to_string_pretty(&meta)?)
         .with_context(|| format!("writing {}", dir.join("volume.json").display()))?;
