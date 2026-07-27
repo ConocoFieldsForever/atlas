@@ -2527,35 +2527,28 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                 break 'grass;
             }
         };
-        // grass albedo + tint from the sidecar.
+        // Grass KINDS from the sidecar. EFT scatters 9-30 different detail prototypes per map
+        // (grass11, T_WhitGrass_A, Grass4_D, Field_grass_D, nettles...), each its own billboard
+        // card with its own density grid. `format:2` sidecars carry that list; older sidecars
+        // carry a single `albedo`+`tint`, which we read as a one-kind list so old packs still
+        // render. One kind == one cross-quad mesh + one material + one indirect draw.
         let side = std::fs::read_to_string(pack.root.join("grass_sidecar.json"))
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-        let grass_albedo_raw = side
-            .as_ref()
-            .and_then(|v| v.get("albedo").and_then(|a| a.as_str()))
-            .unwrap_or("")
-            .to_string();
-        if grass_albedo_raw.is_empty() {
-            warn!("gpu-driven grass: no grass albedo in sidecar — skipping");
-            break 'grass;
-        }
-        // Resolve the grass albedo PORTABLY. A correct sidecar carries a pack-relative name
-        // ("grass_albedo.png"). A broken build can bake an ABSOLUTE build-time path (a personal-path
-        // leak) that may even point at ANOTHER map's texture — observed on customs, whose sidecar
-        // referenced `.../eft_assets/interchange_v2/terrain_layers/grass_Grass3_D.png`. Trust an
-        // absolute path only if that exact file exists on THIS machine; otherwise look for a pack-local
-        // file of the same basename. If nothing resolves, SKIP grass instead of loading the magenta
-        // placeholder — that placeholder is the "pink grass all over customs" bug.
-        let grass_albedo = {
-            let raw = std::path::Path::new(&grass_albedo_raw);
+        let rec_stride: usize = match side.as_ref().and_then(|v| v.get("format")).and_then(|f| f.as_u64()) {
+            Some(2) => 24, // [x,y,z,rotY,scale] f32 + kind u32
+            _ => 20,       // legacy: [x,y,z,rotY,scale] f32
+        };
+        // Resolve a sidecar albedo PORTABLY. A correct sidecar carries a pack-relative name. A
+        // broken build can bake an ABSOLUTE build-time path (a personal-path leak) that may even
+        // point at ANOTHER map's texture — observed on customs, whose sidecar referenced
+        // `.../eft_assets/interchange_v2/terrain_layers/grass_Grass3_D.png`. Trust an absolute
+        // path only if that exact file exists on THIS machine; otherwise look for a pack-local
+        // file of the same basename. Unresolvable => that kind is dropped (never the magenta
+        // placeholder — that placeholder is the "pink grass all over customs" bug).
+        let resolve_albedo = |raw_s: &str| -> Option<String> {
+            let raw = std::path::Path::new(raw_s);
             let base = raw.file_name().unwrap_or(raw.as_os_str());
-            // Candidate order matters: (1) an absolute path that really exists (trusted as-is);
-            // (2) the FULL pack-relative path — the CORRECT portable form, including subdirs
-            //     ("terrain_layers/grass_Grass3_D.png"; the old code jumped straight to basename
-            //     and silently skipped grass on every pack whose sidecar used a subdir);
-            // (3) basename at the pack root, then (4) basename under terrain_layers/ — recovery
-            //     for ABSOLUTE build-path leaks pointing at another machine/map tree.
             let mut cands: Vec<std::path::PathBuf> = Vec::new();
             if raw.is_absolute() {
                 cands.push(raw.to_path_buf());
@@ -2564,113 +2557,180 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             }
             cands.push(pack.root.join(base));
             cands.push(pack.root.join("terrain_layers").join(base));
-            match cands.iter().find(|c| c.is_file()) {
-                Some(c) => c.to_string_lossy().into_owned(),
-                None => {
-                    warn!(
-                        "gpu-driven grass: albedo '{grass_albedo_raw}' not found in pack \
-                         (non-portable / wrong-map build) — skipping grass to avoid the magenta placeholder"
-                    );
-                    break 'grass;
-                }
+            cands.iter().find(|c| c.is_file()).map(|c| c.to_string_lossy().into_owned())
+        };
+        let read_tint = |v: Option<&serde_json::Value>| -> [f32; 4] {
+            v.and_then(|a| a.as_array())
+                .map(|a| {
+                    let g = |i: usize, d: f32| {
+                        a.get(i).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32
+                    };
+                    [g(0, 0.7), g(1, 0.75), g(2, 0.55), 1.0]
+                })
+                .unwrap_or([0.7, 0.75, 0.55, 1.0])
+        };
+        // (resolved albedo path, tint) per kind, in SIDECAR ORDER — grass.bin's kind indices
+        // address this list, so a dropped kind must keep its slot (None) rather than shift.
+        let kinds: Vec<Option<(String, [f32; 4])>> = match side
+            .as_ref()
+            .and_then(|v| v.get("kinds"))
+            .and_then(|k| k.as_array())
+        {
+            Some(arr) => arr
+                .iter()
+                .map(|k| {
+                    let a = k.get("albedo").and_then(|a| a.as_str()).unwrap_or("");
+                    resolve_albedo(a).map(|p| (p, read_tint(k.get("tint"))))
+                })
+                .collect(),
+            None => {
+                let a = side
+                    .as_ref()
+                    .and_then(|v| v.get("albedo").and_then(|a| a.as_str()))
+                    .unwrap_or("");
+                vec![if a.is_empty() { None } else { resolve_albedo(a).map(|p| (p, read_tint(side.as_ref().and_then(|v| v.get("tint"))))) }]
             }
         };
-        let grass_tint = side
-            .as_ref()
-            .and_then(|v| v.get("tint").and_then(|a| a.as_array()))
-            .map(|a| {
-                let g = |i: usize, d: f32| a.get(i).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32;
-                [g(0, 0.7), g(1, 0.75), g(2, 0.55), 1.0]
-            })
-            .unwrap_or([0.7, 0.75, 0.55, 1.0]);
+        if kinds.iter().all(|k| k.is_none()) {
+            warn!("gpu-driven grass: no usable grass texture in the sidecar — skipping grass");
+            break 'grass;
+        }
+        // WavingGrass params authored on the terrain (extractor -> grass.json -> sidecar). Fed to
+        // the shader through the material's otherwise-unused `vp` lane; the vertex stage sways
+        // each blade's TOP verts so the base stays planted. Absent/zero => static grass.
+        let wind = side.as_ref().and_then(|v| v.get("wind"));
+        let wf = |k: &str, d: f32| {
+            wind.and_then(|w| w.get(k)).and_then(|x| x.as_f64()).unwrap_or(d as f64) as f32
+        };
+        let (w_strength, w_amount, w_speed) = (wf("strength", 0.0), wf("amount", 0.0), wf("speed", 0.0));
 
-        // Grass material: alpha-cutout (blade coverage in the texture alpha), matte.
-        let grass_albedo_idx = *path_to_index.entry(grass_albedo.clone()).or_insert_with(|| {
-            let idx = albedo_paths.len() as u32;
-            albedo_paths.push(grass_albedo.clone());
-            idx
-        });
-        let grass_mat_id = materials_gpu.len() as u32;
-        materials_gpu.push(GpuMaterial {
-            albedo_index: grass_albedo_idx,
-            flags: MAT_FLAG_CUTOUT,
-            alpha_cutoff: 0.35,
-            roughness: 0.9,
-            uv_xform: [1.0, 1.0, 0.0, 0.0],
-            tint: grass_tint,
-            vp: [0.0; 4],
-            normal_index: NO_NORMAL,
-            normal_flags: 0,
-            normal_scale: 1.0,
-            _pad2: 0,
-            // No emissive: the all-zero Default would alias bindless slot 0 as an emissive map.
-            emissive_index: NO_EMISSIVE,
-            // #6: grass carries no detail map.
-            ..GpuMaterial::default()
-        });
-
-        // Cross-quad clump mesh: 3 quads at 0/60/120° around Y, base at y=0.
-        let base_vertex = vtx_cursor as i32;
-        let first_index = idx_cursor;
-        let mbits = f32::from_bits(grass_mat_id);
+        // Cross-quad clump mesh + material, ONE PER KIND. The geometry is identical (3 quads at
+        // 0/60/120 deg around Y, base at y=0) but the material id is baked into the vertex data,
+        // so each kind needs its own 12-vertex copy — 11 kinds is ~132 verts, free.
         let (hw, gh) = (0.42f32, 0.9f32);
-        let (mut nverts, mut nidx) = (0u32, 0u32);
-        for q in 0..3u32 {
-            let ang = q as f32 * std::f32::consts::PI / 3.0;
-            let (s, c) = ang.sin_cos();
-            let (dx, dz) = (c * hw, s * hw);
-            let b = nverts;
-            let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @28
-            let up_oct = oct_bits(Vec3::Y);
-            let mk = |x: f32, y: f32, z: f32, u: f32, v: f32| {
-                [x, y, z, up_oct, u, v, mbits, white]
+        let mut kind_mesh: Vec<Option<usize>> = Vec::with_capacity(kinds.len()); // kind -> mesh slot
+        let mut kind_bins: Vec<Vec<[f32; 5]>> = vec![Vec::new(); kinds.len()];
+        for k in &kinds {
+            let Some((albedo, tint)) = k else {
+                kind_mesh.push(None);
+                continue;
             };
-            for vtx in [
-                mk(-dx, 0.0, -dz, 0.0, 1.0),
-                mk(dx, 0.0, dz, 1.0, 1.0),
-                mk(dx, gh, dz, 1.0, 0.0),
-                mk(-dx, gh, -dz, 0.0, 0.0),
-            ] {
-                vertex_data.extend_from_slice(&vtx);
-            }
-            index_data.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
-            nverts += 4;
-            nidx += 6;
-        }
-        vtx_cursor += nverts;
-        idx_cursor += nidx;
-
-        // One instance per grass clump (deterministic transform from grass.bin).
-        let instance_base = inst_cursor;
-        let mut count = 0u32;
-        for ch in bin.chunks_exact(20) {
-            let f = |o: usize| f32::from_le_bytes([ch[o], ch[o + 1], ch[o + 2], ch[o + 3]]);
-            let (x, y, z, rot, sc) = (f(0), f(4), f(8), f(12), f(16));
-            let (s, c) = rot.sin_cos();
-            inst_lod_group.push(-1); // grass (synthetic, ungrouped)
-            instances.push(InstanceGpuRecord {
-                m0: [c * sc, 0.0, s * sc, x],
-                m1: [0.0, sc, 0.0, y],
-                m2: [-s * sc, 0.0, c * sc, z],
-                // ids.z = 1 tags GRASS for the cull's screen-size test (a clump's ~1.3 m sphere
-                // is sub-pixel long before the frustum far plane — cull it by projected size).
-                ids: [mesh_meta.len() as u32, 0, 1, 0],
-                sphere: [x, y + gh * sc * 0.5, z, 1.3 * sc],
+            let albedo_idx = *path_to_index.entry(albedo.clone()).or_insert_with(|| {
+                let idx = albedo_paths.len() as u32;
+                albedo_paths.push(albedo.clone());
+                idx
             });
-            count += 1;
+            let mat_id = materials_gpu.len() as u32;
+            materials_gpu.push(GpuMaterial {
+                albedo_index: albedo_idx,
+                flags: MAT_FLAG_CUTOUT,
+                alpha_cutoff: 0.35,
+                roughness: 0.9,
+                uv_xform: [1.0, 1.0, 0.0, 0.0],
+                tint: *tint,
+                // vp is unused by cutout foliage -> carry the wind params (see gpu_draw.wgsl).
+                vp: [w_strength, w_amount, w_speed, 0.0],
+                normal_index: NO_NORMAL,
+                normal_flags: 0,
+                normal_scale: 1.0,
+                _pad2: 0,
+                // No emissive: the all-zero Default would alias bindless slot 0 as an emissive map.
+                emissive_index: NO_EMISSIVE,
+                // #6: grass carries no detail map.
+                ..GpuMaterial::default()
+            });
+            let base_vertex = vtx_cursor as i32;
+            let first_index = idx_cursor;
+            let mbits = f32::from_bits(mat_id);
+            let (mut nverts, mut nidx) = (0u32, 0u32);
+            for q in 0..3u32 {
+                let ang = q as f32 * std::f32::consts::PI / 3.0;
+                let (sa, ca) = ang.sin_cos();
+                let (dx, dz) = (ca * hw, sa * hw);
+                let b = nverts;
+                let white = f32::from_bits(0xFFFF_FFFF); // color Unorm8x4 @28
+                let up_oct = oct_bits(Vec3::Y);
+                let mk = |x: f32, y: f32, z: f32, u: f32, v: f32| {
+                    [x, y, z, up_oct, u, v, mbits, white]
+                };
+                for vtx in [
+                    mk(-dx, 0.0, -dz, 0.0, 1.0),
+                    mk(dx, 0.0, dz, 1.0, 1.0),
+                    mk(dx, gh, dz, 1.0, 0.0),
+                    mk(-dx, gh, -dz, 0.0, 0.0),
+                ] {
+                    vertex_data.extend_from_slice(&vtx);
+                }
+                index_data.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+                nverts += 4;
+                nidx += 6;
+            }
+            vtx_cursor += nverts;
+            idx_cursor += nidx;
+            kind_mesh.push(Some(mesh_meta.len()));
+            mesh_names.push(String::new()); // grass (synthetic)
+            mesh_meta.push(MeshMeta {
+                index_count: nidx,
+                first_index,
+                base_vertex,
+                instance_base: 0, // filled once the instances are bucketed below
+                instance_count: 0,
+                blend_class: 0,
+                _pad: [0; 2],
+            });
         }
-        inst_cursor += count;
-        mesh_names.push(String::new()); // grass (synthetic)
-        mesh_meta.push(MeshMeta {
-            index_count: nidx,
-            first_index,
-            base_vertex,
-            instance_base,
-            instance_count: count,
-            blend_class: 0,
-            _pad: [0; 2],
-        });
-        info!("gpu-driven #4 grass: {count} clumps appended (cross-quad, alpha-cutout)");
+
+        // Bucket the records by kind: a mesh's instances must be CONTIGUOUS for the indirect
+        // multidraw (instance_base + instance_count), and grass.bin is written per prototype
+        // layer per slice, so several runs map to the same kind.
+        let mut dropped = 0u32;
+        for ch in bin.chunks_exact(rec_stride) {
+            let f = |o: usize| f32::from_le_bytes([ch[o], ch[o + 1], ch[o + 2], ch[o + 3]]);
+            let kind = if rec_stride == 24 {
+                u32::from_le_bytes([ch[20], ch[21], ch[22], ch[23]]) as usize
+            } else {
+                0
+            };
+            match kind_bins.get_mut(kind) {
+                Some(b) if kind_mesh.get(kind).copied().flatten().is_some() => {
+                    b.push([f(0), f(4), f(8), f(12), f(16)])
+                }
+                _ => dropped += 1,
+            }
+        }
+        if dropped > 0 {
+            warn!("gpu-driven grass: {dropped} instances referenced a missing grass kind — dropped");
+        }
+        let mut count = 0u32;
+        for (kind, recs) in kind_bins.iter().enumerate() {
+            let Some(slot) = kind_mesh[kind] else { continue };
+            let instance_base = inst_cursor;
+            for r in recs {
+                let (x, y, z, rot, sc) = (r[0], r[1], r[2], r[3], r[4]);
+                let (s, c) = rot.sin_cos();
+                inst_lod_group.push(-1); // grass (synthetic, ungrouped)
+                instances.push(InstanceGpuRecord {
+                    m0: [c * sc, 0.0, s * sc, x],
+                    m1: [0.0, sc, 0.0, y],
+                    m2: [-s * sc, 0.0, c * sc, z],
+                    // ids.z = 1 tags GRASS for the cull's screen-size test (a clump's ~1.3 m
+                    // sphere is sub-pixel long before the frustum far plane — cull it by
+                    // projected size) AND for the wind sway in the vertex stage.
+                    ids: [slot as u32, 0, 1, 0],
+                    sphere: [x, y + gh * sc * 0.5, z, 1.3 * sc],
+                });
+            }
+            let n = recs.len() as u32;
+            mesh_meta[slot].instance_base = instance_base;
+            mesh_meta[slot].instance_count = n;
+            inst_cursor += n;
+            count += n;
+        }
+        info!(
+            "gpu-driven #4 grass: {count} clumps across {} kind(s) appended (cross-quad, \
+             alpha-cutout; wind {w_strength}/{w_amount}/{w_speed})",
+            kind_mesh.iter().filter(|m| m.is_some()).count()
+        );
     }
 
     // ---- SEA: horizon fill for coastal maps. The game DOES ship its ocean surface as geometry
@@ -3950,7 +4010,16 @@ fn prepare_gpu_buffers(
         &BindGroupLayoutEntries::with_indices(
             ShaderStages::FRAGMENT,
             (
-                (0, storage_buffer_read_only_sized(false, None)),
+                // The material TABLE is also read in the VERTEX stage (the grass WavingGrass sway
+                // reads its wind params from the material's `vp` lane); without VERTEX here the
+                // draw pipelines fail to create with "Shader global ResourceBinding { group: 2,
+                // binding: 0 } is not available in the pipeline layout". Only binding 0 is
+                // widened — the bindless texture ARRAY stays fragment-only.
+                (
+                    0,
+                    storage_buffer_read_only_sized(false, None)
+                        .visibility(ShaderStages::VERTEX_FRAGMENT),
+                ),
                 (
                     1,
                     texture_2d(TextureSampleType::Float { filterable: true })
@@ -4313,7 +4382,12 @@ fn prepare_gpu_buffers(
                 (2, texture_3d(TextureSampleType::Float { filterable: true })),
                 (3, texture_3d(TextureSampleType::Float { filterable: true })),
                 (4, sampler(SamplerBindingType::Filtering)),
-                (5, uniform_buffer_sized(false, None)),          // #5 SunShadowUniform
+                // #5 SunShadowUniform. VERTEX too: gfx.w carries the app time that phases the
+                // grass WavingGrass sway in the vertex stage (gpu_draw.wgsl).
+                (
+                    5,
+                    uniform_buffer_sized(false, None).visibility(ShaderStages::VERTEX_FRAGMENT),
+                ),
                 (6, texture_2d_array(TextureSampleType::Depth)), // #5 texture_depth_2d_array
                 (7, sampler(SamplerBindingType::Comparison)),    // #5 sampler_comparison
                 (8, uniform_buffer_sized(false, None)),          // realtime LightGrid uniform
@@ -5513,6 +5587,8 @@ fn prepare_shadow_uniforms(
     // Source of the bindless albedo count uploaded in `params.y` (the shadow fragment's
     // descriptor-index clamp). Same `views` vec that builds the material bind group.
     mat_res: Option<Res<EftMaterialResources>>,
+    // gfx.w = phase for the grass sway (see the WavingGrass block in gpu_draw.wgsl's vertex stage).
+    time: Res<bevy::time::Time>,
 ) {
     let (Some(config), Some(res)) = (config, resources) else {
         return;
@@ -5529,9 +5605,13 @@ fn prepare_shadow_uniforms(
     // Runtime UI scales (GfxSettings, extracted) ride a spare uniform lane; the shadow switch
     // itself was already synced into config.enabled by sync_gfx_shadow_toggle this frame.
     let shadows_on = config.enabled;
+    // gfx.w = app time in seconds, the phase for the grass WavingGrass sway (gpu_draw.wgsl
+    // vertex stage). Wrapped to a long period so f32 keeps sub-millisecond precision over a
+    // multi-hour session instead of visibly quantising the animation.
+    let t_wind = (time.elapsed_secs_wrapped() % 3600.0) as f32;
     let gfx = match settings.as_ref() {
-        Some(s) => [s.fog, s.sky_refl, s.emissive, 0.0],
-        None => [1.0, 1.0, 1.0, 0.0],
+        Some(s) => [s.fog, s.sky_refl, s.emissive, t_wind],
+        None => [1.0, 1.0, 1.0, t_wind],
     };
     let lsun = config.lsun;
     let clip_from_view = view.clip_from_view;
