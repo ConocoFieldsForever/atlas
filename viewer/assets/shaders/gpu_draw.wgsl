@@ -404,10 +404,17 @@ fn sh_irradiance_b(world_pos: vec3<f32>, n_eval: vec3<f32>, n_bias: vec3<f32>) -
         sum  = sum + w * max(e, vec3<f32>(0.0));
         wsum = wsum + w;
     }
-    // Fallback: if the hemisphere weighting rejected essentially everything (fully
-    // enclosed point), don't go black — use the plain hardware-trilinear reconstruction.
-    var local_e = sum / wsum;
-    if (wsum < 1e-3) { local_e = sh_irradiance_hw(wp, n); }
+    // Fallback: where the hemisphere weighting rejects essentially everything (a fully enclosed
+    // point) fall back to the plain hardware-trilinear reconstruction so it doesn't go black.
+    //
+    // This handover MUST be smooth. As a hard `if (wsum < 1e-3)` it was a cliff in the middle of
+    // the shading function: two neighbouring pixels either side of the threshold reconstructed
+    // from completely different estimators, so surfaces near the boundary — glass sitting in a
+    // wall is the worst case — were painted with hard, probe-grid-ALIGNED rectangles, complete
+    // with a texel staircase along the edge where the threshold crossing follows the probe
+    // lattice. Blending over a small band keeps both estimators' behaviour and removes the edge.
+    let hw_e = sh_irradiance_hw(wp, n);
+    var local_e = mix(hw_e, sum / max(wsum, 1e-6), smoothstep(0.0, 4e-3, wsum));
     if (t_out <= 0.0) { return local_e; }
     let sky_e = sh_irradiance_hw(sh_sky_pos(world_pos), n) * sh.dims.w; // top layer is inside -> no recursion depth
     return mix(local_e, sky_e, t_out);
