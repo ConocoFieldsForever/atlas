@@ -3114,6 +3114,7 @@ fn poll_cpu_build(
 struct EftComputePipelines {
     reset_id: CachedComputePipelineId,
     cull_id: CachedComputePipelineId,
+    sort_blend_id: CachedComputePipelineId,
     cull_layout: BindGroupLayout,
 }
 
@@ -3155,6 +3156,8 @@ struct EftGpuBuffers {
     blend_meshes: Vec<(u32, Vec<[f32; 3]>, u32)>,
     mesh_count: u32,
     instance_total: u32,
+    /// Workgroups for `cs_sort_blend` (one invocation per BLEND mesh; 64 per group).
+    blend_sort_groups: u32,
 }
 
 #[derive(Resource)]
@@ -3286,6 +3289,7 @@ fn init_gpu_pipelines(
                 storage_buffer_sized(false, None),           // 4: indirect OPAQUE (rw)
                 storage_buffer_sized(false, None),           // 5: indirect BLEND (rw)
                 storage_buffer_read_only_sized(false, None), // 6: lod_centers (B1 group-center metric)
+                storage_buffer_read_only_sized(false, None), // 7: blend mesh ids (cs_sort_blend)
             ),
         ),
     );
@@ -3302,6 +3306,7 @@ fn init_gpu_pipelines(
     );
 
     let cull_shader = asset_server.load("shaders/gpu_cull.wgsl");
+    let cull_shader_sort = cull_shader.clone();
     let draw_shader = asset_server.load("shaders/gpu_draw.wgsl");
     let shadow_shader = asset_server.load("shaders/gpu_shadow.wgsl"); // #5 depth-only caster
 
@@ -3324,9 +3329,22 @@ fn init_gpu_pipelines(
         zero_initialize_workgroup_memory: false,
     });
 
+    // Per-instance back-to-front ordering for transparent draws (see cs_sort_blend). Runs after
+    // cs_cull, before the main pass.
+    let sort_blend_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("eft_cull_sort_blend".into()),
+        layout: vec![cull_layout.clone()],
+        push_constant_ranges: vec![],
+        shader: cull_shader_sort,
+        shader_defs: vec![],
+        entry_point: Some("cs_sort_blend".into()),
+        zero_initialize_workgroup_memory: false,
+    });
+
     commands.insert_resource(EftComputePipelines {
         reset_id,
         cull_id,
+        sort_blend_id,
         cull_layout,
     });
     commands.insert_resource(EftDrawPipeline {
@@ -3870,6 +3888,19 @@ fn prepare_gpu_buffers(
         contents: bytemuck::cast_slice(&cpu.lod_centers),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
+    // Mesh indices that have a BLEND submesh — the work list for cs_sort_blend. Never empty:
+    // an empty storage buffer is invalid, so a map with no transparent geometry gets one dummy
+    // entry and the shader's `count < 2` guard makes it a no-op.
+    let mut blend_ids: Vec<u32> = cpu.blend_meshes.iter().map(|(m, _, _)| *m).collect();
+    if blend_ids.is_empty() {
+        blend_ids.push(0);
+    }
+    let blend_ids_buf = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_gpu_blend_mesh_ids"),
+        contents: bytemuck::cast_slice(&blend_ids),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let blend_sort_groups = (blend_ids.len() as u32).div_ceil(64);
     let cull_bg = render_device.create_bind_group(
         "eft_cull_bg",
         &compute.cull_layout,
@@ -3881,6 +3912,7 @@ fn prepare_gpu_buffers(
             indirect.as_entire_binding(),
             indirect_blend.as_entire_binding(),
             lod_centers.as_entire_binding(),
+            blend_ids_buf.as_entire_binding(),
         )),
     );
     let draw_bg = render_device.create_bind_group(
@@ -4492,6 +4524,7 @@ fn prepare_gpu_buffers(
         blend_meshes: cpu.blend_meshes.clone(),
         mesh_count: cpu.mesh_count,
         instance_total: cpu.instance_total,
+        blend_sort_groups,
         index_format: if cpu.index_u16 { IndexFormat::Uint16 } else { IndexFormat::Uint32 },
     });
     commands.insert_resource(EftCullBindGroup(cull_bg));
@@ -6211,6 +6244,18 @@ impl Node for EftCullNode {
             pass.set_pipeline(cull);
             pass.set_bind_group(0, &**bg, &[]);
             pass.dispatch_workgroups(cull_groups, 1, 1);
+        }
+        // Third pass (its own barrier): order each BLEND mesh's survivors back-to-front. cs_cull
+        // compacts with atomics, so without this the per-instance draw order inside a transparent
+        // mesh reshuffles every frame and overlapping glass flickers with a STILL camera.
+        if let Some(sort_blend) = cache.get_compute_pipeline(pipelines.sort_blend_id) {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("eft_cull_sort_blend"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(sort_blend);
+            pass.set_bind_group(0, &**bg, &[]);
+            pass.dispatch_workgroups(buffers.blend_sort_groups.max(1), 1, 1);
         }
         Ok(())
     }
