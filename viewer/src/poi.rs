@@ -278,7 +278,8 @@ pub struct GameDataZones {
 pub struct PoiPlugin;
 impl Plugin for PoiPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<QuestData>()
+        app.init_resource::<PoiMarkersRespawned>()
+            .init_resource::<QuestData>()
             .init_resource::<KeyCatalog>()
             .init_resource::<GameDataZones>()
             .init_resource::<MapIntelMeta>()
@@ -299,6 +300,18 @@ impl Plugin for PoiPlugin {
             .add_systems(Update, (draw_quest_outlines, draw_gamedata_outlines, draw_operation_links));
     }
 }
+
+/// Set by `spawn_pois` whenever markers are (re)created, cleared by `apply_poi_visibility` once it
+/// has actually applied their visibility.
+///
+/// A plain `is_added()`/`is_changed()` test cannot carry this: markers spawn `Hidden`, and the
+/// visibility pass skips itself unless a toggle changed, the epoch changed, or the camera moved.
+/// On a COLD load none of those are true — `pois_need_rebuild` fires on `pack.is_added()`, not on
+/// an epoch bump — so a freshly loaded map with a still camera showed NO markers at all until the
+/// user nudged the camera or ticked a layer. A latch survives the frame boundary between the two
+/// systems and is immune to their ordering.
+#[derive(Resource, Default)]
+pub struct PoiMarkersRespawned(pub bool);
 
 fn pois_need_rebuild(
     epoch: Res<crate::render::MapEpoch>,
@@ -846,8 +859,35 @@ fn gd_spawn_info(s: &GdSpawn, layer: PoiLayer, zone_disp: Option<&str>) -> Marke
 /// the tarkov.dev position wins (dev's own position came from that zone's boss spawns:
 /// Killa lands 8 m from ZoneCenterBot, 40 m from ZoneCenter), with a 250 m sanity bound.
 /// No match keeps the dev position. `zones`: (internal name lower, en lower, centroid).
-fn snap_boss_pos(nd: &Node, zones: &[(String, Option<String>, Vec3)]) -> Option<[f32; 3]> {
+fn snap_boss_pos(
+    nd: &Node,
+    zones: &[(String, Option<String>, Vec3)],
+    boss_hints: &[(String, Vec3)],
+) -> Option<[f32; 3]> {
     let dev = Vec3::from(nd.pos);
+    // PASS 0 — the game's own naming. If any BotZone or PatrolWay name contains this boss's name
+    // ("ZoneTagilla" contains "tagilla"; "KILLA_PATROL_ALT" contains "killa"), that zone IS the
+    // boss's zone, straight from the client files — no translation table in the loop. Nearest
+    // candidate wins, same 250 m sanity bound as below.
+    let boss_key = nd
+        .name
+        .as_deref()
+        .or(nd.boss.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Take the LAST word: display names arrive as "Killa"/"Tagilla" but also "Cultist Priest",
+    // and the game names its zones after the distinctive part.
+    let token = boss_key.split_whitespace().last().unwrap_or("").trim();
+    if token.len() >= 4 {
+        if let Some((_, p)) = boss_hints
+            .iter()
+            .filter(|(n, _)| n.contains(token))
+            .min_by(|a, b| a.1.distance_squared(dev).total_cmp(&b.1.distance_squared(dev)))
+            .filter(|(_, p)| p.distance(dev) < 250.0)
+        {
+            return Some([p.x, p.y, p.z]);
+        }
+    }
     let pick = |cands: Vec<&(String, Option<String>, Vec3)>| {
         cands
             .into_iter()
@@ -1655,8 +1695,12 @@ fn spawn_pois(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     pack: Option<Res<LoadedPack>>,
+    mut respawned: ResMut<PoiMarkersRespawned>,
 ) {
     let Some(lp) = pack else { return };
+    // Markers below spawn Hidden; latch so the visibility pass runs even on a cold load with a
+    // motionless camera and untouched toggles.
+    respawned.0 = true;
     let root = &lp.0.root;
 
     let sphere = meshes.add(Sphere::new(1.0));
@@ -1833,6 +1877,39 @@ fn spawn_pois(
         .unwrap_or((0, 0));
     // First-party BotZone centroids (internal name lower, en display lower, position) —
     // boss nodes snap onto these (exact join on `en`, substring fallback on the id).
+    // BOSS -> ZONE, derived from the GAME'S OWN NAMES. The game labels its boss areas outright:
+    // interchange ships a BotZone literally called `ZoneTagilla`, and six `KILLA_PATROL_ALT`
+    // patrol ways (GameObjects `Patrol_Killa_alarm1..6`) that point at `ZoneCenterBot`. Joining on
+    // those is exact, whereas the tarkov.dev join below has to match a localized `spawnLocations`
+    // string against a zone's `en` translation — a fragile pairing its own doc-comment calls out
+    // ("Center" matching both ZoneCenter and ZoneCenterBot). Each entry is (lowercased game name
+    // that mentions a boss, zone centroid); `snap_boss_pos` tries these FIRST.
+    let gd_boss_hints: Vec<(String, Vec3)> = gamedata
+        .as_ref()
+        .map(|g| {
+            let zone_at = |zn: &str| -> Option<Vec3> {
+                g.bot_zones
+                    .iter()
+                    .find(|z| z.name.eq_ignore_ascii_case(zn))
+                    .map(|z| Vec3::from(z.pos))
+            };
+            let mut v: Vec<(String, Vec3)> = Vec::new();
+            // a zone that names a boss (ZoneTagilla)
+            for z in &g.bot_zones {
+                v.push((z.name.to_ascii_lowercase(), Vec3::from(z.pos)));
+            }
+            // a patrol way that names a boss, attributed to the zone it belongs to
+            for w in &g.patrol_ways {
+                let Some(zn) = w.zone.as_deref() else { continue };
+                let Some(c) = zone_at(zn) else { continue };
+                for n in [w.name.as_deref(), w.go.as_deref()].into_iter().flatten() {
+                    v.push((n.to_ascii_lowercase(), c));
+                }
+            }
+            v
+        })
+        .unwrap_or_default();
+
     let gd_zone_cents: Vec<(String, Option<String>, Vec3)> = gamedata
         .as_ref()
         .map(|g| {
@@ -1900,7 +1977,7 @@ fn spawn_pois(
         // the spawnLocations name joins one — exact geometry under the dev-only intel.
         let mut snapped = 0usize;
         for nd in &mn.boss_nodes {
-            let pos = match snap_boss_pos(nd, &gd_zone_cents) {
+            let pos = match snap_boss_pos(nd, &gd_zone_cents, &gd_boss_hints) {
                 Some(p) => {
                     snapped += 1;
                     p
@@ -2700,6 +2777,7 @@ fn teardown_pois(mut commands: Commands, q: Query<Entity, With<PoiLayer>>) {
 fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
+    mut respawned: ResMut<PoiMarkersRespawned>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     mut last_cam: Local<Vec3>,
     mut q: Query<
@@ -2720,9 +2798,15 @@ fn apply_poi_visibility(
     // bit-identical results and the whole pass (5k+ markers on streets) can be skipped.
     let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
     let moved = camera.distance_squared(*last_cam) > 0.25;
-    if !toggles.is_changed() && !epoch.is_changed() && !(toggles.cluster_dense && moved) {
+    // `respawned` is the COLD-LOAD case: fresh markers exist but nothing else changed.
+    if !respawned.0
+        && !toggles.is_changed()
+        && !epoch.is_changed()
+        && !(toggles.cluster_dense && moved)
+    {
         return;
     }
+    respawned.0 = false;
     *last_cam = camera;
     let mut occupied = std::collections::HashSet::new();
     for (l, val, inactive, gt, dense, mut vis) in &mut q {
