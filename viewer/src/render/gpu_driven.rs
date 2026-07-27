@@ -869,6 +869,12 @@ struct ShVolumeCpu {
     tex_r: Vec<u8>,
     tex_g: Vec<u8>,
     tex_b: Vec<u8>,
+    /// PER-PROBE VALIDITY (Unity APV): one u8 per probe, probe-major, 255 = open space, 0 = buried
+    /// in geometry. Uploaded as an R8Unorm 3D texture and used to weight the shader's trilinear
+    /// taps, so a probe sealed inside a wall cannot bleed onto the surfaces around it. All-255
+    /// (= "everything valid") when the pack predates `volume_valid.bin`, which reproduces the old
+    /// behaviour exactly.
+    valid: Vec<u8>,
 }
 
 impl ShVolumeCpu {
@@ -888,6 +894,7 @@ impl ShVolumeCpu {
             tex_r: texel.to_vec(),
             tex_g: texel.to_vec(),
             tex_b: texel.to_vec(),
+            valid: vec![255u8], // the single fallback probe is "open"
         }
     }
 }
@@ -1025,6 +1032,29 @@ fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
     } else {
         1.0
     };
+    // Per-probe VALIDITY (Unity APV). Optional sidecar: packs baked before it simply get all-255,
+    // which makes every tap fully weighted — i.e. byte-identical behaviour to before.
+    let valid = std::fs::read(pack.resolve_path("volume_valid.bin"))
+        .ok()
+        .filter(|v: &Vec<u8>| {
+            if v.len() == n_probes {
+                true
+            } else {
+                warn!(
+                    "SH-GI: volume_valid.bin is {} bytes, expected {n_probes} (one per probe) —                      ignoring it and treating every probe as valid",
+                    v.len()
+                );
+                false
+            }
+        })
+        .unwrap_or_else(|| vec![255u8; n_probes]);
+    let n_invalid = valid.iter().filter(|&&v| v < 128).count();
+    info!(
+        "SH-GI: probe validity {} ({} of {} probes invalid/in-geometry)",
+        if n_invalid > 0 || valid.iter().any(|&v| v != 255) { "loaded" } else { "absent (all valid)" },
+        n_invalid,
+        n_probes
+    );
     Some(ShVolumeCpu {
         ground_over_top,
         dims: meta.dims,
@@ -1035,6 +1065,7 @@ fn load_sh_volume(pack: &Pack) -> Option<ShVolumeCpu> {
         tex_r,
         tex_g,
         tex_b,
+        valid,
     })
 }
 
@@ -4132,6 +4163,24 @@ fn prepare_gpu_buffers(
     let (sh_r_tex, sh_r_view) = make_sh_tex(&sh.tex_r, "eft_sh_r");
     let (sh_g_tex, sh_g_view) = make_sh_tex(&sh.tex_g, "eft_sh_g");
     let (sh_b_tex, sh_b_view) = make_sh_tex(&sh.tex_b, "eft_sh_b");
+    // Probe validity: R8Unorm so the shader reads it straight as 0..1. Sampled with the SAME
+    // linear sampler and uvw as the SH textures, so a tap's validity always matches its probe.
+    let sh_valid_tex = render_device.create_texture_with_data(
+        &render_queue,
+        &TextureDescriptor {
+            label: Some("eft_sh_valid"),
+            size: sh_extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::default(),
+        &sh.valid,
+    );
+    let sh_valid_view = sh_valid_tex.create_view(&TextureViewDescriptor::default());
 
     let sh_sampler = render_device.create_sampler(&SamplerDescriptor {
         label: Some("eft_sh_sampler"),
@@ -4428,6 +4477,8 @@ fn prepare_gpu_buffers(
                 (8, uniform_buffer_sized(false, None)),          // realtime LightGrid uniform
                 (9, storage_buffer_read_only_sized(false, None)), // realtime packed light records
                 (10, storage_buffer_read_only_sized(false, None)), // realtime CSR light grid
+                // 11: per-probe validity (Unity APV leak reduction), R8Unorm 3D, same grid as sh_r/g/b
+                (11, texture_3d(TextureSampleType::Float { filterable: true })),
             ),
         ),
     );
@@ -4446,6 +4497,7 @@ fn prepare_gpu_buffers(
             (8, light_uniform.as_entire_binding()),
             (9, lights_buf.as_entire_binding()),
             (10, light_grid_buf.as_entire_binding()),
+            (11, &sh_valid_view),
         )),
     );
 

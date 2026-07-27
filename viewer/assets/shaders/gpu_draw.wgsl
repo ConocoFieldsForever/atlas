@@ -257,6 +257,11 @@ struct LightGrid {
 @group(3) @binding(9) var<storage, read> lights: array<vec4<f32>>;
 // CSR: [0..=nCells] offsets (base-included) then concatenated per-cell light indices.
 @group(3) @binding(10) var<storage, read> light_grid: array<u32>;
+// Per-probe VALIDITY (Unity Adaptive Probe Volumes). R8Unorm 3D on the SAME grid as sh_r/g/b:
+// 1 = probe sits in open space, 0 = probe is buried in geometry (baked from its backface ratio,
+// see sh_bake.rs). Weighting the trilinear taps by this is Unity's "Validity and Normal Based"
+// leak reduction, and it is what stops a probe sealed inside a wall from lighting the room.
+@group(3) @binding(11) var sh_valid: texture_3d<f32>;
 
 // Reconstruct diffuse IRRADIANCE (÷π folded in: cosine-convolved A0=π, A1=2π/3; the
 // π cancels the Lambert 1/π) from the L1 radiance SH at `world_pos`, for surface
@@ -378,10 +383,17 @@ fn sh_irradiance_b(world_pos: vec3<f32>, n_eval: vec3<f32>, n_bias: vec3<f32>) -
         let tw3 = mix(vec3<f32>(1.0) - f, f, o);      // per-axis trilinear weight
         let tw  = tw3.x * tw3.y * tw3.z;
         let dir = probe_pos - wp;
-        // Reject probes behind the SURFACE (n_bias), not behind the eval direction: a mirror
-        // vector can point straight into the wall, which would select the probes on the wrong
-        // side of the indoor/outdoor cliff.
-        let wn  = max(dot(normalize(dir + n_bias * 1e-3), n_bias), 0.0);
+        // Two independent rejections, both Unity APV:
+        //  * VALIDITY — is this probe inside geometry? Baked, view-independent, and the actual fix
+        //    for light leaking through walls. A probe entombed in a wall is near-black (or lit by
+        //    the wrong side) and used to bleed straight through; now it simply carries no weight.
+        //  * NORMAL — is the probe behind the surface we are shading? Cheap and catches the
+        //    below-slab case the bake cannot know about (a probe can be perfectly valid and still
+        //    be on the wrong side of the floor you are standing on).
+        // Sampling validity with textureLoad at the SAME integer probe coord as the SH keeps tap
+        // and weight in lockstep — no filtering skew between the two.
+        let pv = textureLoad(sh_valid, ipc, 0).x;
+        let wn  = max(dot(normalize(dir + n_bias * 1e-3), n_bias), 0.0) * pv;
         // The epsilon MUST ride the trilinear weight. As `tw * wn + 1e-4` it was a CONSTANT floor
         // that survived tw -> 0, so a probe contributed 1e-4 of its radiance even when its
         // trilinear weight was zero. Crossing a probe-cell boundary swaps which 8 probes are in
