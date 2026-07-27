@@ -36,6 +36,8 @@ struct ShadowCascadeUniform {
     dir_texel: vec4<f32>,
     // x = grass casts shadows (1/0, B2). Grass cross-quads are the dominant shadow-pass fragment
     // cost (alpha-tested albedo sample x 2 cascades) for micro-shadows invisible at map scale.
+    // y = albedo_tex bindless array length, for the descriptor-index clamp in fragment(). WGSL has
+    //     no arrayLength() for a binding_array, so the count is uploaded. zw pad.
     params: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> cascade: ShadowCascadeUniform;
@@ -55,15 +57,20 @@ struct MaterialGpu {
     normal_flags: u32,
     normal_scale: f32,
     _pad2: u32,
-    // Stride padding ONLY: the bound table is the 176-byte gpu_draw.wgsl/Rust record (#6 detail
-    // maps + emissive). This shader reads none of those fields, but the array STRIDE must match
-    // or every material index > 0 reads garbage (cutout casters alpha-test the wrong texture).
+    // Stride padding ONLY: the bound table is the 192-byte gpu_draw.wgsl/Rust record (#6 detail
+    // maps + emissive + parallax). This shader reads none of those fields, but the array STRIDE
+    // must match or every material index > 0 reads garbage (cutout casters alpha-test the wrong
+    // texture — and the misdecoded `albedo_index` lane becomes an out-of-range bindless
+    // descriptor index, which FAULTS AMD hardware: two field device-losses, RX 7800 XT and
+    // RX 6800, both traced here. Keep in lockstep with the Rust `GpuMaterial` (192 B, asserted
+    // at gpu_driven.rs) and gpu_draw.wgsl — shader_material_stride.rs pins all three.
     _detail_idx: vec4<u32>,     // @80  detail indices + flags + pad
     _detail_auv: vec4<f32>,     // @96
     _detail_nuv: vec4<f32>,     // @112
     _detail_par: vec4<f32>,     // @128
     _detail_mg: vec4<f32>,      // @144
-    _emissive: vec4<u32>,       // @160 emissive_index + rgb (stride only) -> 176 B total
+    _emissive: vec4<u32>,       // @160 emissive_index + rgb (stride only)
+    _parallax: vec4<u32>,       // @176 parallax_index + scale + 2 pad (stride only) -> 192 B total
 };
 @group(2) @binding(0) var<storage, read> materials: array<MaterialGpu>;
 @group(2) @binding(1) var albedo_tex: binding_array<texture_2d<f32>>;
@@ -136,8 +143,16 @@ fn fragment(o: ShadowVOut) {
 
     // CUTOUT surfaces (grass/foliage): alpha-test the caster so gaps between blades don't write
     // depth (otherwise 109k grass cross-quads project solid rectangular cards).
-    if ((m.flags & MAT_FLAG_CUTOUT) != 0u) {
-        let idx = select(0u, m.albedo_index, m.albedo_index != MAT_ALBEDO_NONE);
+    // n_tex == 0 only if the material bind group carries an empty albedo array (no textures in the
+    // pack) — then there is no descriptor to sample and the caster stays fully opaque.
+    let n_tex = u32(max(cascade.params.y, 0.0));
+    if ((m.flags & MAT_FLAG_CUTOUT) != 0u && m.albedo_index != MAT_ALBEDO_NONE && n_tex > 0u) {
+        // CLAMP the bindless descriptor index. An out-of-range index into a binding_array is
+        // undefined behaviour that AMD hardware answers with a DEVICE FAULT (NVIDIA quietly
+        // returns zeros), so an index defect anywhere upstream must degrade to a wrong texel,
+        // never to a lost device. This is the amplifier that turned the 176-vs-192 stride bug
+        // above into "Parent device is lost" on two different Radeons.
+        let idx = min(m.albedo_index, n_tex - 1u);
         let a = textureSampleGrad(albedo_tex[idx], albedo_samp, o.uv, duv_dx, duv_dy).a * m.tint.a;
         if (a < m.alpha_cutoff) {
             discard;
