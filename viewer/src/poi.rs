@@ -2907,10 +2907,11 @@ fn apply_quest_visibility(
 /// Lazily-built, per-map cache of patrol connectors CONTOURED to the walkable world. Each leg
 /// between consecutive PatrolPoints is routed through the nav grid (multi-floor: mall storeys,
 /// stairs, around walls); a leg with no route — or one whose route detours absurdly (nav is
-/// WORK IN PROGRESS, see README) — falls back to the straight line height-snapped every ~2 m
-/// onto the nearest floor layer (`NavGrid::floor_near`). Built on the first patrol draw once
-/// the nav grid is up (straight lines until then; `with_nav` triggers a one-time rebuild when
-/// it arrives). Verts carry their route-fraction t so the bright→faint order fade survives.
+/// WORK IN PROGRESS, see README) — falls back to a straight chord between the two real
+/// PatrolPoints, flagged `unrouted` and drawn DASHED so it never poses as a walked route.
+/// Built on the first patrol draw once the nav grid is up (straight lines until then;
+/// `with_nav` triggers a one-time rebuild when it arrives). Verts carry their route-fraction t
+/// so the bright→faint order fade survives.
 #[derive(Default)]
 struct PatrolContours {
     epoch: u64,
@@ -2921,16 +2922,17 @@ struct PatrolContours {
     /// sized, so one long way dominates). Doing that inside the draw system froze the app the
     /// instant "Patrol areas" was ticked. It now runs on the async compute pool and the straight
     /// -line contours draw until it lands, so enabling the layer is instant and simply sharpens.
-    task: Option<bevy::tasks::Task<Vec<(Vec<(Vec3, f32, f32)>, f32)>>>,
-    /// Per way: contour verts as (pos, route-fraction t, cumulative arc metres) + total arc.
-    /// t drives the order fade; arc drives the marching arrows + the comet pulse.
-    ways: Vec<(Vec<(Vec3, f32, f32)>, f32)>,
+    task: Option<bevy::tasks::Task<Vec<(Vec<(Vec3, f32, f32, bool)>, f32)>>>,
+    /// Per way: contour verts as (pos, route-fraction t, cumulative arc metres, unrouted) + total
+    /// arc. t drives the order fade; arc drives the marching arrows + the comet pulse; `unrouted`
+    /// marks a segment we could NOT route, drawn dashed and excluded from the animation.
+    ways: Vec<(Vec<(Vec3, f32, f32, bool)>, f32)>,
 }
 
 fn build_patrol_contours(
     ways: &[Vec<Vec3>],
     nav: Option<&crate::nav::NavGrid>,
-) -> Vec<(Vec<(Vec3, f32, f32)>, f32)> {
+) -> Vec<(Vec<(Vec3, f32, f32, bool)>, f32)> {
     // PARALLEL over ways. Each leg runs an A* through the nav grid, and this whole function runs
     // synchronously inside the draw system — i.e. on the frame the user ticks "Patrol areas".
     // Measured on interchange BEFORE this: 24 ways / 231 legs = 9,433 ms of dead main thread, a
@@ -2943,24 +2945,24 @@ fn build_patrol_contours(
     // fallback leg is drawn as a height-snapped STRAIGHT line, which is exactly what produces
     // connectors that cut through floors and walls.
     let (n_legs, n_routed, n_detour) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
-    let out: Vec<(Vec<(Vec3, f32, f32)>, f32)> = ways.par_iter()
+    let out: Vec<(Vec<(Vec3, f32, f32, bool)>, f32)> = ways.par_iter()
         .map_init(
             || nav.map(|g| crate::nav::pooled_scratch(g.nodes())),
             |scratch, way| {
             let n = way.len();
-            let mut out: Vec<(Vec3, f32)> = Vec::new();
-            let finish = |verts: Vec<(Vec3, f32)>| -> (Vec<(Vec3, f32, f32)>, f32) {
+            let mut out: Vec<(Vec3, f32, bool)> = Vec::new();
+            let finish = |verts: Vec<(Vec3, f32, bool)>| -> (Vec<(Vec3, f32, f32, bool)>, f32) {
                 // Stamp cumulative arc metres (animation parameter) over the finished contour.
                 let mut arc = 0.0f32;
                 let mut prev: Option<Vec3> = None;
-                let stamped: Vec<(Vec3, f32, f32)> = verts
+                let stamped: Vec<(Vec3, f32, f32, bool)> = verts
                     .into_iter()
-                    .map(|(p, t)| {
+                    .map(|(p, t, unrouted)| {
                         if let Some(q) = prev {
                             arc += q.distance(p);
                         }
                         prev = Some(p);
-                        (p, t, arc)
+                        (p, t, arc, unrouted)
                     })
                     .collect();
                 (stamped, arc)
@@ -2992,19 +2994,19 @@ fn build_patrol_contours(
                         }
                     }
                 }
-                // Fallback: straight leg, height-contoured onto the nearest floor layer.
+                // Fallback for a leg the router could not solve. It is a straight chord between
+                // the two REAL PatrolPoint transforms, drawn dashed by the caller — an explicit
+                // "we don't know this route", not a claim about where a bot walks.
+                //
+                // It used to be draped onto `floor_near`, i.e. snapped to whatever floor layer sat
+                // nearest in Y at each sample. Over a car park that layer is the roof of whatever
+                // you happen to pass over, so an unroutable leg would climb the top of a fuel
+                // tanker and read as a real patrol route across it. Draping invents geometry the
+                // leg was never shown to have; a straight chord at interpolated height does not.
+                let unrouted = leg.is_none();
                 let leg = leg.unwrap_or_else(|| {
                     let steps = (straight / 2.0).ceil().max(1.0) as usize;
-                    (0..=steps)
-                        .map(|k| {
-                            let p = a.lerp(b, k as f32 / steps as f32);
-                            let y = nav
-                                .and_then(|g| g.floor_near(p.x, p.z, p.y))
-                                .map(|h| h + 0.1)
-                                .unwrap_or(p.y);
-                            Vec3::new(p.x, y, p.z)
-                        })
-                        .collect()
+                    (0..=steps).map(|k| a.lerp(b, k as f32 / steps as f32)).collect()
                 });
                 // Distribute the order-fade t by arc length within the leg; skip the shared
                 // vertex so consecutive legs don't double it.
@@ -3018,7 +3020,7 @@ fn build_patrol_contours(
                     if i > 0 && j == 0 {
                         continue;
                     }
-                    out.push((*p, t0 + (t1 - t0) * (acc / total)));
+                    out.push((*p, t0 + (t1 - t0) * (acc / total), unrouted));
                 }
             }
             finish(out)
@@ -3032,7 +3034,9 @@ fn build_patrol_contours(
             n_detour.load(Ordering::Relaxed),
         );
         info!(
-            "patrol routing: {r}/{l} legs routed through the nav grid; {} fell back to a              STRAIGHT line ({d} rejected as absurd detours, {} had no route at all) — fallback              legs are height-snapped only, so they can cut through floors/walls",
+            "patrol routing: {r}/{l} legs routed through the nav grid; {} drawn as a DASHED chord \
+             ({d} rejected as absurd detours, {} had no route at all) — a dashed leg asserts only \
+             the serialized order, never a walkable route",
             l - r,
             l - r - d
         );
@@ -3206,6 +3210,26 @@ fn draw_gamedata_outlines(
                 for w in cw.windows(2) {
                     let (a, ta, arc0) = (w[0].0 + lift, w[0].1, w[0].2);
                     let (b, arc1) = (w[1].0 + lift, w[1].2);
+                    // A leg the router could not solve is a straight chord between two real
+                    // PatrolPoints, NOT a walkable route. Draw it dashed and dim so it reads as
+                    // "order hint, route unknown", and give it none of the animation that says
+                    // "a bot walks this": no comet, no marching arrows.
+                    if w[0].3 {
+                        const DASH: f32 = 1.4; // metres of ink per 2·DASH of chord
+                        let seg = b - a;
+                        let len = (arc1 - arc0).max(1e-3);
+                        let mut m = (arc0 / (DASH * 2.0)).floor() * (DASH * 2.0);
+                        while m < arc1 {
+                            let (s, e) = (m.max(arc0), (m + DASH).min(arc1));
+                            if e > s {
+                                let f0 = (s - arc0) / len;
+                                let f1 = (e - arc0) / len;
+                                gizmos.line(a + seg * f0, a + seg * f1, hdr(0.7, 0.30 - 0.15 * ta));
+                            }
+                            m += DASH * 2.0;
+                        }
+                        continue;
+                    }
                     // Base line: gentle HDR lift so the path itself has a soft neon presence,
                     // still faded bright->faint by serialized order.
                     gizmos.line(a, b, hdr(1.6, 0.85 - 0.60 * ta));

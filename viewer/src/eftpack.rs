@@ -120,6 +120,89 @@ pub struct Manifest {
     /// tuning). None = inland map, no sea.
     #[serde(rename = "seaLevel", default)]
     pub sea_level: Option<f32>,
+    /// PHYSICS tier: what the player collides with. Absent on packs built before colliders were
+    /// extracted (the nav bake then falls back to render geometry alone, as it always did).
+    #[serde(default)]
+    pub collider: Option<ColliderLayout>,
+    #[serde(rename = "colliderCount", default)]
+    pub collider_count: u32,
+    /// Geometry table for `kind == 3` (MeshCollider) — offsets into collider_meshes.bin, which
+    /// holds POSITIONS ONLY (f32x3) followed by u32 indices. Deliberately separate from meshes.bin:
+    /// this geometry is invisible and must never reach the renderer.
+    #[serde(rename = "colliderMeshes", default)]
+    pub collider_meshes: Vec<ColliderMeshEntry>,
+    /// Unity layer index -> name, straight from TagManager. EFT separates MOVEMENT collision
+    /// (`LowPolyCollider`) from HIT collision (`HighPolyCollider`), so the nav bake selects by NAME
+    /// rather than hardcoding an index that could shift between builds.
+    #[serde(rename = "layerNames", default)]
+    pub layer_names: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColliderLayout {
+    pub stride: u32,
+    pub fields: Vec<Attr>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ColliderMeshEntry {
+    pub id: u32,
+    pub name: String,
+    #[serde(rename = "vtxOffset")]
+    pub vtx_offset: u64,
+    #[serde(rename = "vtxCount")]
+    pub vtx_count: u32,
+    #[serde(rename = "idxOffset")]
+    pub idx_offset: u64,
+    #[serde(rename = "idxCount")]
+    pub idx_count: u32,
+}
+
+/// Collider flag bits — lockstep with `assemble_bevy.py` (COL_TRIGGER/COL_NAVIGNORE/...).
+pub mod col_flags {
+    /// `m_IsTrigger`. A Unity trigger has NO contact response, so it never blocks movement.
+    pub const TRIGGER: u32 = 1 << 0;
+    /// `NavMeshModifier.m_IgnoreFromBuild` — the GAME excludes this from its bot navmesh.
+    pub const NAV_IGNORE: u32 = 1 << 1;
+    /// The GameObject also has a MeshRenderer, i.e. it is already a render instance.
+    pub const VISIBLE: u32 = 1 << 2;
+    /// det3(affine) < 0.
+    pub const MIRROR: u32 = 1 << 3;
+}
+
+/// One physics collider in viewer world space.
+#[derive(Debug, Clone, Copy)]
+pub struct Collider {
+    /// ROW-MAJOR world 3x4, already conjugated — apply to raw shape verts, never TRS-decompose.
+    pub affine: [f32; 12],
+    /// 0 box, 1 sphere, 2 capsule, 3 mesh.
+    pub kind: u32,
+    /// Index into `manifest.collider_meshes` when `kind == 3`, else -1.
+    pub mesh_id: i32,
+    /// Unity `m_Center`, collider-local.
+    pub center: [f32; 3],
+    /// box: `m_Size` xyz | sphere: (radius,0,0) | capsule: (radius,height,direction).
+    pub shape: [f32; 3],
+    /// Unity `m_Layer` (name it via `manifest.layer_names`).
+    pub layer: u32,
+    pub flags: u32,
+}
+
+impl Collider {
+    pub fn affine3a(&self) -> Affine3A {
+        let m = &self.affine;
+        Affine3A::from_mat3_translation(
+            Mat3::from_cols(
+                Vec3::new(m[0], m[4], m[8]),
+                Vec3::new(m[1], m[5], m[9]),
+                Vec3::new(m[2], m[6], m[10]),
+            ),
+            Vec3::new(m[3], m[7], m[11]),
+        )
+    }
+    pub fn is_trigger(&self) -> bool {
+        self.flags & col_flags::TRIGGER != 0
+    }
 }
 
 /// Emitter-declared conventions. Every flag here changes how a shader must treat
@@ -909,6 +992,12 @@ pub struct Pack {
     /// Per-instance "is this the default (finest-present) LOD shell?" mask (distance-LOD). All-true
     /// on a lean pack. CPU consumers query it via `is_default_lod` to avoid double-counting shells.
     pub default_lod_mask: Vec<bool>,
+    /// PHYSICS colliders (empty on a pack that predates them). This is the world the player
+    /// collides with; most of it has no renderer, so it is NOT a subset of `instances`.
+    pub colliders: Vec<Collider>,
+    /// Raw collider_meshes.bin: positions (f32x3) then u32 indices, sliced by
+    /// `manifest.collider_meshes` byte offsets.
+    pub collider_meshes_bin: Vec<u8>,
 }
 
 impl Pack {
@@ -1030,6 +1119,35 @@ impl Pack {
             }
         );
 
+        // PHYSICS tier (optional). A pack without it loads exactly as before — the nav bake then
+        // sees only render geometry, which is the pre-collider behaviour. Any failure here is
+        // logged and degrades to "no colliders" rather than failing the whole map load.
+        let (colliders, collider_meshes_bin) = match manifest.collider.as_ref() {
+            Some(layout) => {
+                let bin = std::fs::read(root.join("colliders.bin")).unwrap_or_default();
+                match parse_colliders(layout, &bin) {
+                    Ok(c) => {
+                        let geom = std::fs::read(root.join("collider_meshes.bin")).unwrap_or_default();
+                        let solid = c.iter().filter(|x| !x.is_trigger()).count();
+                        bevy::log::info!(
+                            "pack: {} physics colliders ({} solid, {} trigger), {} collider meshes ({:.1} MB)",
+                            c.len(),
+                            solid,
+                            c.len() - solid,
+                            manifest.collider_meshes.len(),
+                            geom.len() as f32 / 1e6
+                        );
+                        (c, geom)
+                    }
+                    Err(e) => {
+                        bevy::log::warn!("pack: colliders.bin unusable ({e}); nav will bake from render geometry only");
+                        (Vec::new(), Vec::new())
+                    }
+                }
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+
         let pack = Pack {
             root,
             manifest,
@@ -1042,6 +1160,8 @@ impl Pack {
             exfils,
             doors,
             default_lod_mask,
+            colliders,
+            collider_meshes_bin,
         };
         // Complete checked structural validation BEFORE the pack is exposed (finding 5): a malformed
         // manifest that parsed fine but whose offsets/ranges/ids are out of bounds would otherwise
@@ -1166,6 +1286,32 @@ impl Pack {
 
     /// Unpack a mesh's interleaved bytes into typed attribute vectors for a Bevy
     /// `Mesh`. Reads attribute offsets/formats FROM the manifest vertex layout.
+    /// Positions + u32 indices for a MeshCollider's geometry (collider_meshes.bin holds POSITIONS
+    /// ONLY — no normals/uv/colour, since nav never needs them and it must never render). Returns
+    /// None on an out-of-range entry rather than panicking on the slice.
+    pub fn collider_mesh_geom(&self, id: i32) -> Option<(&[u8], &[u8])> {
+        let m = self.manifest.collider_meshes.get(usize::try_from(id).ok()?)?;
+        let vtx_end = m.vtx_offset as usize + m.vtx_count as usize * 12;
+        let idx_end = m.idx_offset as usize + m.idx_count as usize * 4;
+        let blen = self.collider_meshes_bin.len();
+        if vtx_end > blen || idx_end > blen {
+            return None;
+        }
+        Some((
+            &self.collider_meshes_bin[m.vtx_offset as usize..vtx_end],
+            &self.collider_meshes_bin[m.idx_offset as usize..idx_end],
+        ))
+    }
+
+    /// Unity layer name for a collider (`""` when the pack predates `layerNames`).
+    pub fn layer_name(&self, layer: u32) -> &str {
+        self.manifest
+            .layer_names
+            .get(&layer.to_string())
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
     pub fn mesh_geom(&self, m: &MeshEntry) -> Result<MeshGeom> {
         let vl = &self.manifest.vertex;
         let stride = vl.stride as usize;
@@ -1492,6 +1638,81 @@ fn parse_instances(layout: &InstanceLayout, bin: &[u8]) -> Result<Vec<GpuInstanc
             root_id: read_u32(bin, base + o_root),
             flags: read_u32(bin, base + o_flags),
             _pad: [0; 3],
+        });
+    }
+    Ok(out)
+}
+
+/// Parse colliders.bin by the manifest's declared layout (field offsets resolved by NAME, so the
+/// emitter is free to reorder). Same shape as `parse_instances`, including the bounds validation
+/// that turns a malformed manifest into a load error rather than a panic mid-loop.
+fn parse_colliders(layout: &ColliderLayout, bin: &[u8]) -> Result<Vec<Collider>> {
+    let stride = layout.stride as usize;
+    if stride == 0 {
+        return Err(anyhow!("collider.stride is 0"));
+    }
+    if bin.len() % stride != 0 {
+        return Err(anyhow!(
+            "colliders.bin length {} is not a multiple of stride {}",
+            bin.len(),
+            stride
+        ));
+    }
+    let find = |name: &str| -> Result<&Attr> {
+        layout
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .ok_or_else(|| anyhow!("collider layout missing field '{}'", name))
+    };
+    let f_affine = find("affine")?;
+    if !f_affine.fmt.starts_with("f32x12") {
+        return Err(anyhow!("collider affine field is {}, expected f32x12", f_affine.fmt));
+    }
+    let o_affine = f_affine.offset as usize;
+    let o_kind = find("kind")?.offset as usize;
+    let o_mesh = find("meshId")?.offset as usize;
+    let o_center = find("center")?.offset as usize;
+    let o_shape = find("shape")?.offset as usize;
+    let o_layer = find("layer")?.offset as usize;
+    let o_flags = find("flags")?.offset as usize;
+    for (name, off, sz) in [
+        ("affine", o_affine, 48usize),
+        ("kind", o_kind, 4),
+        ("meshId", o_mesh, 4),
+        ("center", o_center, 12),
+        ("shape", o_shape, 12),
+        ("layer", o_layer, 4),
+        ("flags", o_flags, 4),
+    ] {
+        if off + sz > stride {
+            return Err(anyhow!(
+                "collider field '{}' (offset {} + {} bytes) overruns stride {}",
+                name,
+                off,
+                sz,
+                stride
+            ));
+        }
+    }
+    let count = bin.len() / stride;
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let base = i * stride;
+        let mut affine = [0.0f32; 12];
+        for k in 0..12 {
+            affine[k] = read_f32(bin, base + o_affine + k * 4);
+        }
+        let c = read_vec3(bin, base + o_center);
+        let s = read_vec3(bin, base + o_shape);
+        out.push(Collider {
+            affine,
+            kind: read_u32(bin, base + o_kind),
+            mesh_id: read_i32(bin, base + o_mesh),
+            center: [c.x, c.y, c.z],
+            shape: [s.x, s.y, s.z],
+            layer: read_u32(bin, base + o_layer),
+            flags: read_u32(bin, base + o_flags),
         });
     }
     Ok(out)

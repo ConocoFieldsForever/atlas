@@ -247,7 +247,13 @@ impl NavGrid {
         if up > 0.0 {
             up <= self.step_up || (up <= self.climb && up <= run * self.slope_tan)
         } else {
-            -up <= self.drop_max
+            // DOWN is bounded the same way UP is, not by a free-fall allowance. Every agent type
+            // EFT ships has `ledgeDropHeight = 0` (see nav_agents.json), and in Unity that is the
+            // ONLY setting that creates drop-down off-mesh links — so the game's navmesh has none:
+            // a bot descends only where the surface continues (run·tan(slope)) or over one step.
+            // The old flat `drop_max` let routes fall off any ledge up to 2 m, which is how a route
+            // could leave the ground and traverse the top of a vehicle or container.
+            -up <= self.drop_max.max(run * self.slope_tan)
         }
     }
 
