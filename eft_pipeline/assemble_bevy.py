@@ -112,6 +112,34 @@ FLAG_MIRROR  = 1 << 0   # det3(affine) < 0 -> renderer flips front-face / windin
 FLAG_TERRAIN = 1 << 1   # MicroSplat terrain tile (drive with the terrain splat shader)
 FLAG_BAKED   = 1 << 2   # identity-affine, geometry PRE-BAKED to world (degenerate fallback); no normal-matrix
 
+# ---- PHYSICS COLLIDERS (colliders.bin + collider_meshes.bin) -------------------------------------------------
+# The render pack is built from MeshRenderers, so it only holds geometry you can SEE. The world the
+# player actually collides with is the PHYSICS world, and most of it has no renderer at all
+# (interchange: 131,945 of 141,347 colliders). The nav bake needs THAT world, not the visible one --
+# this is also what Unity does, via NavMeshSurface.m_UseGeometry = PhysicsColliders.
+# Shapes stay in Unity's LOCAL parameterisation; the affine supplies position/rotation/scale, exactly
+# like a render instance (and through the SAME apply_global conjugation -- never a second flip).
+CDT = np.dtype([('affine', '<f4', (12,)), ('kind', '<u4'), ('meshId', '<i4'),
+                ('center', '<f4', (3,)), ('shape', '<f4', (3,)),
+                ('layer', '<u4'), ('flags', '<u4'), ('_pad', '<u4', (2,))])
+assert CDT.itemsize == 96
+COL_KINDS = {'box': 0, 'sphere': 1, 'capsule': 2, 'mesh': 3}
+COLLIDER_FIELDS = [
+    {"name": "affine", "fmt": "f32x12", "offset": 0,  "note": "ROW-MAJOR world 3x4 = apply_global(m)[:12]"},
+    {"name": "kind",   "fmt": "u32",    "offset": 48, "note": "0 box, 1 sphere, 2 capsule, 3 mesh"},
+    {"name": "meshId", "fmt": "i32",    "offset": 52, "note": "index into manifest.colliderMeshes, else -1"},
+    {"name": "center", "fmt": "f32x3",  "offset": 56, "note": "Unity m_Center, collider-local"},
+    {"name": "shape",  "fmt": "f32x3",  "offset": 68,
+     "note": "box: m_Size xyz | sphere: (radius,0,0) | capsule: (radius,height,direction)"},
+    {"name": "layer",  "fmt": "u32",    "offset": 80, "note": "Unity m_Layer; see manifest.layerNames"},
+    {"name": "flags",  "fmt": "u32",    "offset": 84},
+]
+# collider flag bits
+COL_TRIGGER   = 1 << 0  # m_IsTrigger -- NO contact response in Unity, so it never blocks movement
+COL_NAVIGNORE = 1 << 1  # NavMeshModifier.m_IgnoreFromBuild -- excluded from the GAME's bot navmesh
+COL_VISIBLE   = 1 << 2  # the GameObject also has a MeshRenderer (already present as a render instance)
+COL_MIRROR    = 1 << 3  # det3(affine) < 0
+
 ROLES = ('opaque', 'cutout', 'glass', 'decal', 'water')
 
 
@@ -874,6 +902,98 @@ def main():
                   f"(kept as tex/<name>; loader falls back same as for a missing absolute path)")
     json.dump(MF.records, open(os.path.join(OUT, 'materials.json'), 'w'), separators=(',', ':'))
 
+    # ---- physics colliders -> colliders.bin + collider_meshes.bin ---------------------------------------------
+    # Optional: absent colliders.json simply means no physics tier (older datasets still assemble).
+    collider_meta, collider_meshes_meta, layer_names = [], [], {}
+    cpath = os.path.join(DS, 'colliders.json')
+    if os.path.exists(cpath):
+        tC = time.time()
+        cj = json.load(open(cpath, encoding='utf-8'))
+        craw = cj.get('colliders') or []
+        layer_names = cj.get('layers') or {}
+        cvbuf, cibuf = bytearray(), bytearray()      # positions (f32x3) then u32 indices
+        cmesh_id, cverts, cidx = {}, 0, 0
+
+        def collider_mesh(fn):
+            """Intern a collider mesh into collider_meshes.bin. Positions + indices ONLY -- nav never
+            needs normals/uv/colour, and these must never enter meshes.bin or they would render."""
+            nonlocal cverts, cidx
+            mid = cmesh_id.get(fn)
+            if mid is not None:
+                return mid
+            lo = load_obj(DS, fn)
+            if not lo:
+                cmesh_id[fn] = -1
+                return -1
+            V, _VT, F = lo
+            V = np.asarray(V, np.float32).reshape(-1, 3)
+            idx = np.asarray(F, np.int32)[:, :, 0].reshape(-1).astype(np.uint32)
+            if len(V) == 0 or len(idx) < 3:
+                cmesh_id[fn] = -1
+                return -1
+            mid = len(collider_meshes_meta)
+            collider_meshes_meta.append({
+                "id": mid, "name": fn,
+                "vtxOffset": cverts * 12, "vtxCount": int(len(V)),
+                "_idxLocal": cidx * 4, "idxCount": int(len(idx)),
+            })
+            cvbuf.extend(V.tobytes())
+            cibuf.extend(idx.tobytes())
+            cverts += len(V)
+            cidx += len(idx)
+            cmesh_id[fn] = mid
+            return mid
+
+        crecs = []
+        n_nomesh = 0
+        for c in craw:
+            kind = COL_KINDS.get(c.get('t'))
+            if kind is None:
+                continue
+            mid = -1
+            if kind == 3:
+                mid = collider_mesh(c.get('mesh') or '')
+                if mid < 0:
+                    n_nomesh += 1
+                    continue
+            # SAME conjugation as a render instance: the collider world matrix is raw Unity, so it
+            # goes through apply_global exactly once. Never pre-flip collider verts (skill S3).
+            mg = apply_global(c['m'])
+            aff = np.asarray(mg, np.float64).reshape(4, 4)[:3, :].reshape(-1)
+            flags = 0
+            if c.get('trig'):       flags |= COL_TRIGGER
+            if c.get('nav_ignore'): flags |= COL_NAVIGNORE
+            if c.get('vis'):        flags |= COL_VISIBLE
+            if det3(mg) < 0:        flags |= COL_MIRROR
+            if kind == 0:
+                shape = c.get('s') or [1, 1, 1]
+            elif kind == 1:
+                shape = [c.get('r', 0.5), 0.0, 0.0]
+            elif kind == 2:
+                shape = [c.get('r', 0.5), c.get('h', 2.0), float(c.get('d', 1))]
+            else:
+                shape = [0.0, 0.0, 0.0]
+            crecs.append((aff, kind, mid, c.get('c') or [0, 0, 0], shape,
+                          int(c.get('lyr', 0)), flags))
+
+        ca = np.zeros(len(crecs), CDT)
+        for i, (aff, kind, mid, ctr, shp, lyr, fl) in enumerate(crecs):
+            ca['affine'][i] = aff; ca['kind'][i] = kind; ca['meshId'][i] = mid
+            ca['center'][i] = ctr; ca['shape'][i] = shp; ca['layer'][i] = lyr; ca['flags'][i] = fl
+        with open(os.path.join(OUT, 'colliders.bin'), 'wb') as fh:
+            fh.write(ca.tobytes())
+        vlenC = len(cvbuf)
+        for m in collider_meshes_meta:
+            m["idxOffset"] = vlenC + m.pop("_idxLocal")
+        with open(os.path.join(OUT, 'collider_meshes.bin'), 'wb') as fh:
+            fh.write(cvbuf); fh.write(cibuf)
+        collider_meta = crecs
+        solid = sum(1 for c in crecs if not (c[6] & COL_TRIGGER))
+        print(f"[bevy] colliders    = {len(crecs):,} ({solid:,} solid, {len(crecs)-solid:,} trigger), "
+              f"{len(collider_meshes_meta):,} collider meshes, "
+              f"{(len(cvbuf)+len(cibuf))/1e6:.1f} MB geom ({time.time()-tC:.0f}s)"
+              + (f"; {n_nomesh:,} mesh colliders dropped (OBJ missing)" if n_nomesh else ""))
+
     # ---- LOD groups (conjugated centers) for runtime screen-height LOD ---------------------------------------
     lod_groups = []
     for grp in scene.get('lodGroups', []):
@@ -954,6 +1074,18 @@ def main():
         "sidecars": sidecars,
         "note": "web-lossy tail dropped (no 512 downscale / KTX2 / meshopt / quantize / split_glb / TRS split)",
     }
+    if collider_meta:
+        # The PHYSICS tier: what the player collides with, which is mostly invisible and therefore
+        # absent from `meshes`/`instances`. Consumed by the nav bake (see nav_bake.rs); the renderer
+        # ignores it entirely.
+        manifest["collider"] = {"stride": CDT.itemsize, "fields": COLLIDER_FIELDS,
+                                "flagsLegend": {"0x1": "TRIGGER (no contact response - never blocks)",
+                                                "0x2": "NAV_IGNORE (NavMeshModifier.m_IgnoreFromBuild)",
+                                                "0x4": "VISIBLE (GameObject also has a MeshRenderer)",
+                                                "0x8": "MIRROR (det<0)"}}
+        manifest["colliderCount"] = len(collider_meta)
+        manifest["colliderMeshes"] = collider_meshes_meta
+        manifest["layerNames"] = layer_names
     if SELF_CONTAINED:
         # datasetPath above stays ABSOLUTE deliberately (build provenance only): the loader
         # never resolves textures/sidecars through it -- every consumer path is pack-relative.

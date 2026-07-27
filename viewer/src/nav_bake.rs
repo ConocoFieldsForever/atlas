@@ -5,9 +5,24 @@
 //! never produces, so NO pack shipped nav data and routing was dead on every machine. This module
 //! bakes the SAME layered-2.5D nav grid straight from a loaded [`Pack`]'s world triangles on the
 //! CPU (a median-split BVH + vertical down-raycasts, parallelised with rayon), so routing is
-//! produced by default on AMD / NVIDIA / no-GPU alike. It is a faithful port of `bake_nav.py`:
-//! identical constants (RES/K/NY_MIN/HEADROOM/CLIMB/DROP_MAX/VAULT/MISS) and the same
-//! down-cast + up-facing + headroom + door rules, so quality equals the CUDA bake.
+//! produced by default on AMD / NVIDIA / no-GPU alike.
+//!
+//! WALKABILITY IS THE GAME'S, NOT OURS. The rules come from Unity's `NavMeshProjectSettings`
+//! (extracted by `extraction/unity/eft_extract_nav.py` into packs/shared/nav_agents.json) — see
+//! [`NavAgent`]. We bake against `Humanoid`: radius 0.30, height 1.70, slope 48 deg, climb 0.38,
+//! minRegionArea 2 m². The decisive pair is `ledgeDropHeight = 0` and `maxJumpAcrossDistance = 0`,
+//! true of EVERY agent EFT ships: those are the only settings that create drop-down and jump
+//! off-mesh links, so the game's navmesh has none, and a descent is bounded exactly like a climb.
+//!
+//! GEOMETRY IS THE PHYSICS WORLD, NOT THE VISIBLE ONE. `build_tris` bakes render meshes AND the
+//! pack's physics colliders (`add_collider_tris`), because most of what you collide with has no
+//! renderer at all — on interchange, 131,945 of 141,347 colliders. Unity does the same thing via
+//! `NavMeshSurface.m_UseGeometry = PhysicsColliders`. Colliders are selected by LAYER NAME (EFT
+//! splits movement collision `LowPolyCollider` from ballistics collision `HighPolyCollider`), and
+//! triggers are skipped since a Unity trigger has no contact response.
+//!
+//! `EFT_NAV_LEGACY=1` restores the pre-derivation constants and `EFT_NAV_COLLIDERS=0` drops back to
+//! render-only geometry, so any claim about what these changed can be produced as an A/B.
 //!
 //! OUTPUT (matches `crate::nav::NavGrid::load` EXACTLY — see that module's doc):
 //!   nav.json      — { min_x, min_z, res, nx, nz, n_layers(K), miss, climb, drop_max, ... }.
@@ -47,20 +62,120 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::time::Instant;
 
+// ---- agent descriptor: READ FROM THE GAME, never hand-tuned -----------------------------------
+// EFT stores its pathfinding recipe in Unity's `NavMeshProjectSettings` (an ENGINE type, so it is
+// readable despite the encrypted il2cpp metadata). `eft_extract_nav.py` lifts it verbatim into
+// packs/shared/nav_agents.json. We bake against `Humanoid`, the default agent type (agentTypeID 0).
+//
+// The two fields that mattered most were the ones nobody would have guessed: EVERY agent EFT ships
+// has `ledgeDropHeight = 0` and `maxJumpAcrossDistance = 0`. In Unity those are the only settings
+// that generate drop-down and jump-across off-mesh links, so the game's navmesh contains NO drops
+// and NO jumps at all — a bot can only move where the surface is continuous within `agentClimb`.
+// Our router allowed a flat 2.0 m free fall in any direction.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NavAgent {
+    pub(crate) radius: f32,
+    /// Required clearance above a floor (Unity `agentHeight`).
+    pub(crate) height: f32,
+    pub(crate) slope_deg: f32,
+    /// tan(slope_deg) — the per-metre rise of the steepest surface still considered walkable.
+    pub(crate) slope_tan: f32,
+    /// Max step onto a DISCONTINUITY (kerb, stair riser).
+    pub(crate) climb: f32,
+    /// Unity `ledgeDropHeight`: 0 on every EFT agent (no drop-down links exist).
+    pub(crate) ledge_drop: f32,
+    /// Unity `minRegionArea` (m²) — islands smaller than this are discarded by the bake.
+    pub(crate) min_region_area: f32,
+    /// Where the values came from, for the bake log ("game" or "fallback").
+    pub(crate) source: &'static str,
+}
+
+impl NavAgent {
+    /// Fallback used only when packs/shared/nav_agents.json is absent — the previously hand-tuned
+    /// numbers, so a pack without the sidecar bakes exactly as it did before.
+    const FALLBACK: NavAgent = NavAgent {
+        radius: 0.30,
+        height: 1.8,
+        slope_deg: 48.0,
+        slope_tan: 1.110_613,
+        climb: 0.38,
+        ledge_drop: 0.0,
+        min_region_area: 2.0,
+        source: "fallback",
+    };
+
+    /// `EFT_NAV_LEGACY=1` — the exact pre-game-derived rules (60 deg surface recording, 1.8 m
+    /// headroom, and a flat 2 m free-fall via `ledge_drop`). Kept as a measurement knob so any
+    /// claim about what the game-derived rules changed can be produced as an A/B, not asserted.
+    const LEGACY: NavAgent = NavAgent {
+        radius: 0.30,
+        height: 1.8,
+        slope_deg: 60.0,
+        slope_tan: 1.732_051,
+        climb: 0.38,
+        ledge_drop: 2.0,
+        min_region_area: 0.0,
+        source: "legacy",
+    };
+
+    /// Largest legal height CHANGE across one edge of horizontal length `run`, in either direction.
+    /// A continuous surface that passed the slope filter can rise or fall at most `run·tan(slope)`
+    /// over that span; a discontinuity is only crossable up to `climb`. With `ledgeDropHeight = 0`
+    /// there is nothing else — no free fall, in particular none of the old flat 2 m drop.
+    #[inline]
+    pub(crate) fn max_step(&self, run: f32) -> f32 {
+        if self.ledge_drop > 0.0 {
+            // Only the LEGACY A/B profile takes this path: a flat free-fall allowance, independent
+            // of edge length. No agent EFT ships has a non-zero ledgeDropHeight.
+            return self.ledge_drop;
+        }
+        self.climb.max(run * self.slope_tan)
+    }
+}
+
+/// The agent descriptor for this process, loaded once from the shared pack tier.
+pub(crate) fn agent() -> &'static NavAgent {
+    static A: std::sync::OnceLock<NavAgent> = std::sync::OnceLock::new();
+    A.get_or_init(|| {
+        if std::env::var("EFT_NAV_LEGACY").as_deref() == Ok("1") {
+            return NavAgent::LEGACY;
+        }
+        load_agent().unwrap_or(NavAgent::FALLBACK)
+    })
+}
+
+/// `EFT_NAV_COLLIDERS=0` bakes from render geometry only (the pre-collider input), for A/B.
+fn colliders_enabled() -> bool {
+    std::env::var("EFT_NAV_COLLIDERS").as_deref() != Ok("0")
+}
+
+fn load_agent() -> Option<NavAgent> {
+    let txt = std::fs::read_to_string(crate::paths::shared_dir().join("nav_agents.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&txt).ok()?;
+    let list = v.get("agents")?.as_array()?;
+    // Prefer the default `Humanoid` (agentTypeID 0); otherwise take the first entry.
+    let a = list
+        .iter()
+        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some("Humanoid"))
+        .or_else(|| list.first())?;
+    let f = |k: &str, d: f32| a.get(k).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+    let slope_deg = f("agentSlope", 48.0).clamp(10.0, 80.0);
+    Some(NavAgent {
+        radius: f("agentRadius", 0.30),
+        height: f("agentHeight", 1.8),
+        slope_deg,
+        slope_tan: slope_deg.to_radians().tan(),
+        climb: f("agentClimb", 0.38),
+        ledge_drop: f("ledgeDropHeight", 0.0),
+        min_region_area: f("minRegionArea", 2.0),
+        source: "game",
+    })
+}
+
 // ---- constants (match bake_nav.py) ------------------------------------------------------------
-const NY_MIN: f32 = 0.5; // up-facing = slope <= 60deg
-const HEADROOM: f32 = 1.8; // a floor is walkable only with >= this clearance above it
-// DERIVED FROM THE GAME, not hand-picked: EFT ships `NavMeshProjectSettings` whose agent
-// descriptors use climb 0.25-0.38 m and slope 43-48 deg. Ours were 1.2 m / 60 deg -- roughly 3x
-// and 1.3x more permissive than anything the game itself considers walkable, which is why routes
-// scaled ledges no player can step onto. Take the loosest agent BSG ships (0.38 / 48) rather than
-// the tightest, since these are bot descriptors and the human stepOffset was not recovered.
-const CLIMB: f32 = 0.38;
-const DROP_MAX: f32 = 2.0;
 const VAULT: f32 = 1.2;
 const MISS: f32 = -1.0e9;
 const MISS_HALF: f32 = MISS * 0.5;
-const SLOPE_MAX_DEG: i32 = 48;
 const Y_HIGH_FLOOR: f32 = 90.0; // ray origin height floor (bake_nav Y_HIGH); raised for taller maps
 const PAD: f32 = 6.0; // grid padding beyond the geometry (metres)
 /// Below this XZ-projected parallelogram area a triangle is treated as a vertical wall (a vertical
@@ -92,9 +207,9 @@ const PLAYER_HEIGHT_NAV: f32 = 1.8;
 /// Free step-up (m) — matches nav.rs' default `step_up`. The capsule fan starts ABOVE this so
 /// curbs / low risers the router already steps onto are NOT read as walls (the curb-vs-wall band).
 const STEP_UP_NAV: f32 = 0.45;
-/// tan(45°) — nav.rs' default `walk_slope_deg`, so the baker's edge-walkability gate matches the
-/// router's (a bit blocked here is an edge the router would otherwise traverse).
-const SLOPE_TAN_NAV: f32 = 1.0;
+// (The old `SLOPE_TAN_NAV = tan(45°)` stand-in is gone: the baker and the router now BOTH use the
+// game's `agentSlope` — the baker via `agent().slope_tan`, the router via nav.json's
+// `walk_slope_deg`, which this baker emits. There is no second slope number to keep in sync.)
 /// A door-tagged mesh only punches a passable hole (and drops out of the wall set) when its
 /// INSTANCE footprint is door-panel sized (≤ this, in the SMALLER horizontal span). A large
 /// gate/shutter fence keeps blocking — otherwise a `gate`/`shutter` NAME on a wall-wide mesh would
@@ -365,11 +480,352 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
             }
         }
     }
+    // ---- PHYSICS COLLIDERS -------------------------------------------------------------------
+    // The loop above walks RENDER meshes, so it only sees geometry you can look at. The world the
+    // player collides with is the physics world, and on interchange 131,945 of 141,347 colliders
+    // have no renderer at all — invisible walls, kerbs, railings and blockers that every route
+    // baked so far walked straight through. Unity bakes its own navmesh from exactly this
+    // (NavMeshSurface.m_UseGeometry = PhysicsColliders), so this is the game's own input, not an
+    // approximation of it.
+    let n_col = add_collider_tris(pack, &mut tris, &mut walls, &mut min_y, &mut max_y);
+    if n_col > 0 {
+        eprintln!("  nav-bake: +{n_col} triangles from physics colliders");
+    }
+
     if !min_y.is_finite() {
         min_y = 0.0;
         max_y = 0.0;
     }
     (tris, walls, min_y, max_y, door_tris)
+}
+
+/// Unity layers whose SOLID colliders form the world you walk against. Selected by NAME from the
+/// pack's `layerNames` (straight out of TagManager) so no layer index is hardcoded — EFT separates
+/// movement collision (`LowPolyCollider`) from ballistics collision (`HighPolyCollider`), and only
+/// the former plus terrain, doors, the map border and invisible glass should stop a route.
+///
+/// `HighPolyCollider` is deliberately EXCLUDED: it is the fine hit-detection shell that sits on top
+/// of the same objects, so including it would double every surface for no navigational gain.
+const NAV_COLLIDER_LAYERS: [&str; 6] = [
+    "LowPolyCollider",
+    "DoorLowPolyCollider",
+    "Terrain",
+    "LevelBorder",
+    "TransparentCollider",
+    "Default",
+];
+
+/// Tessellate the pack's physics colliders into the nav triangle soup. Returns the triangle count.
+///
+/// Triggers are skipped: a Unity trigger has no contact response, so it cannot block movement.
+/// (Interchange's 5,763 `Swamp_collider` boxes are triggers on the `Triggers` layer — swamp
+/// splash/sound volumes — as are its 26,450 `Foliage` bush volumes.)
+fn add_collider_tris(
+    pack: &Pack,
+    tris: &mut Vec<Tri>,
+    walls: &mut Vec<Tri>,
+    min_y: &mut f32,
+    max_y: &mut f32,
+) -> usize {
+    if pack.colliders.is_empty() || !colliders_enabled() {
+        return 0;
+    }
+    let before = tris.len();
+    let mut skipped_layer = 0usize;
+    let mut skipped_trigger = 0usize;
+    // Scratch reused across colliders so a 43k-collider map doesn't churn the allocator.
+    let mut verts: Vec<Vec3> = Vec::with_capacity(64);
+    let mut idx: Vec<[u32; 3]> = Vec::with_capacity(64);
+
+    for c in &pack.colliders {
+        if c.is_trigger() {
+            skipped_trigger += 1;
+            continue;
+        }
+        if !NAV_COLLIDER_LAYERS.contains(&pack.layer_name(c.layer)) {
+            skipped_layer += 1;
+            continue;
+        }
+        verts.clear();
+        idx.clear();
+        match c.kind {
+            0 => shape_box(Vec3::from(c.center), Vec3::from(c.shape), &mut verts, &mut idx),
+            1 => shape_sphere(Vec3::from(c.center), c.shape[0], &mut verts, &mut idx),
+            2 => shape_capsule(
+                Vec3::from(c.center),
+                c.shape[0],
+                c.shape[1],
+                c.shape[2] as u32,
+                &mut verts,
+                &mut idx,
+            ),
+            3 => {
+                let Some((vb, ib)) = pack.collider_mesh_geom(c.mesh_id) else {
+                    continue;
+                };
+                verts.reserve(vb.len() / 12);
+                for i in 0..vb.len() / 12 {
+                    verts.push(crate::eftpack::read_vec3(vb, i * 12));
+                }
+                idx.reserve(ib.len() / 12);
+                for t in 0..ib.len() / 12 {
+                    let b = t * 12;
+                    idx.push([
+                        crate::eftpack::read_u32(ib, b),
+                        crate::eftpack::read_u32(ib, b + 4),
+                        crate::eftpack::read_u32(ib, b + 8),
+                    ]);
+                }
+            }
+            _ => continue,
+        }
+        let aff = c.affine3a();
+        let mirror = c.flags & crate::eftpack::col_flags::MIRROR != 0;
+        // A door's collision panel must stay PASSABLE, exactly as the render path treats a
+        // door-named mesh: transparent to the column cast and kept out of the wall set, with the
+        // cell stamped as a door so the router may force an edge through it. EFT gives doors their
+        // own layer, so this needs no name matching at all. Without it every mall door became a
+        // solid wall and interior reachability fell off a cliff.
+        let is_door = pack.layer_name(c.layer) == "DoorLowPolyCollider";
+        for t in &idx {
+            let (i0, i1, i2) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            if i0 >= verts.len() || i1 >= verts.len() || i2 >= verts.len() {
+                continue;
+            }
+            let a = aff.transform_point3(verts[i0]);
+            let b = aff.transform_point3(verts[i1]);
+            let cc = aff.transform_point3(verts[i2]);
+            let (e1, e2) = (b - a, cc - a);
+            let n = e1.cross(e2);
+            let nlen = n.length();
+            if nlen < 1.0e-12 {
+                continue;
+            }
+            let mut ny = n.y / nlen;
+            if mirror {
+                ny = -ny;
+            }
+            // Same wall/floor split as the render path: near-vertical faces become blocking walls,
+            // horizontal-ish ones become floor candidates for the column raycast.
+            let span_y = a.y.max(b.y).max(cc.y) - a.y.min(b.y).min(cc.y);
+            if !is_door
+                && ny.abs() < WALL_MAX_NY
+                && (0.5 * nlen >= WALL_MIN_AREA || span_y >= WALL_MIN_SPAN_Y)
+            {
+                walls.push(Tri { a, b, c: cc, ny, door: false, mat: 0 });
+            }
+            let xz_area2 = (e1.x * e2.z - e1.z * e2.x).abs();
+            if xz_area2 < MIN_XZ_AREA2 {
+                continue;
+            }
+            *min_y = min_y.min(a.y.min(b.y.min(cc.y)));
+            *max_y = max_y.max(a.y.max(b.y.max(cc.y)));
+            tris.push(Tri { a, b, c: cc, ny, door: is_door, mat: 0 });
+        }
+    }
+    eprintln!(
+        "  nav-bake: colliders {} total -> {} used ({} triggers skipped, {} off-layer)",
+        pack.colliders.len(),
+        pack.colliders.len() - skipped_trigger - skipped_layer,
+        skipped_trigger,
+        skipped_layer
+    );
+    tris.len() - before
+}
+
+/// Recast's `minRegionArea` filter: flood the (cell,layer) graph over the edges the router would
+/// traverse and blank every region whose area is below `agent().min_region_area`. Returns the
+/// number of nodes blanked.
+///
+/// Blanking a node means shifting its layer out of the cell's ascending height list, so the
+/// invariant `nav.bin` relies on (floors ascending, MISS slots trailing) is preserved.
+fn prune_small_regions(
+    heights: &mut [f32],
+    door: &[u8],
+    blk: &[u8],
+    nx: usize,
+    nz: usize,
+    k: usize,
+    res: f32,
+) -> usize {
+    let a = agent();
+    let min_cells = (a.min_region_area / (res * res)).ceil().max(1.0) as usize;
+    if min_cells <= 1 {
+        return 0; // nothing can be smaller than one node
+    }
+    let cells = nx * nz;
+    let nodes = cells * k;
+    let mut seen = vec![false; nodes];
+    let mut kill = vec![false; nodes];
+    let mut stack: Vec<u32> = Vec::new();
+    let mut region: Vec<u32> = Vec::new();
+
+    // Same neighbour test the router uses: nearest layer by height, walkable step, edge not
+    // wall-blocked. Doors force-pass exactly as `walkable_step(forced=true)` does.
+    let step_ok = |c: usize, l: usize, nc: usize, d: usize| -> Option<usize> {
+        if (blk[c * k + l] >> d) & 1 != 0 {
+            return None;
+        }
+        let h = heights[c * k + l];
+        let nl = best_layer_bake(heights, nc, k, h);
+        if nl < 0 {
+            return None;
+        }
+        let nh = heights[nc * k + nl as usize];
+        let (dx, dz) = (NB_BAKE[d].0 as f32, NB_BAKE[d].1 as f32);
+        let run = (dx * dx + dz * dz).sqrt() * res;
+        let forced = door[c] != 0 || door[nc] != 0;
+        let up = nh - h;
+        let ok = if forced { up >= 0.0 || -up <= a.max_step(run) } else { walkable_step_bake(up, run) };
+        ok.then_some(nl as usize)
+    };
+
+    let mut pruned = 0usize;
+    for c0 in 0..cells {
+        for l0 in 0..k {
+            let n0 = c0 * k + l0;
+            if seen[n0] || heights[n0] <= MISS_HALF {
+                continue;
+            }
+            region.clear();
+            stack.clear();
+            stack.push(n0 as u32);
+            seen[n0] = true;
+            while let Some(n) = stack.pop() {
+                region.push(n);
+                let (c, l) = (n as usize / k, n as usize % k);
+                let (ix, iz) = ((c % nx) as i64, (c / nx) as i64);
+                for (d, (dx, dz)) in NB_BAKE.iter().enumerate() {
+                    let (jx, jz) = (ix + *dx as i64, iz + *dz as i64);
+                    if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
+                        continue;
+                    }
+                    let nc = jz as usize * nx + jx as usize;
+                    if let Some(nl) = step_ok(c, l, nc, d) {
+                        let nn = nc * k + nl;
+                        if !seen[nn] {
+                            seen[nn] = true;
+                            stack.push(nn as u32);
+                        }
+                    }
+                }
+            }
+            // Area is counted in distinct CELLS (a two-storey stairwell is not "twice the area").
+            let mut distinct: std::collections::HashSet<usize> =
+                std::collections::HashSet::with_capacity(region.len());
+            for &n in &region {
+                distinct.insert(n as usize / k);
+            }
+            if distinct.len() < min_cells {
+                for &n in &region {
+                    kill[n as usize] = true;
+                    pruned += 1;
+                }
+            }
+        }
+    }
+    if pruned > 0 {
+        // Re-compact each touched cell so surviving floors stay ascending with MISS trailing.
+        let mut keep: Vec<f32> = Vec::with_capacity(k);
+        for c in 0..cells {
+            if !(0..k).any(|l| kill[c * k + l]) {
+                continue;
+            }
+            keep.clear();
+            for l in 0..k {
+                let h = heights[c * k + l];
+                if h > MISS_HALF && !kill[c * k + l] {
+                    keep.push(h);
+                }
+            }
+            for l in 0..k {
+                heights[c * k + l] = keep.get(l).copied().unwrap_or(MISS);
+            }
+        }
+    }
+    pruned
+}
+
+/// Unity BoxCollider (`m_Center` + full `m_Size`) -> 12 triangles.
+fn shape_box(center: Vec3, size: Vec3, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]>) {
+    let h = size * 0.5;
+    for &sz in &[-1.0f32, 1.0] {
+        for &sy in &[-1.0f32, 1.0] {
+            for &sx in &[-1.0f32, 1.0] {
+                v.push(center + Vec3::new(h.x * sx, h.y * sy, h.z * sz));
+            }
+        }
+    }
+    // corner index = (z<<2)|(y<<1)|x
+    const F: [[u32; 3]; 12] = [
+        [0, 2, 1], [1, 2, 3], // -z
+        [4, 5, 6], [5, 7, 6], // +z
+        [0, 1, 4], [1, 5, 4], // -y
+        [2, 6, 3], [3, 6, 7], // +y
+        [0, 4, 2], [2, 4, 6], // -x
+        [1, 3, 5], [3, 7, 5], // +x
+    ];
+    idx.extend_from_slice(&F);
+}
+
+/// Latitude/longitude sphere. Coarse on purpose: a collider sphere only has to be right to well
+/// under the nav cell size, and nav grids are baked at ~1 m.
+fn shape_sphere(center: Vec3, r: f32, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]>) {
+    const RINGS: u32 = 6; // latitude bands
+    const SEGS: u32 = 10; // longitude segments
+    for i in 0..=RINGS {
+        let phi = std::f32::consts::PI * i as f32 / RINGS as f32;
+        let (sp, cp) = phi.sin_cos();
+        for j in 0..SEGS {
+            let th = std::f32::consts::TAU * j as f32 / SEGS as f32;
+            let (st, ct) = th.sin_cos();
+            v.push(center + Vec3::new(r * sp * ct, r * cp, r * sp * st));
+        }
+    }
+    for i in 0..RINGS {
+        for j in 0..SEGS {
+            let a = i * SEGS + j;
+            let b = i * SEGS + (j + 1) % SEGS;
+            let c = (i + 1) * SEGS + j;
+            let d = (i + 1) * SEGS + (j + 1) % SEGS;
+            idx.push([a, c, b]);
+            idx.push([b, c, d]);
+        }
+    }
+}
+
+/// Unity CapsuleCollider: a cylinder of `height` (total, including the two hemisphere caps) with
+/// radius `r`, aligned to `dir` (0=X, 1=Y, 2=Z). Approximated by a capped cylinder — exact enough
+/// at nav resolution, and the caps matter only for headroom.
+fn shape_capsule(center: Vec3, r: f32, height: f32, dir: u32, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]>) {
+    const SEGS: u32 = 10;
+    let half = (height * 0.5 - r).max(0.0); // cylindrical half-length between the cap centres
+    let axis = match dir {
+        0 => Vec3::X,
+        2 => Vec3::Z,
+        _ => Vec3::Y,
+    };
+    // Two orthogonal radial axes.
+    let u = if axis.x.abs() < 0.9 { Vec3::X.cross(axis) } else { Vec3::Y.cross(axis) }.normalize();
+    let w = axis.cross(u);
+    // Rings at -half-r (pole), -half, +half, +half+r (pole): a cylinder plus flat-ish caps.
+    for &(off, rad) in &[(-(half + r), 0.0f32), (-half, r), (half, r), (half + r, 0.0)] {
+        for j in 0..SEGS {
+            let th = std::f32::consts::TAU * j as f32 / SEGS as f32;
+            let (st, ct) = th.sin_cos();
+            v.push(center + axis * off + (u * ct + w * st) * rad);
+        }
+    }
+    for i in 0..3u32 {
+        for j in 0..SEGS {
+            let a = i * SEGS + j;
+            let b = i * SEGS + (j + 1) % SEGS;
+            let c = (i + 1) * SEGS + j;
+            let d = (i + 1) * SEGS + (j + 1) % SEGS;
+            idx.push([a, c, b]);
+            idx.push([b, c, d]);
+        }
+    }
 }
 
 // ---- BVH (median-split over XZ, for vertical-ray queries) -------------------------------------
@@ -759,10 +1215,16 @@ fn best_layer_bake(h: &[f32], c: usize, k: usize, ref_y: f32) -> i32 {
 /// so a bit is only set on an edge the router would otherwise traverse.
 #[inline]
 fn walkable_step_bake(up: f32, run: f32) -> bool {
+    let a = agent();
     if up > 0.0 {
-        up <= STEP_UP_NAV || (up <= CLIMB && up <= run * SLOPE_TAN_NAV)
+        // slope_tan is the GAME's agentSlope now, so the baker's gate and the router's agree
+        // (nav.json ships walk_slope_deg = agentSlope; both sides read the same number).
+        up <= STEP_UP_NAV || (up <= a.climb && up <= run * a.slope_tan)
     } else {
-        -up <= DROP_MAX
+        // DOWN is now symmetric with UP instead of a flat 2 m free fall. Every EFT agent ships
+        // ledgeDropHeight = 0, so the game's navmesh has no drop-down links whatsoever: you may
+        // only descend where the surface continues (run·tan(slope)) or over one climb-height step.
+        -up <= a.max_step(run)
     }
 }
 
@@ -905,14 +1367,20 @@ fn count_door_crossings(poly: &[Vec3], baked: &Baked) -> usize {
 /// Run the down-cast state machine on one column's hits (mutating `hits` — it is sorted here) and
 /// write ascending floor heights into `hout` (length K, pre-filled MISS). Returns (n_floors,
 /// is_door). Faithful port of the `nav_cast` kernel: up-facing surfaces are floors iff there is
-/// >= HEADROOM clearance under the last ceiling/floor above; a floor also caps clearance for the
-/// floor below it; DOOR faces are transparent (never a surface) but stamp the cell.
+/// >= `agentHeight` clearance under the last ceiling/floor above; a floor also caps clearance for
+/// the floor below it; DOOR faces are transparent (never a surface) but stamp the cell.
+///
+/// The up-facing threshold is `cos(agentSlope)`, i.e. Recast's `rcMarkWalkableTriangles`: a surface
+/// steeper than the agent's slope limit is not a floor at all. It used to be a flat 60°, which
+/// recorded 48-60° rubble/embankments as walkable ground the game would never navigate.
 fn resolve_column(hits: &mut Vec<Hit>, k: usize, hout: &mut [f32], floors: &mut Vec<f32>) -> (usize, bool) {
     floors.clear();
     let mut door_cell = false;
     if hits.is_empty() {
         return (0, false);
     }
+    let a = agent();
+    let ny_min = a.slope_deg.to_radians().cos();
     hits.sort_unstable_by(|p, q| q.y.total_cmp(&p.y)); // top -> bottom
     let mut last_down = f32::INFINITY;
     for h in hits.iter() {
@@ -920,16 +1388,16 @@ fn resolve_column(hits: &mut Vec<Hit>, k: usize, hout: &mut [f32], floors: &mut 
             door_cell = true;
             continue; // transparent to the cast
         }
-        if h.ny >= NY_MIN {
+        if h.ny >= ny_min {
             // up-facing floor
-            if last_down - h.y >= HEADROOM {
+            if last_down - h.y >= a.height {
                 floors.push(h.y);
             }
             last_down = h.y; // a floor also caps clearance for anything below it
             if floors.len() >= k {
                 break;
             }
-        } else if h.ny <= -NY_MIN {
+        } else if h.ny <= -ny_min {
             last_down = h.y; // down-facing ceiling / underside
         }
         // near-vertical wall: ignored (also pre-filtered from the BVH)
@@ -985,8 +1453,10 @@ impl Baked {
         std::fs::write(dir.join("nav_wallcell.bin"), &self.wall_cell)
             .with_context(|| format!("writing {}", dir.join("nav_wallcell.bin").display()))?;
         // Match bake_nav.py's key set exactly (the router reads min_x/min_z/res/nx/nz/n_layers/miss/
-        // climb/drop_max; the rest are informational). step_up/walk_slope_deg are intentionally
-        // omitted so the router falls back to the SAME defaults it used for CUDA-baked packs.
+        // climb/drop_max; the rest are informational). `walk_slope_deg` is now EMITTED (it is the
+        // game's agentSlope, no longer a guess the router had to default); `step_up` stays omitted
+        // so the router keeps its own default.
+        let a = agent();
         let meta = serde_json::json!({
             "map": self.dataset,
             "min_x": self.min_x,
@@ -997,10 +1467,19 @@ impl Baked {
             "n_layers": self.k,
             "y_high": self.y_high,
             "miss": MISS,
-            "climb": CLIMB,
-            "drop_max": DROP_MAX,
+            "climb": a.climb,
+            // ledgeDropHeight = 0 on every EFT agent, so a descent is bounded by the same
+            // continuous-surface rule as an ascent, NOT by a free-fall allowance. The router
+            // applies `max(drop_max, run * tan(walk_slope_deg))` per edge.
+            "drop_max": a.climb,
+            "ledge_drop_height": a.ledge_drop,
             "vault": VAULT,
-            "slope_max_deg": SLOPE_MAX_DEG,
+            "slope_max_deg": a.slope_deg,
+            "walk_slope_deg": a.slope_deg,
+            "agent_radius": a.radius,
+            "agent_height": a.height,
+            "min_region_area": a.min_region_area,
+            "agent_source": a.source,
             "baker": "atlas-cpu-bvh",
             "index": "iz*nx+ix",
             "layout": "nav.bin: (iz*nx+ix)*K + layer -> f32 height (asc, MISS empty); nav_door.bin: u8 per cell",
@@ -1258,6 +1737,26 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
         100.0 * wall_cells as f32 / cells as f32,
         t_blk.elapsed().as_secs_f32()
     );
+
+    // ---- Recast `minRegionArea`: discard islands too small to stand on ------------------------
+    // Unity's build settings ship minRegionArea = 2.0 m² for every EFT agent. Recast drops any
+    // connected walkable region below it, which is what stops one-cell specks -- the top of a
+    // bollard, a lamp housing, a pipe flange -- being navmesh. They matter here because a route
+    // snapped onto a speck is a route that can never leave it.
+    //
+    // Run AFTER the capsule pass so connectivity is measured over the edges the ROUTER will
+    // actually traverse (blocked edges included), not over raw floor adjacency.
+    let n_pruned = prune_small_regions(&mut heights, &door, &blk, nx, nz, k, res);
+    if n_pruned > 0 {
+        let a = agent();
+        eprintln!(
+            "  nav-bake: minRegionArea {:.1} m² ({} cell(s) @ {}m): pruned {} node(s) in undersized islands",
+            a.min_region_area,
+            (a.min_region_area / (res * res)).ceil().max(1.0) as usize,
+            res,
+            n_pruned
+        );
+    }
 
     Ok(Baked {
         dataset: pack.manifest.dataset.clone(),
