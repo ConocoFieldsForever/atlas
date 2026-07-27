@@ -301,10 +301,10 @@ pub fn navigate_tab(
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("min value").size(theme::SIZE_SMALL).color(theme::MUTED));
                         egui::ComboBox::from_id_salt("plan_minv")
-                            .selected_text(format!("{}k \u{20BD}", ui_state.plan_min_value / 1000))
+                            .selected_text(format!("{}k RUB", ui_state.plan_min_value / 1000))
                             .show_ui(ui, |ui| {
                                 for v in [50_000i64, 100_000, 150_000, 200_000, 300_000] {
-                                    ui.selectable_value(&mut ui_state.plan_min_value, v, format!("{}k \u{20BD}", v / 1000));
+                                    ui.selectable_value(&mut ui_state.plan_min_value, v, format!("{}k RUB", v / 1000));
                                 }
                             });
                     });
@@ -343,7 +343,7 @@ pub fn navigate_tab(
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!(
-                                        "\u{2248}{}k \u{20BD}  \u{00B7}  {:.1} min / {:.0} m  \u{00B7}  exits {}",
+                                        "\u{2248}{}k RUB  \u{00B7}  {:.1} min / {:.0} m  \u{00B7}  exits {}",
                                         plan.total_value / 1000,
                                         plan.total_time / 60.0,
                                         plan.total_dist,

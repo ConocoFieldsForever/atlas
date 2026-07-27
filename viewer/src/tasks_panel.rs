@@ -21,8 +21,11 @@
 //!     (`CameraCommand::fly_to`) and a "route" button (`pathfind::RouteRequest`).
 //!
 //! egui 0.32 / bevy_egui 0.37; drawn in `EguiPrimaryContextPass` (the router's schedule). Labels are
-//! ASCII plus the whitelisted glyphs only: `\u{00D7}` (x) `\u{2192}` (->) `\u{00B7}` (.) `\u{25CF}`
-//! (dot) `\u{2026}` (...) `\u{2264}` (<=).
+//! ASCII plus glyphs PRESENT IN THE PROPORTIONAL FONTS (Ubuntu-Light + the two emoji fonts —
+//! verified against their cmaps, field tofu report 2026-07-27): `\u{00D7}` (x) `\u{203a}` (>)
+//! `\u{00B7}` (.) `\u{2026}` (...) `\u{2264}` (<=). NOT safe in proportional text: `\u{2192}`,
+//! `\u{25CF}`, `\u{2715}`, `\u{20BD}`, `\u{24D8}` (Hack-only or nowhere — they render as the
+//! missing-glyph box). Dots are painted via `ui_theme::swatch`, never the `\u{25CF}` glyph.
 //!
 //! Clone-edit-compare discipline (mirrors `ui::layers_panel`): editing a `ResMut` through an egui
 //! widget marks the resource CHANGED every frame it renders, which would make the poi visibility
@@ -745,7 +748,7 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
         });
     });
     ui.horizontal(|ui| {
-        ui.label(RichText::new("\u{25CF}").color(TRACKED).size(11.0));
+        crate::ui_theme::swatch(ui, TRACKED);
         ui.checkbox(&mut quests_on, RichText::new("show markers on map").size(12.0))
             .on_hover_text("the Quest overlay layer (tracked tasks focus it to themselves)");
     });

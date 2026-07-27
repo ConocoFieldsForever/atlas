@@ -1948,7 +1948,7 @@ pub fn menu_ui(
                 }
             });
             // "Screenshot to locate current position" (default ON): poll the EFT screenshot folder
-            // and put the camera on each new fix. The ⓘ carries the one thing users trip over —
+            // and put the camera on each new fix. The \u{2139} info marker carries the one thing users trip over —
             // the in-game screenshot key being swallowed by the Windows Snipping Tool.
             ui.horizontal(|ui| {
                 let mut loc = state.screenshot_locate;
@@ -1965,7 +1965,7 @@ pub fn menu_ui(
                     state.config_err = (!save_config_screenshot_locate(loc))
                         .then(|| "settings could not be saved (read-only folder?)".to_string());
                 }
-                ui.label(RichText::new("\u{24d8}").color(DIM).size(12.0))
+                ui.label(RichText::new("\u{2139}").color(DIM).size(12.0))
                     .on_hover_text(t(lg, K::ScreenshotLocateTip));
             });
             // Sub-option: house-keeping for the screenshots the locator consumes. Indented under
@@ -2007,7 +2007,7 @@ pub fn menu_ui(
                     state.config_err = (!state.overlay.save())
                         .then(|| "settings could not be saved (read-only folder?)".to_string());
                 }
-                ui.label(RichText::new("\u{24d8}").color(DIM).size(12.0))
+                ui.label(RichText::new("\u{2139}").color(DIM).size(12.0))
                     .on_hover_text(t(lg, K::OverlayEnableTip));
             });
             // Build dependencies: the pipeline needs UnityPy/numpy/Pillow. INSTALL DEPS sets them up
