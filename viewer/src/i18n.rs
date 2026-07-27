@@ -382,7 +382,7 @@ Atlas читает только файлы, которые игра уже за�
             "Atlas follows your raid from the game's own logs and turns each in-raid screenshot into a position fix. It only reads files the game already wrote.",
             "Atlas следит за рейдом по логам самой игры и превращает каждый скриншот в рейде в отметку позиции. Он читает только файлы, которые игра уже записала.",
         ],
-        BackToTarkov => ["\u{2936}  BACK TO TARKOV", "\u{2936}  ВЕРНУТЬСЯ В ТАРКОВ"],
+        BackToTarkov => ["\u{21a9}  BACK TO TARKOV", "\u{21a9}  ВЕРНУТЬСЯ В ТАРКОВ"],
         OverlayReopenHint => [
             "Take an in-game screenshot to reopen the overlay",
             "Чтобы снова открыть оверлей, сделайте скриншот в игре",

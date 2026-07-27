@@ -23,7 +23,10 @@
 //! anchors above. NO game asset ships in the exe — all icons here are painter-drawn (procedural).
 //!
 //! egui 0.32 via bevy_egui 0.37. Everything is square-cornered (EFT UI is all hard corners).
-//! ASCII + the whitelisted glyphs only (x -> `\u{00D7}`, dot `\u{25CF}`, etc).
+//! ASCII + glyphs the PROPORTIONAL fonts actually contain (x `\u{00D7}`, `\u{203a}`, `\u{00B7}`,
+//! `\u{2026}`, `\u{2139}`, `\u{21a9}`, `\u{26A0}`). `\u{25CF}`/`\u{2192}`/`\u{20BD}`/`\u{24D8}`
+//! are NOT in Ubuntu-Light/NotoEmoji/emoji-icon-font and tofu in proportional text (2026-07-27
+//! field report) — dots are painted (see `swatch`), arrows use `\u{203a}`, rubles are "RUB".
 
 // A design-system module deliberately exposes a COMPLETE, coherent token vocabulary (the full type
 // and spacing scale, every state color, the widget helpers) so panels reach for the right token
@@ -332,9 +335,16 @@ pub fn count_tag(ui: &mut egui::Ui, n: usize) {
     });
 }
 
-/// A filled swatch dot (`\u{25CF}`) in `color` at [`SIZE_LABEL`] — the on-map legend key in-panel.
+/// A filled swatch dot in `color` at [`SIZE_LABEL`] — the on-map legend key in-panel.
+/// PAINTED, not a font glyph: `\u{25CF}` exists only in the monospace font (Hack), so in
+/// proportional labels it rendered as the missing-glyph box — a colored SQUARE that happened to
+/// pass as a swatch (field report: "are these squares failed icons?"). Same class of fix as
+/// navigate_panel's drawn circle.
 pub fn swatch(ui: &mut egui::Ui, color: Color32) -> Response {
-    ui.label(RichText::new("\u{25CF}").color(color).size(SIZE_LABEL))
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(SIZE_LABEL, SIZE_LABEL), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), SIZE_LABEL * 0.3, color);
+    resp
 }
 
 /// A data-completeness tick label (menu): [`OK`] when present, [`FAINT`] when absent.

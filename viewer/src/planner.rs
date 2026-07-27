@@ -508,7 +508,7 @@ fn poll_plan(
                     points: p.polyline,
                     dist: p.total_dist,
                 }];
-                route_result.dest_label = Some(format!("Loot run \u{2192} {}", p.extract));
+                route_result.dest_label = Some(format!("Loot run \u{203a} {}", p.extract));
                 route_result.stop_count = plan.stops.len() + 1;
                 route_result.status = RouteStatus::Ok;
                 route_result.select(0);

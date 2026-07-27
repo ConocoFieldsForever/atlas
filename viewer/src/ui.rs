@@ -1196,7 +1196,7 @@ fn layers_panel(
                                     });
                             });
                             ui.label(
-                                RichText::new("also filters Map Intel \u{2192} Loose loot")
+                                RichText::new("also filters Map Intel \u{203a} Loose loot")
                                     .size(9.0)
                                     .italics()
                                     .color(MUTED),
@@ -1646,6 +1646,7 @@ fn toolbar_panel(
     mut tab: ResMut<RightPanelTab>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut go_menu: ResMut<crate::ReturnToMenu>,
+    mut confirm_menu: Local<bool>,
 ) {
     use bevy_egui::egui;
     use crate::ui_theme as theme;
@@ -1668,8 +1669,10 @@ fn toolbar_panel(
             ui.spacing_mut().item_spacing.y = 4.0;
             // Top house = "Menu": back to the start menu (map manager). Sits above the tab icons,
             // separated — it's an action, not a tab, so it never shows the active-tab highlight.
+            // Arms the confirm card below rather than firing directly: leaving relaunches the
+            // process (killing any background build), too destructive for a single mis-click.
             if theme::rail_button(ui, false, 4, "Menu", "Back to menu (map manager)") {
-                go_menu.0 = true;
+                *confirm_menu = true;
             }
             ui.add_space(3.0);
             ui.separator();
@@ -1695,6 +1698,56 @@ fn toolbar_panel(
                 *tab = RightPanelTab::Insights;
             }
         });
+
+    // Centered confirm card (same idiom as map_load_error_panel, ACCENT stroke since it's a
+    // question, not an error). Only the explicit button fires ReturnToMenu; Cancel just closes.
+    if *confirm_menu {
+        use bevy_egui::egui::RichText;
+        let mut go = false;
+        let mut stay = false;
+        egui::Area::new(egui::Id::new("menu_confirm"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(egui::Stroke::new(1.0, theme::ACCENT))
+                    .inner_margin(egui::Margin::symmetric(20, 16))
+                    .show(ui, |ui| {
+                        ui.set_max_width(380.0);
+                        ui.label(
+                            RichText::new("RETURN TO MENU?")
+                                .size(16.0)
+                                .strong()
+                                .color(theme::TEXT_BRIGHT),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "Closes this map and goes back to the map manager. \
+                                 A map build running in the background is interrupted.",
+                            )
+                            .size(11.0)
+                            .color(theme::MUTED),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.add(theme::primary_button("RETURN TO MENU")).clicked() {
+                                go = true;
+                            }
+                            if ui.button("Cancel").clicked() {
+                                stay = true;
+                            }
+                        });
+                    });
+            });
+        if go {
+            go_menu.0 = true;
+            *confirm_menu = false;
+        } else if stay {
+            *confirm_menu = false;
+        }
+    }
 }
 
 /// Level-controls tab: flip the map's POWER SWITCHES (each toggles the exact light bank it drives,
@@ -1885,9 +1938,9 @@ fn level_panel(
                             let looks_like_id = t.name.len() >= 20
                                 && t.name.chars().all(|c| c.is_ascii_hexdigit());
                             let label = if t.name.is_empty() || looks_like_id {
-                                format!("\u{2192} opens a {what}")
+                                format!("\u{203a} opens a {what}")
                             } else {
-                                format!("\u{2192} {what}  {}", t.name.replace('_', " "))
+                                format!("\u{203a} {what}  {}", t.name.replace('_', " "))
                             };
                             ui.horizontal(|ui| {
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

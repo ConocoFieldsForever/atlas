@@ -1488,7 +1488,7 @@ fn transit_info(tr: &Transit) -> MarkerInfo {
         detail.push(tr.cond.clone());
     }
     MarkerInfo {
-        title: format!("Transit \u{2192} {dest}"),
+        title: format!("Transit \u{203a} {dest}"),
         subtitle: "Transit".into(),
         detail,
         accent: poi_look(PoiLayer::Transit).0,
