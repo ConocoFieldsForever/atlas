@@ -508,8 +508,25 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
         light_group.push(-1);
     }
 
-    let min = Vec3::new(bounds[0], bounds[1], bounds[2]);
-    let max = Vec3::new(bounds[3], bounds[4], bounds[5]);
+    // Grid extents from the LIGHTS' own AABB (± range), NOT the pack mesh bounds. Backdrop/skybox
+    // meshes inflate pack bounds far past where lights live (Terminal: ±4.4 km vs a ~1 km harbor);
+    // with the per-axis 256-cell clamp below, a bounds-sized grid stopped COVERING the playable
+    // area — every light and every shaded pixel clamped into the same edge cells, so each pixel
+    // looped over ~all lights (225 ms/frame). Lights bound their own influence exactly.
+    let (min, max) = if lights.is_empty() {
+        (
+            Vec3::new(bounds[0], bounds[1], bounds[2]),
+            Vec3::new(bounds[3], bounds[4], bounds[5]),
+        )
+    } else {
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for l in lights {
+            lo = lo.min(l.pos - Vec3::splat(l.range));
+            hi = hi.max(l.pos + Vec3::splat(l.range));
+        }
+        (lo, hi)
+    };
 
     let active = rt_enabled && !lights.is_empty();
     if !active {
@@ -528,12 +545,18 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
     }
 
     let extent = (max - min).max(Vec3::splat(1e-3));
-    // Cell size = median light range clamped [4,12] m (small avg lights/cell, cheap fragment loop).
+    // Cell size = median light range clamped [4,12] m (small avg lights/cell, cheap fragment loop),
+    // raised as needed so 256 cells/axis always COVER the extent — a grid that stops short of the
+    // lights silently degenerates to the all-lights-in-edge-cells worst case (see bounds note above).
     let mut cell = {
         let mut ranges: Vec<f32> = lights.iter().map(|l| l.range).collect();
         ranges.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         ranges[ranges.len() / 2].clamp(4.0, 12.0)
     };
+    cell = cell
+        .max(extent.x / 256.0)
+        .max(extent.y / 256.0)
+        .max(extent.z / 256.0);
     let dims_for = |cell: f32| -> [u32; 3] {
         [
             ((extent.x / cell).ceil() as i64).clamp(1, 256) as u32,

@@ -77,12 +77,14 @@ ROSTER = [
     # dropped it from the menu even though its extraction config — extraction/maps/icebreaker/
     # config.json, levels 699-705 — and packs had been building fine before that).
     _M("icebreaker",     "Icebreaker",     "icebreaker"),
+    _M("terminal",       "Terminal",       "terminal"),           # whole scene set is DOUBLED in
+                                                                  # BuildSettings (600-637 + 651-689)
+                                                                  # — derive_levels path-dedupes
     # --- known NON-playable location folders (excluded from the menu ON PURPOSE) ---
     _M("", "Factory",               "", playable=False),   # legacy pre-rework Factory (rework ships)
     _M("", "Arena",                 "", playable=False),   # Arena mode, not a raid map
     _M("", "bunker",                "", playable=False),   # shared sub-scene, not a standalone map
     _M("", "Sandbox_StartLocation", "", playable=False),   # Ground Zero tutorial start, not the raid
-    _M("", "Terminal",              "", playable=False),   # upcoming, not shipped
     _M("", "Venders",               "", playable=False),   # hideout/vendor scenes, not a raid map
 ]
 
@@ -102,6 +104,7 @@ FALLBACK_NAMES = {
     "streets":        ("Streets of Tarkov", "Улицы Таркова"),
     "labyrinth":      ("The Labyrinth",     "Лабиринт"),
     "icebreaker":     ("Icebreaker",        "Ледокол"),
+    "terminal":       ("Terminal",          "Терминал"),
 }
 
 # Legacy hardcoded scalar LIGHT_LEVELS (the pre-manifest tools/build_map.py table), kept HERE only as
@@ -161,10 +164,15 @@ def is_geometry(path):
 
 
 def derive_levels(scenes, folder):
-    """Geometry level indices (== scene index) whose location folder == folder."""
-    out = []
+    """Geometry level indices (== scene index) whose location folder == folder. PATH-DEDUPED:
+    BuildSettings can list the same scene twice (Terminal ships its ENTIRE 35-scene set at
+    600-637 AND again at 651-689) — without the dedupe every derived consumer extracts the map
+    twice (double geometry, z-fighting twins, double lights). First index per unique path wins."""
+    out, seen = [], set()
     for i, s in enumerate(scenes):
-        if folder_of(s) == folder and is_geometry(s):
+        p = s.replace("\\", "/")
+        if folder_of(s) == folder and is_geometry(s) and p not in seen:
+            seen.add(p)
             out.append(i)
     return out
 
@@ -175,12 +183,16 @@ def derive_light_scenes(scenes, folder):
     non-light scenes (e.g. Lighthouse_Main) don't false-match. Folder match is case-insensitive so a
     config's `source.unity_location` case doesn't matter for the build-time fallback."""
     fl = folder.lower()
-    out = []
+    out, seen = [], set()
     for i, s in enumerate(scenes):
         f = folder_of(s)
         if f and f.lower() == fl:
+            p = s.replace("\\", "/")
+            if p in seen:
+                continue  # duplicated BuildSettings row (see derive_levels) — one bake only
             toks = _basename_tokens(s)
             if "light" in toks or "lights" in toks:
+                seen.add(p)
                 out.append((i, toks))
     return out
 
