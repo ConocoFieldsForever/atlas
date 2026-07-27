@@ -183,3 +183,60 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     let vi = min(base + slot, arrayLength(&visible) - 1u);
     visible[vi] = i;
 }
+
+// ---------------------------------------------------------------------------------------------
+// PER-INSTANCE TRANSPARENT ORDERING (cs_sort_blend)
+//
+// `cs_cull` compacts survivors with `slot = atomicAdd(...)`, so the order of instances INSIDE a
+// mesh's visible[] run is whatever order the GPU's atomics happened to retire — and it differs
+// every frame. That is invisible for opaque geometry (depth sorts it) but the Blend pass draws
+// with depth-write OFF, so the composite of two overlapping panes of the SAME mesh depends
+// entirely on that order: two windows seen through each other FLICKERED between two shadings
+// with the camera completely still (field report: Nikitskaya_2_Outdoor_Glass_04 instances 19539 +
+// 19540 on interchange).
+//
+// Unity avoids this by keeping every transparent surface its own renderer and sorting them
+// individually, back to front, each frame. Our GPU-driven path batches all instances of a mesh
+// into ONE indirect draw, so we have to restore that ordering ourselves: after the cull, sort each
+// blend mesh's visible run by distance from the camera, FARTHEST FIRST. One invocation per blend
+// mesh (counts are tiny — 6,235 blend instances across 1,377 meshes on interchange, ~4.5 each), so
+// a straight insertion sort is the right tool: no scratch memory, stable, and optimal on the
+// nearly-sorted runs we re-sort every frame.
+//
+// Opaque draws read the same visible[] range and do not care about order, so reordering is safe
+// for mixed-class meshes too.
+@group(0) @binding(7) var<storage, read> blend_mesh_ids: array<u32>;
+
+// Beyond this a single-threaded insertion sort would cost more than the artefact: leave the run in
+// cull order (as before this pass existed). Nothing in the shipped packs comes close.
+const SORT_MAX: u32 = 1024u;
+
+@compute @workgroup_size(64)
+fn cs_sort_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= arrayLength(&blend_mesh_ids)) { return; }
+    let mesh_id = min(blend_mesh_ids[k], arrayLength(&mesh_meta) - 1u);
+    let base = mesh_meta[mesh_id].instance_base;
+    // Survivor count written by cs_cull this frame (the opaque counter is the canonical allocator).
+    let count = atomicLoad(&indirect[mesh_id].instance_count);
+    if (count < 2u || count > SORT_MAX) { return; }
+    let last = min(base + count, arrayLength(&visible)) - base;
+
+    // Insertion sort visible[base .. base+last) by DESCENDING distance to the camera, so the
+    // farthest pane is drawn first and nearer glass composites over it.
+    for (var i: u32 = 1u; i < last; i = i + 1u) {
+        let vi = visible[base + i];
+        let ci = instances[min(vi, arrayLength(&instances) - 1u)].sphere.xyz;
+        let di = distance(G.cam_k.xyz, ci);
+        var j: i32 = i32(i) - 1;
+        loop {
+            if (j < 0) { break; }
+            let vj = visible[base + u32(j)];
+            let cj = instances[min(vj, arrayLength(&instances) - 1u)].sphere.xyz;
+            if (distance(G.cam_k.xyz, cj) >= di) { break; }   // already farther: position found
+            visible[base + u32(j) + 1u] = vj;
+            j = j - 1;
+        }
+        visible[base + u32(j) + 1u] = vi;
+    }
+}
