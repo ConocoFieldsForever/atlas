@@ -693,6 +693,21 @@ fn main() {
     // A/B selector: `EFT_RENDER=m0|gpu` env, or a 2nd argv token; default = GPU-driven.
     let render_path = RenderPath::from_env_or(std::env::args().nth(2).as_deref());
     eprintln!("render path: {render_path:?}  (override with EFT_RENDER=m0|gpu)");
+    // Standard-path VRAM guard: Standard decodes textures as UNCOMPRESSED RGBA8 (no BC), so a
+    // persisted textureQuality=Full that is fine on the GPU-driven path (~2.2 GB BC on
+    // interchange) is a ~17 GB peak there (measured, 707e5d2) — overcommit + driver paging on
+    // any 16 GB card, and the first resize's reallocation dies under it. Clamp Standard to
+    // Half; EFT_TEX_FULL=1 is the explicit escape hatch. Other paths keep the user's choice.
+    if matches!(render_path, RenderPath::Standard)
+        && render::gpu_driven::TEX_MIP_SKIP.load(std::sync::atomic::Ordering::Relaxed) == 0
+        && !std::env::var("EFT_TEX_FULL").map(|v| v.trim() == "1").unwrap_or(false)
+    {
+        render::gpu_driven::set_tex_mip_skip(1);
+        eprintln!(
+            "texture quality: Full clamped to Half on the Standard render path \
+             (uncompressed decode; Full peaks ~17 GB on big maps). EFT_TEX_FULL=1 overrides."
+        );
+    }
     // NOTE: this runs BEFORE DefaultPlugins installs Bevy's log subscriber, so use
     // eprintln! (not info!/error!) or the diagnostics are silently dropped and a
     // bad pack opens an empty window with no message (Codex P2).
@@ -819,6 +834,19 @@ fn main() {
                         .unwrap_or((1600u32, 1000u32))
                         .into(),
                     present_mode,
+                    // Frame-queue depth 1 (wgpu default: 2). On a GPU-bound machine under
+                    // FIFO/vsync the deeper queue keeps the swapchain backlog permanently
+                    // full, which is what pushed acquire toward its 1 s budget during window
+                    // moves/resizes (RX 6800 field crash — see the vendored bevy_render
+                    // prepare_windows patch, the other half of this fix). Depth 1 trades a
+                    // little CPU/GPU overlap for backlog headroom + lower input latency;
+                    // EFT_FRAME_LATENCY=2 restores the wgpu default for A/B.
+                    desired_maximum_frame_latency: std::num::NonZeroU32::new(
+                        std::env::var("EFT_FRAME_LATENCY")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<u32>().ok())
+                            .unwrap_or(1),
+                    ),
                     // EFT_HIDDEN=1: render without showing a window (headless EFT_SHOT
                     // verification runs — GPU screenshot capture works on an invisible
                     // window; pair with EFT_UNCAPPED so the focus-idle gate doesn't stall).
@@ -973,7 +1001,10 @@ fn main() {
         // the LLPC auto-fallback exposed this instantly on an RX 7800 XT). Init it here for every
         // path; on M0 it's a dead-letter box, which is harmless.
         .init_resource::<render::gpu_driven::DoorClick>()
-        .add_systems(Startup, (setup, log_render_path))
+        .add_systems(Startup, (setup, log_render_path, install_gpu_error_handler))
+        // Clean, logged exit on a fatal GPU error (device lost / OOM): wgpu's default handler
+        // panics, and release panic=abort made that a silent death — see the handler below.
+        .add_systems(Update, gpu_fatal_watchdog)
         // walk_move/drone_move run AFTER flycam_look (orientation resolved) and flycam_move
         // (mutually exclusive by CamMode) so they can't race the shared Transform; the agent
         // spectate cam runs last and wins while a session drives the drone. Disabled in the MENU
@@ -1063,6 +1094,54 @@ fn main() {
 /// double-click launch — this line is how a user's atlas_viewer.log tells us which path ran.
 fn log_render_path(rp: Res<RenderPath>) {
     info!("render path: {:?} (auto-probed unless EFT_RENDER was set)", *rp);
+}
+
+/// Set by the uncaptured-error handler (render/wgpu internal thread) when an error class the
+/// device cannot survive comes through; drained by `gpu_fatal_watchdog` on the main schedule.
+static GPU_FATAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// wgpu's DEFAULT uncaptured-error handler panics, and release builds are panic=abort — so any
+/// validation error or device loss at runtime was a silent process death with no field
+/// evidence (the sh-bake CLI installs a non-panicking handler for exactly this reason,
+/// sh_bake_gpu.rs). Log every uncaptured error through the file-log layer instead; flag the
+/// fatal classes (OutOfMemory, Internal = device-lost family) for a clean exit. Validation
+/// errors are rate-limited: a lost device error-floods every frame, and the first few lines
+/// carry all the signal.
+fn install_gpu_error_handler(device: Res<bevy::render::renderer::RenderDevice>) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    device.wgpu_device().on_uncaptured_error(Box::new(|e| {
+        let fatal = matches!(
+            e,
+            wgpu::Error::OutOfMemory { .. } | wgpu::Error::Internal { .. }
+        );
+        let n = SEEN.fetch_add(1, Ordering::Relaxed);
+        if fatal || n < 24 || n % 256 == 0 {
+            error!(
+                "wgpu uncaptured error #{n}{}: {e}",
+                if fatal { " (FATAL class)" } else { "" }
+            );
+        }
+        if fatal {
+            GPU_FATAL.store(true, Ordering::Relaxed);
+        }
+    }));
+}
+
+/// A lost device can't be rebuilt inside a running Bevy 0.17 app — every later submit fails
+/// forever. Freezing (skip-frame loop) or aborting both strand the user; one loud log line +
+/// a clean coded exit is actionable and shows up in packs/logs/atlas_viewer.log.
+fn gpu_fatal_watchdog(mut exit: MessageWriter<bevy::app::AppExit>) {
+    if GPU_FATAL.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        error!(
+            "fatal GPU error (device lost or out of GPU memory) — exiting cleanly. Please \
+             report this with packs/logs/atlas_viewer.log attached. If it happened while \
+             moving/resizing the window or alt-tabbing, mention that too."
+        );
+        exit.write(bevy::app::AppExit::Error(
+            std::num::NonZeroU8::new(86).unwrap(),
+        ));
+    }
 }
 
 /// File layer for the LogPlugin: tee all tracing output (incl. wgpu validation errors and

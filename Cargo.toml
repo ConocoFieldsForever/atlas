@@ -85,3 +85,13 @@ panic = "abort"
 # .github/workflows/release.yml) which passes --remap-path-prefix via RUSTFLAGS to remap those
 # prefixes to neutral tokens. Those flags carry the machine-specific home path, so they are computed
 # from the environment at build time and live in the build env, NOT committed here.
+
+# Vendored bevy_render 0.17.3 with ONE functional change (third_party/bevy_render/src/view/window/
+# mod.rs prepare_windows): swapchain-acquire Timeout/Other no longer panic — they skip the frame,
+# and Lost reconfigures like Outdated. Upstream panics there on Windows, which under our release
+# panic=abort was a silent process death when a window move/resize stalled presentation on a
+# GPU-bound machine (RX 6800 field report; bevy#13150, bevy#21753, wgpu#9029). Drop this patch
+# when upstream un-cfg's its Timeout tolerance. Keep the crate byte-identical to crates.io
+# otherwise, so a future diff against the registry copy shows only the prepare_windows change.
+[patch.crates-io]
+bevy_render = { path = "third_party/bevy_render" }
