@@ -278,6 +278,53 @@ fn backface_ratio(bvh: &Bvh, o: Vec3, dirs: &[(Vec3, [f32; 4])], stride: usize, 
     if hit == 0 { 0.0 } else { back as f32 / hit as f32 }
 }
 
+/// VIRTUAL OFFSET (Unity Adaptive Probe Volumes): find a lighting position for a probe that is
+/// buried in geometry.
+///
+/// Rejecting an in-wall probe at runtime only turns it into a HOLE, and the hole is its own
+/// artefact: measured on interchange, a window sat 98% of the way into its cell, so the probe
+/// carrying nearly all the trilinear weight was the invalid one and the cell collapsed to zero GI
+/// — a hard, probe-grid-aligned rectangle painted across the glass. Runtime offsetting cannot
+/// rescue it either, because it can only step along the shaded surface's normal while the lighting
+/// cliff may run along a different axis entirely (that window's normal is +X; its cliff runs in Z).
+///
+/// Unity's fix is to MOVE the probe out of the collider before lighting it, so the probe holds real
+/// light instead of being excluded. Same idea here: search outward for the nearest position whose
+/// backface ratio says "open space", and bake there. Returns the probe's own position when it is
+/// already valid or when nothing valid is within reach (deep inside rock — correctly still dark).
+fn virtual_offset(bvh: &Bvh, o: Vec3, spacing: [f32; 3], dirs: &[(Vec3, [f32; 4])],
+                  stride: usize, stack: &mut Vec<u32>) -> Vec3 {
+    // 26 neighbour directions (the 3x3x3 cube minus the centre), tried nearest-first so a probe
+    // moves the SHORTEST distance that reaches open space — Unity likewise caps the push and
+    // prefers the smallest one, because a probe dragged far away stops representing its cell.
+    // Candidate directions: the 6 face axes first (a probe buried in a wall almost always escapes
+    // straight out of one), then the 8 cube diagonals for corners. Nearest distance first, so a
+    // probe moves the SHORTEST way into open space — Unity likewise caps and minimises the push,
+    // because a probe dragged far stops representing its own cell.
+    const DIRS: [[f32; 3]; 14] = [
+        [1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0],
+        [1.0, 1.0, 1.0], [1.0, 1.0, -1.0], [1.0, -1.0, 1.0], [1.0, -1.0, -1.0],
+        [-1.0, 1.0, 1.0], [-1.0, 1.0, -1.0], [-1.0, -1.0, 1.0], [-1.0, -1.0, -1.0],
+    ];
+    let step = spacing[0].min(spacing[1]).min(spacing[2]);
+    for frac in [0.5f32, 1.0] {
+        let mut best: Option<(f32, Vec3)> = None;
+        for d in DIRS.iter() {
+            let dir = Vec3::new(d[0], d[1], d[2]).normalize();
+            let c = o + dir * (step * frac);
+            let r = backface_ratio(bvh, c, dirs, stride, stack);
+            if r < 0.25 && best.map_or(true, |(br, _)| r < br) {
+                best = Some((r, c));
+            }
+        }
+        if let Some((_, c)) = best {
+            return c;
+        }
+    }
+    o
+}
+
 // ---- grid + bake ------------------------------------------------------------------------------
 
 /// `q`-th percentile (0..100) of a mutable slice via partial select.
@@ -508,12 +555,96 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         eprintln!("  sh-bake: INDIRECT-ONLY — practicals skipped (baked = sky + bounce; direct=false)");
     }
 
+    // ================= PROBE VALIDITY + VIRTUAL OFFSET (Unity APV) =================================
+    // Both must run BEFORE pass A: virtual offset changes WHERE a probe is lit from.
+    let t_v = Instant::now();
+    let v_stride = (n_dir / 64).max(1);           // ~64 rays: "am I inside a solid" is low-frequency
+    let mut validity: Vec<u8> = vec![255; n_probe];
+    validity.par_iter_mut().enumerate().for_each_init(
+        || Vec::<u32>::with_capacity(64),
+        |stack, (pi, out)| {
+            let o = probe_o(pi, nx, ny, gmin, spacing);
+            let r = backface_ratio(&bvh, o, &dirs, v_stride, stack);
+            // Unity treats >=25% backfaces as invalid; ramp to zero over that range so a probe near
+            // a wall fades out of the interpolation rather than popping.
+            *out = (((1.0 - (r / 0.25)).clamp(0.0, 1.0)) * 255.0 + 0.5) as u8;
+        },
+    );
+    let n_invalid = validity.iter().filter(|&&v| v < 128).count();
+    eprintln!(
+        "  sh-bake: validity {n_probe} probes in {:.2}s ({} invalid / in-geometry, {:.1}%)",
+        t_v.elapsed().as_secs_f32(), n_invalid, 100.0 * n_invalid as f32 / n_probe.max(1) as f32
+    );
+
+    // VIRTUAL OFFSET: light an invalid probe from open space instead of leaving a hole. Restricted
+    // to probes that BORDER valid space — a probe deep inside rock has nowhere useful to go and is
+    // correctly dark, and skipping those keeps the search affordable (the useful set is a small
+    // fraction of the invalid ones). EFT_SH_VO=0 disables.
+    let vo_on = std::env::var("EFT_SH_VO").map(|v| v.trim() != "0").unwrap_or(true);
+    let mut positions: Vec<Vec3> = Vec::new();
+    let mut n_moved = 0usize;
+    if vo_on && n_invalid > 0 {
+        let t_vo = Instant::now();
+        let idx = |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
+        let borders_valid = |pi: usize| -> bool {
+            let x = pi % nx;
+            let y = (pi / nx) % ny;
+            let z = pi / (nx * ny);
+            let mut n = 0u8;
+            for (dx, dy, dz) in [(1i32, 0i32, 0i32), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)] {
+                let (a, b, c) = (x as i32 + dx, y as i32 + dy, z as i32 + dz);
+                if a < 0 || b < 0 || c < 0 || a >= nx as i32 || b >= ny as i32 || c >= nz as i32 {
+                    continue;
+                }
+                if validity[idx(a as usize, b as usize, c as usize)] >= 128 {
+                    n += 1;
+                }
+            }
+            n > 0
+        };
+        positions = (0..n_probe).map(|pi| probe_o(pi, nx, ny, gmin, spacing)).collect();
+        let moved: Vec<bool> = positions
+            .par_iter_mut()
+            .enumerate()
+            .map_init(
+                || Vec::<u32>::with_capacity(64),
+                |stack, (pi, pos)| {
+                    if validity[pi] >= 128 || !borders_valid(pi) {
+                        return false;
+                    }
+                    let c = virtual_offset(&bvh, *pos, spacing, &dirs, v_stride * 4, stack);
+                    if c != *pos {
+                        *pos = c;
+                        return true;
+                    }
+                    false
+                },
+            )
+            .collect();
+        n_moved = moved.iter().filter(|&&m| m).count();
+        eprintln!(
+            "  sh-bake: virtual offset {} probes relocated out of geometry in {:.2}s",
+            n_moved, t_vo.elapsed().as_secs_f32()
+        );
+        // A relocated probe is lit from open space, so it is no longer a hole: mark it valid.
+        for (pi, m) in moved.iter().enumerate() {
+            if *m {
+                validity[pi] = 255;
+            }
+        }
+    }
+    let probe_pos = |pi: usize| -> Vec3 {
+        if positions.is_empty() { probe_o(pi, nx, ny, gmin, spacing) } else { positions[pi] }
+    };
+
     // ================= PASS A — direct: sky-visibility (M1) + shadow-tested practicals (M2) =========
     // GPU (vendor-neutral wgpu compute; the tri/node BVH is chunked across storage bindings to keep
     // even interchange/streets-scale giants on-GPU) when available + it fits; else the rayon CPU pass
     // below. Kept in f32 (NOT packed yet) so the M3 diffuse bounce can trilinearly gather irradiance.
     let t_bake = Instant::now();
-    let gpu_a = if matches!(backend, Backend::Gpu | Backend::Auto) {
+    // The GPU pass computes probe positions from (gmin, spacing) internally, so it cannot honour
+    // virtual offset. When probes have been relocated the CPU pass is the correct one.
+    let gpu_a = if n_moved == 0 && matches!(backend, Backend::Gpu | Backend::Auto) {
         crate::sh_bake_gpu::pass_a_gpu(
             &bvh, lights, gmin, spacing, dims, n_dir, sky_scale, light_scale, indirect_only,
         )
@@ -531,7 +662,7 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         sh_a.par_iter_mut().enumerate().for_each_init(
         || Vec::<u32>::with_capacity(64),
         |stack, (pi, out)| {
-            let o = probe_o(pi, nx, ny, gmin, spacing);
+            let o = probe_pos(pi);
             // --- M1: sky-visibility (each escaping Fibonacci ray sees a neutral sky gradient) ---
             let mut sh = [Vec3::ZERO; 4];
             let mut n_sky = 0u32;
@@ -597,35 +728,6 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         inside_solid
     );
 
-    // ================= PROBE VALIDITY (Unity APV) ==================================================
-    // Per-probe backface ratio -> validity. Runs for BOTH pass-A backends (the GPU path does not
-    // count it), on a strided subset of the sky directions: validity is a low-frequency "am I inside
-    // a solid" signal, so ~1/4 of the rays resolves it and keeps the cost off the critical path.
-    let t_v = Instant::now();
-    let v_stride = (n_dir / 64).max(1); // ~64 probe rays regardless of the sky-ray budget
-    let mut validity: Vec<u8> = vec![255; n_probe];
-    validity
-        .par_iter_mut()
-        .enumerate()
-        .for_each_init(
-            || Vec::<u32>::with_capacity(64),
-            |stack, (pi, out)| {
-                let o = probe_o(pi, nx, ny, gmin, spacing);
-                let r = backface_ratio(&bvh, o, &dirs, v_stride, stack);
-                // Unity treats >=25% backfaces as invalid. Ramp to zero over that range instead of a
-                // hard cut so a probe near a wall fades out of the interpolation rather than popping.
-                let v = (1.0 - (r / 0.25)).clamp(0.0, 1.0);
-                *out = (v * 255.0 + 0.5) as u8;
-            },
-        );
-    let n_invalid = validity.iter().filter(|&&v| v < 128).count();
-    eprintln!(
-        "  sh-bake: validity {n_probe} probes in {:.2}s ({} invalid / in-geometry, {:.1}%)",
-        t_v.elapsed().as_secs_f32(),
-        n_invalid,
-        100.0 * n_invalid as f32 / n_probe.max(1) as f32
-    );
-
     // ================= PASS B — one diffuse bounce (M3) =============================================
     // Re-cast a Fibonacci sphere; at each NEAREST surface hit, gather irradiance E(hit,n) from the
     // pass-A grid (trilinear + cosine convolution) and re-emit albedo/pi * E + emissive back into the
@@ -680,7 +782,7 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         halfs.par_chunks_mut(12).enumerate().for_each_init(
             || Vec::<u32>::with_capacity(64),
             |stack, (pi, out)| {
-                let o = probe_o(pi, nx, ny, gmin, spacing);
+                let o = probe_pos(pi);
                 let mut sh_b = [Vec3::ZERO; 4];
                 for (d, basis) in &bdirs {
                     if let Some((t, face)) = ray_hit(&bvh, o, *d, max_dist, stack) {
