@@ -331,6 +331,24 @@ fn sh_irradiance_hw(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
 // texture_3d fetches an exact probe texel (no filtering, sampler ignored) so no
 // derivatives are required — still callable after a `discard`.
 fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    return sh_irradiance_b(world_pos, n, n);
+}
+
+// As `sh_irradiance`, but the volume is probed about `n_bias` (the true SURFACE normal) while the
+// SH is evaluated in `n_eval` (an arbitrary direction, e.g. the mirror vector).
+//
+// WHY THIS EXISTS: the environment-reflection lookup used to call sh_irradiance(world_pos, R) with
+// the REFLECTION vector standing in for the normal, so R also drove the probe-position bias
+// (`sp = wp + n * bias`) and the hemisphere rejection. On a window that is catastrophic: the probe
+// grid holds a HARD indoor/outdoor cliff right at the glass (measured on interchange around
+// Nikitskaya_2_Outdoor_Glass_04 — outdoor probes ~1.2-2.1, indoor ~0.01-0.04, a 40x step across one
+// cell), and as R swings across the pane the biased sample slides back and forth over that cliff.
+// The result is a hard-edged, AXIS-ALIGNED bright rectangle painted across the glass (the edges are
+// the probe grid's own axes), which then saturates to a flat cream block. Biasing by the real
+// normal keeps the sample on the outside of the wall everywhere on the pane, so the reflection is
+// continuous; `n_eval` still gives the mirror direction its correct directional SH response.
+fn sh_irradiance_b(world_pos: vec3<f32>, n_eval: vec3<f32>, n_bias: vec3<f32>) -> vec3<f32> {
+    let n = n_eval;
     // Blend RESULTS across the volume boundary, not positions: a position lerp walks the sample
     // through mid-air heights where the hemisphere weights below collapse near a probe plane and
     // the epsilon fallback averages in the dark below-floor probes (a dark crease line hugging the
@@ -344,7 +362,7 @@ fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let ext_l = vec3<f32>(1.0) / max(sh.vol_inv_extent.xyz, vec3<f32>(1e-9));
     let wp = clamp(world_pos, sh.vol_min.xyz, sh.vol_min.xyz + ext_l);
     let bias = sh.vol_inv_extent.w;
-    let sp   = wp + n * bias;
+    let sp   = wp + n_bias * bias;   // offset off the SURFACE, never along the eval direction
     let dims = sh.dims.xyz;
     let spacing = sh.spacing.xyz;
     let grid = clamp((sp - sh.vol_min.xyz) / spacing, vec3<f32>(0.0), dims - vec3<f32>(1.0)); // continuous grid coords
@@ -360,8 +378,21 @@ fn sh_irradiance(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         let tw3 = mix(vec3<f32>(1.0) - f, f, o);      // per-axis trilinear weight
         let tw  = tw3.x * tw3.y * tw3.z;
         let dir = probe_pos - wp;
-        let wn  = max(dot(normalize(dir + n * 1e-3), n), 0.0);  // ~0 for below-slab / back-facing probes (the leak)
-        let w   = tw * wn + 1e-4;
+        // Reject probes behind the SURFACE (n_bias), not behind the eval direction: a mirror
+        // vector can point straight into the wall, which would select the probes on the wrong
+        // side of the indoor/outdoor cliff.
+        let wn  = max(dot(normalize(dir + n_bias * 1e-3), n_bias), 0.0);
+        // The epsilon MUST ride the trilinear weight. As `tw * wn + 1e-4` it was a CONSTANT floor
+        // that survived tw -> 0, so a probe contributed 1e-4 of its radiance even when its
+        // trilinear weight was zero. Crossing a probe-cell boundary swaps which 8 probes are in
+        // the octet, so those floor terms changed discontinuously — a hard-edged rectangular patch
+        // wherever a bright probe entered/left the set. It is worst exactly on WINDOWS: a pane's
+        // outward normal makes `wn` reject every indoor probe, leaving the floor terms to decide
+        // the result, so the sunlit OUTDOOR probe painted a cream block across the glass (field
+        // report: Nikitskaya_2_Outdoor_Glass_04 on interchange). Scaling by tw restores partition
+        // of unity, so the reconstruction is continuous across cell boundaries; the all-rejected
+        // case still falls through to the hardware-trilinear path below (wsum -> 1e-4 < 1e-3).
+        let w   = tw * (wn + 1e-4);
         let cr = textureLoad(sh_r, ipc, 0);
         let cg = textureLoad(sh_g, ipc, 0);
         let cb = textureLoad(sh_b, ipc, 0);
@@ -1251,7 +1282,10 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // sky; rougher ones fade back to the soft SH probe. Fresnel brightens toward grazing angles (why
     // glass / wet floors / water flash at glancing view). Matte surfaces untouched (gloss ~0). Sun-
     // shadowed like the GGX lobe. `sh_env`/`sky_env` are reused by the water/glass blend branches.
-    let sh_env = max(sh_irradiance(o.world_pos, R), ambient_floor) * sh.vol_min.w;
+    // Probe about the surface normal N, evaluate the SH toward the mirror vector R (see
+    // sh_irradiance_b): passing R for BOTH slid the sample across the indoor/outdoor probe cliff
+    // and painted a hard cream rectangle on every window.
+    let sh_env = max(sh_irradiance_b(o.world_pos, R, N), ambient_floor) * sh.vol_min.w;
     let refl_level = dot(sh_env, vec3<f32>(0.2126, 0.7152, 0.0722)); // local exposure anchor (luma)
     let sky_env = sky_reflect(R, refl_level);
     let gloss = 1.0 - rough; // per-pixel when RFA — glossy pipes/tiles pop, worn surfaces go matte

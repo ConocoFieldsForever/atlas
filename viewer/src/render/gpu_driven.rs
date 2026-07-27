@@ -1159,7 +1159,7 @@ pub struct CpuData {
     /// Meshes with >=1 BLEND submesh: (mesh index, first-instance world center, pass mask).
     /// The mask separates depth-writing SoftCutout coverage, surface overlays, and true
     /// transparency so coplanar roads never share glass's render state.
-    blend_meshes: Vec<(u32, [f32; 3], u32)>,
+    blend_meshes: Vec<(u32, Vec<[f32; 3]>, u32)>,
     /// #5 shadows: sun direction (points TOWARD the sun) X-flipped into pack space, or `None` when
     /// the volume sidecar has no valid `sun_dir` (the shadow feature then disables itself; no
     /// invented fallback direction). Mirrors standard.rs's exact access + flip.
@@ -2200,7 +2200,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     // Blend-pass restructure (Codex review): per-mesh material class + a representative center
     // for back-to-front sorting of the per-mesh blend draws. class: 0=opaque-only, 1=blend-only,
     // 2=mixed (drawn in both passes; fragment class-discard splits it).
-    let mut blend_meshes: Vec<(u32, [f32; 3], u32)> = Vec::new();
+    let mut blend_meshes: Vec<(u32, Vec<[f32; 3]>, u32)> = Vec::new();
 
     let mut vtx_cursor: u32 = 0;
     let mut idx_cursor: u32 = 0;
@@ -2444,7 +2444,10 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         let bs = local_spheres[mi];
         let local_center = Vec3::new(bs[0], bs[1], bs[2]);
         let local_r = bs[3];
-        let mut first_center: Option<Vec3> = None;
+        // ALL instance centres for this mesh: the blend sort key is the distance to the NEAREST
+        // one (see prepare/queue). Keeping only the first instance's centre made a mesh sort by an
+        // arbitrary far-away copy of itself.
+        let mut inst_centers: Vec<[f32; 3]> = Vec::new();
         for &i in inst_ids {
             let inst = &pack.instances[i as usize];
             let a = &inst.affine;
@@ -2462,9 +2465,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                 ids: [mesh_meta.len() as u32, inst.flags, lz, lw],
                 sphere: [center.x, center.y, center.z, radius],
             });
-            if first_center.is_none() {
-                first_center = Some(center);
-            }
+            // Collected for every mesh (the blend class is only known after this loop); the Vec is
+            // moved into `blend_meshes` for blend meshes and dropped for the rest.
+            inst_centers.push(center.to_array());
         }
         let instance_count = inst_ids.len() as u32;
         inst_cursor += instance_count;
@@ -2498,7 +2501,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         if blend_class != 0 {
             blend_meshes.push((
                 mesh_meta.len() as u32,
-                first_center.unwrap_or(Vec3::ZERO).to_array(),
+                core::mem::take(&mut inst_centers),
                 blend_passes,
             ));
         }
@@ -3149,7 +3152,7 @@ struct EftGpuBuffers {
     cull_uniform: Buffer,
     /// (mesh index, first-instance world center, transparent-pass mask) for every mesh with a
     /// BLEND submesh — the per-frame sort key and render-state classification source.
-    blend_meshes: Vec<(u32, [f32; 3], u32)>,
+    blend_meshes: Vec<(u32, Vec<[f32; 3]>, u32)>,
     mesh_count: u32,
     instance_total: u32,
 }
@@ -5865,8 +5868,23 @@ fn queue_gpu_driven(
                 extra_index: PhaseItemExtraIndex::None,
                 indexed: true,
             });
-            for (mesh_idx, center, pass_mask) in &_buffers.blend_meshes {
-                let d = (cam_pos - Vec3::from_array(*center)).length();
+            for (mesh_idx, centers, pass_mask) in &_buffers.blend_meshes {
+                // Sort key = distance to this mesh's NEAREST instance. It used to be the distance
+                // to its FIRST instance, which is an arbitrary copy that can sit anywhere on the
+                // map, so a mesh sorted as if it were somewhere it is not: on interchange the
+                // pane you look THROUGH (Nikitskaya_2_Outdoor_Glass_04, nearest instance 7.2 m)
+                // carried a 32.2 m key while the pane BEHIND it (…Glass_02, 8.0 m) carried 16.6 m
+                // — so the near glass composited behind the far glass. Worse, both keys track
+                // far-away instances, so ordinary camera movement made them CROSS and the pair
+                // swapped: windows seen through windows flashed between two shadings. Taking the
+                // minimum is O(blend instances) per frame (6,235 on interchange — microseconds).
+                // NOTE this orders MESHES correctly, not instances WITHIN one mesh: two panes of
+                // the SAME mesh still share one indirect record and blend in arbitrary order.
+                let d = centers
+                    .iter()
+                    .map(|c| (cam_pos - Vec3::from_array(*c)).length())
+                    .fold(f32::INFINITY, f32::min);
+                let d = if d.is_finite() { d } else { 0.0 };
                 let item = |pipeline, distance| Transparent3d {
                     entity: (entity, *main_entity),
                     pipeline,
