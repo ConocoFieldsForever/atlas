@@ -3210,24 +3210,17 @@ fn draw_gamedata_outlines(
                 for w in cw.windows(2) {
                     let (a, ta, arc0) = (w[0].0 + lift, w[0].1, w[0].2);
                     let (b, arc1) = (w[1].0 + lift, w[1].2);
-                    // A leg the router could not solve is a straight chord between two real
-                    // PatrolPoints, NOT a walkable route. Draw it dashed and dim so it reads as
-                    // "order hint, route unknown", and give it none of the animation that says
-                    // "a bot walks this": no comet, no marching arrows.
+                    // A leg the router could not solve gets NO connector at all.
+                    //
+                    // There is no honest line to draw here. Draping the straight chord onto the
+                    // nearest floor layer (the original behaviour) invents a route over whatever
+                    // you pass above — on a car park that is the roof of a fuel tanker. Drawing the
+                    // raw 3-D chord instead puts a line straight through a mall floor slab whenever
+                    // the two waypoints sit on different storeys. Both assert a path we could not
+                    // find. The waypoint DOTS are the actual game data and still show, still fade
+                    // in serialized order; the count of undrawn legs is logged by
+                    // `build_patrol_contours` so this stays visible rather than silent.
                     if w[0].3 {
-                        const DASH: f32 = 1.4; // metres of ink per 2·DASH of chord
-                        let seg = b - a;
-                        let len = (arc1 - arc0).max(1e-3);
-                        let mut m = (arc0 / (DASH * 2.0)).floor() * (DASH * 2.0);
-                        while m < arc1 {
-                            let (s, e) = (m.max(arc0), (m + DASH).min(arc1));
-                            if e > s {
-                                let f0 = (s - arc0) / len;
-                                let f1 = (e - arc0) / len;
-                                gizmos.line(a + seg * f0, a + seg * f1, hdr(0.7, 0.30 - 0.15 * ta));
-                            }
-                            m += DASH * 2.0;
-                        }
                         continue;
                     }
                     // Base line: gentle HDR lift so the path itself has a soft neon presence,

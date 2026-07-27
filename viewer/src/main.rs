@@ -662,6 +662,13 @@ fn main() {
         if argv.get(1).map(String::as_str) == Some("bake-terrain") {
             std::process::exit(terrain_bake::run_cli(&argv[2..]));
         }
+        // Headless routing QA — `atlas check-nav <pack_dir> --to "<exfil>" [--side pmc|scav|all]`
+        // routes EVERY spawn point in the map to an extract and reports which ones cannot get
+        // there. This is the acceptance test for a nav bake: a spawn that cannot reach an extract
+        // is a map you can be stranded on.
+        if argv.get(1).map(String::as_str) == Some("check-nav") {
+            std::process::exit(nav_bake::run_check_cli(&argv[2..]));
+        }
     }
     // --version/--help fast path BEFORE any Bevy/GPU init: CI runners have no usable GPU, so
     // this is the only smoke test a workflow can run (redistribution PR5).
