@@ -1230,37 +1230,100 @@ pub fn valid_game_dir(dir: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// BSG launcher registry entry -> "<InstallLocation>\EscapeFromTarkov_Data". Windows only — there
-/// is no Windows registry to query on Linux/macOS.
+/// One registry string value via `reg query` (no winreg dependency). Windows only.
 #[cfg(windows)]
-fn registry_game_dir() -> Option<String> {
+fn reg_value(key: &str, value: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
     let out = std::process::Command::new("reg")
-        .args([
-            "query",
-            r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov",
-            "/v",
-            "InstallLocation",
-        ])
+        .args(["query", key, "/v", value])
         .creation_flags(0x0800_0000)
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
-    let loc = s
+    let v = s
         .lines()
-        .find(|l| l.trim_start().starts_with("InstallLocation"))?
+        .find(|l| l.trim_start().starts_with(value))?
         .split("REG_SZ")
         .nth(1)?
         .trim()
         .to_string();
-    (!loc.is_empty()).then(|| format!(r"{loc}\EscapeFromTarkov_Data"))
+    (!v.is_empty()).then_some(v)
 }
 
-/// Autodetect priority: EFT_GAME_DATA env > saved config > launcher registry > drive probe.
-/// The registry lookup and drive-letter probe are Windows-only (EFT is a Windows game; there is
-/// no registry on Linux/macOS). On those platforms we still take a best-effort guess at common
-/// Wine/Lutris prefixes, but this is unverified — EFT has no official Linux/Proton support, so
-/// most Linux users will end up setting GAME INSTALL by hand via the folder picker.
+/// BSG launcher registry entry -> "<InstallLocation>\EscapeFromTarkov_Data". Windows only — there
+/// is no Windows registry to query on Linux/macOS.
+#[cfg(windows)]
+fn registry_game_dir() -> Option<String> {
+    let loc = reg_value(
+        r"HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov",
+        "InstallLocation",
+    )?;
+    Some(format!(r"{loc}\EscapeFromTarkov_Data"))
+}
+
+/// STEAM install -> ".../steamapps/common/<name>/EscapeFromTarkov_Data". EFT ships on Steam
+/// too, and Steam users have no BSG-launcher registry entry. Appid-free route: locate the
+/// Steam root (registry on Windows, the default install dirs on Linux), then check EVERY
+/// library listed in `steamapps/libraryfolders.vdf` — secondary libraries on other drives are
+/// the common case ("D:\SteamLibrary"). Folder-name variants cover Steam's capitalization.
+fn steam_game_dir() -> Option<String> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    #[cfg(windows)]
+    {
+        // Per-user SteamPath (forward slashes) then machine-wide InstallPath, then the default.
+        if let Some(p) = reg_value(r"HKCU\Software\Valve\Steam", "SteamPath") {
+            roots.push(std::path::PathBuf::from(p.replace('/', r"\")));
+        }
+        if let Some(p) = reg_value(r"HKLM\SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath") {
+            roots.push(std::path::PathBuf::from(p));
+        }
+        roots.push(std::path::PathBuf::from(r"C:\Program Files (x86)\Steam"));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = std::path::Path::new(&home);
+            roots.push(home.join(".steam/steam"));
+            roots.push(home.join(".local/share/Steam"));
+        }
+    }
+    // Steam roots are themselves libraries; libraryfolders.vdf adds the rest.
+    let mut libs = roots.clone();
+    for r in &roots {
+        let Ok(txt) = std::fs::read_to_string(r.join("steamapps").join("libraryfolders.vdf"))
+        else {
+            continue;
+        };
+        for line in txt.lines() {
+            // VDF rows look like:  "path"    "D:\\SteamLibrary"
+            let l = line.trim();
+            let Some(rest) = l.strip_prefix("\"path\"") else { continue };
+            let p = rest.trim().trim_matches('"').replace("\\\\", "\\");
+            if !p.is_empty() {
+                libs.push(std::path::PathBuf::from(p));
+            }
+        }
+    }
+    for lib in libs {
+        for name in ["Escape from Tarkov", "Escape From Tarkov", "EscapeFromTarkov"] {
+            let d = lib
+                .join("steamapps")
+                .join("common")
+                .join(name)
+                .join("EscapeFromTarkov_Data");
+            let s = d.to_string_lossy().into_owned();
+            if valid_game_dir(&s) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// Autodetect priority: EFT_GAME_DATA env > saved config > BSG launcher registry > STEAM
+/// (registry/default roots + every library in libraryfolders.vdf) > drive probe. The registry
+/// lookups and drive-letter probe are Windows-only; on Linux the Steam/Proton default roots
+/// and common Wine/Lutris prefixes are probed, and the folder picker remains the fallback.
 pub fn detect_game_dir() -> String {
     if let Ok(d) = std::env::var("EFT_GAME_DATA") {
         if !d.is_empty() {
@@ -1270,9 +1333,13 @@ pub fn detect_game_dir() -> String {
     if let Some(d) = config_game_dir().filter(|d| valid_game_dir(d)) {
         return d;
     }
+    // Steam is platform-shared: Proton installs on Linux land in the same library layout.
     #[cfg(windows)]
     {
         if let Some(d) = registry_game_dir().filter(|d| valid_game_dir(d)) {
+            return d;
+        }
+        if let Some(d) = steam_game_dir() {
             return d;
         }
         for drive in ["C", "D", "E", "F", "G"] {
@@ -1280,6 +1347,9 @@ pub fn detect_game_dir() -> String {
                 r"\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data",
                 r"\Battlestate Games\EFT\EscapeFromTarkov_Data",
                 r"\Games\Escape from Tarkov\EscapeFromTarkov_Data",
+                // Registry-less Steam leftovers: default + the common secondary-library name.
+                r"\Program Files (x86)\Steam\steamapps\common\Escape from Tarkov\EscapeFromTarkov_Data",
+                r"\SteamLibrary\steamapps\common\Escape from Tarkov\EscapeFromTarkov_Data",
             ] {
                 let d = format!("{drive}:{tail}");
                 if valid_game_dir(&d) {
@@ -1291,9 +1361,14 @@ pub fn detect_game_dir() -> String {
     }
     #[cfg(not(windows))]
     {
+        if let Some(d) = steam_game_dir() {
+            return d;
+        }
         if let Some(home) = std::env::var_os("HOME") {
             let home = std::path::Path::new(&home);
             for root in [
+                // Steam/Proton prefixes keep the game under the LIBRARY (covered by
+                // steam_game_dir above); these are the non-Steam Wine/Lutris guesses.
                 home.join(".wine/drive_c"),
                 home.join(".local/share/lutris/runners/wine"), // not a prefix root; harmless miss
                 home.join("Games/escape-from-tarkov/drive_c"), // common Lutris default prefix

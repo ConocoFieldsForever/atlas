@@ -129,8 +129,9 @@ Then:
    run `bootstrap.ps1`.)
 2. At the bottom of the menu:
    - **GAME INSTALL** — point it at the **`EscapeFromTarkov_Data`** folder inside your
-     Tarkov install (e.g. `…\Escape from Tarkov\EscapeFromTarkov_Data`; usually
-     auto-fills — if not, paste that path and press **SET**).
+     Tarkov install (e.g. `…\Escape from Tarkov\EscapeFromTarkov_Data`). Both the **BSG
+     launcher** and **Steam** installs are auto-detected (including Steam libraries on
+     other drives) — if yours isn't found, paste the path and press **SET**.
    - **EXTRACTED ASSETS** — press **CHOOSE…** and pick a folder with plenty of free
      space (the extracted map data lands here — budget **~1–6 GB per map**).
 3. **Close the game and its launcher** (the extractor needs the files unlocked),
