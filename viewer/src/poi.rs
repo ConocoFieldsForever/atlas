@@ -2916,6 +2916,12 @@ struct PatrolContours {
     epoch: u64,
     with_nav: bool,
     n_ways: usize,
+    /// In-flight background build. Routing every patrol leg through the nav grid costs SECONDS
+    /// (interchange: 9.4 s serial, 3.7 s even with rayon across ways — they are very unevenly
+    /// sized, so one long way dominates). Doing that inside the draw system froze the app the
+    /// instant "Patrol areas" was ticked. It now runs on the async compute pool and the straight
+    /// -line contours draw until it lands, so enabling the layer is instant and simply sharpens.
+    task: Option<bevy::tasks::Task<Vec<(Vec<(Vec3, f32, f32)>, f32)>>>,
     /// Per way: contour verts as (pos, route-fraction t, cumulative arc metres) + total arc.
     /// t drives the order fade; arc drives the marching arrows + the comet pulse.
     ways: Vec<(Vec<(Vec3, f32, f32)>, f32)>,
@@ -2925,9 +2931,22 @@ fn build_patrol_contours(
     ways: &[Vec<Vec3>],
     nav: Option<&crate::nav::NavGrid>,
 ) -> Vec<(Vec<(Vec3, f32, f32)>, f32)> {
-    let mut scratch = nav.map(|g| crate::nav::pooled_scratch(g.nodes()));
-    ways.iter()
-        .map(|way| {
+    // PARALLEL over ways. Each leg runs an A* through the nav grid, and this whole function runs
+    // synchronously inside the draw system — i.e. on the frame the user ticks "Patrol areas".
+    // Measured on interchange BEFORE this: 24 ways / 231 legs = 9,433 ms of dead main thread, a
+    // multi-second freeze the moment the layer is enabled (the drawing itself is free — patrols on
+    // vs off benchmarked identically at 7.14 ms/frame). Ways are independent, and `pooled_scratch`
+    // is mutex-guarded and hands back an OWNED buffer, so one scratch per worker is safe.
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Diagnostics: how many legs the router actually solved vs fell back to a straight line. A
+    // fallback leg is drawn as a height-snapped STRAIGHT line, which is exactly what produces
+    // connectors that cut through floors and walls.
+    let (n_legs, n_routed, n_detour) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let out: Vec<(Vec<(Vec3, f32, f32)>, f32)> = ways.par_iter()
+        .map_init(
+            || nav.map(|g| crate::nav::pooled_scratch(g.nodes())),
+            |scratch, way| {
             let n = way.len();
             let mut out: Vec<(Vec3, f32)> = Vec::new();
             let finish = |verts: Vec<(Vec3, f32)>| -> (Vec<(Vec3, f32, f32)>, f32) {
@@ -2951,13 +2970,24 @@ fn build_patrol_contours(
                 let t0 = i as f32 / (n - 1).max(1) as f32;
                 let t1 = (i + 1) as f32 / (n - 1).max(1) as f32;
                 let straight = a.distance(b);
+                n_legs.fetch_add(1, Ordering::Relaxed);
                 // Preferred: the real walkable route for this leg (how a bot would move).
                 let mut leg: Option<Vec<Vec3>> = None;
                 if let (Some(g), Some(s)) = (nav, scratch.as_deref_mut()) {
                     if let Some((pts, dist)) = g.path(a, b, s, None) {
-                        // Sanity bound: a WIP-router detour 3x the crow-flies leg (or +15 m on
-                        // short hops) would misrepresent the patrol — fall back instead.
-                        if pts.len() >= 2 && dist <= (straight * 3.0).max(straight + 15.0) {
+                        if !(pts.len() >= 2 && dist <= (straight * 8.0).max(straight + 60.0)) {
+                            n_detour.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            n_routed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Sanity bound on a WIP router. DELIBERATELY GENEROUS: the fallback is a
+                        // straight line snapped only in height, so rejecting a route means drawing a
+                        // connector THROUGH floors and walls — which misrepresents the patrol far
+                        // worse than a long-but-walkable route does. Measured on interchange at the
+                        // old 3x bound: 16 of 231 legs fell back, and 13 of those had a perfectly
+                        // good route that was merely long (real bots do walk around the mall).
+                        // Only a genuinely unroutable leg should degrade to a straight line.
+                        if pts.len() >= 2 && dist <= (straight * 8.0).max(straight + 60.0) {
                             leg = Some(pts);
                         }
                     }
@@ -2992,8 +3022,22 @@ fn build_patrol_contours(
                 }
             }
             finish(out)
-        })
-        .collect()
+            },
+        )
+        .collect();
+    if nav.is_some() {
+        let (l, r, d) = (
+            n_legs.load(Ordering::Relaxed),
+            n_routed.load(Ordering::Relaxed),
+            n_detour.load(Ordering::Relaxed),
+        );
+        info!(
+            "patrol routing: {r}/{l} legs routed through the nav grid; {} fell back to a              STRAIGHT line ({d} rejected as absurd detours, {} had no route at all) — fallback              legs are height-snapped only, so they can cut through floors/walls",
+            l - r,
+            l - r - d
+        );
+    }
+    out
 }
 
 fn draw_gamedata_outlines(
@@ -3103,7 +3147,35 @@ fn draw_gamedata_outlines(
             contours.epoch = epoch.0;
             contours.n_ways = zones.patrols.len();
             contours.with_nav = nav_grid.is_some();
-            contours.ways = build_patrol_contours(&zones.patrols, nav_grid);
+            // Straight-line contours IMMEDIATELY (cheap: no routing) so the layer draws the
+            // instant it is enabled...
+            contours.ways = build_patrol_contours(&zones.patrols, None);
+            contours.task = None;
+            // ...then route them through the nav grid in the BACKGROUND and swap the result in.
+            if let Some(g) = nav.as_ref().and_then(|n| n.0.clone()) {
+                let ways = zones.patrols.clone();
+                contours.task = Some(bevy::tasks::AsyncComputeTaskPool::get().spawn(async move {
+                    let t = std::time::Instant::now();
+                    let out = build_patrol_contours(&ways, Some(g.as_ref()));
+                    let segs: usize = out.iter().map(|(v, _)| v.len()).sum();
+                    info!(
+                        "patrol contours: {} ways -> {} verts routed in {:.1} ms (background)",
+                        out.len(),
+                        segs,
+                        t.elapsed().as_secs_f32() * 1000.0
+                    );
+                    out
+                }));
+            }
+        }
+        // Land a finished background route without ever blocking the frame.
+        if let Some(t) = contours.task.as_mut() {
+            if let Some(done) =
+                bevy::tasks::block_on(bevy::tasks::futures_lite::future::poll_once(t))
+            {
+                contours.ways = done;
+                contours.task = None;
+            }
         }
         // ---- ANIMATED patrol flow: HDR-boosted colors bloom into a glow (the in-raid camera
         // runs Bloom), arrows MARCH down-route at bot-walk pace, and a bright comet pulse
