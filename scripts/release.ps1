@@ -66,6 +66,9 @@ foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","g
 Copy-Item "README.md" $dist -ErrorAction SilentlyContinue
 Copy-Item "README_DIST.md" $dist -ErrorAction SilentlyContinue
 Copy-Item "LICENSE-NOTES.md" $dist -ErrorAction SilentlyContinue
+# Field-test protocol for the target-GPU testers (RTX 4060 / RX 6800 round): ships at the zip
+# root so a tester can't miss it.
+Copy-Item "docs\FIELD_TEST_GPU.md" "$dist\FIELD_TEST.md" -ErrorAction SilentlyContinue
 
 if ($Full) {
     # Tier B: the python pipeline kit ("build your own packs").

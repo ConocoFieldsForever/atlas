@@ -19,6 +19,17 @@ Tracking issues deferred during M0–M2. Updated 2026-07-14.
 - [ ] **BC7/BC5 texture compression** on load (M3 will start with RGBA8 uploads → more VRAM).
 
 ## Correctness / robustness
+- [ ] **Self-enforce AMD's 2 GiB single-buffer cap** (target-GPU audit, 2026-07-27). Adrenalin
+  reports maxMemoryAllocationSize = maxBufferSize = exactly 2 GiB (verified across 25.6.1→25.12.1),
+  and wgpu 26 does NOT validate it on Windows (`max_buffer_size = u64::MAX`; the failure surfaces
+  as a create-time OutOfMemory from gpu-alloc). Streets' monolithic `eft_gpu_vertex` is 1.84 GB —
+  ~15% headroom. Any bigger map or stride growth breaks AMD first. Either chunk the vertex pool or
+  fail the load with a per-map message before allocation. NVIDIA is not affected (4 GiB
+  storage-binding range / 1 TiB buffer cap).
+- [ ] **VRAM-aware degradation via VK_EXT_memory_budget**. Both target GPUs expose it (the 4060
+  exposes 7.77 GiB of its 8 GB to apps); wgpu doesn't surface it, but an out-of-band poll would let
+  the viewer clamp texture quality instead of paging (the RX 6800 45fps field report was likely
+  healthy GPU-bound, but the 17 GB Standard-path case was paging death).
 - [ ] **ExtractedCpuData warning**. The P1 memory-free churns the resource for a few frames → Bevy
   logs "Removing resource … not expected, may decrease performance". Benign (settles in ~4 frames),
   but a clean extract-once pattern (custom extract gated on buffers-built) would silence it.
