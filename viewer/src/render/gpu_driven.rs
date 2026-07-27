@@ -706,7 +706,10 @@ struct ShadowCascadeUniform {
     dir_texel: [f32; 4],
     /// x = grass casts shadows (1/0). B2: the 109k grass cross-quads were ~the whole shadow-pass
     /// fragment cost (alpha-tested albedo sample × 2 cascades) for micro-shadows that read as
-    /// noise at map scale — skipped by default; EFT_GRASS_SHADOWS=1 restores. yzw pad.
+    /// noise at map scale — skipped by default; EFT_GRASS_SHADOWS=1 restores.
+    /// y = bindless `albedo_tex` array length, so the shadow fragment can CLAMP its descriptor
+    /// index (WGSL has no `arrayLength` for a `binding_array`). An out-of-range binding_array
+    /// index faults AMD hardware outright, so the bound must reach the shader. zw pad.
     params: [f32; 4],
 }
 // #6: LOCK the byte layout — matches `ShadowCascadeUniform` in gpu_shadow.wgsl (mat4 + 2×vec4 = 96).
@@ -4143,10 +4146,18 @@ fn prepare_gpu_buffers(
         ..default()
     });
 
-    // group(1) cascade-uniform layout for the shadow pipeline (vertex-stage world->light-clip).
+    // group(1) cascade-uniform layout for the shadow pipeline. VERTEX reads the world->light-clip
+    // matrix; FRAGMENT reads `params.y` (the bindless albedo count) for its descriptor-index
+    // clamp — so the binding must be visible to BOTH stages or pipeline creation fails with
+    // "Shader global ResourceBinding { group: 1, binding: 0 } is not available in the pipeline
+    // layout / Visibility flags don't include the shader stage" and the shadow pass silently
+    // stops existing.
     let cascade_layout = render_device.create_bind_group_layout(
         "eft_shadow_cascade_layout",
-        &BindGroupLayoutEntries::single(ShaderStages::VERTEX, uniform_buffer_sized(false, None)),
+        &BindGroupLayoutEntries::single(
+            ShaderStages::VERTEX_FRAGMENT,
+            uniform_buffer_sized(false, None),
+        ),
     );
     // Two per-cascade uniform buffers (+ bind groups). Filled per frame by prepare_shadow_uniforms;
     // sized to the POD so the initial (zeroed) content is a valid, inert matrix until then.
@@ -5499,6 +5510,9 @@ fn prepare_shadow_uniforms(
     mut cache: ResMut<EftShadowCache>,
     nonce: Res<EftDynamicNonce>,
     buffers: Option<Res<EftGpuBuffers>>,
+    // Source of the bindless albedo count uploaded in `params.y` (the shadow fragment's
+    // descriptor-index clamp). Same `views` vec that builds the material bind group.
+    mat_res: Option<Res<EftMaterialResources>>,
 ) {
     let (Some(config), Some(res)) = (config, resources) else {
         return;
@@ -5653,7 +5667,12 @@ fn prepare_shadow_uniforms(
         let cascade = ShadowCascadeUniform {
             view_proj: vp_cols,
             dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / shadow_map_size() as f32],
-            params: [if grass_casters { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            params: [
+                if grass_casters { 1.0 } else { 0.0 },
+                mat_res.as_ref().map_or(0.0, |m| m.views.len() as f32),
+                0.0,
+                0.0,
+            ],
         };
         render_queue.write_buffer(
             &res.cascade_uniforms[c],
@@ -6243,5 +6262,69 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
             }
         }
         RenderCommandResult::Success
+    }
+}
+
+#[cfg(test)]
+mod material_stride_tests {
+    use super::GpuMaterial;
+
+    /// Byte size of one WGSL `MaterialGpu` declaration, computed from the shader source with
+    /// std430 rules (scalar 4/4, vec2 8/8, vec3 12/16, vec4 16/16; struct rounded to its
+    /// strictest member alignment). Only the field forms these shaders actually use.
+    fn wgsl_material_size(src: &str) -> usize {
+        let body = src
+            .split_once("struct MaterialGpu {")
+            .expect("no `struct MaterialGpu` in shader")
+            .1
+            .split_once("};")
+            .expect("unterminated struct MaterialGpu")
+            .0;
+        let (mut size, mut struct_align) = (0usize, 4usize);
+        for line in body.lines() {
+            // strip comments, then take the `name: type,` pair
+            let line = line.split("//").next().unwrap_or("").trim();
+            let Some((_, ty)) = line.split_once(':') else { continue };
+            let ty = ty.trim().trim_end_matches(',').trim();
+            let (fsize, falign) = match ty {
+                "u32" | "i32" | "f32" => (4, 4),
+                t if t.starts_with("vec2<") => (8, 8),
+                t if t.starts_with("vec3<") => (12, 16),
+                t if t.starts_with("vec4<") => (16, 16),
+                t if t.starts_with("mat4x4<") => (64, 16),
+                other => panic!("material_stride_tests: unhandled WGSL type `{other}`"),
+            };
+            size = size.div_ceil(falign) * falign + fsize; // pad up to this field's alignment
+            struct_align = struct_align.max(falign);
+        }
+        size.div_ceil(struct_align) * struct_align
+    }
+
+    /// REGRESSION (field device-loss, RX 7800 XT + RX 6800): the material table is ONE buffer read
+    /// by BOTH gpu_draw.wgsl and gpu_shadow.wgsl. When parallax mapping grew the record 176 -> 192,
+    /// the Rust POD and gpu_draw.wgsl were updated but gpu_shadow.wgsl was left at 176 — so the
+    /// shadow pass indexed a 192-byte table with a 176-byte stride and every material after the
+    /// first decoded garbage. The misread `albedo_index` lane became an out-of-range bindless
+    /// descriptor index, which NVIDIA answers with zeros and AMD answers with a DEVICE FAULT:
+    /// "Parent device is lost" a random 1..1980 frames into any map. Nothing in the build caught
+    /// it — the Rust-side size assert only pins the Rust side. This pins all three together.
+    #[test]
+    fn wgsl_material_structs_match_the_rust_pod() {
+        let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
+        let rust = std::mem::size_of::<GpuMaterial>();
+        for name in ["gpu_draw.wgsl", "gpu_shadow.wgsl"] {
+            let src = std::fs::read_to_string(shaders.join(name))
+                .unwrap_or_else(|e| panic!("cannot read {name}: {e}"));
+            assert_eq!(
+                wgsl_material_size(&src),
+                rust,
+                "{name}: WGSL `MaterialGpu` is {} B but the Rust `GpuMaterial` is {rust} B. \
+                 These index the SAME storage buffer — a stride mismatch makes every material \
+                 index > 0 decode garbage and turns the bindless texture index into an \
+                 out-of-range descriptor access (device fault on AMD). Add/remove the padding \
+                 block in {name} to match.",
+                wgsl_material_size(&src),
+            );
+        }
     }
 }
