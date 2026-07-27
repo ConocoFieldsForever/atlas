@@ -6,14 +6,21 @@ Consumed by the pack grass step (eft_pipeline/build_grass.py), which places gras
 EFT's grass is NOT Unity's native terrain detail (that DB is a deliberately-ZEROED decoy:
 m_DetailPrototypes=[], 16384 empty patches, m_DrawTreesAndFoliage=False). It uses the GPU Instancer
 plugin: each terrain slice's "GPUI Detail Manager (Slice_X_Y)" GameObject (in level<lv>) references
-~12-22 GPUInstancerDetailPrototype MonoBehaviours (in sharedassets<lv>).
+30-50 GPUInstancerDetailPrototype MonoBehaviours (in sharedassets<lv>), each a different plant.
 
-DENSITY LAYOUT (verified on interchange lv63 + lighthouse lv200): each prototype MB serializes an
-int32[side*side] instance-count grid (side=512 on both; values ~0..16 per cell). We locate it by its
-aligned int32 count field (side*side for a plausible side), NOT by a fixed byte window - the array
-offset varies with the prototype's name length, and the file also carries ~136 tail bytes of float
-params after the grid. (A previous version read "the last 1MiB as 1024x1024 uint8", which sheared
-every row across two byte-rows and x-stretched the placement - do not regress to that.)
+IDENTIFICATION IS BY CLASS, NOT BY SHAPE. Components are found by resolving m_Script -> MonoScript
+-> "GPUInstancer.GPUInstancerDetailPrototype" / "...DetailManager". MonoScript is an ENGINE type
+with a hardcoded type tree, so this works even though il2cpp global-metadata.dat is encrypted
+(docs/IL2CPP.md) — no decryption, no process contact. Do NOT go back to sniffing payloads.
+
+DENSITY LAYOUT: each prototype MB serializes an int32[side*side] instance-count grid (values
+0..16 per cell). We locate it by its aligned int32 count field, NOT by a fixed byte window - the
+array offset varies with the prototype's name length, and the file also carries ~136 tail bytes of
+float params after the grid. The SIDE IS DERIVED from the count (any perfect square); it is
+map-specific - 320 and 512 on interchange, 384 and 576 on woods, 448/640 on customs. A previous
+version tested a hardcoded whitelist of "plausible" sides and so extracted ZERO grass from woods,
+which carries 186 real prototypes. (An older version still read "the last 1MiB as 1024x1024 uint8",
+which sheared every row across two byte-rows and x-stretched the placement - do not regress.)
 
 MANAGER -> PROTOTYPE references are parsed as a strict serialized PPtr array (int32 count, then
 count x {int32 fileID, int64 pathID}) with fileID validated against the level file's externals
@@ -43,41 +50,97 @@ OUTROOT = os.environ.get("EFT_ASSETS_ROOT") or (
     os.path.join(os.path.dirname(_TK), "eft_assets") if _TK else
     os.path.join(os.getcwd(), "eft_assets"))
 
-# plausible detail-grid resolutions (side of the square int32 array). interchange/lighthouse use 512;
-# customs uses 448 + 640 (verified: sharedassets17 payloads 803,500 B / 1,639,092 B with aligned count
-# fields 200704=448^2 @ +544 / 409600=640^2 @ +552). Other resolutions are accepted so a future map
-# with a denser grid extracts instead of vanishing; build_grass infers side from the file size.
-_SIDES = (256, 448, 512, 640, 1024, 2048)
 _MAX_TAIL = 4096          # bytes of trailing fields allowed after the density array
 _MAX_CELL_VALUE = 65535   # sanity ceiling for per-cell instance counts
+_MIN_SIDE = 32            # below this a "square array" is more likely a coincidence than a grid
 
 
 def _find_density_grid(raw):
     """Locate the serialized int32 density array in a GPUInstancerDetailPrototype's raw MB bytes.
-    Returns (side, int32 ndarray[side,side]) or None. Anchors on the aligned int32 COUNT field
-    (side*side) whose array fits the remaining bytes with only a small tail, and whose values are
-    sane non-negative instance counts. Ambiguity (2+ candidates) is rejected loudly."""
-    good = []
-    for side in _SIDES:
-        cnt = side * side
-        if len(raw) < 4 + cnt * 4:
+
+    Returns (side, int32 ndarray[side,side]) or None. Anchors on an aligned int32 COUNT field
+    whose array fills the rest of the payload bar a small tail of trailing fields, whose count is
+    a PERFECT SQUARE, and whose values are sane non-negative instance counts.
+
+    NO whitelist of resolutions. This used to test a hardcoded `_SIDES` tuple of "plausible"
+    sides (256/448/512/640/1024/2048) — so Woods, whose grids are 384^2 and 576^2, matched
+    nothing and silently extracted ZERO grass while carrying 186 real detail prototypes. The side
+    is DERIVED from the array length instead; callers must not assume any particular resolution.
+    """
+    good, L = [], len(raw)
+    for off in range(0, max(0, L - 8), 4):
+        cnt = struct.unpack_from("<i", raw, off)[0]
+        if cnt < _MIN_SIDE * _MIN_SIDE or off + 4 + cnt * 4 > L:
             continue
-        pat = struct.pack("<i", cnt)
-        off = raw.find(pat)
-        while off != -1:
-            if off % 4 == 0 and off + 4 + cnt * 4 <= len(raw):
-                tail = len(raw) - (off + 4 + cnt * 4)
-                if tail <= _MAX_TAIL:
-                    arr = np.frombuffer(raw, "<i4", count=cnt, offset=off + 4)
-                    if arr.min() >= 0 and arr.max() <= _MAX_CELL_VALUE:
-                        good.append((side, arr))
-            off = raw.find(pat, off + 4)
+        if L - (off + 4 + cnt * 4) > _MAX_TAIL:
+            continue
+        side = int(round(cnt ** 0.5))
+        if side * side != cnt:
+            continue
+        arr = np.frombuffer(raw, "<i4", count=cnt, offset=off + 4)
+        if arr.min() >= 0 and arr.max() <= _MAX_CELL_VALUE:
+            good.append((side, arr))
     if len(good) != 1:
         if len(good) > 1:
             print(f"  density grid: {len(good)} candidate arrays in one MB - AMBIGUOUS, skipped")
         return None
     side, arr = good[0]
     return side, arr.reshape(side, side)
+
+
+# The component classes we care about, by their REAL C# names. Resolved from each
+# MonoBehaviour's m_Script -> MonoScript, which is an ENGINE type with a hardcoded type tree —
+# so this works with the il2cpp metadata fully encrypted (docs/IL2CPP.md). Identifying components
+# by class instead of by "payload looks like X" removes the last discovery guess: a prototype is
+# a prototype because the game says so, not because its bytes resembled a grid.
+CLS_PROTOTYPE = "GPUInstancer.GPUInstancerDetailPrototype"
+CLS_MANAGER = "GPUInstancer.GPUInstancerDetailManager"
+
+
+class _ScriptClasses:
+    """MonoBehaviour raw bytes -> "Namespace.ClassName" (or None)."""
+
+    def __init__(self, data_root, env):
+        self.data_root = data_root
+        sf = list(env.files.values())[0]
+        self.externals = [e.path for e in sf.externals]
+        self.local = {o.path_id: o for o in env.objects}
+        self._files = {}
+        self._names = {}
+
+    def _table(self, fid):
+        if fid == 0:
+            return self.local
+        if not (1 <= fid <= len(self.externals)):
+            return {}
+        key = self.externals[fid - 1]
+        if key not in self._files:
+            p = os.path.join(self.data_root, os.path.basename(key))
+            try:
+                self._files[key] = {o.path_id: o for o in UnityPy.load(p).objects} \
+                    if os.path.exists(p) else {}
+            except Exception:
+                self._files[key] = {}
+        return self._files[key]
+
+    def of(self, raw):
+        # m_Script PPtr @16: m_GameObject(12) + m_Enabled(1 + 3 pad)
+        if len(raw) < 28:
+            return None
+        fid, pid = struct.unpack_from("<iq", raw, 16)
+        if (fid, pid) in self._names:
+            return self._names[(fid, pid)]
+        name = None
+        try:
+            o = self._table(fid).get(pid)
+            if o is not None and o.type.name == "MonoScript":
+                d = o.read_typetree()
+                ns = d.get("m_Namespace") or ""
+                name = f"{ns + '.' if ns else ''}{d.get('m_ClassName') or ''}"
+        except Exception:
+            name = None
+        self._names[(fid, pid)] = name
+        return name
 
 
 def _sharedassets_fids(level_env, lv):
@@ -109,7 +172,10 @@ def _pptr_list(raw, valid_fids, pids):
     L = len(raw)
     for off in range(0, L - 16, 4):
         n = struct.unpack_from("<i", raw, off)[0]
-        if not (4 <= n <= 64) or off + 4 + n * 12 > L:
+        # >=1: the caller now identifies the manager by CLASS, so a slice legitimately referencing
+        # only a couple of prototypes must still be accepted (the old >=4 floor was a proxy for
+        # "this payload is probably a detail manager").
+        if not (1 <= n <= 4096) or off + 4 + n * 12 > L:
             continue
         got = []
         for k in range(n):
@@ -213,22 +279,25 @@ def extract_grass_density(data_root, lv, out_dir):
     """
     sa = UnityPy.load(os.path.join(data_root, f"sharedassets{lv}.assets"))
     res = _ExtResolver(data_root, sa)
+    cls = _ScriptClasses(data_root, sa)
     proto = {}
     proto_side = {}
     proto_name = {}
     proto_tex = {}
+    n_class, n_nogrid = 0, 0
     for o in sa.objects:
         if o.type.name != "MonoBehaviour":
             continue
         try:
-            raw = o.get_raw_data()
+            raw = bytes(o.get_raw_data())
         except Exception:
             continue
-        if len(raw) < 4 + min(_SIDES) ** 2 * 4:      # too small to hold any density grid
+        if cls.of(raw) != CLS_PROTOTYPE:             # identified by CLASS, not by payload shape
             continue
-        raw = bytes(raw)
+        n_class += 1
         found = _find_density_grid(raw)
         if found is None:
+            n_nogrid += 1
             continue
         proto_side[o.path_id], proto[o.path_id] = found
         nm = _mb_name(raw)
@@ -237,19 +306,28 @@ def extract_grass_density(data_root, lv, out_dir):
         side = found[0]
         goff = raw.find(struct.pack("<i", side * side))
         proto_tex[o.path_id] = res.textures(raw, goff if goff > 0 else 0, nm)
+    if n_class and not proto:
+        # LOUD: the game says these ARE detail prototypes, so a grid we cannot parse is a decoder
+        # gap, not an absent feature. Silently returning {} here is what made Woods look grassless.
+        print(f"grass density: {n_class} {CLS_PROTOTYPE} in sharedassets{lv} but NO density grid "
+              f"could be parsed in any of them — decoder gap, NOT a grassless map")
+        return {}
     if not proto:
-        print(f"grass density: no GPU Instancer detail prototypes in sharedassets{lv} — skip")
+        print(f"grass density: no {CLS_PROTOTYPE} components in sharedassets{lv} — skip")
         return {}
     sides = sorted(set(proto_side.values()))
-    print(f"grass density: {len(proto)} detail prototypes in sharedassets{lv} (grid side {sides})")
+    print(f"grass density: {len(proto)}/{n_class} detail prototypes carry a grid in "
+          f"sharedassets{lv} (sides {sides}"
+          + (f"; {n_nogrid} with no parsable grid" if n_nogrid else "") + ")")
 
     lvl = UnityPy.load(os.path.join(data_root, f"level{lv}"))
+    lvl_cls = _ScriptClasses(data_root, lvl)
     objmap = {o.path_id: o for o in lvl.objects}
     valid_fids = _sharedassets_fids(lvl, lv)
     if valid_fids is None:
         print("  WARNING: could not resolve the level's externals table - "
               "accepting any external fileID for prototype PPtrs")
-    quick_pats = [struct.pack("<q", p) for p in proto]
+    # (prototype pathIDs are validated inside _pptr_list against `proto`)
     slice_pids = {}                                  # slice_name -> set of prototype path_ids
     for o in lvl.objects:
         if o.type.name != "MonoBehaviour":
@@ -258,12 +336,14 @@ def extract_grass_density(data_root, lv, out_dir):
             raw = bytes(o.get_raw_data())
         except Exception:
             continue
-        if len(raw) > 200000:                        # managers are small
-            continue
-        if sum(p in raw for p in quick_pats) < 3:    # cheap prefilter before the strict scan
+        # Identify the manager by CLASS (was: "small payload that mentions >=3 prototype pathIDs
+        # and parses as a >=4-entry PPtr run"). The strict PPtr parse below still validates the
+        # list itself; this just stops the search from depending on how many prototypes a manager
+        # happens to reference.
+        if lvl_cls.of(raw) != CLS_MANAGER:
             continue
         pl = _pptr_list(raw, valid_fids, proto)
-        if len(pl) < 4:                              # a detail manager references >=~12 prototypes
+        if not pl:
             continue
         go_pid = struct.unpack("<q", raw[4:12])[0]   # MonoBehaviour.m_GameObject pathID
         go = objmap.get(go_pid)

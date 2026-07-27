@@ -2,13 +2,16 @@
 """#4 GRASS — deterministic placement from the GPU-Instancer density grids.
 
 EFT grass is baked GPU-Instancer density (NOT Unity terrain detail — that DB is a zeroed
-decoy). The extractor (extraction/unity/eft_extract_grass.py) dumps per-slice combined grids
-(grass_density_Slice_*.bin, side^2 uint8; side=512 on interchange/lighthouse — the game's
-int32[512*512] detail arrays summed over ~12-22 prototypes, road/building-excluding,
-hand-authored). This emits one grass instance per non-empty cell (deterministic per-cell hash
-for rotation/scale — NEVER client-random), placed on the terrain surface via a UV->world
-bilinear lookup built from the pack's terrain meshes (so XZ AND height are exact and in pack
-space).
+decoy). The extractor (extraction/unity/eft_extract_grass.py) dumps, per terrain slice, a
+PER-PROTOTYPE stack (grass_protos_Slice_*.bin, uint8[nproto][side][side]) plus the combined
+grid (grass_density_Slice_*.bin) for back-compat. Grid side is map-specific and DERIVED, not
+assumed (320/384/512/576/640 all occur).
+
+This emits one instance per COUNT stored in each cell of each prototype's grid — the game's
+grids hold an instance count (0..16 per prototype), and each prototype is a different plant
+with its own billboard card. Rotation, scale and sub-cell jitter come from a deterministic
+per-(cell, prototype, k) hash — NEVER client-random. Positions come from a UV->world bilinear
+lookup built from the pack's terrain meshes, so XZ AND height are exact and in pack space.
 
 GRID ORIENTATION: grids are dumped in GAME row order (Unity detail [row=z][col=x], terrain-
 local). Our terrain meshes carry UVs in the Unity heightmap/splat IMAGE frame — u = x_frac,
@@ -17,8 +20,10 @@ so grid cell (col cx, row cy) samples the mesh at u=(cx+.5)/side, v=1-(cy+.5)/si
 Verified against road footprints + sea level on lighthouse AND interchange (the un-flipped
 mapping drops 75% of lighthouse Slice_5_4's clumps into the sea).
 
-Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 (20 B), pack space.
-        <pack>/grass_sidecar.json = {count, albedo, tint}
+Output: <pack>/grass.bin  = N records of [x,y,z, rotY, scale] f32 + kind u32 (24 B), pack space.
+        <pack>/grass_sidecar.json = {count, format:2, kinds:[{albedo,tint}], wind:{...},
+                                     albedo, tint}   (albedo/tint = legacy single-card fields)
+        <pack>/grass_<Tex>.png    = one billboard card per kind, copied in (self-contained)
 
   python -m eft_pipeline.build_grass --pack packs/interchange.eftpack [--self-contained]
 
@@ -88,13 +93,43 @@ def _rasterize_tri_xz(cells, cell, ax, az, bx, bz, cx, cz):
     inside = ~(((d1 < 0) | (d2 < 0) | (d3 < 0)) & ((d1 > 0) | (d2 > 0) | (d3 > 0)))
     zz, xx = np.where(inside)
     cells.update(zip(gx[xx].tolist(), gz[zz].tolist()))
-    # conservative edge sampling at half-cell spacing (bounded by the same span guard above)
-    for (x0, z0, x1, z1) in ((ax, az, bx, bz), (bx, bz, cx, cz), (cx, cz, ax, az)):
-        npt = int(max(abs(x1 - x0), abs(z1 - z0)) / (cell * 0.5)) + 1
-        t = np.linspace(0.0, 1.0, npt + 1)
-        ex = np.round((x0 + (x1 - x0) * t) / cell).astype(np.int64)
-        ez = np.round((z0 + (z1 - z0) * t) / cell).astype(np.int64)
-        cells.update(zip(ex.tolist(), ez.tolist()))
+    # NOTE: the conservative EDGE pass is no longer done here — it is batched per mesh instance in
+    # build_road_mask (`_rasterize_edges`). It used to run three np.linspace + np.round + .tolist()
+    # calls PER TRIANGLE: ~9.5M numpy calls on interchange's 3.18M road triangles, which reliably
+    # crashed the interpreter with an access violation inside np.round/.tolist (verified: the input
+    # data is clean — 0 non-finite coords, 0 oversized spans, worst edge only 1043 samples). Same
+    # cells, ~3k vectorised calls instead.
+
+
+def _rasterize_edges(cells, cell, WX, WZ):
+    """Conservative edge coverage for a whole batch of triangles at once.
+
+    WX/WZ are (T,3) world XZ arrays. Samples every triangle edge at half-cell spacing — the half
+    of the road raster that catches thin strips containing no cell CENTRE (dilation cannot grow an
+    empty seed). Vectorised across the batch because doing it per triangle meant millions of tiny
+    numpy calls (see the note in _rasterize_tri_xz)."""
+    if len(WX) == 0:
+        return
+    x0 = np.concatenate([WX[:, 0], WX[:, 1], WX[:, 2]])
+    z0 = np.concatenate([WZ[:, 0], WZ[:, 1], WZ[:, 2]])
+    x1 = np.concatenate([WX[:, 1], WX[:, 2], WX[:, 0]])
+    z1 = np.concatenate([WZ[:, 1], WZ[:, 2], WZ[:, 0]])
+    ok = np.isfinite(x0) & np.isfinite(z0) & np.isfinite(x1) & np.isfinite(z1)
+    x0, z0, x1, z1 = x0[ok], z0[ok], x1[ok], z1[ok]
+    if len(x0) == 0:
+        return
+    span = np.maximum(np.abs(x1 - x0), np.abs(z1 - z0))
+    npt = np.minimum((span / (cell * 0.5)).astype(np.int64) + 1, 4096) + 1  # samples per edge
+    total = int(npt.sum())
+    if total <= 0:
+        return
+    e = np.repeat(np.arange(len(npt), dtype=np.int64), npt)                 # edge index per sample
+    k = np.arange(total, dtype=np.int64) - np.repeat(
+        np.concatenate(([0], np.cumsum(npt)[:-1])), npt)                    # sample index in edge
+    t = k / np.maximum(npt[e] - 1, 1)
+    ex = np.rint((x0[e] + (x1[e] - x0[e]) * t) / cell).astype(np.int64)
+    ez = np.rint((z0[e] + (z1[e] - z0[e]) * t) / cell).astype(np.int64)
+    cells.update(zip(ex.tolist(), ez.tolist()))
 
 
 def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
@@ -113,7 +148,7 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
     mbnp = np.frombuffer(mb, np.uint8)
     n = len(ib) // istride
     cells = set()
-    ninst = 0; ntri = 0
+    ninst = 0; ntri = 0; nbig = 0
     for i in range(n):
         b = i * istride
         mid = struct.unpack_from("<I", ib, b + fo["meshId"])[0]
@@ -127,15 +162,36 @@ def build_road_mask(mani, mb, ib, cell=1.0, dilate=1):
         # NO triangle subsampling: index order gives no coverage guarantee, so a cap can drop
         # arbitrary (even large) triangles and leave grass-through-road holes. Full raster is
         # only ~14% more triangles than the old cap on interchange.
-        for t in idx:
-            wx = [0.0, 0.0, 0.0]; wz = [0.0, 0.0, 0.0]
-            for j in range(3):
-                o = voff + int(t[j]) * vs
-                lx, ly, lz = struct.unpack_from("<3f", mb, o + poff)
-                wx[j] = a[0] * lx + a[1] * ly + a[2] * lz + a[3]
-                wz[j] = a[8] * lx + a[9] * ly + a[10] * lz + a[11]
-            _rasterize_tri_xz(cells, cell, wx[0], wz[0], wx[1], wz[1], wx[2], wz[2])
-            ntri += 1
+        # Transform this instance's road verts to world XZ ONCE (vectorised), then rasterize.
+        # The per-vertex struct.unpack_from loop this replaces ran 3x per triangle over millions
+        # of triangles; the batched edge pass below also avoids the numpy-call storm that crashed
+        # the interpreter on interchange.
+        nv = me["vtxCount"]
+        pos = (np.frombuffer(mb, np.uint8, count=nv * vs, offset=voff)
+               .reshape(nv, vs)[:, poff:poff + 12]
+               .copy().view("<f4"))
+        lx, ly, lz = pos[:, 0], pos[:, 1], pos[:, 2]
+        vwx = a[0] * lx + a[1] * ly + a[2] * lz + a[3]
+        vwz = a[8] * lx + a[9] * ly + a[10] * lz + a[11]
+        ti = idx.astype(np.int64)
+        WX = vwx[ti]
+        WZ = vwz[ti]
+        # Interior FILL is only needed for triangles big enough to contain a cell centre that no
+        # edge sample reaches. At half-cell edge spacing every cell centre of a <=2-cell-wide
+        # triangle is already within half a cell of a sample, so the fill would be redundant —
+        # and running it unconditionally meant 3.18M np.meshgrid calls on interchange, which
+        # crashed the interpreter (access violation inside meshgrid/broadcast). Big slabs
+        # (parking_floor_LOD0 = 298x519 m from 433 verts) still get the full fill, which is the
+        # case the fill exists for.
+        spanx = WX.max(axis=1) - WX.min(axis=1)
+        spanz = WZ.max(axis=1) - WZ.min(axis=1)
+        big = np.where((spanx > 2.0 * cell) | (spanz > 2.0 * cell))[0]
+        for r in big.tolist():
+            _rasterize_tri_xz(cells, cell, WX[r, 0], WZ[r, 0], WX[r, 1], WZ[r, 1],
+                              WX[r, 2], WZ[r, 2])
+        _rasterize_edges(cells, cell, WX, WZ)
+        ntri += len(ti)
+        nbig += len(big)
     if dilate:
         d = set()
         for (cx, cz) in cells:
