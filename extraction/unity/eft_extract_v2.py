@@ -1213,6 +1213,7 @@ def main():
 
         # ---- mesh renderers + skinned mesh renderers ----
         cnt = 0
+        nomat_skipped = {}   # GameObject name -> count of renderers dropped for having NO material
         if not args.terrain_only:
             for o in env.objects:
                 tn = o.type.name
@@ -1246,7 +1247,20 @@ def main():
                     if not fn: continue
                     W = world_of_go(mr.m_GameObject.path_id)
                     if W is None: continue
-                    subs = submesh_mats(tri_per, mr.m_Materials or [])
+                    # A renderer with an EMPTY m_Materials array draws NOTHING in Unity -- there is no
+                    # shader to run. Emitting it anyway synthesised a fake untextured white submesh, so
+                    # the viewer drew flat sheets the game does not: interchange's four
+                    # `Shoreline_Lake_Water_02_LOD0` planes (which is why they had `sh: null, tex: null`),
+                    # plus ~1,620 AreaLight/AreaLightGI and per-vehicle `*_lanterns_*_Area` placeholder
+                    # quads. Structural, not a name rule: measured across interchange's 14 levels,
+                    # 206,089 renderers have materials and exactly 1,624 do not -- and every one of those
+                    # is an invisible placeholder. (Objects whose material EXISTS but whose shader fails
+                    # to resolve still come through: those keep a material and are unaffected.)
+                    mats = list(g(mr, "m_Materials", default=[]) or [])
+                    if not mats:
+                        nomat_skipped[getattr(go, "m_Name", "?")] = nomat_skipped.get(getattr(go, "m_Name", "?"), 0) + 1
+                        continue
+                    subs = submesh_mats(tri_per, mats)
                     # WATER (geometric): a big dead-flat horizontal plane whose material has NO albedo texture is a water/
                     # mirror sheet (its flat `col` was the "white water"). Reflective props share the shader but aren't flat.
                     if _flat_water_plane(aabb, W):
@@ -1344,6 +1358,10 @@ def main():
                         err = _bake_tile(job)
                         if err: print(err)
             _tile_jobs.clear()
+        if nomat_skipped:
+            top = sorted(nomat_skipped.items(), key=lambda kv: -kv[1])[:4]
+            print(f"  level{lv}: dropped {sum(nomat_skipped.values())} renderer(s) with NO material "
+                  f"(draw nothing in Unity): {', '.join(f'{n}x{c}' for n, c in top)}", flush=True)
         print(f"level{lv}: +{cnt} mesh +{tcnt} terrain  total={len(instances)} meshes={len([v for v in exported.values() if v])} tex={len(tex_done)} ({time.time()-t0:.0f}s)", flush=True)
         del env, tfm, wcache, go2tf, _tf, _goc, mesh_intrinsic; gc.collect()
 

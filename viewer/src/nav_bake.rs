@@ -1908,6 +1908,172 @@ fn self_check(baked: &Baked, dir: &Path) {
     }
 }
 
+// ---- CLI entry: `atlas check-nav <pack_dir> --to "<exfil>" [--side ...]` -----------------------
+
+/// Route EVERY spawn point in the pack to one extract and report the ones that cannot get there.
+///
+/// This is the acceptance test a nav bake actually has to pass. The self-check's random cell pairs
+/// measure the grid in the abstract; this measures the thing a player cares about — can you leave
+/// the map from where the game puts you. Spawn points and extracts both come from gamedata.json
+/// (the game's own tables), so nothing here is authored.
+///
+/// Exfils are matched on the SERIALIZED name; the game's English display names live in the shared
+/// tarkov.dev locale (e.g. `SE Exfil` is "Emercom Checkpoint"), so either string is accepted.
+pub fn run_check_cli(args: &[String]) -> i32 {
+    let mut pack_dir: Option<String> = None;
+    let mut want: Option<String> = None;
+    let mut side = "all".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--to" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => want = Some(v.clone()),
+                    None => {
+                        eprintln!("check-nav: --to needs an exfil name");
+                        return 2;
+                    }
+                }
+            }
+            "--side" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => side = v.to_lowercase(),
+                    None => {
+                        eprintln!("check-nav: --side needs pmc|scav|all");
+                        return 2;
+                    }
+                }
+            }
+            s if pack_dir.is_none() => pack_dir = Some(s.to_string()),
+            s => {
+                eprintln!("check-nav: unexpected argument '{s}'");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+    let Some(dir) = pack_dir else {
+        eprintln!("usage: atlas check-nav <pack_dir> --to \"<exfil name>\" [--side pmc|scav|all]");
+        return 2;
+    };
+    let root = Path::new(&dir);
+
+    let gd: serde_json::Value = match std::fs::read_to_string(root.join("gamedata.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("check-nav: no readable gamedata.json in {dir}");
+            return 1;
+        }
+    };
+    let Some(grid) = NavGrid::load(root) else {
+        eprintln!("check-nav: no nav grid in {dir} — run `atlas bake-nav` first");
+        return 1;
+    };
+
+    // Locale: the serialized exfil id -> English display name (tarkov.dev `maps_en`), so `--to`
+    // accepts either. Missing cache is fine; matching then falls back to the serialized name.
+    let locale: serde_json::Value = std::fs::read_to_string(
+        crate::paths::shared_dir().join(".tarkov-json-cache").join("maps_en.json"),
+    )
+    .ok()
+    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    .and_then(|v| v.get("data").cloned())
+    .unwrap_or(serde_json::Value::Null);
+    let display = |name: &str| -> String {
+        locale.get(name).and_then(|v| v.as_str()).unwrap_or(name).to_string()
+    };
+
+    let empty = vec![];
+    let exfils = gd.get("exfils").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let want_s = want.unwrap_or_default();
+    let wl = want_s.to_lowercase();
+    let mut targets: Vec<(String, String, Vec3)> = Vec::new();
+    for e in exfils {
+        let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let disp = display(&name);
+        let p = e.get("pos").and_then(|v| v.as_array());
+        let Some(p) = p else { continue };
+        if p.len() < 3 {
+            continue;
+        }
+        let pos = Vec3::new(
+            p[0].as_f64().unwrap_or(0.0) as f32,
+            p[1].as_f64().unwrap_or(0.0) as f32,
+            p[2].as_f64().unwrap_or(0.0) as f32,
+        );
+        if wl.is_empty() || name.to_lowercase().contains(&wl) || disp.to_lowercase().contains(&wl) {
+            targets.push((name, disp, pos));
+        }
+    }
+    if targets.is_empty() {
+        eprintln!("check-nav: no exfil matches '{want_s}'. Available:");
+        for e in exfils {
+            let n = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            eprintln!("    {:<34} {}", n, display(n));
+        }
+        return 1;
+    }
+
+    let spawns = gd.get("spawn_points").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let mut sc = Scratch::new(grid.nodes());
+    let mut rc = 0;
+
+    for (name, disp, tgt) in &targets {
+        let mut ok = 0usize;
+        let mut fail: Vec<(String, String, Vec3)> = Vec::new();
+        let mut skipped = 0usize;
+        for s in spawns {
+            let sside = s.get("side").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            if side != "all" && sside != side {
+                continue;
+            }
+            let Some(p) = s.get("pos").and_then(|v| v.as_array()) else { continue };
+            if p.len() < 3 {
+                continue;
+            }
+            let from = Vec3::new(
+                p[0].as_f64().unwrap_or(0.0) as f32,
+                p[1].as_f64().unwrap_or(0.0) as f32,
+                p[2].as_f64().unwrap_or(0.0) as f32,
+            );
+            let sname = s.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            match grid.path(from, *tgt, &mut sc, None) {
+                Some((pts, _)) if pts.len() >= 2 => ok += 1,
+                _ => {
+                    skipped += 0;
+                    fail.push((sname, sside, from))
+                }
+            }
+        }
+        let total = ok + fail.len() + skipped;
+        let pct = if total > 0 { 100.0 * ok as f32 / total as f32 } else { 0.0 };
+        println!(
+            "\n=== {} ({}) at [{:.1}, {:.1}, {:.1}] ===",
+            disp, name, tgt.x, tgt.y, tgt.z
+        );
+        println!("  {ok}/{total} spawns can reach it ({pct:.1}%)   [side filter: {side}]");
+        if !fail.is_empty() {
+            rc = 1;
+            println!("  UNREACHABLE ({}):", fail.len());
+            for (n, sd, p) in fail.iter().take(40) {
+                println!(
+                    "    {:<22} {:<5} at [{:>8.1},{:>7.1},{:>8.1}]   EFT_ROUTE=\"{:.2},{:.2},{:.2};{:.2},{:.2},{:.2}\"",
+                    n, sd, p.x, p.y, p.z, p.x, p.y, p.z, tgt.x, tgt.y, tgt.z
+                );
+            }
+            if fail.len() > 40 {
+                println!("    ... and {} more", fail.len() - 40);
+            }
+        }
+    }
+    rc
+}
+
 // ---- CLI entry: `atlas bake-nav <pack_dir> [--res R] [--layers K]` -----------------------------
 
 /// Handle the headless `bake-nav` subcommand. `args` is argv AFTER the "bake-nav" token. Returns a
