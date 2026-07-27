@@ -124,11 +124,99 @@ def _pptr_list(raw, valid_fids, pids):
     return best
 
 
+_PROTO_NAME_RE = re.compile(r"^Detail_\d+_(.+?)_[0-9a-fA-F]{6}$")
+
+
+def _mb_name(raw):
+    """MonoBehaviour m_Name: after m_GameObject(12) + m_Enabled(4) + m_Script(12) = @28."""
+    try:
+        n = struct.unpack_from("<i", raw, 28)[0]
+        if 0 < n <= 200 and 32 + n <= len(raw):
+            return raw[32:32 + n].decode("utf-8", "replace")
+    except Exception:
+        pass
+    return ""
+
+
+class _ExtResolver:
+    """Resolves a prototype's texture PPtrs, which point into OTHER assets files.
+
+    The grass billboard textures do NOT live in the terrain level's sharedassets bundle — on
+    reserve they sit in sharedassets17/25, referenced through the level's externals table. The
+    old exporter only scanned the terrain bundle for Texture2D objects whose NAME contained
+    'grass', so every map whose textures live elsewhere (reserve, lighthouse) exported ZERO
+    cards and silently lost its grass. Follow the actual reference instead of guessing names.
+    """
+
+    def __init__(self, data_root, env):
+        self.data_root = data_root
+        self.sf = list(env.files.values())[0]
+        self.externals = [e.path for e in self.sf.externals]
+        self.local = {o.path_id: o for o in env.objects}
+        self._cache = {}
+
+    def _ext(self, fid):
+        """{path_id: obj} for external fileID (1-based into the externals table)."""
+        if not (1 <= fid <= len(self.externals)):
+            return None
+        key = self.externals[fid - 1]
+        if key not in self._cache:
+            p = os.path.join(self.data_root, os.path.basename(key))
+            try:
+                self._cache[key] = {o.path_id: o for o in UnityPy.load(p).objects} \
+                    if os.path.exists(p) else {}
+            except Exception:
+                self._cache[key] = {}
+        return self._cache[key]
+
+    def textures(self, raw, grid_off, proto_name):
+        """Texture2D objects referenced by this prototype, best match first.
+
+        Prefers the texture whose m_Name matches the one embedded in the prototype's own name
+        ('Detail_7_Grass4_D_bf0a23' -> 'Grass4_D') — the game's own authored link, so it is a
+        strict validation rather than a heuristic. Falls back to any referenced Texture2D that
+        carries a real alpha cutout (a billboard card).
+        """
+        want = (_PROTO_NAME_RE.match(proto_name).group(1).lower()
+                if _PROTO_NAME_RE.match(proto_name) else None)
+        head, seen, hits = raw[:grid_off], set(), []
+        for off in range(0, max(0, len(head) - 12), 4):
+            fid, pid = struct.unpack_from("<iq", head, off)
+            if pid <= 0 or pid > 10 ** 9 or (fid, pid) in seen:
+                continue
+            seen.add((fid, pid))
+            tbl = self.local if fid == 0 else self._ext(fid)
+            obj = (tbl or {}).get(pid)
+            if obj is None or obj.type.name != "Texture2D":
+                continue
+            try:
+                nm = obj.read().m_Name or ""
+            except Exception:
+                continue
+            hits.append((nm, obj))
+        if want:
+            hits.sort(key=lambda h: h[0].lower() != want)
+        return hits
+
+
 def extract_grass_density(data_root, lv, out_dir):
-    """Per-slice combined grass density grids from GPU Instancer. Returns {slice_name: {dims, nonzero}}."""
+    """Per-slice grass density from GPU Instancer.
+
+    Writes, per slice: the COMBINED grid `grass_density_<Slice>.bin` (uint8, back-compat) AND
+    the PER-PROTOTYPE stack `grass_protos_<Slice>.bin` (uint8[nproto][side][side]). The per-
+    prototype grids are what carry the map's plant VARIETY: each detail type is a different
+    plant with its own card (grass11, T_WhitGrass_A, Grass4_D, Grass_new_1_D...) and its own
+    footprint. Summing them into one grid (the old behaviour) collapsed 12-30 species into a
+    single repeated texture.
+
+    Returns ({slice_name: {dims, nonzero, prototypes:[...]}} , exported_texture_count).
+    """
     sa = UnityPy.load(os.path.join(data_root, f"sharedassets{lv}.assets"))
+    res = _ExtResolver(data_root, sa)
     proto = {}
     proto_side = {}
+    proto_name = {}
+    proto_tex = {}
     for o in sa.objects:
         if o.type.name != "MonoBehaviour":
             continue
@@ -138,10 +226,17 @@ def extract_grass_density(data_root, lv, out_dir):
             continue
         if len(raw) < 4 + min(_SIDES) ** 2 * 4:      # too small to hold any density grid
             continue
-        found = _find_density_grid(bytes(raw))
+        raw = bytes(raw)
+        found = _find_density_grid(raw)
         if found is None:
             continue
         proto_side[o.path_id], proto[o.path_id] = found
+        nm = _mb_name(raw)
+        proto_name[o.path_id] = nm
+        # grid offset: _find_density_grid anchored on the count field; recover it for the head slice
+        side = found[0]
+        goff = raw.find(struct.pack("<i", side * side))
+        proto_tex[o.path_id] = res.textures(raw, goff if goff > 0 else 0, nm)
     if not proto:
         print(f"grass density: no GPU Instancer detail prototypes in sharedassets{lv} — skip")
         return {}
@@ -184,6 +279,7 @@ def extract_grass_density(data_root, lv, out_dir):
         slice_pids.setdefault(m.group(0), set()).update(pl)
 
     result = {}
+    exported = {}                                    # texture m_Name -> written filename
     for slice_name, pids in sorted(slice_pids.items()):
         ss = {proto_side[p] for p in pids}
         side = max(ss)
@@ -195,17 +291,52 @@ def extract_grass_density(data_root, lv, out_dir):
             # the road/building-excluding boundaries the grids exist to preserve.
             print(f"  grass density {slice_name}: MIXED grid sides {sorted(ss)} - nearest-resampled to {side}")
         acc = np.zeros((side, side), np.uint32)
+        stack, protos = [], []
         for p in sorted(pids):                       # SUM instance counts across this slice's detail types
             g = proto[p].astype(np.uint32)
             if g.shape[0] != side:                   # nearest neighbour in the shared normalized UV space
                 idx = (np.arange(side, dtype=np.int64) * g.shape[0]) // side
                 g = g[np.ix_(idx, idx)]
             acc += g
+            if not g.any():                          # a prototype with an all-zero grid places nothing
+                continue
+            # export this prototype's billboard card (following its OWN reference, not a name scan)
+            texfile = ""
+            for nm, obj in proto_tex.get(p, []):
+                if nm in exported:
+                    texfile = exported[nm]
+                    break
+                try:
+                    img = obj.read().image
+                    if "A" not in img.getbands():
+                        continue
+                    lo, hi = img.getchannel("A").getextrema()
+                    if hi - lo < 32:                 # no real cutout -> not a billboard card
+                        continue
+                    texfile = "grass_" + nm + ".png"
+                    img.save(os.path.join(out_dir, texfile))
+                    exported[nm] = texfile
+                    break
+                except Exception:
+                    continue
+            if not texfile:
+                print(f"    prototype {proto_name.get(p, p)!r}: no usable billboard texture — skipped")
+                continue
+            stack.append(np.clip(g, 0, 255).astype(np.uint8))
+            protos.append({"name": proto_name.get(p, str(p)), "tex": texfile,
+                           "cells": int((g > 0).sum()), "max": int(g.max())})
         grid = np.clip(acc, 0, 255).astype(np.uint8)
         grid.tofile(os.path.join(out_dir, f"grass_density_{slice_name}.bin"))
-        result[slice_name] = {"dims": [side, side], "nonzero": round(float((grid > 0).mean()), 4)}
-        print(f"  grass density {slice_name}: {len(pids)} prototypes, "
-              f"{result[slice_name]['nonzero']*100:.1f}% cells, max {int(acc.max())}")
+        if stack:
+            np.stack(stack).tofile(os.path.join(out_dir, f"grass_protos_{slice_name}.bin"))
+        result[slice_name] = {"dims": [side, side],
+                              "nonzero": round(float((grid > 0).mean()), 4),
+                              "prototypes": protos}
+        print(f"  grass density {slice_name}: {len(pids)} prototypes "
+              f"({len(protos)} with geometry+texture), "
+              f"{result[slice_name]['nonzero']*100:.1f}% cells, max {int(acc.max())}/cell")
+    print(f"grass billboard textures exported: {len(exported)} "
+          f"({', '.join(sorted(exported)) if exported else 'none'})")
     return result
 
 
@@ -242,27 +373,12 @@ def main():
     env = UnityPy.load(os.path.join(args.data_root, f"sharedassets{args.level}.assets"))
     out = os.path.join(OUTROOT, args.name, "terrain_layers")
     os.makedirs(out, exist_ok=True)
-    # GRASS BILLBOARD TEXTURES: EFT's terrain grass cards (Grass3_D = tall rye clump, Grass5_512_D = seed-head
-    # row). Real alpha-cutout atlases the viewer scatters as billboards. Export every grass-named Texture2D that
-    # HAS a real alpha channel (the *_D albedo cards; skip *_N normals). Sidecar-published like the splat layers.
-    ntex = 0
-    for obj in env.objects:
-        if obj.type.name != "Texture2D":
-            continue
-        try:
-            d = obj.read(); nm = d.m_Name or ""
-            if "grass" not in nm.lower() or nm.lower().endswith("_n"):
-                continue
-            img = d.image
-            if "A" not in img.getbands():
-                continue
-            lo, hi = img.getchannel("A").getextrema()
-            if hi - lo < 32:                                   # no real cutout -> not a billboard card
-                continue
-            img.save(os.path.join(out, "grass_" + nm + ".png")); ntex += 1
-        except Exception:
-            pass
-    print(f"grass billboard textures exported: {ntex}")
+    # GRASS BILLBOARD TEXTURES are exported by extract_grass_density() below, which follows each
+    # GPU-Instancer prototype's OWN texture reference (across the externals table into whatever
+    # sharedassets bundle actually holds the card). The previous implementation scanned only this
+    # terrain bundle for Texture2D objects whose NAME contained "grass" — a name guess that
+    # exported 0 textures on every map storing them elsewhere (reserve, lighthouse), which then
+    # emitted an empty sidecar albedo and silently disabled grass in the viewer.
     slices = {}
     for obj in env.objects:
         if obj.type.name != "TerrainData":
@@ -281,7 +397,21 @@ def main():
         print(f"level{args.level}: no TerrainData in sharedassets{args.level}.assets — nothing written")
         return
     # DETERMINISTIC per-slice grass DENSITY grids (GPU Instancer) — the authoritative placement.
+    # The detail prototypes do NOT always live in the same bundle as the TerrainData, so try the
+    # terrain level first and then every other level the caller listed. (Woods really has none
+    # anywhere — its ground cover is placed mesh geometry, not GPU-Instancer detail — but a map
+    # that merely SPLITS them would otherwise silently extract zero grass.)
     density = extract_grass_density(args.data_root, args.level, out)
+    if not density:
+        others = [int(x) for x in (args.levels or "").split(",") if x.strip()]
+        for lv in [l for l in others if l != args.level]:
+            if not os.path.exists(os.path.join(args.data_root, f"sharedassets{lv}.assets")):
+                continue
+            print(f"grass density: retrying in sharedassets{lv} (prototypes may not share the "
+                  f"TerrainData bundle)")
+            density = extract_grass_density(args.data_root, lv, out)
+            if density:
+                break
     fp = os.path.join(out, "grass.json")
     json.dump({"slices": slices, "density": density}, open(fp, "w"), indent=1)
     print(f"wrote {fp}: {len(slices)} slice(s), {len(density)} density grid(s)")

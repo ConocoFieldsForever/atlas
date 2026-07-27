@@ -729,7 +729,31 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     let t = vec3<f32>(inst.m0.w, inst.m1.w, inst.m2.w);
     let lin = mat3x3<f32>(col0, col1, col2);
 
-    let world = lin * v.position + t;
+    var world = lin * v.position + t;
+
+    // ---- WavingGrass (#4): sway the blade TOPS, leave the base planted ------------------------
+    // ids.z == 1 tags a grass clump (same marker the cull's screen-size test uses). The authored
+    // Unity terrain params (WavingGrassStrength/Amount/Speed) ride the material's `vp` lane,
+    // which cutout foliage does not otherwise use; sun.gfx.w carries app time. All three are 0
+    // for packs built before wind was plumbed through, which reduces to exactly the old static
+    // grass — no behaviour change for old packs.
+    if (inst.ids.z == 1u) {
+        let m = materials[min(v.material_index, arrayLength(&materials) - 1u)];
+        let strength = m.vp.x;
+        let amount = m.vp.y;
+        let speed = m.vp.z;
+        // v.position.y is the blade-local height (0 at the base, ~0.9 at the tip): weight the
+        // displacement by it so the clump bends rather than slides.
+        let h = max(v.position.y, 0.0);
+        if (strength > 0.0 && h > 0.0) {
+            // Two decorrelated phases + a per-clump offset from the instance origin so the field
+            // ripples instead of pulsing in unison.
+            let ph = sun.gfx.w * speed + t.x * 0.35 + t.z * 0.27;
+            let sway = vec2<f32>(sin(ph) + 0.5 * sin(ph * 2.13 + 1.7),
+                                 cos(ph * 0.87 + 0.4) + 0.5 * sin(ph * 1.61));
+            world = world + vec3<f32>(sway.x, 0.0, sway.y) * (amount * strength * h);
+        }
+    }
 
     var o: VOut;
     o.clip = position_world_to_clip(world);

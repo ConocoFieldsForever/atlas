@@ -208,6 +208,11 @@ def main():
                     help="keep ~1/N^2 of the nonzero density cells (deterministic hash-selected, "
                          "no parity bias). Default 1 = every nonzero cell: the 512-res grids "
                          "(1.37m cells) already bound the count (~435k lighthouse, ~217k interchange)")
+    ap.add_argument("--density", type=float, default=1.0,
+                    help="scale on the game's per-cell instance COUNT. 1.0 (default) = faithful: "
+                         "every instance the game's grids ask for (reserve ~1.24M). Lower it "
+                         "(0.5, 0.25) to thin the meadow on weaker GPUs; relative variation and "
+                         "placement are preserved, and every nonzero cell keeps >=1 instance")
     ap.add_argument("--self-contained", action="store_true",
                     help="redistribution PR3: keep every path written into grass_sidecar.json "
                          "pack-relative, copying the grass albedo into the pack when it does not "
@@ -254,6 +259,28 @@ def main():
                 print(f"[grass] density grids not in {TL} - reading from dataset {ds_tl}")
                 TL = ds_tl
                 names = ds_names
+    # The pack's terrain_layers copy can be STALE relative to the dataset (assemble copies it
+    # before the grass extractor runs, and a re-extraction that adds per-prototype grids lands
+    # only in the dataset). Per-prototype grids are what carry the plant variety, so prefer
+    # whichever source actually has them — otherwise a pack silently rebuilds from the old
+    # single-summed-grid data and loses every species but one.
+    if os.path.isdir(ds_tl) and os.path.normcase(os.path.normpath(TL)) != os.path.normcase(os.path.normpath(ds_tl)):
+        has_pack_protos = bool(glob.glob(os.path.join(TL, "grass_protos_Slice_*.bin")))
+        ds_protos = glob.glob(os.path.join(ds_tl, "grass_protos_Slice_*.bin"))
+        if ds_protos and not has_pack_protos:
+            if a.self_contained:
+                os.makedirs(TL, exist_ok=True)
+                for pat in ("grass_protos_Slice_*.bin", "grass_density_Slice_*.bin",
+                            "grass_*.png", "grass.json"):
+                    for f in glob.glob(os.path.join(ds_tl, pat)):
+                        shutil.copy2(f, os.path.join(TL, os.path.basename(f)))
+                print(f"[grass] self-contained: mirrored {len(ds_protos)} per-prototype slice(s) "
+                      f"+ cards from the dataset into {TL}")
+                names = _density_names(TL)
+            else:
+                print(f"[grass] per-prototype grids only in the dataset — reading from {ds_tl}")
+                TL = ds_tl
+                names = _density_names(TL)
     if not names:
         print(f"[grass] {pack}: no grass_density_Slice_*.bin under {TL} — grassless map, skipping")
         return
@@ -287,6 +314,141 @@ def main():
     # road/asphalt footprint mask (grass under road SURFACE meshes -> pokes through, skip it).
     road_cells, rcell = build_road_mask(mani, mb, ib)
 
+    # ---- authored grass params from the extractor's grass.json --------------------------------
+    # PER-SLICE tint + the WavingGrass wind params. Both were extracted all along and thrown
+    # away: the old build read `next(iter(slices.values()))` — the FIRST slice's tint applied to
+    # the whole map (customs' slices genuinely differ: [.499,.484,.275] vs [.7,.6,.5]) — and the
+    # wind params never reached the pack at all, so our grass stood perfectly still.
+    DEF_TINT = [0.7, 0.75, 0.55]
+    grass_json, slice_tints, wind = {}, {}, {"strength": 0.0, "amount": 0.0, "speed": 0.0}
+    try:
+        # Read grass.json from the SAME source TL resolved to above. The manifest sidecar points
+        # at the pack's copy, which can be stale (different slices, no prototype list) — trusting
+        # it silently reverted this build to the single-summed-grid path.
+        gj = os.path.join(TL, "grass.json")
+        if not os.path.exists(gj):
+            gj = (mani.get("sidecars") or {}).get("grassJson") or ""
+            if gj and not os.path.isabs(gj):
+                gj = os.path.join(pack, gj)
+        grass_json = json.load(open(gj))
+        print(f"[grass] params from {gj}")
+        # NOTE the two key spaces do NOT always agree: `slices` is keyed by TerrainData m_Name
+        # while `density` is keyed by the GPU-Instancer detail MANAGER's GameObject name (reserve:
+        # TerrainData "Slice_3_4" vs managers "Slice_4_3"/"Slice_4_4"). Requiring an exact match
+        # silently dropped BOTH the authored tint and the wind params to defaults, which is how
+        # reserve ended up with wind 0 and the generic green. Exact match wins; otherwise fall
+        # back to the first authored slice (the params are per-terrain and near-uniform per map).
+        sl_all = grass_json.get("slices") or {}
+        first = next(iter(sl_all.values()), None)
+        for sn, sv in sl_all.items():
+            slice_tints[sn] = sv.get("tint", DEF_TINT)
+        for sn in (grass_json.get("density") or {}):
+            if sn not in slice_tints and first:
+                slice_tints[sn] = first.get("tint", DEF_TINT)
+        sv = next((sl_all[s] for s in (grass_json.get("density") or {}) if s in sl_all), first)
+        if sv:
+            wind = {"strength": float(sv.get("strength", 0.5)),
+                    "amount": float(sv.get("amount", 0.15)),
+                    "speed": float(sv.get("speed", 0.5))}
+        print(f"[grass] wind: {wind}; per-slice tints: "
+              f"{ {k: [round(c,3) for c in v] for k, v in slice_tints.items()} }")
+    except Exception as e:
+        print(f"[grass] no grass.json params ({e}) — default tint, no wind")
+
+    # legacy fallback card, used only for datasets extracted before per-prototype grids existed
+    legacy_albedo = ""
+    for cand in ("grass_Grass3_D.png", "grass_Grass5_512_D.png"):
+        if os.path.exists(os.path.join(TL, cand)):
+            legacy_albedo = cand
+            break
+    if not legacy_albedo:
+        hits = sorted(glob.glob(os.path.join(TL, "grass_*.png")))
+        hits = [h for h in hits if not os.path.basename(h).lower().endswith(("_n.png", "_normal.png"))]
+        if hits:
+            legacy_albedo = os.path.basename(hits[0])
+
+    def bilinear_many(grid, u, v):
+        """Vectorised twin of `bilinear` — the faithful density now places ~1.2M instances, far
+        too many for the old per-instance Python call."""
+        G = grid.shape[0]
+        fx = np.clip(np.asarray(u, np.float64), 0.0, 1.0) * (G - 1)
+        fy = np.clip(np.asarray(v, np.float64), 0.0, 1.0) * (G - 1)
+        x0 = np.clip(np.floor(fx).astype(np.int64), 0, G - 2)
+        y0 = np.clip(np.floor(fy).astype(np.int64), 0, G - 2)
+        tx = (fx - x0)[:, None]
+        ty = (fy - y0)[:, None]
+        return (grid[y0, x0] * (1 - tx) * (1 - ty) + grid[y0, x0 + 1] * tx * (1 - ty)
+                + grid[y0 + 1, x0] * (1 - tx) * ty + grid[y0 + 1, x0 + 1] * tx * ty)
+
+    # ---- PLACEMENT -------------------------------------------------------------------------
+    # Per PROTOTYPE (plant species) and per CELL COUNT. EFT's grids store an instance COUNT per
+    # cell (0..16 per prototype here, up to 50 summed) for EACH of the map's 9-30 detail
+    # prototypes, every one a different plant with its own billboard card. The old build
+    # collapsed BOTH axes: it summed every prototype into one grid, then treated that grid as a
+    # BOOLEAN (np.nonzero), emitting exactly one clump per nonzero cell of a single repeated
+    # texture. That is why our grass read as a uniform carpet of one plant instead of the game's
+    # mixed, clumpy meadow. Records are 24 B: [x,y,z,rotY,scale] f32 + kind u32.
+    kinds, kind_list = {}, []
+
+    def kind_id(tex, tint):
+        """One render kind per (billboard texture, tint). Several prototypes share a card
+        (Grass_new_1_D appears 4x on reserve Slice_4_3), so dedupe — each kind becomes one
+        mesh + material + draw in the viewer."""
+        key = (tex, tuple(round(float(c), 4) for c in tint))
+        if key not in kinds:
+            kinds[key] = len(kind_list)
+            kind_list.append({"albedo": tex, "tint": list(key[1])})
+        return kinds[key]
+
+    def place_layer(layer, side, grid, kid, seed):
+        """Vectorised placement of ONE prototype layer -> (bytes, emitted, road-skipped)."""
+        ys, xs = np.nonzero(layer)
+        if len(xs) == 0:
+            return b"", 0, 0
+        cnt = layer[ys, xs].astype(np.int64)
+        if a.density != 1.0:
+            cnt = np.maximum(1, np.rint(cnt * a.density).astype(np.int64))
+        rep = np.repeat(np.arange(len(xs), dtype=np.int64), cnt)
+        k = np.arange(len(rep), dtype=np.int64) - np.repeat(
+            np.concatenate(([0], np.cumsum(cnt)[:-1])), cnt)
+        cx, cy = xs[rep].astype(np.int64), ys[rep].astype(np.int64)
+        # deterministic 64-bit hash per (cell, prototype, k) — NEVER client-random
+        h = ((cx * np.int64(73856093)) ^ (cy * np.int64(19349663))
+             ^ (k * np.int64(83492791)) ^ np.int64(seed)).astype(np.uint64)
+        h ^= h >> np.uint64(13)
+        h *= np.uint64(0x9E3779B97F4A7C15)
+        h ^= h >> np.uint64(29)
+        # sub-cell jitter: the game scatters instances INSIDE the detail cell. Placing several
+        # per cell at the cell CENTRE would rebuild a visible 512-lattice.
+        du = (h & np.uint64(0xFFFF)).astype(np.float64) / 65535.0
+        dv = ((h >> np.uint64(16)) & np.uint64(0xFFFF)).astype(np.float64) / 65535.0
+        u = (cx + du) / float(side)
+        v = 1.0 - (cy + dv) / float(side)
+        w = np.asarray(bilinear_many(grid, u, v), np.float32)
+        ok = np.all(np.isfinite(w), axis=1)
+        onroad = np.zeros(len(w), bool)
+        if road_cells and ok.any():
+            # only the finite rows: an unfilled terrain UV node yields NaN, and casting NaN to
+            # int64 is undefined (and warns)
+            wf = w[ok]
+            kx = np.rint(wf[:, 0] / rcell).astype(np.int64)
+            kz = np.rint(wf[:, 2] / rcell).astype(np.int64)
+            onroad[ok] = np.fromiter((p in road_cells for p in zip(kx.tolist(), kz.tolist())),
+                                     bool, len(kx))
+        nroad = int((ok & onroad).sum())
+        sel = ok & ~onroad
+        w, hs = w[sel], h[sel]
+        if len(w) == 0:
+            return b"", 0, nroad
+        rot = ((hs >> np.uint64(32)) & np.uint64(0xFFFF)).astype(np.float32) / 65535.0 * 6.2831855
+        scale = 0.75 + ((hs >> np.uint64(48)) & np.uint64(0xFF)).astype(np.float32) / 255.0 * 0.6
+        out = np.empty((len(w), 6), np.float32)
+        out[:, 0:3] = w[:, 0:3]
+        out[:, 3] = rot
+        out[:, 4] = scale
+        out[:, 5] = np.full(len(w), kid, np.uint32).view(np.float32)
+        return out.tobytes(), len(w), nroad
+
     recs = bytearray()
     total = 0
     skipped_road = 0
@@ -298,98 +460,89 @@ def main():
         side = int(round(len(raw) ** 0.5))
         if side * side != len(raw):
             print(f"[grass] {sname}: density file is {len(raw)} bytes (not square) - skipping"); continue
-        dens = raw.reshape(side, side)  # GAME order: [row=terrain-local z, col=terrain-local x]
         grid = terrain_uv_world_grid(mani, mb, aff, me)
-        ys, xs = np.nonzero(dens)
-        ngame = len(xs)
-        if a.stride > 1:
-            # deterministic hash selection (NOT xs%stride: 512 is divisible by common strides,
-            # so a modulo grid would alias against the density grid with origin-locked bias).
-            # The xor-shift/multiply finalizer avalanches the low bits so `% stride^2` does not
-            # fall back into a fixed diagonal lattice.
-            hh = (xs.astype(np.uint64) * np.uint64(73856093)) ^ (ys.astype(np.uint64) * np.uint64(19349663))
-            hh ^= hh >> np.uint64(13)
-            hh *= np.uint64(0x9E3779B97F4A7C15)
-            hh ^= hh >> np.uint64(29)
-            sel = (hh % np.uint64(a.stride * a.stride)) == 0
-            xs, ys = xs[sel], ys[sel]
-        cnt = 0
-        sk = 0
-        for cx, cy in zip(xs, ys):
-            # game grid row axis runs OPPOSITE the mesh v axis (see module docstring)
-            u = (cx + 0.5) / float(side)
-            v = 1.0 - (cy + 0.5) / float(side)
-            # cast to f32 BEFORE the road test: records are stored as f32, so testing the f64
-            # bilinear value can round a half-cell boundary differently than consumers see it
-            w = np.asarray(bilinear(grid, u, v), np.float32)
-            if not np.all(np.isfinite(w)):
+        stint = slice_tints.get(sname, DEF_TINT)          # PER-SLICE tint (was: first slice for all)
+        ppath = os.path.join(TL, f"grass_protos_{sname}.bin")
+        pmeta = ((grass_json.get("density", {}) or {}).get(sname, {}) or {}).get("prototypes") or []
+        layers = []
+        if os.path.exists(ppath) and pmeta:
+            stack = np.fromfile(ppath, np.uint8)
+            if len(stack) == len(pmeta) * side * side:
+                stack = stack.reshape(len(pmeta), side, side)
+                layers = [(stack[i], pmeta[i].get("tex", "")) for i in range(len(pmeta))]
+            else:
+                print(f"[grass] {sname}: grass_protos is {len(stack)} B, expected "
+                      f"{len(pmeta)*side*side} — falling back to the summed grid")
+        if not layers:                                     # datasets extracted before per-proto grids
+            layers = [(raw.reshape(side, side), legacy_albedo)]
+        scnt = 0
+        for i, (layer, tex) in enumerate(layers):
+            if not tex:
                 continue
-            # skip clumps that land under a road/asphalt surface mesh
-            if (int(round(w[0] / rcell)), int(round(w[2] / rcell))) in road_cells:
-                sk += 1
-                continue
-            # deterministic per-cell hash -> rotation + scale (never client-random)
-            h = (int(cx) * 73856093) ^ (int(cy) * 19349663)
-            rot = (h & 0xFFFF) / 0xFFFF * 6.28318
-            scale = 0.75 + ((h >> 16) & 0xFF) / 255.0 * 0.6
-            recs += struct.pack("<5f", float(w[0]), float(w[1]), float(w[2]), rot, scale)
-            cnt += 1
-        total += cnt
-        skipped_road += sk
-        print(f"[grass] {sname}: {cnt} clumps ({ngame} game cells, {sk} road-masked)")
+            b, n, nr = place_layer(layer, side, grid, kind_id(tex, stint), (i + 1) * 2654435761)
+            recs += b
+            scnt += n
+            skipped_road += nr
+        total += scnt
+        print(f"[grass] {sname}: {scnt} instances from {len(layers)} prototype layer(s), "
+              f"tint {[round(c, 3) for c in stint]}")
 
     if total == 0:
         raise SystemExit(f"[grass] FATAL: 0 clumps emitted for {pack} — "
                          f"refusing to write an empty grass.bin (it would silently disable grass)")
     open(os.path.join(pack, "grass.bin"), "wb").write(recs)
-    # grass albedo: prefer the denser Grass3_D, else Grass5, else cross-map fallback
-    alb = None
-    for cand in ("grass_Grass3_D.png", "grass_Grass5_512_D.png"):
-        p = os.path.join(TL, cand)
-        if os.path.exists(p):
-            alb = p
-            break
-    if alb is None:
-        alb = _fallback_albedo(TL)
-        print(f"[grass] no grass albedo in {TL}, using cross-map fallback {alb}")
-    # Sidecar albedo path: packs MUST be self-contained + portable, so the sidecar ALWAYS gets a
-    # pack-relative path — NEVER an absolute one. An absolute build-tree path breaks on redistribution
-    # (the dir is gone on the user's machine), leaks a personal path, AND the cross-map fallback may
-    # reference ANOTHER map's texture (this was the "pink grass all over customs" bug: customs's
-    # sidecar pointed at .../eft_assets/interchange_v2/.../grass_Grass3_D.png). So: an albedo already
-    # inside the pack stays relative; an outside albedo is ALWAYS copied in as grass_albedo.png (no
-    # --self-contained gate); a truly-missing albedo emits an EMPTY path so the viewer skips grass
-    # (no magenta placeholder) instead of a dangling absolute.
-    pack_abs = os.path.abspath(pack)
-    alb_abs = os.path.abspath(alb)
-    try:
-        rel = os.path.relpath(alb_abs, pack_abs)
-    except ValueError:                                    # different drive on Windows
-        rel = None
-    if rel is not None and rel.split(os.sep)[0] != ".." and not os.path.isabs(rel):
-        alb_out = rel.replace("\\", "/")
-        print(f"[grass] albedo inside pack -> pack-relative {alb_out}")
-    elif os.path.exists(alb_abs):
-        shutil.copy2(alb_abs, os.path.join(pack_abs, "grass_albedo.png"))
-        alb_out = "grass_albedo.png"
-        print(f"[grass] copied {alb_abs} -> {alb_out} (self-contained; portable)")
-    else:
-        print(f"[grass] WARNING: no grass albedo found ({alb_abs} missing) — emitting empty albedo "
-              f"so the viewer skips grass rather than showing the magenta placeholder")
-        alb_out = ""
-    tint = [0.7, 0.75, 0.55]
-    try:
-        gj = mani["sidecars"]["grassJson"]
-        if gj and not os.path.isabs(gj):
-            gj = os.path.join(pack, gj)                   # self-contained packs: pack-relative sidecar
-        g = json.load(open(gj))
-        sl = next(iter(g.get("slices", {}).values()), {})
-        tint = sl.get("tint", tint)
-    except Exception:
-        pass
-    json.dump({"count": total, "albedo": alb_out, "tint": tint},
+
+    # ---- SIDECAR ---------------------------------------------------------------------------
+    # Every kind's card is copied INTO the pack (packs must be self-contained + portable: an
+    # absolute build path breaks on the user's machine and leaks a personal path). A kind whose
+    # texture cannot be resolved is DROPPED loudly rather than silently emptying the sidecar —
+    # an empty albedo makes the viewer skip grass entirely, which is how reserve shipped 197,599
+    # clumps that never drew a single pixel.
+    out_kinds, dropped = [], []
+    for ki in kind_list:
+        srcpng = ki["albedo"]
+        cand = srcpng if os.path.isabs(srcpng) else os.path.join(TL, srcpng)
+        base = os.path.basename(srcpng)
+        if not os.path.exists(cand):
+            dropped.append(base)
+            out_kinds.append(None)
+            continue
+        dst = os.path.join(os.path.abspath(pack), base)
+        if os.path.abspath(cand) != os.path.abspath(dst):
+            shutil.copy2(cand, dst)
+        out_kinds.append({"albedo": base, "tint": ki["tint"]})
+    if dropped:
+        print(f"[grass] WARNING: {len(dropped)} kind(s) had no texture on disk and were dropped: "
+              f"{sorted(set(dropped))}")
+    if not any(out_kinds):
+        raise SystemExit(f"[grass] FATAL: no grass texture resolved for {pack} — refusing to "
+                         f"write a sidecar the viewer would silently skip (run the grass "
+                         f"extractor for this dataset)")
+    # Remap kind indices past any dropped kind so grass.bin stays consistent with the sidecar.
+    remap = {}
+    kept = []
+    for i, k in enumerate(out_kinds):
+        if k is not None:
+            remap[i] = len(kept)
+            kept.append(k)
+    if len(kept) != len(out_kinds):
+        arr = np.frombuffer(bytes(recs), np.float32).reshape(-1, 6).copy()
+        kid = arr[:, 5].view(np.uint32)
+        keep = np.fromiter((int(v) in remap for v in kid), bool, len(kid))
+        arr = arr[keep]
+        kid = arr[:, 5].view(np.uint32)
+        arr[:, 5] = np.fromiter((remap[int(v)] for v in kid), np.uint32, len(kid)).view(np.float32)
+        recs = bytearray(arr.tobytes())
+        total = len(arr)
+        open(os.path.join(pack, "grass.bin"), "wb").write(recs)
+    json.dump({"count": total, "format": 2, "kinds": kept, "wind": wind,
+               # legacy single-texture fields: a viewer older than the multi-kind format still
+               # renders (one card, one tint) instead of skipping grass outright.
+               "albedo": kept[0]["albedo"], "tint": kept[0]["tint"]},
               open(os.path.join(pack, "grass_sidecar.json"), "w"), indent=1)
-    print(f"[grass] TOTAL {total} clumps ({skipped_road} skipped under roads) -> {pack}/grass.bin ({len(recs)//20} recs, {len(recs)/1e6:.1f} MB)")
+    print(f"[grass] TOTAL {total} instances across {len(kept)} kind(s) "
+          f"({skipped_road} skipped under roads) -> {pack}/grass.bin "
+          f"({len(recs)//24} recs, {len(recs)/1e6:.1f} MB)")
 
 
 if __name__ == "__main__":
