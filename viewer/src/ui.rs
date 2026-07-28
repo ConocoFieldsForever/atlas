@@ -1392,11 +1392,50 @@ fn layers_panel(
                                     .color(theme::WARN),
                             );
                         }
+                        // ---- QUALITY PRESET -------------------------------------------------
+                        // One row that moves the three knobs that actually cost anything, with the
+                        // MEASURED numbers on the label so the choice is informed rather than
+                        // superstitious. Everything below the separator stays available for
+                        // per-option tuning, which flips the preset to Custom.
+                        let tex_q = crate::menu::config_f32_pub("textureQuality").unwrap_or(1.0) as u8;
+                        let active = crate::render::QualityPreset::detect(&g, tex_q);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("quality").size(11.0).strong());
+                            for p in crate::render::QualityPreset::ALL {
+                                if ui
+                                    .selectable_label(active == p, RichText::new(p.label()).size(11.0))
+                                    .on_hover_text(p.summary())
+                                    .clicked()
+                                    && p != crate::render::QualityPreset::Custom
+                                {
+                                    p.apply(&mut g);
+                                    if let Some(q) = p.tex_quality() {
+                                        crate::render::gpu_driven::set_tex_mip_skip(q);
+                                        crate::menu::save_config_f32_pub("textureQuality", q as f32);
+                                    }
+                                }
+                            }
+                        });
+                        ui.label(RichText::new(active.summary()).size(10.0).color(MUTED));
+                        // Texture quality is the ONLY lever that moves VRAM (measured: Full 4.4 GB,
+                        // Half 2.2 GB, Quarter 1.6 GB on Interchange) and it is applied when
+                        // textures are uploaded, so it needs a reload to take effect.
+                        ui.label(
+                            RichText::new(match tex_q {
+                                0 => "textures: Full \u{2022} ~4.4 GB VRAM (reload to change)",
+                                2 => "textures: Quarter \u{2022} ~1.6 GB VRAM (reload to change)",
+                                _ => "textures: Half \u{2022} ~2.2 GB VRAM (reload to change)",
+                            })
+                            .size(10.0)
+                            .color(MUTED),
+                        );
+                        ui.separator();
                         ui.add_enabled(is_gpu, egui::Slider::new(&mut g.fog, 0.0..=2.0).text("fog"));
                         ui.add_enabled(is_gpu, egui::Slider::new(&mut g.sky_refl, 0.0..=2.0).text("sky reflections"));
                         ui.add_enabled(is_gpu, egui::Slider::new(&mut g.emissive, 0.0..=3.0).text("emissive"));
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut g.bloom, "bloom");
+                            ui.checkbox(&mut g.bloom, "bloom")
+                                .on_hover_text("MEASURED: off is ~7% faster. No VRAM change.");
                             ui.add_enabled(
                                 g.bloom,
                                 egui::Slider::new(&mut g.bloom_intensity, 0.0..=0.3),
@@ -1416,13 +1455,21 @@ fn layers_panel(
                         });
                         ui.add_enabled_ui(g.shadows_available && is_gpu, |ui| {
                             ui.checkbox(&mut g.shadows, "sun shadows")
-                                .on_hover_text("real-time cascades; marginal on the baked-GI look");
+                                .on_hover_text(
+                                    "real-time cascades; marginal on the baked-GI look. MEASURED: \
+                                     off is ~5% faster. No VRAM change - the shadow atlas is \
+                                     allocated either way.",
+                                );
                         });
-                        ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.grass, "grass"));
+                        ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.grass, "foliage / grass"))
+                            .on_hover_text(
+                                "MEASURED: off is ~13% faster at 1600x1000 and ~17% at 2560x1440 \
+                                 - the single biggest frame-time lever. No VRAM change.",
+                            );
                         ui.add_enabled(
                             is_gpu,
                             egui::Slider::new(&mut g.cull_px, 0.0..=8.0)
-                                .text("prop cull px")
+                                .text("prop cull px (4px = +2%)")
                                 .clamping(egui::SliderClamping::Always),
                         );
                         ui.add_enabled(
@@ -1431,7 +1478,10 @@ fn layers_panel(
                                 .text("grass cull px"),
                         );
                         ui.checkbox(&mut g.ssao, "SSAO (contact shading)")
-                            .on_hover_text("depth-based ambient occlusion \u{2014} crevices/corners darken like the game");
+                            .on_hover_text(
+                                "depth-based ambient occlusion - crevices/corners darken like the \
+                                 game. MEASURED COST: ~2-3% slower when on.",
+                            );
                         ui.add_enabled(
                             g.ssao,
                             egui::Slider::new(&mut g.ssao_intensity, 0.0..=2.0).text("ssao intensity"),
@@ -1520,6 +1570,17 @@ fn layers_panel(
                                 .size(10.0)
                                 .italics()
                                 .color(MUTED),
+                        );
+                        // Measured-but-free: say so, rather than letting people burn time on knobs
+                        // that do nothing for performance. (docs/GFX_BENCH_*.json)
+                        ui.label(
+                            RichText::new(
+                                "fog, vignette, practical lights, GI, LOD bias and shadow-map size \
+                                 measured within noise - they are look settings, not speed ones",
+                            )
+                            .size(9.0)
+                            .italics()
+                            .color(MUTED),
                         );
                     });
 

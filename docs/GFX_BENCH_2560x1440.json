@@ -1,0 +1,365 @@
+[
+ {
+  "name": "baseline",
+  "label": "Baseline (defaults, textures Half)",
+  "texQuality": 1,
+  "env": {},
+  "wall_s": 15.4,
+  "vram_base": 1988,
+  "vram_peak": 4385,
+  "vram_mib": 2397,
+  "frames": 1435,
+  "avg_ms": 5.576,
+  "fps": 179.3,
+  "p50": 5.437,
+  "p95": 6.177,
+  "p99": 6.587,
+  "max_ms": 9.89
+ },
+ {
+  "name": "tex_full",
+  "label": "Textures: Full",
+  "texQuality": 0,
+  "env": {},
+  "wall_s": 15.4,
+  "vram_base": 2021,
+  "vram_peak": 6570,
+  "vram_mib": 4549,
+  "frames": 1432,
+  "avg_ms": 5.589,
+  "fps": 178.9,
+  "p50": 5.461,
+  "p95": 6.14,
+  "p99": 7.569,
+  "max_ms": 10.287
+ },
+ {
+  "name": "tex_quarter",
+  "label": "Textures: Quarter",
+  "texQuality": 2,
+  "env": {},
+  "wall_s": 15.4,
+  "vram_base": 2015,
+  "vram_peak": 3818,
+  "vram_mib": 1803,
+  "frames": 1445,
+  "avg_ms": 5.537,
+  "fps": 180.6,
+  "p50": 5.401,
+  "p95": 6.126,
+  "p99": 6.564,
+  "max_ms": 10.528
+ },
+ {
+  "name": "shadows_off",
+  "label": "Sun shadows OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_SHADOWS": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2015,
+  "vram_peak": 4394,
+  "vram_mib": 2379,
+  "frames": 1513,
+  "avg_ms": 5.29,
+  "fps": 189.1,
+  "p50": 5.161,
+  "p95": 5.885,
+  "p99": 6.185,
+  "max_ms": 9.36
+ },
+ {
+  "name": "shadow_1024",
+  "label": "Shadow map 1024 (from 2048)",
+  "texQuality": 1,
+  "env": {
+   "EFT_SHADOW_SIZE": "1024"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2015,
+  "vram_peak": 4362,
+  "vram_mib": 2347,
+  "frames": 1422,
+  "avg_ms": 5.627,
+  "fps": 177.7,
+  "p50": 5.513,
+  "p95": 6.235,
+  "p99": 7.181,
+  "max_ms": 9.868
+ },
+ {
+  "name": "shadow_4096",
+  "label": "Shadow map 4096 (from 2048)",
+  "texQuality": 1,
+  "env": {
+   "EFT_SHADOW_SIZE": "4096"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2015,
+  "vram_peak": 4492,
+  "vram_mib": 2477,
+  "frames": 1433,
+  "avg_ms": 5.585,
+  "fps": 179.1,
+  "p50": 5.491,
+  "p95": 6.1,
+  "p99": 6.876,
+  "max_ms": 10.7
+ },
+ {
+  "name": "grass_shadows",
+  "label": "Grass casts shadows ON",
+  "texQuality": 1,
+  "env": {
+   "EFT_GRASS_SHADOWS": "1"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2015,
+  "vram_peak": 4393,
+  "vram_mib": 2378,
+  "frames": 1439,
+  "avg_ms": 5.562,
+  "fps": 179.8,
+  "p50": 5.485,
+  "p95": 6.086,
+  "p99": 6.384,
+  "max_ms": 7.557
+ },
+ {
+  "name": "lights_off",
+  "label": "Realtime point/spot lights OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_LIGHTS": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2014,
+  "vram_peak": 4393,
+  "vram_mib": 2379,
+  "frames": 1437,
+  "avg_ms": 5.57,
+  "fps": 179.5,
+  "p50": 5.451,
+  "p95": 6.153,
+  "p99": 6.477,
+  "max_ms": 9.254
+ },
+ {
+  "name": "gi_off",
+  "label": "Baked GI (SH volume) OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_GI": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2014,
+  "vram_peak": 4395,
+  "vram_mib": 2381,
+  "frames": 1442,
+  "avg_ms": 5.551,
+  "fps": 180.1,
+  "p50": 5.426,
+  "p95": 6.161,
+  "p99": 6.41,
+  "max_ms": 6.883
+ },
+ {
+  "name": "bloom_off",
+  "label": "Bloom OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_BLOOM": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2014,
+  "vram_peak": 4393,
+  "vram_mib": 2379,
+  "frames": 1523,
+  "avg_ms": 5.256,
+  "fps": 190.3,
+  "p50": 5.111,
+  "p95": 5.954,
+  "p99": 6.584,
+  "max_ms": 7.135
+ },
+ {
+  "name": "ssao_on",
+  "label": "SSAO ON (default off)",
+  "texQuality": 1,
+  "env": {
+   "EFT_SSAO": "1"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2014,
+  "vram_peak": 4393,
+  "vram_mib": 2379,
+  "frames": 1392,
+  "avg_ms": 5.748,
+  "fps": 174.0,
+  "p50": 5.642,
+  "p95": 6.342,
+  "p99": 6.562,
+  "max_ms": 11.243
+ },
+ {
+  "name": "fog_off",
+  "label": "Distance fog OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_FOG": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2014,
+  "vram_peak": 4393,
+  "vram_mib": 2379,
+  "frames": 1438,
+  "avg_ms": 5.565,
+  "fps": 179.7,
+  "p50": 5.452,
+  "p95": 6.155,
+  "p99": 6.454,
+  "max_ms": 7.411
+ },
+ {
+  "name": "vignette_off",
+  "label": "Vignette OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_VIGNETTE": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2014,
+  "vram_peak": 4392,
+  "vram_mib": 2378,
+  "frames": 1434,
+  "avg_ms": 5.581,
+  "fps": 179.2,
+  "p50": 5.459,
+  "p95": 6.141,
+  "p99": 6.512,
+  "max_ms": 11.155
+ },
+ {
+  "name": "parallax_off",
+  "label": "Parallax mapping OFF",
+  "texQuality": 1,
+  "env": {
+   "EFT_PARALLAX": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2013,
+  "vram_peak": 4389,
+  "vram_mib": 2376,
+  "frames": 1433,
+  "avg_ms": 5.586,
+  "fps": 179.0,
+  "p50": 5.475,
+  "p95": 6.138,
+  "p99": 7.068,
+  "max_ms": 9.213
+ },
+ {
+  "name": "grass_off",
+  "label": "Foliage/grass culled",
+  "texQuality": 1,
+  "env": {
+   "EFT_CULL_PX": "1.5,1000"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2010,
+  "vram_peak": 4385,
+  "vram_mib": 2375,
+  "frames": 1676,
+  "avg_ms": 4.774,
+  "fps": 209.5,
+  "p50": 4.671,
+  "p95": 5.399,
+  "p99": 5.674,
+  "max_ms": 6.68
+ },
+ {
+  "name": "cull_aggressive",
+  "label": "Aggressive small-object cull (4px/8px)",
+  "texQuality": 1,
+  "env": {
+   "EFT_CULL_PX": "4,8"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2006,
+  "vram_peak": 4385,
+  "vram_mib": 2379,
+  "frames": 1448,
+  "avg_ms": 5.526,
+  "fps": 181.0,
+  "p50": 5.383,
+  "p95": 6.163,
+  "p99": 7.13,
+  "max_ms": 9.556
+ },
+ {
+  "name": "lod_bias2",
+  "label": "LOD bias 2.0 (coarser shells sooner)",
+  "texQuality": 1,
+  "env": {
+   "EFT_LOD_BIAS": "2.0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2006,
+  "vram_peak": 4385,
+  "vram_mib": 2379,
+  "frames": 1439,
+  "avg_ms": 5.562,
+  "fps": 179.8,
+  "p50": 5.481,
+  "p95": 6.086,
+  "p99": 6.365,
+  "max_ms": 7.751
+ },
+ {
+  "name": "stack_low",
+  "label": "STACK: quarter tex + no shadows/bloom/GI/lights + grass culled",
+  "texQuality": 2,
+  "env": {
+   "EFT_SHADOWS": "0",
+   "EFT_BLOOM": "0",
+   "EFT_GI": "0",
+   "EFT_LIGHTS": "0",
+   "EFT_CULL_PX": "4,1000",
+   "EFT_PARALLAX": "0",
+   "EFT_VIGNETTE": "0",
+   "EFT_FOG": "0"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2006,
+  "vram_peak": 3809,
+  "vram_mib": 1803,
+  "frames": 1899,
+  "avg_ms": 4.215,
+  "fps": 237.3,
+  "p50": 4.067,
+  "p95": 5.211,
+  "p99": 5.715,
+  "max_ms": 8.238
+ },
+ {
+  "name": "stack_medium",
+  "label": "STACK: half tex + no shadows + grass culled",
+  "texQuality": 1,
+  "env": {
+   "EFT_SHADOWS": "0",
+   "EFT_CULL_PX": "2,600"
+  },
+  "wall_s": 15.4,
+  "vram_base": 2006,
+  "vram_peak": 4384,
+  "vram_mib": 2378,
+  "frames": 1750,
+  "avg_ms": 4.572,
+  "fps": 218.7,
+  "p50": 4.461,
+  "p95": 5.201,
+  "p99": 5.49,
+  "max_ms": 8.057
+ }
+]
