@@ -1475,7 +1475,12 @@ fn layers_panel(
                         );
                         ui.add_enabled(
                             is_gpu,
-                            egui::Slider::new(&mut g.cull_px_grass, 0.0..=16.0)
+                            // Range must cover the PRESET values (Medium 600, Low 1000) -- egui
+                            // clamps a slider's value into its range, so a narrower range would
+                            // silently rewrite the preset the first frame this panel draws, and
+                            // then report Custom because the state no longer matches any preset.
+                            egui::Slider::new(&mut g.cull_px_grass, 0.0..=1000.0)
+                                .logarithmic(true)
                                 .text("grass cull px"),
                         );
                         ui.checkbox(&mut g.ssao, "SSAO (contact shading)")

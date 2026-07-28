@@ -224,6 +224,29 @@ impl QualityPreset {
         QualityPreset::Custom,
     ];
 
+    /// Stable index for persistence (`qualityPreset` in atlas.config.json). The preset is chosen in
+    /// the MAIN MENU because texture quality is applied when textures are uploaded — picking it
+    /// after a map is already resident cannot change what was uploaded.
+    pub fn index(self) -> u8 {
+        match self {
+            QualityPreset::Low => 0,
+            QualityPreset::Medium => 1,
+            QualityPreset::High => 2,
+            QualityPreset::Ultra => 3,
+            QualityPreset::Custom => 4,
+        }
+    }
+
+    pub fn from_index(i: u8) -> QualityPreset {
+        match i {
+            0 => QualityPreset::Low,
+            1 => QualityPreset::Medium,
+            3 => QualityPreset::Ultra,
+            4 => QualityPreset::Custom,
+            _ => QualityPreset::High,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             QualityPreset::Low => "Low",
