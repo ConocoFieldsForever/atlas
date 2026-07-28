@@ -1371,7 +1371,8 @@ fn layers_panel(
                     // frame the sliders render).
                     CollapsingHeader::new(section_hdr("Graphics (experimental)", 0))
                     .id_salt("sec_gfx")
-                    .default_open(false)
+                    // EFT_GFX_OPEN=1 starts the section expanded (screenshots / QA of the panel).
+                    .default_open(std::env::var("EFT_GFX_OPEN").is_ok_and(|v| v.trim() == "1"))
                     .show(ui, |ui| {
                         let mut g = gfx_ui.gfx.clone();
                         // Finding 9: fog / sky-refl / emissive / shadows / grass / cull / LOD ride the
