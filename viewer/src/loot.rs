@@ -84,6 +84,56 @@ struct Container {
 #[derive(Component, Clone, Copy)]
 pub struct LootTime(pub f32);
 
+/// Probability this container is actually PRESENT in a given raid (0..1).
+///
+/// Kept separate from [`crate::poi::MarkerValue`] deliberately. MarkerValue stays the raw worth of
+/// the contents, so the panel's "min value" filter keeps meaning "worth this much IF it is there";
+/// folding the odds into it would silently hide most of the map behind the existing 100k default.
+/// The planner multiplies the two to rank by EXPECTED value, which is the number that should decide
+/// where a run goes.
+///
+/// Preferred source is the game's own `LootableContainersGroup` odds (`grp_p` in gamedata.json:
+/// how many of a group's containers spawn, over its member count - 19% for the mall stashes, 83%
+/// at Kiba Arms). Falls back to loot.json's per-TYPE average fill rate, which is location-blind.
+#[derive(Component, Clone, Copy)]
+pub struct SpawnChance(pub f32);
+
+/// Container spawn odds from gamedata.json, as (position, probability).
+///
+/// Joined to the priced loot.json containers BY POSITION: the two sets come from different sources
+/// (823 priced entries vs 907 typed ones on interchange) and share no id, but both are already in
+/// viewer space, so the nearest typed container within a tight radius is the same object.
+fn load_group_odds(pack_root: Option<&std::path::Path>) -> Vec<(Vec3, f32)> {
+    let Some(root) = pack_root else { return Vec::new() };
+    let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for c in v.get("containers").and_then(|c| c.as_array()).unwrap_or(&Vec::new()) {
+        let (Some(p), Some(pos)) = (
+            c.get("grp_p").and_then(|x| x.as_f64()),
+            c.get("pos").and_then(|x| x.as_array()),
+        ) else {
+            continue;
+        };
+        if pos.len() < 3 {
+            continue;
+        }
+        out.push((
+            Vec3::new(
+                pos[0].as_f64().unwrap_or(0.0) as f32,
+                pos[1].as_f64().unwrap_or(0.0) as f32,
+                pos[2].as_f64().unwrap_or(0.0) as f32,
+            ),
+            p as f32,
+        ));
+    }
+    out
+}
+
 /// Container class -> (base color, half-extents in metres). Weapon boxes are dark
 /// (the "black weapon crate") but never pure black, and every class gets an emissive
 /// term so it's visible in shadow. Sizes are rough per-type so markers read as boxes.
@@ -208,6 +258,10 @@ pub(crate) fn spawn_loot(
         return;
     };
 
+    // The game's own per-area spawn odds, joined to the priced containers below by position.
+    let group_odds = load_group_odds(pack.as_ref().map(|lp| lp.0.root.as_path()));
+    let mut n_grouped = 0usize;
+
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let mut mats: HashMap<String, Handle<StandardMaterial>> = HashMap::new();
     for c in &ml.containers {
@@ -232,12 +286,33 @@ pub(crate) fn spawn_loot(
         } else {
             c.type_.clone()
         };
+        // Spawn odds: the GAME's per-group figure when this container matches a typed one,
+        // else loot.json's per-type average. 0.75 m: containers are metre-scale and the two
+        // sources agree closely, so a tight radius avoids binding to a neighbour on a shelf.
+        let gpos = Vec3::new(c.pos[0], c.pos[1], c.pos[2]);
+        let group_p = group_odds
+            .iter()
+            .filter(|(p, _)| p.distance_squared(gpos) <= 0.75 * 0.75)
+            .min_by(|a, b| {
+                a.0.distance_squared(gpos).total_cmp(&b.0.distance_squared(gpos))
+            })
+            .map(|(_, p)| *p);
+        let spawn_p = group_p.unwrap_or(if c.spawn > 0.0 { c.spawn } else { 1.0 }).clamp(0.0, 1.0);
+        if group_p.is_some() {
+            n_grouped += 1;
+        }
         let mut detail = Vec::new();
         if c.ev > 0 {
             detail.push(format!("Value  {}", money(c.ev)));
+            // Expected value is what actually decides a route; show it next to the raw worth.
+            detail.push(format!("Expected  {}", money((c.ev as f32 * spawn_p) as i64)));
         }
-        if c.spawn > 0.0 {
-            detail.push(format!("Spawn {:.0}%", c.spawn * 100.0));
+        if spawn_p > 0.0 {
+            detail.push(format!(
+                "Spawn {:.0}%{}",
+                spawn_p * 100.0,
+                if group_p.is_some() { " (this area)" } else { "" }
+            ));
         }
         let search_s = c.t.unwrap_or(7.0).max(0.0);
         detail.push(format!("Search ~{search_s:.0}s"));
@@ -254,6 +329,7 @@ pub(crate) fn spawn_loot(
             // The ev estimate feeds the panel's min-value filter (0 = no estimate, hides under
             // an active filter).
             MarkerValue(c.ev),
+            SpawnChance(spawn_p),
             LootTime(search_s),
             crate::poi::DenseMarker,
             PickRadius(pick_r),
@@ -266,11 +342,14 @@ pub(crate) fn spawn_loot(
         ));
     }
     info!(
-        "loot: {} container markers spawned from {} (map '{}', {} classes)",
+        "loot: {} container markers spawned from {} (map '{}', {} classes); {} matched the game's \
+         per-area spawn odds, {} fell back to the per-type average",
         ml.containers.len(),
         path.display(),
         map_key,
-        mats.len()
+        mats.len(),
+        n_grouped,
+        ml.containers.len().saturating_sub(n_grouped)
     );
 }
 

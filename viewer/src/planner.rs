@@ -179,6 +179,7 @@ fn dispatch_plan(
         Option<&crate::poi::PoiLayer>,
         Option<&crate::loot::LootTime>,
         Option<&crate::poi::LootJackpot>,
+        Option<&crate::loot::SpawnChance>,
     )>,
     locks: Query<(&GlobalTransform, &crate::poi::LockKeys)>,
     progress: Res<crate::progress::PlayerProgress>,
@@ -219,22 +220,29 @@ fn dispatch_plan(
     // top-120 by value so the optimizer stays bounded on loot-dense maps (streets: 2k+ points).
     let mut cands: Vec<Cand> = loot
         .iter()
-        .filter(|(_, _, v, cls, layer, _, _)| {
+        .filter(|(_, _, v, cls, layer, _, _, _)| {
+            // The filter stays on RAW worth: "min value" means "worth this much if it is there".
             v.0 >= req.min_value
                 && (cls.is_some() // loot.rs container
                     || matches!(layer, Some(crate::poi::PoiLayer::LooseLoot))) // priced loose
         })
-        .filter(|(gt, _, _, _, _, _, _)| {
+        .filter(|(gt, _, _, _, _, _, _, _)| {
             !locks.iter().any(|(lock_gt, keys)| {
                 lock_gt.translation().distance(gt.translation()) <= 14.0
                     && !keys.0.is_empty()
                     && !keys.0.iter().any(|key| progress.owns_key(key))
             })
         })
-        .map(|(gt, info, v, _, _, loot_time, jackpot)| Cand {
+        .map(|(gt, info, v, _, _, loot_time, jackpot, chance)| Cand {
             name: info.title.clone(),
             value: v.0,
-            score_value: v.0 as f32 * if jackpot.is_some() { 0.18 } else { 1.0 },
+            // RANK by expected value: worth x probability it is actually there. The odds come from
+            // the game's own LootableContainersGroup counts where available (19% for the mall
+            // stashes, 83% at Kiba Arms), else loot.json's location-blind per-type average. Ranking
+            // on raw worth scored those identically, which is a 4x error on the same container type.
+            score_value: v.0 as f32
+                * chance.map(|c| c.0).unwrap_or(1.0)
+                * if jackpot.is_some() { 0.18 } else { 1.0 },
             pos: gt.translation(),
             loot_s: loot_time.map(|t| t.0).unwrap_or(5.0),
         })
