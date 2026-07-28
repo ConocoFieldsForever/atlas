@@ -997,8 +997,11 @@ fn config_str(key: &str) -> Option<String> {
 #[must_use]
 fn save_config_str(key: &str, val: &str) -> bool {
     let path = config_path();
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
+    // MUST go through `read_config_text` (BOM-tolerant) like the readers do. With a raw read, a
+    // BOM'd config fails to parse here, this starts from `{}` and the write then DESTROYS every
+    // other setting - game dir, language, overlay layout, the lot. Making only the readers
+    // BOM-tolerant turned a visible all-defaults revert into silent data loss on first save.
+    let mut v: serde_json::Value = read_config_text()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     v[key] = serde_json::Value::String(val.to_string());
@@ -1034,8 +1037,11 @@ pub fn config_f32_pub(key: &str) -> Option<f32> {
 #[must_use]
 pub fn save_config_f32_pub(key: &str, val: f32) -> bool {
     let path = config_path();
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
+    // MUST go through `read_config_text` (BOM-tolerant) like the readers do. With a raw read, a
+    // BOM'd config fails to parse here, this starts from `{}` and the write then DESTROYS every
+    // other setting - game dir, language, overlay layout, the lot. Making only the readers
+    // BOM-tolerant turned a visible all-defaults revert into silent data loss on first save.
+    let mut v: serde_json::Value = read_config_text()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     v[key] = serde_json::json!(val);
@@ -1062,8 +1068,11 @@ fn config_bool(key: &str) -> Option<bool> {
 #[must_use]
 fn save_config_bool(key: &str, val: bool) -> bool {
     let path = config_path();
-    let mut v: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
+    // MUST go through `read_config_text` (BOM-tolerant) like the readers do. With a raw read, a
+    // BOM'd config fails to parse here, this starts from `{}` and the write then DESTROYS every
+    // other setting - game dir, language, overlay layout, the lot. Making only the readers
+    // BOM-tolerant turned a visible all-defaults revert into silent data loss on first save.
+    let mut v: serde_json::Value = read_config_text()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
     v[key] = serde_json::Value::Bool(val);
