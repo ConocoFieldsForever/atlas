@@ -291,11 +291,26 @@ pub fn navigate_tab(
                     .min_size(full)
                     .corner_radius(0.0),
                 )
-                .on_hover_text("compares the walkable route to every active extract and takes the shortest")
+                .on_hover_text(if ui_state.plan_extracts.is_empty() {
+                    "compares the walkable route to every active extract and takes the shortest"
+                } else {
+                    "compares the walkable route to each SELECTED extract and takes the shortest"
+                })
                 .clicked()
             {
                 ui_state.pending = None;
-                let act: Vec<&Row> = rows.iter().filter(|r| !r.inactive).collect();
+                // Honour the same selection the loot plan uses. Which extracts are open depends on
+                // side, time, keys and the raid's random draw, so "nearest" must mean "nearest of
+                // the ones I can actually use" - routing to an extract the player cannot take is
+                // worse than not routing at all. Empty selection = any active extract.
+                let act: Vec<&Row> = rows
+                    .iter()
+                    .filter(|r| !r.inactive)
+                    .filter(|r| {
+                        ui_state.plan_extracts.is_empty()
+                            || ui_state.plan_extracts.contains(&r.title)
+                    })
+                    .collect();
                 route.write(RouteRequest {
                     start: None,
                     dests: act.iter().map(|r| r.pos).collect(),
