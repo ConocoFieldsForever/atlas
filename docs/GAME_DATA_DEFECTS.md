@@ -73,6 +73,37 @@ Worth recording, because "we looked and it was fine" is a result:
 
 ---
 
+## 3b. Duplication-class integrity: scanned, nothing found
+
+**Scope, stated up front.** EFT's real item-duplication surface is server-side — inventory
+transactions, raid-exit reconciliation, netcode — and **none of it exists in the client files**. What
+is checkable here is whether objects the game identifies by a string id are uniquely identified,
+because an id collision is how one physical thing ends up tracked as two. That is the class of defect
+this section covers, and it is narrower than "are there dupe bugs".
+
+| check | result |
+|---|---|
+| Container instance ids colliding within one level | **none** — 907 `LootableContainer` components on interchange, 907 shipped, zero lost to dedupe |
+| Loot-point GUIDs colliding within one level | **none** |
+| Switch ids repeated | none |
+| Loot-group `max` exceeding member count | 0 of 19 |
+| Quest objectives with the same kind+name at >1 position | present, and almost certainly intentional — see below |
+
+The container count is the strongest of these. Our extractor dedupes containers **by id**, so a
+collision would have silently dropped one — the per-level game count matching the shipped count
+exactly means no two containers in a level share an id.
+
+**Quest objectives at multiple positions** — Woods has `em_quest4_1` at 3 places,
+`ny25_quest_6_woods_houseinvillage` at 4; Factory has `nf2024_4_zone_kill1` at 4. This reads as
+ordinary design: an objective that accepts any one of several locations. Whether credit is granted
+per-objective or per-location is **server-side logic that is not in these files**, so it cannot be
+determined here, and it is recorded as an observation rather than a finding.
+
+Stationary weapons "sharing" a `weapon_id` is a template id (two mounts of the same weapon type),
+not an instance collision.
+
+---
+
 ## 4. NOT a defect — investigated and dismissed
 
 **Containers stacked at identical coordinates** (27 extra on Interchange, 24 Woods, 6 Factory).
