@@ -8,7 +8,12 @@ SAME G3 = diag(-1,1,1) conjugation the geometry pipeline uses (viewer = (-x, y, 
 tacmap. Tasks span all maps, so this is ONE global catalog the viewer filters by the current map — supports every map.
 
   python extraction/intel/build_tasks.py                 -> <EFT_TARKMAP_ROOT>/out/tasks.json  (all tasks, all maps)
-Re-run per wipe (task data changes per wipe, not per session). No game files needed (tarkov.dev only)."""
+Re-run per wipe (task data changes per wipe, not per session).
+
+ZONE GEOMETRY IS FIRST-PARTY where the game has it: tarkov.dev supplies task IDENTITY (name,
+trader, prereqs, rewards - none of which the client ships), but every objective zone also exists
+in the scene as a typed trigger with a real polygon footprint, and that wins. See
+apply_first_party_zones. Falls back cleanly to tarkov.dev-only when no map has been built."""
 import os, json, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +50,100 @@ def conv_zone(z):
     return {'map': zid, 'pos': bridge(z.get('position')),
             'outline': [bridge(p) for p in z['outline']] if z.get('outline') else None,
             'top': z.get('top'), 'bottom': z.get('bottom')}
+
+
+# ---------------------------------------------------------------------------------------------
+# FIRST-PARTY ZONE GEOMETRY
+# ---------------------------------------------------------------------------------------------
+# tarkov.dev is the only source for task IDENTITY (name, trader, prereqs, rewards) - the client
+# ships none of that. But it is a poor source for task GEOMETRY, and the game ships the real thing:
+# every objective zone exists in the scene as a typed trigger component with a true polygon
+# footprint. Measured on interchange:
+#
+#   tarkov.dev zones on this map            30
+#   game quest triggers on this map         59
+#   dev zones with a game trigger <= 12 m   29 / 30      (its positions are broadly right)
+#   dev zones with NO trigger nearby         1           ("The Blood of War - Part 1", 75.8 m)
+#   game zones tarkov.dev does not have     30           (incl. all 10 Shootable_Duck_* and
+#                                                         interchange_secret_extraction_quest)
+#
+# And the shapes differ in kind: game outlines carry 4-304 vertices; tarkov.dev ships a box.
+#
+# So: where a dev zone corresponds to a game trigger, the GAME's position and outline win and the
+# dev entry contributes only its identity. Where it does not, the dev zone is kept and MARKED, so a
+# stale upstream position is visible as such instead of silently drawn as fact.
+MATCH_R = 12.0      # metres; a dev zone within this of a trigger is the same objective
+SUSPECT_R = 30.0    # beyond this from ANY trigger, the dev position is probably wrong
+
+
+def _load_game_zones():
+    """{map id: [{'pos', 'outline', 'name', 'kind'}]} from every pack's gamedata.json.
+
+    Absent packs simply yield nothing and the build degrades to the old tarkov.dev-only behaviour,
+    so this never becomes a hard dependency on having built a map.
+    """
+    import glob
+    out = {}
+    roots = [os.path.join(REPO, 'packs', '*.eftpack', 'gamedata.json')]
+    if _TK:
+        roots.append(os.path.join(_TK, 'out', '*', 'gamedata.json'))
+    for pat in roots:
+        for p in glob.glob(pat):
+            mid = os.path.basename(os.path.dirname(p)).replace('.eftpack', '')
+            if mid in out:
+                continue
+            try:
+                gd = json.load(open(p, encoding='utf-8'))
+            except Exception:
+                continue
+            zs = []
+            for q in (gd.get('quest_triggers') or []):
+                if not q.get('pos'):
+                    continue
+                zs.append({'pos': q['pos'], 'outline': q.get('outline') or [],
+                           'name': q.get('name'), 'kind': q.get('kind')})
+            if zs:
+                out[mid] = zs
+    return out
+
+
+def _dist(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
+def apply_first_party_zones(out_tasks, game):
+    """Replace dev zone geometry with the game's wherever the two describe the same objective."""
+    if not game:
+        print('[tasks] no gamedata.json found - zones stay tarkov.dev-only')
+        return
+    n_game = n_dev = n_suspect = 0
+    for t in out_tasks:
+        for o in t['objectives']:
+            for z in (o.get('zones') or []):
+                cands = game.get(z.get('map') or '')
+                if not cands or not z.get('pos'):
+                    continue
+                best = min(cands, key=lambda c: _dist(c['pos'], z['pos']))
+                d = _dist(best['pos'], z['pos'])
+                if d <= MATCH_R:
+                    # First-party geometry wins outright: exact position AND the real footprint.
+                    z['pos'] = best['pos']
+                    if best['outline']:
+                        z['outline'] = best['outline']
+                    z['src'] = 'game'
+                    z['game'] = best['name']
+                    z['d'] = round(d, 1)
+                    n_game += 1
+                else:
+                    z['src'] = 'dev'
+                    z['d'] = round(d, 1)
+                    if d > SUSPECT_R:
+                        z['suspect'] = True
+                        n_suspect += 1
+                    n_dev += 1
+    print(f'[tasks] first-party zones: {n_game} objective zone(s) took the GAME\'s position + '
+          f'outline; {n_dev} kept tarkov.dev geometry ({n_suspect} flagged suspect, '
+          f'>{SUSPECT_R:.0f} m from any trigger)')
 
 
 def item_ref(i):
@@ -175,6 +274,10 @@ def main():
         out_tasks.append(out)
         for m in out['maps']: map_task_count[m] = map_task_count.get(m, 0) + 1
 
+    # FIRST-PARTY GEOMETRY: run BEFORE the supplemental patch so the patch only ever fills gaps the
+    # game itself cannot fill. Most of what that file was written for is now answered upstream of it.
+    apply_first_party_zones(out_tasks, _load_game_zones())
+
     # SUPPLEMENTAL ZONES (tasks_zone_patch.json): upstream data gaps, positions derived from OUR map
     # geometry (each entry documents its derivation). Applied by (task name, desc substring) so a
     # rebuilt/refreshed upstream keeps the patch until tarkov.dev fills the gap (then it double-zones,
@@ -193,7 +296,7 @@ def main():
         print(f"[tasks] zone patch: {applied} supplemental zone(s) applied")
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    doc = {'version': 2, 'source': source, 'built': int(time.time()),
+    doc = {'version': 3, 'source': source, 'built': int(time.time()),
            'coord_bridge': 'viewer = diag(-1,1,1) * unity', 'count': len(out_tasks),
            'map_task_count': map_task_count, 'tasks': out_tasks}
     json.dump(doc, open(OUT, 'w'), separators=(',', ':'))
