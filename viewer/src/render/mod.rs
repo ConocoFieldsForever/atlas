@@ -182,6 +182,147 @@ impl Default for GfxSettings {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// QUALITY PRESETS — every number below is MEASURED, not guessed.
+// ---------------------------------------------------------------------------------------------
+/// `tools/bench_gfx.py` runs one headless-ish bench per knob against a fixed Interchange camera at
+/// two resolutions, recording frame time and VRAM (board delta, since Windows/WDDM reports no
+/// per-process figure). Raw data: `docs/GFX_BENCH_1600x1000.json`, `docs/GFX_BENCH_2560x1440.json`.
+///
+/// Baseline reproduced within 0.35% across runs, so treat anything under ~1.5% as noise.
+///
+///   knob                     Δfps @1600x1000   Δfps @2560x1440   ΔVRAM
+///   foliage off                   +13.1%            +16.8%          0
+///   bloom off                      +7.8%             +6.1%          0
+///   sun shadows off                +5.3%             +5.5%          0
+///   aggressive prop cull           +2.3%             +0.9%          0
+///   SSAO on (cost)                 -2.0%             -3.0%          0
+///   textures Full (from Half)      +0.3%             -0.2%      +2177 MiB
+///   textures Quarter (from Half)   +1.7%             +0.7%       -577 MiB
+///   lights off / GI off / fog off / vignette off / parallax off / LOD bias / shadow-map size
+///                                  all within noise at both resolutions
+///
+/// Two conclusions drive the presets:
+///   1. VRAM is ENTIRELY a texture-quality story. Nothing else moves it by more than ~20 MiB.
+///   2. Speed is foliage > bloom > shadows, and then nothing. The remaining toggles are visual
+///      choices, and the UI must not advertise them as performance levers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QualityPreset {
+    Low,
+    Medium,
+    High,
+    Ultra,
+    Custom,
+}
+
+impl QualityPreset {
+    pub const ALL: [QualityPreset; 5] = [
+        QualityPreset::Low,
+        QualityPreset::Medium,
+        QualityPreset::High,
+        QualityPreset::Ultra,
+        QualityPreset::Custom,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QualityPreset::Low => "Low",
+            QualityPreset::Medium => "Medium",
+            QualityPreset::High => "High",
+            QualityPreset::Ultra => "Ultra",
+            QualityPreset::Custom => "Custom",
+        }
+    }
+
+    /// Headline the user can act on: measured speed vs High, and measured VRAM.
+    pub fn summary(self) -> &'static str {
+        match self {
+            QualityPreset::Low => "~30% faster \u{2022} ~1.6 GB VRAM \u{2014} no foliage, shadows or bloom",
+            QualityPreset::Medium => "~20% faster \u{2022} ~2.2 GB VRAM \u{2014} thinned foliage, no shadows",
+            QualityPreset::High => "baseline \u{2022} ~2.2 GB VRAM \u{2014} the shipped look",
+            QualityPreset::Ultra => "~2% slower \u{2022} ~4.4 GB VRAM \u{2014} full-res textures + SSAO",
+            QualityPreset::Custom => "your own mix \u{2014} see the per-option costs below",
+        }
+    }
+
+    /// Texture quality this preset wants: 0 = Full, 1 = Half, 2 = Quarter. `None` for Custom
+    /// (leave whatever the user set).
+    pub fn tex_quality(self) -> Option<u8> {
+        match self {
+            QualityPreset::Low => Some(2),
+            QualityPreset::Medium | QualityPreset::High => Some(1),
+            QualityPreset::Ultra => Some(0),
+            QualityPreset::Custom => None,
+        }
+    }
+
+    /// Apply the preset's render-side choices in place. Texture quality is handled separately by
+    /// the caller because it is a persisted config value that only takes effect on the next map
+    /// load (mip levels are dropped at upload time).
+    pub fn apply(self, g: &mut GfxSettings) {
+        let d = GfxSettings::default();
+        match self {
+            QualityPreset::Custom => {}
+            QualityPreset::Ultra => {
+                g.grass = true;
+                g.shadows = true;
+                g.bloom = true;
+                g.ssao = true;
+                g.lights = true;
+                g.cull_px = d.cull_px;
+                g.cull_px_grass = d.cull_px_grass;
+            }
+            QualityPreset::High => {
+                g.grass = true;
+                g.shadows = true;
+                g.bloom = true;
+                g.ssao = false;
+                g.lights = true;
+                g.cull_px = d.cull_px;
+                g.cull_px_grass = d.cull_px_grass;
+            }
+            QualityPreset::Medium => {
+                // Measured stack: shadows off + thinned foliage = +17% / +22%.
+                g.grass = true;
+                g.shadows = false;
+                g.bloom = true;
+                g.ssao = false;
+                g.lights = true;
+                g.cull_px = 2.0;
+                g.cull_px_grass = 600.0;
+            }
+            QualityPreset::Low => {
+                // Measured stack: +29% / +32%, and the texture drop takes VRAM to ~1.6 GB.
+                g.grass = false;
+                g.shadows = false;
+                g.bloom = false;
+                g.ssao = false;
+                g.lights = false;
+                g.cull_px = 4.0;
+                g.cull_px_grass = 1000.0;
+            }
+        }
+    }
+
+    /// Which preset (if any) the current settings correspond to. Returns `Custom` as soon as the
+    /// user deviates, so the UI never claims a preset the scene isn't actually running.
+    pub fn detect(g: &GfxSettings, tex_quality: u8) -> QualityPreset {
+        for p in [
+            QualityPreset::Ultra,
+            QualityPreset::High,
+            QualityPreset::Medium,
+            QualityPreset::Low,
+        ] {
+            let mut probe = g.clone();
+            p.apply(&mut probe);
+            if probe == *g && p.tex_quality() == Some(tex_quality) {
+                return p;
+            }
+        }
+        QualityPreset::Custom
+    }
+}
+
 /// Bumped by the in-place map loader (`main::load_map`) on every `.eftpack` swap. Extracted to the
 /// render world so the epoch-aware GPU reset (`gpu_driven::reset_gpu_map_if_epoch_changed`) can tear
 /// down the old map's buffers/bind-groups/pipelines and rebuild for the new pack. Also gates the

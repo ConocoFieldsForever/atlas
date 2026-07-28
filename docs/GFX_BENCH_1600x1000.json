@@ -1,0 +1,45 @@
+[
+ {
+  "name": "baseline",
+  "label": "Baseline (defaults, textures Half)",
+  "texQuality": 1,
+  "env": {},
+  "wall_s": 14.4,
+  "vram_base": 2016,
+  "vram_peak": 4238,
+  "vram_mib": 2222,
+  "frames": 1570,
+  "avg_ms": 3.824,
+  "fps": 261.5,
+  "p50": 3.715,
+  "p95": 4.495,
+  "p99": 4.812,
+  "max_ms": 5.673
+ },
+ {
+  "name": "stack_low",
+  "label": "STACK: quarter tex + no shadows/bloom/GI/lights + grass culled",
+  "texQuality": 2,
+  "env": {
+   "EFT_SHADOWS": "0",
+   "EFT_BLOOM": "0",
+   "EFT_GI": "0",
+   "EFT_LIGHTS": "0",
+   "EFT_CULL_PX": "4,1000",
+   "EFT_PARALLAX": "0",
+   "EFT_VIGNETTE": "0",
+   "EFT_FOG": "0"
+  },
+  "wall_s": 13.7,
+  "vram_base": 2016,
+  "vram_peak": 3662,
+  "vram_mib": 1646,
+  "frames": 1997,
+  "avg_ms": 3.005,
+  "fps": 332.8,
+  "p50": 2.878,
+  "p95": 3.852,
+  "p99": 4.451,
+  "max_ms": 8.802
+ }
+]

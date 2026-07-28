@@ -71,3 +71,4 @@ venv/
 /*_DESIGN.md
 # one-off probe scripts (the repo's leading-underscore = scratch convention)
 tools/_*
+docs/_bench_logs/
