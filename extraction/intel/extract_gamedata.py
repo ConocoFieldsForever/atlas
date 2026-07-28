@@ -1205,6 +1205,23 @@ def scan_level(lv, sink, ai=False):
             _g = group_of(_tp)
             if _g is not None:
                 _rec["grp"] = _g
+    # Turn (min, max, member count) into the per-container spawn probability the value model wants.
+    # Members are counted from the attribution above rather than trusted from the payload, so the
+    # number always matches the containers actually shipped for this level.
+    _members = Counter(r["grp"] for r in sink["containers"] if r.get("grp"))
+    for _g in sink["loot_groups"]:
+        _gid = _g.get("gid")
+        if not _gid or _g.get("min") is None:
+            continue
+        _n = _members.get(_gid, 0)
+        _g["members"] = _n
+        if _n:
+            _g["p"] = round(min(1.0, ((_g["min"] + _g["max"]) / 2.0) / _n), 4)
+    _p = {g["gid"]: g["p"] for g in sink["loot_groups"] if g.get("gid") and g.get("p") is not None}
+    for _rec in sink["containers"]:
+        _pp = _p.get(_rec.get("grp"))
+        if _pp is not None:
+            _rec["grp_p"] = _pp
 
     # ---- AI-scene post-pass: patrol ways + the bot-zone registry -----------------------------
     # PatrolPoint payloads are all zero — each point's POSITION is its Transform. A way's zone
