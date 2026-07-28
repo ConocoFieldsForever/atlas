@@ -454,6 +454,42 @@ def dec_stationary(pl):
     return name, wid, aim
 
 
+def dec_lootgroup(pl):
+    """LootableContainersGroup -> (id, min_spawn, max_spawn).
+
+    Layout after the 28-byte MonoBehaviour header: m_Name (int32 length, always 0 here), then a
+    length-prefixed 4-ALIGNED id string, then two int32s.
+
+        Goshan          -> 00000000 06000000 "Goshan"..  11000000 15000000  -> (17, 21)
+        ClothingShops   -> 00000000 0d000000 "ClothingShops"  0b000000 0f000000 -> (11, 15)
+
+    The pair is how many of the group's containers actually spawn in a raid. Verified on all 19
+    interchange groups: 0 <= min <= max <= (number of descendant LootableContainers) held every
+    time, and the ratio varies enormously by area - Kiba Arms 2-3 of 3 (~83%) vs the mall stashes
+    18-21 of 104 (~19%). That is the GAME's own per-location spawn odds, where the value model
+    otherwise applies one type-average fill rate everywhere.
+    """
+    # NOTE the offsets: `payload_of` already consumes the MonoBehaviour header AND m_Name, so the
+    # group-id length is at 0 here, not 4 (raw[28:] would put it at 4 -- that is where the probe saw
+    # it, and reading the probe offsets straight into this decoder is what made every group decode
+    # to nothing while still emitting a record).
+    if len(pl) < 12:
+        return None, None, None
+    n = int.from_bytes(pl[0:4], "little")
+    if not 0 <= n <= 64 or 4 + n > len(pl):
+        return None, None, None
+    gid = pl[4:4 + n].decode("utf-8", "replace")
+    off = 4 + n
+    off += (-off) % 4                      # Unity 4-aligns after a string
+    if off + 8 > len(pl):
+        return gid or None, None, None
+    lo = int.from_bytes(pl[off:off + 4], "little", signed=True)
+    hi = int.from_bytes(pl[off + 4:off + 8], "little", signed=True)
+    if not (0 <= lo <= hi <= 4096):
+        return gid or None, None, None     # decode did not hold: report the id, no odds
+    return (gid or None), lo, hi
+
+
 def dec_container(pl):
     """LootableContainer: [44B fixed][Id str @44 ("container_<zone>_00001")][...][24-hex
     container TEMPLATE id (tarkov.dev lootContainers: jacket / duffle-bag / dead-scav / ...)]
@@ -686,6 +722,39 @@ def scan_level(lv, sink, ai=False):
         act_cache[key] = ok
         return ok
 
+    group_tf = {}          # Transform pid of a LootableContainersGroup -> its record
+    group_of_cache = {}
+
+    def group_of(tpid):
+        """Nearest ancestor LootableContainersGroup id for a Transform, or None.
+
+        Memoized PER NODE (not per leaf): the same chain is walked by every container under a
+        group, and a per-leaf memo is the quadratic pattern that has cost hours on deep hierarchies
+        before. Groups are discovered as the scan goes, so a container seen BEFORE its group is
+        resolved in the post-pass below instead.
+        """
+        if not tpid:
+            return None
+        if tpid in group_of_cache:
+            return group_of_cache[tpid]
+        chain, cur, guard = [], tpid, 0
+        found = None
+        while cur and guard < 256:
+            guard += 1
+            if cur in group_of_cache:
+                found = group_of_cache[cur]
+                break
+            g = group_tf.get(cur)
+            if g is not None:
+                found = g.get("gid")
+                break
+            chain.append(cur)
+            d = tt(cur, tr_obj)
+            cur = (d.get("m_Father") or {}).get("m_PathID", 0) if d else 0
+        for c in chain:
+            group_of_cache[c] = found
+        return found
+
     def go_info(go_pid):
         """(name, transform pid, [BoxCollider tt, ...]) of a GameObject."""
         gd = go_tt(go_pid)
@@ -850,6 +919,7 @@ def scan_level(lv, sink, ai=False):
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
                 "SpawnPointMarker", "MineDirectional", "LootPoint", "LootPointsGroup",
                 "LighthouseTraderZone", "BufferGateSwitcher", "LootableContainer",
+                "LootableContainersGroup",
                 "CardReader", "RaidDialogEntryPoint",
                 "BotZone", "PatrolWay", "PatrolWayWithName", "PatrolWayWithConditions",
                 "AirdropPoint", "IndoorTrigger", "TOD_Sky", "LevelBorder",
@@ -936,6 +1006,18 @@ def scan_level(lv, sink, ai=False):
             if aim:
                 rec.update(aim)
             sink["stationary"].append(rec)
+        elif cls == "LootableContainersGroup":
+            gid, lo, hi = dec_lootgroup(pl)
+            rec = {"pos": tpos, "name": name, "active": active, "lv": lv}
+            if gid:
+                rec["gid"] = gid
+            if lo is not None:
+                rec["min"] = lo
+                rec["max"] = hi
+            # tpid identifies the group's Transform; containers underneath it are its members.
+            if tpid:
+                group_tf[tpid] = rec
+            sink["loot_groups"].append(rec)
         elif cls == "LootableContainer":
             cid, tpl = dec_container(pl)
             rec = {"pos": tpos, "name": name, "active": active, "lv": lv}
@@ -943,6 +1025,13 @@ def scan_level(lv, sink, ai=False):
                 rec["id"] = cid
             if tpl:
                 rec["template"] = tpl
+            # Attribute the container to the nearest ANCESTOR group. Membership is hierarchical in
+            # the scene (a group is the parent GameObject), so walking up beats any spatial guess.
+            g = group_of(tpid)
+            if g is not None:
+                rec["grp"] = g
+            elif tpid:
+                rec["_tpid"] = tpid   # resolved in the post-pass (its group may not be scanned yet)
             sink["containers"].append(rec)
         elif cls in DAMAGE_ZONE_CLASSES:
             box = cols[0] if cols else None
@@ -1104,6 +1193,18 @@ def scan_level(lv, sink, ai=False):
                     "pos": tpos, "name": name, "guid": guid, "templates": tps,
                     "active": active, "lv": lv,
                 })
+
+    # ---- loot-group post-pass ---------------------------------------------------------------
+    # A container can be scanned BEFORE the group that owns it, so anything still unattributed is
+    # re-walked now that every group on this level is known. The memo is cleared first: entries
+    # cached during the main loop may have concluded "no group" only because it had not been seen.
+    group_of_cache.clear()
+    for _rec in sink["containers"]:
+        _tp = _rec.pop("_tpid", None)
+        if _tp is not None and "grp" not in _rec:
+            _g = group_of(_tp)
+            if _g is not None:
+                _rec["grp"] = _g
 
     # ---- AI-scene post-pass: patrol ways + the bot-zone registry -----------------------------
     # PatrolPoint payloads are all zero — each point's POSITION is its Transform. A way's zone
