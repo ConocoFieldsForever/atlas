@@ -122,6 +122,12 @@ impl NavAgent {
     /// A continuous surface that passed the slope filter can rise or fall at most `run·tan(slope)`
     /// over that span; a discontinuity is only crossable up to `climb`. With `ledgeDropHeight = 0`
     /// there is nothing else — no free fall, in particular none of the old flat 2 m drop.
+    ///
+    /// HARD-CAPPED AT [`VAULT`]: whatever the slope term works out to, a single edge may never
+    /// span more height than a player can actually vault. On a 1 m grid the `run·tan(48°)` term
+    /// reaches 1.11 m orthogonally and **1.57 m diagonally** — above the 1.2 m vault — so without
+    /// this clamp the diagonal moves were quietly the most permissive edges on the grid, which is
+    /// exactly how a route steps onto something it has no business standing on.
     #[inline]
     pub(crate) fn max_step(&self, run: f32) -> f32 {
         if self.ledge_drop > 0.0 {
@@ -129,7 +135,7 @@ impl NavAgent {
             // of edge length. No agent EFT ships has a non-zero ledgeDropHeight.
             return self.ledge_drop;
         }
-        self.climb.max(run * self.slope_tan)
+        self.climb.max(run * self.slope_tan).min(VAULT)
     }
 }
 
@@ -631,6 +637,85 @@ fn add_collider_tris(
         skipped_layer
     );
     tris.len() - before
+}
+
+/// Recast's `rcFilterLedgeSpans`, scaled to this grid and bounded by what a player can VAULT.
+///
+/// A surface you cannot get down from in one move is a surface you cannot be standing on. Recast
+/// marks a span unwalkable when the drop to any orthogonal neighbour exceeds the agent's climb; we
+/// use [`VAULT`] instead, because that is the real limit on how much height a player can cross in
+/// one move, and at 1 m cells the tighter climb value erodes ordinary kerbs and stair heads.
+///
+/// This is what removes the "path in the air": the top of a truss beam, a pipe run or a gantry has
+/// a multi-metre drop on EVERY side, so every one of its cells is a ledge and the whole surface
+/// disappears. A real floor only loses its outermost ring, because its interior cells have
+/// neighbours at their own height.
+///
+/// A neighbour with NO floor at or below `h + VAULT` is SKIPPED rather than counted as a cliff —
+/// at 1 m resolution that case is a wall or solid interior, not open air, and treating it as a drop
+/// would eat every floor that meets a wall.
+fn filter_ledge_spans(heights: &mut [f32], nx: usize, nz: usize, k: usize) -> usize {
+    let cells = nx * nz;
+    let mut kill = vec![false; cells * k];
+    let mut pruned = 0usize;
+    const ORTHO: [(i64, i64); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+
+    for c in 0..cells {
+        let (ix, iz) = ((c % nx) as i64, (c / nx) as i64);
+        for l in 0..k {
+            let h = heights[c * k + l];
+            if h <= MISS_HALF {
+                break; // floors are ascending; MISS trails
+            }
+            for (dx, dz) in ORTHO {
+                let (jx, jz) = (ix + dx, iz + dz);
+                if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
+                    continue; // off-grid is the map border, not a cliff
+                }
+                let nc = jz as usize * nx + jx as usize;
+                // Highest neighbour floor that is still steppable-onto or droppable-to.
+                let mut best = f32::NEG_INFINITY;
+                for nl in 0..k {
+                    let nh = heights[nc * k + nl];
+                    if nh <= MISS_HALF {
+                        break;
+                    }
+                    if nh <= h + VAULT && nh > best {
+                        best = nh;
+                    }
+                }
+                if best == f32::NEG_INFINITY {
+                    continue; // nothing to step to on this side: wall/solid, not open air
+                }
+                if best - h < -VAULT {
+                    kill[c * k + l] = true;
+                    pruned += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Re-compact each touched cell so the ascending-floors / trailing-MISS invariant survives.
+    if pruned > 0 {
+        let mut keep: Vec<f32> = Vec::with_capacity(k);
+        for c in 0..cells {
+            if !(0..k).any(|l| kill[c * k + l]) {
+                continue;
+            }
+            keep.clear();
+            for l in 0..k {
+                let h = heights[c * k + l];
+                if h > MISS_HALF && !kill[c * k + l] {
+                    keep.push(h);
+                }
+            }
+            for l in 0..k {
+                heights[c * k + l] = keep.get(l).copied().unwrap_or(MISS);
+            }
+        }
+    }
+    pruned
 }
 
 /// Recast's `minRegionArea` filter: flood the (cell,layer) graph over the edges the router would
@@ -1562,6 +1647,11 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     // Cast one vertical column per cell, in parallel. Per-thread scratch (hit list + BVH stack +
     // floor buffer) is created once per worker via for_each_init.
     let t_cast = Instant::now();
+    // Footprint probes for the agent-radius erosion below: the four cardinal points at agentRadius.
+    let a_erode = agent();
+    let er = a_erode.radius.max(0.05);
+    let footprint: [(f32, f32); 4] = [(er, 0.0), (-er, 0.0), (0.0, er), (0.0, -er)];
+    let erode_climb = a_erode.climb;
     let mut heights = vec![MISS; m];
     let mut door = vec![0u8; cells];
     heights
@@ -1569,17 +1659,83 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
         .zip(door.par_iter_mut())
         .enumerate()
         .for_each_init(
-            || (Vec::<Hit>::with_capacity(64), Vec::<u32>::with_capacity(64), Vec::<f32>::with_capacity(16)),
-            |(hits, nstack, floors), (cell, (hout, dout))| {
+            // `support` is the footprint probe's output buffer and must be K long, exactly like the
+            // per-cell `hout` slice `resolve_column` normally writes into.
+            || (
+                Vec::<Hit>::with_capacity(64),
+                Vec::<u32>::with_capacity(64),
+                Vec::<f32>::with_capacity(16),
+                vec![MISS; k],
+            ),
+            |(hits, nstack, floors, support), (cell, (hout, dout))| {
                 let ix = cell % nx;
                 let iz = cell / nx;
                 let x = min_x + ix as f32 * res;
                 let z = min_z + iz as f32 * res;
                 bvh.column(x, z, y_low, y_high, hits, nstack);
-                let (_, is_door) = resolve_column(hits, k, hout, floors);
+                let (n, is_door) = resolve_column(hits, k, hout, floors);
                 *dout = is_door as u8;
+                // AGENT-RADIUS EROSION (Recast `rcErodeWalkableArea`), done by SUPERSAMPLING the
+                // agent's footprint rather than by dilating the grid.
+                //
+                // One ray at the cell CENTRE makes a whole 1 m^2 cell walkable when all it hit was
+                // a 0.2 m truss beam or a pipe top. Those then chain into ramps, and routes climb
+                // gantries and roofs — the "path way up in the air" over the power station. Unity
+                // never has this: it erodes the walkable area by agentRadius, which deletes any
+                // surface narrower than the agent outright.
+                //
+                // Grid dilation cannot express that here (radius 0.30 m is smaller than one cell),
+                // but the footprint test can: probe the four cardinal points at agentRadius and keep
+                // a floor only where the surface is still there, within one climb step. A beam,
+                // railing or pipe fails on both sides; a real walkway, kerb or stair tread passes.
+                if n > 0 && !is_door {
+                    for l in 0..n {
+                        let h = hout[l];
+                        if h <= MISS_HALF {
+                            break;
+                        }
+                        let mut supported = true;
+                        for &(ox, oz) in &footprint {
+                            bvh.column(x + ox, z + oz, y_low, y_high, hits, nstack);
+                            let (sn, _) = resolve_column(hits, k, support, floors);
+                            // Supported if ANY floor under the offset probe is within a climb step
+                            // of this one — i.e. the agent's edge still has ground beneath it.
+                            if !support[..sn].iter().any(|&sh| (sh - h).abs() <= erode_climb) {
+                                supported = false;
+                                break;
+                            }
+                        }
+                        if !supported {
+                            hout[l] = MISS;
+                        }
+                    }
+                    // Re-compact so surviving floors stay ascending with MISS trailing.
+                    let mut w = 0usize;
+                    for l in 0..k {
+                        let h = hout[l];
+                        if h > MISS_HALF {
+                            hout[w] = h;
+                            w += 1;
+                        }
+                    }
+                    for l in w..k {
+                        hout[l] = MISS;
+                    }
+                }
             },
         );
+
+    // Ledge filter runs BEFORE the wall/blk pass and the region prune, so both of those see the
+    // final floor set (a blocked-edge bit on a floor that no longer exists is wasted work, and a
+    // region's area must be measured over surviving cells).
+    let t_ledge = Instant::now();
+    let n_ledge = filter_ledge_spans(&mut heights, nx, nz, k);
+    if n_ledge > 0 {
+        eprintln!(
+            "  nav-bake: ledge filter (drop > {VAULT} m vault on any side): removed {n_ledge} floor(s) in {:.2}s",
+            t_ledge.elapsed().as_secs_f32()
+        );
+    }
 
     let walkable = heights
         .par_chunks(k)
@@ -2017,6 +2173,62 @@ pub fn run_check_cli(args: &[String]) -> i32 {
             eprintln!("    {:<34} {}", n, display(n));
         }
         return 1;
+    }
+
+    // --patrols: route every PatrolWay leg and report the ones whose route CLIMBS far above both
+    // of its endpoints. A patrol leg between two ground-level waypoints has no business going up a
+    // gantry or onto a roof, so this names the offending legs (and the height they reach) instead
+    // of leaving "the path goes up in the air" to be diagnosed by eye.
+    if side == "patrols" {
+        let ways = gd.get("patrol_ways").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let pt = |v: &serde_json::Value| -> Option<Vec3> {
+            let a = v.as_array()?;
+            if a.len() < 3 {
+                return None;
+            }
+            Some(Vec3::new(
+                a[0].as_f64()? as f32,
+                a[1].as_f64()? as f32,
+                a[2].as_f64()? as f32,
+            ))
+        };
+        let mut sc = Scratch::new(grid.nodes());
+        let (mut legs, mut routed, mut climbers) = (0usize, 0usize, 0usize);
+        let mut worst: Vec<(f32, Vec3, Vec3, Vec3)> = Vec::new();
+        for w in ways {
+            let Some(pts) = w.get("points").and_then(|v| v.as_array()) else { continue };
+            let ps: Vec<Vec3> = pts.iter().filter_map(pt).collect();
+            for pair in ps.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                legs += 1;
+                let Some((poly, _)) = grid.path(a, b, &mut sc, None) else { continue };
+                routed += 1;
+                let base = a.y.max(b.y);
+                let mut top = f32::NEG_INFINITY;
+                let mut at = a;
+                for p in &poly {
+                    if p.y > top {
+                        top = p.y;
+                        at = *p;
+                    }
+                }
+                let rise = top - base;
+                if rise > 2.0 {
+                    climbers += 1;
+                    worst.push((rise, at, a, b));
+                }
+            }
+        }
+        worst.sort_by(|x, y| y.0.total_cmp(&x.0));
+        println!("\n=== patrol legs that climb above BOTH endpoints ===");
+        println!("  {legs} legs, {routed} routed, {climbers} climb >2 m above their endpoints");
+        for (rise, at, a, b) in worst.iter().take(25) {
+            println!(
+                "   +{:6.1} m  peak [{:8.1},{:7.1},{:8.1}]   leg [{:.0},{:.0},{:.0}] -> [{:.0},{:.0},{:.0}]",
+                rise, at.x, at.y, at.z, a.x, a.y, a.z, b.x, b.y, b.z
+            );
+        }
+        return if climbers > 0 { 1 } else { 0 };
     }
 
     let spawns = gd.get("spawn_points").and_then(|v| v.as_array()).unwrap_or(&empty);
