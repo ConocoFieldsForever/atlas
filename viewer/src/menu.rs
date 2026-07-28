@@ -776,6 +776,9 @@ pub struct MenuState {
     pub overlay: crate::overlay::OverlayConfig,
     /// Texture quality: 0 = full, 1 = half, 2 = quarter (mip levels dropped at upload).
     pub tex_quality: u8,
+    /// Quality preset index (see `render::QualityPreset`). Chosen in the MENU and carried into the
+    /// scene by main.rs, because texture quality is applied while a map loads.
+    pub quality_preset: u8,
     /// Which SETTINGS tab the right-hand panel shows (0 = Overlay, 1 = Live link, 2 = General).
     /// `None` = the panel is collapsed and the map list has the full width.
     pub settings_tab: Option<u8>,
@@ -959,9 +962,20 @@ fn config_path() -> std::path::PathBuf {
     crate::paths::config_path()
 }
 
+/// Read atlas.config.json, tolerating a UTF-8 BOM.
+///
+/// `serde_json` rejects a leading BOM, and a rejected parse means EVERY setting silently
+/// reverts to its default - language, game dir, overlay layout, quality preset, the lot. Any
+/// editor that writes UTF-8-with-BOM (Notepad, PowerShell's `Out-File -Encoding utf8`) produces
+/// one, and the failure is invisible: the file looks perfectly fine. Strip it on read.
+fn read_config_text() -> Option<String> {
+    let t = std::fs::read_to_string(config_path()).ok()?;
+    Some(t.strip_prefix('\u{feff}').map(str::to_string).unwrap_or(t))
+}
+
 fn config_game_dir() -> Option<String> {
     let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+        serde_json::from_str(&read_config_text()?).ok()?;
     v.get("gameData").and_then(|s| s.as_str()).map(str::to_string)
 }
 
@@ -972,7 +986,7 @@ pub fn save_config_game_dir(dir: &str) -> bool {
 /// Generic single-key read from atlas.config.json (the game-dir helpers are the canonical example).
 fn config_str(key: &str) -> Option<String> {
     let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+        serde_json::from_str(&read_config_text()?).ok()?;
     v.get(key).and_then(|s| s.as_str()).map(str::to_string)
 }
 
@@ -1014,7 +1028,7 @@ pub fn save_config_bool_pub(key: &str, val: bool) -> bool {
 /// f32 variants (overlay geometry / fps cap). Stored as JSON numbers.
 pub fn config_f32_pub(key: &str) -> Option<f32> {
     let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+        serde_json::from_str(&read_config_text()?).ok()?;
     v.get(key).and_then(|n| n.as_f64()).map(|n| n as f32)
 }
 #[must_use]
@@ -1039,7 +1053,7 @@ pub fn save_config_f32_pub(key: &str, val: f32) -> bool {
 
 fn config_bool(key: &str) -> Option<bool> {
     let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(config_path()).ok()?).ok()?;
+        serde_json::from_str(&read_config_text()?).ok()?;
     v.get(key).and_then(|b| b.as_bool())
 }
 
@@ -1499,7 +1513,13 @@ pub fn build_state() -> MenuState {
         // Clamp: a hand-edited config value outside 0..=2 would leave no button selected while
         // `set_tex_mip_skip` silently clamped to Quarter.
         tex_quality: (config_f32_pub("textureQuality").unwrap_or(1.0) as u8).min(2), // Half (see main.rs)
-        settings_tab: None,
+        quality_preset: (config_f32_pub("qualityPreset").unwrap_or(2.0) as u8).min(4), // High
+        // EFT_SETTINGS_TAB=<0|1|2> opens a settings tab on launch (0 Overlay, 1 Live link,
+        // 2 General) — screenshots / QA of the menu without hand-driving the UI.
+        settings_tab: std::env::var("EFT_SETTINGS_TAB")
+            .ok()
+            .and_then(|s| s.trim().parse::<u8>().ok())
+            .filter(|t| *t <= 2),
         reattached: false,
     }
 }
@@ -2404,6 +2424,58 @@ pub fn menu_ui(
                             }
                         }
                         ui.add_space(10.0);
+                        // QUALITY PRESET — set HERE, before a map loads, and carried into the
+                        // scene. It has to live in the menu: texture quality is applied while
+                        // textures upload, so picking it in-raid cannot change what was uploaded.
+                        // main.rs seeds both the mip-skip and GfxSettings from `qualityPreset`.
+                        // Every number in the summaries is measured (docs/GFX_BENCH_*.json).
+                        ui.label(RichText::new(t(lg, K::Quality)).size(11.0))
+                            .on_hover_text(t(lg, K::QualityTip));
+                        ui.horizontal(|ui| {
+                            for p in crate::render::QualityPreset::ALL {
+                                let sum = match p {
+                                    crate::render::QualityPreset::Low => K::QualityLowSum,
+                                    crate::render::QualityPreset::Medium => K::QualityMediumSum,
+                                    crate::render::QualityPreset::High => K::QualityHighSum,
+                                    crate::render::QualityPreset::Ultra => K::QualityUltraSum,
+                                    crate::render::QualityPreset::Custom => K::QualityCustomSum,
+                                };
+                                if ui
+                                    .selectable_label(
+                                        state.quality_preset == p.index(),
+                                        RichText::new(p.label()).size(11.0),
+                                    )
+                                    .on_hover_text(t(lg, sum))
+                                    .clicked()
+                                {
+                                    state.quality_preset = p.index();
+                                    if !save_config_f32_pub("qualityPreset", p.index() as f32) {
+                                        state.config_err = Some(
+                                            "settings could not be saved (read-only folder?)".to_string(),
+                                        );
+                                    }
+                                    // A non-Custom preset owns texture quality; keep the persisted
+                                    // value and the visible Texture-quality row in agreement.
+                                    if let Some(q) = p.tex_quality() {
+                                        state.tex_quality = q;
+                                        crate::render::gpu_driven::set_tex_mip_skip(q);
+                                        save_config_f32_pub("textureQuality", q as f32);
+                                    }
+                                }
+                            }
+                        });
+                        {
+                            let p = crate::render::QualityPreset::from_index(state.quality_preset);
+                            let sum = match p {
+                                crate::render::QualityPreset::Low => K::QualityLowSum,
+                                crate::render::QualityPreset::Medium => K::QualityMediumSum,
+                                crate::render::QualityPreset::High => K::QualityHighSum,
+                                crate::render::QualityPreset::Ultra => K::QualityUltraSum,
+                                crate::render::QualityPreset::Custom => K::QualityCustomSum,
+                            };
+                            ui.label(RichText::new(t(lg, sum)).size(10.0).color(DIM));
+                        }
+                        ui.add_space(8.0);
                         // TEXTURE QUALITY — the one VRAM lever that matters (docs/VRAM_AUDIT.md:
                         // textures are ~59% of streets' residency; Half reclaims ~3.8 GiB there).
                         ui.label(RichText::new(t(lg, K::TexQuality)).size(11.0))
@@ -2424,6 +2496,19 @@ pub fn menu_ui(
                                 {
                                     state.tex_quality = i as u8;
                                     crate::render::gpu_driven::set_tex_mip_skip(i as u8);
+                                    // Hand-picking a texture quality deviates from whatever preset
+                                    // was active, so the preset becomes Custom rather than lying.
+                                    if crate::render::QualityPreset::from_index(state.quality_preset)
+                                        .tex_quality()
+                                        != Some(i as u8)
+                                    {
+                                        state.quality_preset =
+                                            crate::render::QualityPreset::Custom.index();
+                                        save_config_f32_pub(
+                                            "qualityPreset",
+                                            crate::render::QualityPreset::Custom.index() as f32,
+                                        );
+                                    }
                                     if !save_config_f32_pub("textureQuality", i as f32) {
                                         state.config_err = Some(
                                             "settings could not be saved (read-only folder?)"

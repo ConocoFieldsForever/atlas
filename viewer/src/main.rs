@@ -639,8 +639,12 @@ fn main() {
     // than the whole budget of a mid-range card; Half is visually near-identical (one mip down)
     // and cuts that to ~1.3 GB. Users who have explicitly chosen a quality keep their choice --
     // this only changes the default for someone who has never touched the setting.
+    // A non-Custom preset OWNS texture quality, so the two can never drift apart (a stale
+    // `textureQuality` from before a preset was picked would otherwise load the wrong mips).
     render::gpu_driven::set_tex_mip_skip(
-        menu::config_f32_pub("textureQuality").unwrap_or(1.0) as u8,
+        render::QualityPreset::from_index(menu::config_f32_pub("qualityPreset").unwrap_or(2.0) as u8)
+            .tex_quality()
+            .unwrap_or_else(|| menu::config_f32_pub("textureQuality").unwrap_or(1.0) as u8),
     );
     // Headless nav baker BEFORE any Bevy/GPU init: `atlas bake-nav <pack_dir> [--res R] [--layers K]`
     // bakes the routing grid on the CPU (portable — AMD/NVIDIA/no-GPU) and exits, so the map-build
@@ -931,6 +935,15 @@ fn main() {
     // Runtime graphics settings (UI "Graphics (experimental)"). Defaults reproduce the shipped
     // look; availability flags gate the toggles that need pack data.
     let mut gfx = render::GfxSettings::default();
+    // CARRY THE MENU'S QUALITY PRESET INTO THE SCENE. The preset is picked in the main menu (it has
+    // to be: texture quality is applied when textures are UPLOADED, so choosing it after a map is
+    // resident cannot change what was uploaded). Apply it here, before the pack builds, so the
+    // render-side choices match the textures that are about to be loaded. `Custom` deliberately
+    // applies nothing — it means "the user's own mix", which is whatever the other settings say.
+    let preset = render::QualityPreset::from_index(
+        menu::config_f32_pub("qualityPreset").unwrap_or(2.0) as u8,
+    );
+    preset.apply(&mut gfx);
     gfx.grade_available = grade_lut.is_some();
     // Menu backdrop: crank Bloom so the neon globe reads as a hazy VOLUMETRIC glow (in-raid keeps
     // the subtle 0.06). apply_gfx_camera pushes this to the camera.

@@ -135,6 +135,13 @@ pub enum K {
     UnbuiltProcess,
     UnbuiltProcessTip,
     UnbuiltCancel,
+    Quality,
+    QualityTip,
+    QualityLowSum,
+    QualityMediumSum,
+    QualityHighSum,
+    QualityUltraSum,
+    QualityCustomSum,
     TexQuality,
     TexQualityTip,
     TexQualityFull,
@@ -398,6 +405,31 @@ Atlas читает только файлы, которые игра уже за�
             "Запускает полную сборку карты. Это занимает несколько минут и сильно нагружает CPU/GPU - запекание не трогает GPU, пока Atlas рисует, но игра всё равно это почувствует. Можно продолжать играть: сборка переживёт закрытие Atlas.",
         ],
         UnbuiltCancel => ["Cancel", "Отмена"],
+        Quality => ["Quality preset", "Пресет качества"],
+        QualityTip => [
+            "Sets the options that actually cost performance, measured on this build. Chosen here rather than in-raid because texture quality is applied while a map loads.",
+            "Задаёт параметры, которые действительно влияют на производительность. Выбирается здесь, так как качество текстур применяется при загрузке карты.",
+        ],
+        QualityLowSum => [
+            "~30% faster • ~1.6 GB VRAM — no foliage, shadows or bloom",
+            "~30% быстрее • ~1.6 ГБ — без травы, теней и свечения",
+        ],
+        QualityMediumSum => [
+            "~20% faster • ~2.2 GB VRAM — thinned foliage, no shadows",
+            "~20% быстрее • ~2.2 ГБ — меньше травы, без теней",
+        ],
+        QualityHighSum => [
+            "baseline • ~2.2 GB VRAM — the shipped look",
+            "базовый • ~2.2 ГБ — стандартный вид",
+        ],
+        QualityUltraSum => [
+            "~2% slower • ~4.4 GB VRAM — full-res textures + SSAO",
+            "~2% медленнее • ~4.4 ГБ — текстуры полного разрешения + SSAO",
+        ],
+        QualityCustomSum => [
+            "your own mix — tune it in-raid under Graphics",
+            "ваш набор — настройте в рейде",
+        ],
         TexQuality => ["Texture quality", "Качество текстур"],
         TexQualityTip => [
             "How sharply map textures load. Half keeps the map perfectly readable and reclaims most of the texture memory - the right choice when Tarkov and Atlas share the GPU. Textures already at or below 128 px are never reduced.",
