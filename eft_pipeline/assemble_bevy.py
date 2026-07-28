@@ -911,6 +911,17 @@ def main():
         cj = json.load(open(cpath, encoding='utf-8'))
         craw = cj.get('colliders') or []
         layer_names = cj.get('layers') or {}
+        # Collider primitives are parameterised on local axes (box size xyz, capsule direction), so
+        # they only survive a global matrix that maps axes onto axes. Check it rather than assume.
+        _g_abs = np.abs(np.asarray(G3, np.float64))
+        if not (np.allclose(_g_abs.sum(axis=0), 1.0, atol=1e-6)
+                and np.allclose(_g_abs.sum(axis=1), 1.0, atol=1e-6)
+                and np.allclose(_g_abs[_g_abs > 0.5], 1.0, atol=1e-6)):
+            raise SystemExit(
+                "[bevy] global_matrix is not a signed permutation; collider box/capsule "
+                "parameterisation cannot be expressed in the viewer frame. Refusing to emit "
+                "silently-wrong colliders."
+            )
         cvbuf, cibuf = bytearray(), bytearray()      # positions (f32x3) then u32 indices
         cmesh_id, cverts, cidx = {}, 0, 0
 
@@ -973,8 +984,21 @@ def main():
                 shape = [c.get('r', 0.5), c.get('h', 2.0), float(c.get('d', 1))]
             else:
                 shape = [0.0, 0.0, 0.0]
-            crecs.append((aff, kind, mid, c.get('c') or [0, 0, 0], shape,
-                          int(c.get('lyr', 0)), flags))
+            # m_Center is Unity-LOCAL and must be carried into the viewer frame like every other
+            # piece of local geometry. Mesh colliders get this free (UnityPy's mesh.export()
+            # X-negates verts, so their local space is ALREADY G-applied) -- primitives do not,
+            # because their geometry is generated from `center`/`shape` at bake time. Without this
+            # the conjugated affine `G*M*G^-1` is applied to an un-flipped center, which mirrors the
+            # primitive about its own pivot: the skill's S3 signature, measured at 2,704 misplaced
+            # nav colliders on interchange, up to 4.02 m out.
+            #
+            # Only `center` needs it under a signed-permutation G: box `size` is symmetric about the
+            # center, a sphere is isotropic, and a capsule's axis maps onto itself (sign-flipped),
+            # so `shape`/`direction` are invariant. A ROTATIONAL global matrix would break that
+            # parameterisation entirely, so refuse rather than emit silently-wrong colliders.
+            ctr = list(c.get('c') or [0, 0, 0])
+            ctr = [float(v) for v in (G3 @ np.asarray(ctr, np.float64))]
+            crecs.append((aff, kind, mid, ctr, shape, int(c.get('lyr', 0)), flags))
 
         ca = np.zeros(len(crecs), CDT)
         for i, (aff, kind, mid, ctr, shp, lyr, fl) in enumerate(crecs):

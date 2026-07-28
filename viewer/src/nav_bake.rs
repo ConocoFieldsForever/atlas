@@ -727,7 +727,7 @@ fn filter_ledge_spans(heights: &mut [f32], nx: usize, nz: usize, k: usize) -> us
 fn prune_small_regions(
     heights: &mut [f32],
     door: &[u8],
-    blk: &[u8],
+    blk: &mut [u8],
     nx: usize,
     nz: usize,
     k: usize,
@@ -811,20 +811,32 @@ fn prune_small_regions(
     }
     if pruned > 0 {
         // Re-compact each touched cell so surviving floors stay ascending with MISS trailing.
+        //
+        // `blk` MUST be permuted by the SAME keep-mask. It is indexed per (cell, LAYER) and the
+        // router reads it by layer index, so compacting heights alone silently re-points every
+        // surviving layer at another layer's block mask. Concretely: a cell holding [speck, deck]
+        // where the deck has a railing bit; prune the speck, the deck slides to layer 0, and the
+        // router reads the speck's empty mask and walks through the railing. That is precisely the
+        // routes-through-walls failure this grid exists to prevent, so the two arrays are compacted
+        // together or not at all.
         let mut keep: Vec<f32> = Vec::with_capacity(k);
+        let mut keep_blk: Vec<u8> = Vec::with_capacity(k);
         for c in 0..cells {
             if !(0..k).any(|l| kill[c * k + l]) {
                 continue;
             }
             keep.clear();
+            keep_blk.clear();
             for l in 0..k {
                 let h = heights[c * k + l];
                 if h > MISS_HALF && !kill[c * k + l] {
                     keep.push(h);
+                    keep_blk.push(blk[c * k + l]);
                 }
             }
             for l in 0..k {
                 heights[c * k + l] = keep.get(l).copied().unwrap_or(MISS);
+                blk[c * k + l] = keep_blk.get(l).copied().unwrap_or(0);
             }
         }
     }
@@ -873,8 +885,12 @@ fn shape_sphere(center: Vec3, r: f32, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]>
             let b = i * SEGS + (j + 1) % SEGS;
             let c = (i + 1) * SEGS + j;
             let d = (i + 1) * SEGS + (j + 1) % SEGS;
-            idx.push([a, c, b]);
-            idx.push([b, c, d]);
+            // OUTWARD winding. `resolve_column` classifies a surface purely on the sign of `ny`,
+            // so an inward-wound primitive has its top read as a CEILING and its underside read as
+            // a FLOOR -- inventing a walkable surface in mid-air, the exact artifact this bake is
+            // meant to remove. Covered by `collider_primitives_are_wound_outward`.
+            idx.push([a, b, c]);
+            idx.push([b, d, c]);
         }
     }
 }
@@ -907,8 +923,12 @@ fn shape_capsule(center: Vec3, r: f32, height: f32, dir: u32, v: &mut Vec<Vec3>,
             let b = i * SEGS + (j + 1) % SEGS;
             let c = (i + 1) * SEGS + j;
             let d = (i + 1) * SEGS + (j + 1) % SEGS;
-            idx.push([a, c, b]);
-            idx.push([b, c, d]);
+            // OUTWARD winding. `resolve_column` classifies a surface purely on the sign of `ny`,
+            // so an inward-wound primitive has its top read as a CEILING and its underside read as
+            // a FLOOR -- inventing a walkable surface in mid-air, the exact artifact this bake is
+            // meant to remove. Covered by `collider_primitives_are_wound_outward`.
+            idx.push([a, b, c]);
+            idx.push([b, d, c]);
         }
     }
 }
@@ -1917,7 +1937,7 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     //
     // Run AFTER the capsule pass so connectivity is measured over the edges the ROUTER will
     // actually traverse (blocked edges included), not over raw floor adjacency.
-    let n_pruned = prune_small_regions(&mut heights, &door, &blk, nx, nz, k, res);
+    let n_pruned = prune_small_regions(&mut heights, &door, &mut blk, nx, nz, k, res);
     if n_pruned > 0 {
         let a = agent();
         eprintln!(
@@ -2403,4 +2423,110 @@ pub fn run_cli(args: &[String]) -> i32 {
     // Headless proof the writer matches the runtime loader + the router routes on it.
     self_check(&baked, dir_path);
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every generated collider triangle must face OUTWARD. `resolve_column` classifies a surface
+    /// purely on the sign of `ny` (`nav_bake.rs` up-facing = floor, down-facing = ceiling), so an
+    /// inward-wound primitive has its top read as a ceiling and its underside read as a FLOOR —
+    /// i.e. it invents a walkable surface in mid-air, the exact artifact this bake exists to avoid.
+    fn assert_outward(verts: &[Vec3], idx: &[[u32; 3]], centre: Vec3, what: &str) {
+        for (i, t) in idx.iter().enumerate() {
+            let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let n = (b - a).cross(c - a);
+            // A lat/long sphere collapses all SEGS vertices onto each pole, so the polar band is
+            // made of zero-area triangles with no meaningful orientation. `add_collider_tris`
+            // discards them on the same basis (`nlen < 1e-12`), so skip them here rather than
+            // asserting on floating-point noise.
+            if n.length() < 1.0e-6 {
+                continue;
+            }
+            let outward = (a + b + c) / 3.0 - centre;
+            assert!(
+                n.dot(outward) > 0.0,
+                "{what}: triangle {i} is wound INWARD (n·out = {})",
+                n.dot(outward)
+            );
+        }
+    }
+
+    #[test]
+    fn collider_primitives_are_wound_outward() {
+        let (mut v, mut i) = (Vec::new(), Vec::new());
+        shape_box(Vec3::ZERO, Vec3::splat(2.0), &mut v, &mut i);
+        assert_outward(&v, &i, Vec3::ZERO, "box");
+
+        v.clear();
+        i.clear();
+        shape_sphere(Vec3::ZERO, 1.0, &mut v, &mut i);
+        assert_outward(&v, &i, Vec3::ZERO, "sphere");
+
+        for dir in 0..3u32 {
+            v.clear();
+            i.clear();
+            shape_capsule(Vec3::ZERO, 0.5, 2.0, dir, &mut v, &mut i);
+            assert_outward(&v, &i, Vec3::ZERO, "capsule");
+        }
+    }
+
+    /// The baker decides which edges to capsule-test; the router decides which edges to walk. If
+    /// the baker is STRICTER, it skips the wall test on an edge the router will take, and that
+    /// edge's block bit stays 0 — a route through a wall, which is the failure this whole grid is
+    /// built to prevent. They must agree exactly.
+    #[test]
+    fn baker_and_router_agree_on_walkability() {
+        let a = agent();
+        let grid = NavGrid::test_grid(a.climb, a.slope_deg, VAULT);
+        for run in [1.0f32, std::f32::consts::SQRT_2] {
+            let mut up = -2.5f32;
+            while up <= 2.5 {
+                let baker = walkable_step_bake(up, run);
+                let router = grid.walkable_step_pub(up, run, false);
+                assert_eq!(
+                    baker, router,
+                    "disagree at up={up:.3} run={run:.3}: baker={baker} router={router}"
+                );
+                up += 0.01;
+            }
+        }
+    }
+
+    /// `nav.bin`'s contract: floors ascending, `MISS` only ever trailing, so every reader can stop
+    /// at the first MISS. Both mutating passes re-compact, and a bug there silently truncates a
+    /// cell's floor list for every consumer.
+    fn assert_invariant(h: &[f32], k: usize, what: &str) {
+        for (c, cell) in h.chunks(k).enumerate() {
+            let mut seen_miss = false;
+            let mut prev = f32::NEG_INFINITY;
+            for (l, &v) in cell.iter().enumerate() {
+                if v <= MISS_HALF {
+                    seen_miss = true;
+                } else {
+                    assert!(!seen_miss, "{what}: cell {c} layer {l} is a floor AFTER a MISS");
+                    assert!(v >= prev, "{what}: cell {c} layer {l} breaks ascending order");
+                    prev = v;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ledge_filter_preserves_the_height_invariant() {
+        let (nx, nz, k) = (6usize, 6usize, 4usize);
+        let mut h = vec![MISS; nx * nz * k];
+        for c in 0..nx * nz {
+            h[c * k] = 10.0; // continuous ground everywhere
+        }
+        // An isolated pillar top 8 m up in the middle: a ledge on every side.
+        let mid = (nz / 2) * nx + nx / 2;
+        h[mid * k + 1] = 18.0;
+        let removed = filter_ledge_spans(&mut h, nx, nz, k);
+        assert!(removed > 0, "the pillar top should have been removed as a ledge");
+        assert_invariant(&h, k, "after filter_ledge_spans");
+        assert_eq!(h[mid * k], 10.0, "ground must survive and compact to layer 0");
+        assert!(h[mid * k + 1] <= MISS_HALF, "the pillar top must be gone");
+    }
 }

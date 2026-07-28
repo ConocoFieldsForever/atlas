@@ -268,7 +268,45 @@ impl NavGrid {
             // a bot descends only where the surface continues (run·tan(slope)) or over one step.
             // The old flat `drop_max` let routes fall off any ledge up to 2 m, which is how a route
             // could leave the ground and traverse the top of a vehicle or container.
-            -up <= self.drop_max.max(run * self.slope_tan)
+            // ...and capped by `vault` for the SAME reason the up-branch is. The slope term reaches
+            // 1.57 m on a diagonal at 48 deg, above the 1.2 m vault. The baker's `max_step` already
+            // clamps here, so without this the two disagree in exactly the band (vault, 1.57]: the
+            // baker judges such an edge unwalkable and therefore never capsule-tests it, leaving its
+            // block bit 0, while the router happily takes it — a route straight through a wall.
+            -up <= self.drop_max.max(run * self.slope_tan).min(self.vault)
+        }
+    }
+
+    /// Test-only view of the walkability rule, so a unit test can prove the baker and the router
+    /// agree. A silent divergence here is unobservable at runtime but produces routes through walls.
+    #[cfg(test)]
+    pub fn walkable_step_pub(&self, up: f32, run: f32, forced: bool) -> bool {
+        self.walkable_step(up, run, forced)
+    }
+
+    /// Test-only grid carrying just the walkability parameters, seeded exactly as `bake` writes
+    /// them into nav.json (drop_max = climb, walk_slope_deg = agentSlope, vault = VAULT).
+    #[cfg(test)]
+    pub fn test_grid(climb: f32, slope_deg: f32, vault: f32) -> NavGrid {
+        NavGrid {
+            min_x: 0.0,
+            min_z: 0.0,
+            res: 1.0,
+            nx: 1,
+            nz: 1,
+            k: 1,
+            miss: -1.0e9,
+            climb,
+            drop_max: climb,
+            vault,
+            step_up: 0.45,
+            slope_tan: slope_deg.clamp(20.0, 70.0).to_radians().tan(),
+            h: vec![-1.0e9],
+            door: vec![0],
+            comp: std::sync::OnceLock::new(),
+            blk: vec![0],
+            near_wall: vec![false],
+            wall_cell: vec![0],
         }
     }
 

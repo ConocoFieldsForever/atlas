@@ -943,7 +943,33 @@ fn main() {
     let preset = render::QualityPreset::from_index(
         menu::config_f32_pub("qualityPreset").unwrap_or(2.0) as u8,
     );
-    preset.apply(&mut gfx);
+    {
+        // An EXPLICIT env override outranks the preset. `GfxSettings::default()` reads
+        // EFT_SHADOWS/EFT_BLOOM/EFT_SSAO/EFT_LIGHTS, and a blanket `apply` would overwrite them --
+        // silently, and on a fresh install too, since a missing `qualityPreset` defaults to High.
+        // That would make the A/B capture and benchmark harnesses (tools/bench_gfx.py) measure
+        // something other than what they asked for, which is exactly how a measurement lies.
+        let (env_shadows, env_bloom, env_ssao, env_lights) = (
+            std::env::var("EFT_SHADOWS").is_ok(),
+            std::env::var("EFT_BLOOM").is_ok(),
+            std::env::var("EFT_SSAO").is_ok(),
+            std::env::var("EFT_LIGHTS").is_ok(),
+        );
+        let before = gfx.clone();
+        preset.apply(&mut gfx);
+        if env_shadows {
+            gfx.shadows = before.shadows;
+        }
+        if env_bloom {
+            gfx.bloom = before.bloom;
+        }
+        if env_ssao {
+            gfx.ssao = before.ssao;
+        }
+        if env_lights {
+            gfx.lights = before.lights;
+        }
+    }
     gfx.grade_available = grade_lut.is_some();
     // Menu backdrop: crank Bloom so the neon globe reads as a hazy VOLUMETRIC glow (in-raid keeps
     // the subtle 0.06). apply_gfx_camera pushes this to the camera.
