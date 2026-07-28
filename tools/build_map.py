@@ -507,6 +507,12 @@ def main():
     # and read TK/out/<map id> (they resolve the dataset via the map config themselves).
     out_dir = os.path.join(TK, "out", m)
     pack = os.path.join(VIEWER, "packs", f"{m}.eftpack")
+    # The GAME'S OWN pathfinding parameters (Unity NavMeshProjectSettings: agent radius/height/
+    # slope/climb, ledgeDropHeight, minRegionArea) + the area and layer tables. Engine-global, not
+    # per-map, so it lands in the SHARED pack tier and every map's nav bake reads the same numbers.
+    # Without it `nav_bake` silently falls back to hand-tuned constants -- the guesswork this is
+    # meant to replace -- so it runs on every build and is cheap (one globalgamemanagers read).
+    shared_dir = os.path.join(VIEWER, "packs", "shared")
     total = 9
 
     print(f"[BUILD] map={m} dataset={dsname} dataset_dir={dataset}", flush=True)
@@ -578,12 +584,32 @@ def main():
         run(1, total, "extract grass density",
             [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_grass.py"),
              "--levels", levels, "--name", dsname], VIEWER, optional=True)
+        # PHYSICS COLLIDERS -- the world the player actually collides with. The dataset above is
+        # built from MeshRenderers, so it only holds geometry you can SEE; most of the collision
+        # world has no renderer at all (interchange: 131,945 of 141,347 colliders), which leaves the
+        # nav bake blind to invisible walls, kerbs, railings and blockers. Unity bakes its own
+        # navmesh from exactly this (NavMeshSurface.m_UseGeometry = PhysicsColliders). Map-agnostic;
+        # optional, so a map that yields none still builds.
+        run(1, total, "extract physics colliders",
+            [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_colliders.py"),
+             "--levels", levels, "--name", dsname], VIEWER, optional=True)
         if not os.path.isfile(os.path.join(dataset, "scene.json")):
             print(f"[BUILD FAILED] extraction finished but no scene.json at {dataset} - check the "
                   f"log above (is UnityPy installed for EFT_PY_UNITY? is EFT_GAME_DATA correct and "
                   f"the game closed?)", flush=True)
             sys.exit(3)
     print(f"[STAGE 1/{total}] check dataset: done", flush=True)
+
+    # 1b: THE GAME'S PATHFINDING PARAMETERS (global, cheap, every build). Unity's
+    #     NavMeshProjectSettings holds the agent descriptors the nav bake must match -- radius,
+    #     height, slope, climb, and the two that matter most, ledgeDropHeight and
+    #     maxJumpAcrossDistance (both 0 on every EFT agent, i.e. the game's navmesh has no drop or
+    #     jump links at all). It is an ENGINE type, so it reads despite the encrypted il2cpp
+    #     metadata. Absent, `nav_bake` falls back to hand-tuned constants -- the guesswork this
+    #     replaces -- so it is refreshed on every build rather than cached per map.
+    run(1, total, "extract nav agent settings (global)",
+        [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_nav.py"),
+         "--out", shared_dir], VIEWER, optional=True)
 
     # 2a: POWER SWITCHES (optional, map-agnostic) -- scan the map's geometry levels for a power lever
     #     (an EFT.Interactive.Switch whose serialized PPtr[] resolves entirely to LampController).
