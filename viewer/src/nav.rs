@@ -56,6 +56,10 @@ pub struct NavGrid {
     climb: f32,
     /// A drop larger than this is routed around (fall damage), not stepped off.
     drop_max: f32,
+    /// ABSOLUTE ceiling on any upward step, however it is authorised. A player can pull themselves
+    /// over an obstacle up to about this height and no further, so nothing — not a slope, not a
+    /// door-forced edge — may exceed it. Read from nav.json (`vault`), default 1.2 m.
+    vault: f32,
     /// Free step-up height (stairs / curbs auto-stepped without a slope check) — Unity stepHeight.
     step_up: f32,
     /// tan(max walkable incline). An up-move's rise/run above this is too STEEP to scale — the
@@ -174,6 +178,7 @@ impl NavGrid {
         let miss = f("miss").unwrap_or(-1.0e9) as f32;
         let climb = f("climb").unwrap_or(1.2) as f32;
         let drop_max = f("drop_max").unwrap_or(2.0) as f32;
+        let vault = f("vault").unwrap_or(1.2) as f32;
         // Walkability tuning (runtime — no re-bake). step_up = freely-walked curb/stair height;
         // walk_slope_deg = max incline you can scale (Unity maxSlope), distinct from the bake's
         // surface-recording slope (nav.json slope_max_deg, ~60). Env-overridable for A/B tuning.
@@ -227,8 +232,8 @@ impl NavGrid {
             dir.display()
         );
         Some(NavGrid {
-            min_x, min_z, res, nx, nz, k, miss, climb, drop_max, step_up, slope_tan, h, door, blk,
-            near_wall, wall_cell,
+            min_x, min_z, res, nx, nz, k, miss, climb, drop_max, vault, step_up, slope_tan, h, door,
+            blk, near_wall, wall_cell,
             comp: std::sync::OnceLock::new(),
         })
     }
@@ -240,12 +245,22 @@ impl NavGrid {
     #[inline]
     fn walkable_step(&self, up: f32, run: f32, forced: bool) -> bool {
         if forced {
-            // Doors bypass the step/slope/thin-wall rule for UP moves and small downs, but a forced
-            // edge still must not authorize a lethal multi-storey fall — cap the drop at drop_max.
-            return up >= 0.0 || -up <= self.drop_max;
+            // Doors bypass the step/slope/thin-wall rule so a threshold, sill or frame stays
+            // passable — but "forced" USED TO MEAN `up >= 0.0`, i.e. an UNBOUNDED upward step.
+            // A door disc is stamped on every cell around each of the map's typed doors, and an
+            // interchange column stacks floors like [9.3, 21.3, 27.1, 36.6, 46.5]; wherever the
+            // neighbour cell's nearest layer was a storey up, that rule authorised a +9.9 m hop
+            // onto a roof. No door lets you do that.
+            //
+            // A forced UP step is now capped by what a player can actually get over unaided
+            // (`vault`), and a forced DOWN step by `drop_max`, as before.
+            return (up >= 0.0 && up <= self.vault) || (up < 0.0 && -up <= self.drop_max);
         }
         if up > 0.0 {
-            up <= self.step_up || (up <= self.climb && up <= run * self.slope_tan)
+            // `vault` is a hard ceiling on EVERY up-move. The slope term `run * slope_tan` grows
+            // with edge length (1.11 m orthogonally at 48 deg, 1.57 m on a diagonal), so without
+            // this cap a single diagonal step could lift a route more than a player can climb.
+            up <= self.vault && (up <= self.step_up || (up <= self.climb && up <= run * self.slope_tan))
         } else {
             // DOWN is bounded the same way UP is, not by a free-fall allowance. Every agent type
             // EFT ships has `ledgeDropHeight = 0` (see nav_agents.json), and in Unity that is the
