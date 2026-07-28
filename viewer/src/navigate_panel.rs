@@ -36,6 +36,10 @@ pub struct NavUiState {
     plan_min_value: i64,
     plan_stops: usize,
     plan_budget_min: f32,
+    /// Raw extract titles the loot plan may finish at. EMPTY = any active extract. Stale entries
+    /// are dropped each frame against the live list, so a map swap cannot leave a selection that
+    /// silently excludes every real extract.
+    plan_extracts: std::collections::HashSet<String>,
     /// Last MapEpoch we reacted to — on a swap, `pending` (an extract Entity from the OLD map) is
     /// cleared so it can't highlight a wrong row / recycled id on the new map.
     last_epoch: u64,
@@ -47,6 +51,7 @@ impl Default for NavUiState {
             plan_min_value: 100_000,
             plan_stops: 10,
             plan_budget_min: 25.0,
+            plan_extracts: std::collections::HashSet::new(),
             last_epoch: 0,
         }
     }
@@ -55,6 +60,9 @@ impl Default for NavUiState {
 /// One extract row, resolved from the marker entities each frame (cheap: a handful of extracts).
 struct Row {
     entity: Entity,
+    /// RAW `MarkerInfo::title`. The loot planner filters its extract candidates on this exact
+    /// string, so the multi-select must key on it, not on the prettified `name`/`label`.
+    title: String,
     /// Prettified display name, faction tag stripped ("NW Exfil").
     name: String,
     /// Faction tag without brackets ("PMC" / "Scav" / "All" / ""), shown separated + dim.
@@ -132,6 +140,7 @@ pub fn navigate_tab(
             let label = if tag.is_empty() { name.clone() } else { format!("{name} [{tag}]") };
             Row {
                 entity: e,
+                title: info.title.clone(),
                 name,
                 tag,
                 label,
@@ -249,6 +258,15 @@ pub fn navigate_tab(
                 ui.checkbox(&mut route_opts.avoid_scav, RichText::new("scavs").size(theme::SIZE_SMALL))
                     .on_hover_text("detour around scav spawn areas");
             });
+            ui.checkbox(
+                &mut route_opts.avoid_combat,
+                RichText::new("avoid combat").size(theme::SIZE_SMALL),
+            )
+            .on_hover_text(
+                "Weight routes away from the game's own PatrolWay lines, and away from ground an \
+                 AI-PMC spawn can SEE - line of sight through the baked wall data, not just \
+                 distance. Costs walking distance; the Cautious / Wide-berth variants show how much.",
+            );
 
             // ---- live search visualization: replay the A* flood as it converges on a single
             // destination (cosmetic; only affects single-extract routes, not tours/loot plans). ----
@@ -316,6 +334,55 @@ pub fn navigate_tab(
                         ui.label(RichText::new("budget").size(theme::SIZE_SMALL).color(theme::MUTED));
                         ui.add(egui::Slider::new(&mut ui_state.plan_budget_min, 5.0..=50.0).suffix(" min").step_by(1.0));
                     });
+                    // EXTRACTS the run may end at. Which are open depends on side, time, keys
+                    // and the raid's random selection - none of which the viewer can know - so the
+                    // player picks and the plan honours exactly those. Empty = any active extract.
+                    {
+                        let mut opts: Vec<(String, String)> = rows
+                            .iter()
+                            .filter(|r| !r.inactive)
+                            .map(|r| (r.title.clone(), r.label.clone()))
+                            .collect();
+                        opts.sort_by(|a, b| a.1.cmp(&b.1));
+                        opts.dedup_by(|a, b| a.0 == b.0);
+                        ui_state.plan_extracts.retain(|t| opts.iter().any(|(k, _)| k == t));
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("end at").size(theme::SIZE_SMALL).color(theme::MUTED),
+                            );
+                            let sel = ui_state.plan_extracts.len();
+                            ui.label(
+                                RichText::new(if sel == 0 {
+                                    "any extract".to_string()
+                                } else {
+                                    format!("{sel} of {}", opts.len())
+                                })
+                                .size(theme::SIZE_SMALL)
+                                .color(if sel == 0 { theme::MUTED } else { theme::ACCENT }),
+                            );
+                            if ui.small_button("any").on_hover_text("clear the selection").clicked() {
+                                ui_state.plan_extracts.clear();
+                            }
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("plan_extracts")
+                            .max_height(92.0)
+                            .show(ui, |ui| {
+                                for (key, label) in &opts {
+                                    let mut on = ui_state.plan_extracts.contains(key);
+                                    if ui
+                                        .checkbox(&mut on, RichText::new(label).size(theme::SIZE_SMALL))
+                                        .changed()
+                                    {
+                                        if on {
+                                            ui_state.plan_extracts.insert(key.clone());
+                                        } else {
+                                            ui_state.plan_extracts.remove(key);
+                                        }
+                                    }
+                                }
+                            });
+                    }
                     let full = egui::vec2(ui.available_width(), 26.0);
                     if ui
                         .add_enabled(ready, egui::Button::new(
@@ -329,6 +396,7 @@ pub fn navigate_tab(
                             min_value: ui_state.plan_min_value,
                             max_stops: ui_state.plan_stops,
                             budget_s: ui_state.plan_budget_min * 60.0,
+                            extracts: ui_state.plan_extracts.iter().cloned().collect(),
                         });
                     }
                     match &plan.status {
@@ -354,7 +422,12 @@ pub fn navigate_tab(
                                 );
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if ui.small_button(RichText::new("clear").size(10.0)).clicked() {
-                                        plan_req.write(PlanRequest { min_value: 0, max_stops: 0, budget_s: 0.0 });
+                                        plan_req.write(PlanRequest {
+                                            min_value: 0,
+                                            max_stops: 0,
+                                            budget_s: 0.0,
+                                            extracts: Vec::new(),
+                                        });
                                         route.write(RouteRequest::default());
                                     }
                                 });

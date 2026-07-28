@@ -389,6 +389,107 @@ impl NavGrid {
         m
     }
 
+    /// Avoid-weight for every cell that has LINE OF SIGHT to one of `eyes` within `radius`.
+    ///
+    /// "Avoid combat" is not the same problem as "avoid a spawn point". A spawn is a disc you can
+    /// walk around; being SEEN is a function of the geometry between you and them, so the far side
+    /// of a wall two metres from a PMC anchor is safer than open ground forty metres away. This
+    /// weights exposure instead of proximity.
+    ///
+    /// LOS is tested against `wall_cell` — the baked "a wall triangle occupies this cell's body
+    /// column" mask — walked with the same DDA the route simplifier uses. That is a 2-D proxy: it
+    /// ignores floor separation, so a cell directly below an eye on another storey reads as visible.
+    /// Deliberate at this cost: the alternative is a per-cell 3-D raycast against the wall BVH,
+    /// which is a bake-time structure the viewer does not keep resident.
+    ///
+    /// Cost is O(eyes × cells_in_radius × chord), so both are capped by the caller.
+    pub fn build_visibility_avoid(&self, eyes: &[Vec3], radius: f32, strength: f32) -> AvoidMap {
+        let mut m = AvoidMap::new();
+        if self.wall_cell.iter().all(|&w| w == 0) {
+            return m; // pack predates nav_wallcell.bin: no occlusion data, so no honest LOS answer
+        }
+        let cr = (radius / self.res).ceil() as i64;
+        for eye in eyes {
+            let (ex, ez) = (
+                ((eye.x - self.min_x) / self.res).round() as i64,
+                ((eye.z - self.min_z) / self.res).round() as i64,
+            );
+            for dz in -cr..=cr {
+                for dx in -cr..=cr {
+                    let (jx, jz) = (ex + dx, ez + dz);
+                    if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                        continue;
+                    }
+                    let d = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                    if d > radius {
+                        continue;
+                    }
+                    if !self.cells_visible(ex, ez, jx, jz) {
+                        continue;
+                    }
+                    // Closer = more exposed. Same falloff shape as `build_avoid` so the two
+                    // compose on one scale when a caller merges them.
+                    let w = strength * (1.0 - d / radius) * self.res;
+                    let cell = (jz * self.nx as i64 + jx) as u32;
+                    let e = m.entry(cell).or_insert(0.0);
+                    if w > *e {
+                        *e = w;
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// Integer-grid LOS: is the straight line between two cell centres free of wall cells? The
+    /// endpoints are exempt — an eye or a destination standing next to a wall still sees out.
+    fn cells_visible(&self, x0: i64, z0: i64, x1: i64, z1: i64) -> bool {
+        let (mut x, mut z) = (x0, z0);
+        let (dx, dz) = ((x1 - x0).abs(), -(z1 - z0).abs());
+        let (sx, sz) = (if x0 < x1 { 1 } else { -1 }, if z0 < z1 { 1 } else { -1 });
+        let mut err = dx + dz;
+        let mut guard = 0i64;
+        let max_steps = dx - dz + 4;
+        loop {
+            if x == x1 && z == z1 {
+                return true;
+            }
+            guard += 1;
+            if guard > max_steps {
+                return false; // never spin: release is panic=abort
+            }
+            let e2 = 2 * err;
+            if e2 >= dz {
+                err += dz;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                z += sz;
+            }
+            if x < 0 || z < 0 || x >= self.nx as i64 || z >= self.nz as i64 {
+                return false;
+            }
+            if x == x1 && z == z1 {
+                return true; // destination reached: its own wall bit doesn't block sight OF it
+            }
+            if self.wall_cell[(z * self.nx as i64 + x) as usize] != 0 {
+                return false;
+            }
+        }
+    }
+
+    /// Merge `other` into `into`, keeping the STRONGER weight per cell. Avoid fields are penalties,
+    /// not additive costs — stacking them would make two mild sources read as one severe one.
+    pub fn merge_avoid(into: &mut AvoidMap, other: AvoidMap) {
+        for (cell, w) in other {
+            let e = into.entry(cell).or_insert(0.0);
+            if w > *e {
+                *e = w;
+            }
+        }
+    }
+
     #[inline]
     fn cell_of(&self, x: f32, z: f32) -> i64 {
         let ix = ((x - self.min_x) / self.res).round() as i64;

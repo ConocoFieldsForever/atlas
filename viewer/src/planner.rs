@@ -34,6 +34,13 @@ pub struct PlanRequest {
     pub max_stops: usize,
     /// Total raid-time budget in seconds, including search time and extract reserve.
     pub budget_s: f32,
+    /// Extract names the run is allowed to END at. EMPTY = any active extract (the old behaviour).
+    ///
+    /// A loot run is only useful if it finishes somewhere you can actually leave from, and which
+    /// extracts are open depends on side, time, keys and the raid's random selection - none of
+    /// which the viewer can know. So the player says which ones count and the plan honours exactly
+    /// those, instead of the optimizer quietly picking one that will not be available.
+    pub extracts: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -134,6 +141,8 @@ fn debug_plan(mut frame: Local<u32>, mut done: Local<bool>, mut w: MessageWriter
         min_value: nums.first().map(|v| *v as i64).filter(|&v| v > 1).unwrap_or(100_000),
         max_stops: nums.get(1).map(|v| *v as usize).unwrap_or(10),
         budget_s: nums.get(2).copied().unwrap_or(25.0) * 60.0,
+            // debug harness: any active extract is acceptable
+        extracts: Vec::new(),
     };
     info!(
         "planner: EFT_PLAN debug plan requested (min {}k, {} stops, {:.0} min)",
@@ -183,6 +192,7 @@ fn dispatch_plan(
         ),
         Without<crate::poi::ZoneWall>,
     >,
+    zones: Res<crate::poi::GameDataZones>,
     mut task: ResMut<PlanTask>,
     mut plan: ResMut<PlanResult>,
     mut route_result: ResMut<RouteResult>,
@@ -237,13 +247,21 @@ fn dispatch_plan(
     }
 
     // ---- extract candidates (active only) — the run must END somewhere safe.
+    let want: std::collections::HashSet<&str> = req.extracts.iter().map(String::as_str).collect();
     let extracts: Vec<(String, Vec3)> = all_marks
         .iter()
         .filter(|(l, _, _, inactive, _)| **l == crate::poi::PoiLayer::Extract && inactive.is_none())
+        .filter(|(_, _, info, _, _)| want.is_empty() || want.contains(info.title.as_str()))
         .map(|(_, gt, info, _, _)| (info.title.clone(), gt.translation()))
         .collect();
     if extracts.is_empty() {
-        plan.status = PlanStatus::Error("no active extracts on this map".into());
+        // Distinguish "this map has none" from "you deselected them all" - otherwise the user
+        // reads a data problem into their own filter.
+        plan.status = PlanStatus::Error(if want.is_empty() {
+            "no active extracts on this map".to_string()
+        } else {
+            "no extracts selected \u{2014} tick at least one under EXTRACTS".to_string()
+        });
         return;
     }
 
@@ -263,11 +281,38 @@ fn dispatch_plan(
         }
     }
 
+    // "Avoid combat": the game's patrol lines + ground an AI-PMC anchor can actually see.
+    // Gathered here because it needs the patrol polylines rather than a per-marker radius, and
+    // merged into the same avoid field so the tour and any route drawn to one of its stops agree
+    // about what is dangerous.
+    let (combat_patrols, combat_eyes): (Vec<Vec<Vec3>>, Vec<Vec3>) = if opts.avoid_combat {
+        (
+            zones.patrols.clone(),
+            all_marks
+                .iter()
+                .filter(|(l, _, _, _, ps)| **l == crate::poi::PoiLayer::PmcSpawn && ps.is_none())
+                .map(|(_, gt, _, _, _)| gt.translation())
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
     plan.status = PlanStatus::Pending;
     route_result.status = RouteStatus::Pending;
     let (max_stops, budget) = (req.max_stops, req.budget_s.max(300.0));
     let t = AsyncComputeTaskPool::get().spawn(async move {
-        let avoid = (!avoid_pts.is_empty()).then(|| grid.build_avoid(&avoid_pts, 4.0));
+        let mut avoid = (!avoid_pts.is_empty()).then(|| grid.build_avoid(&avoid_pts, 4.0));
+        if !combat_patrols.is_empty() || !combat_eyes.is_empty() {
+            if let Some(c) =
+                crate::pathfind::build_combat_avoid(&grid, &combat_patrols, &combat_eyes, 4.0)
+            {
+                match avoid.as_mut() {
+                    Some(a) => crate::nav::NavGrid::merge_avoid(a, c),
+                    None => avoid = Some(c),
+                }
+            }
+        }
         solve(&grid, start, cands, extracts, max_stops, budget, avoid.as_ref())
     });
     task.0 = Some(t);

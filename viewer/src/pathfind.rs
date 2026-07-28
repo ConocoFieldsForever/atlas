@@ -106,6 +106,11 @@ pub struct RouteOpts {
     pub avoid_boss: bool,
     pub avoid_pmc: bool,
     pub avoid_scav: bool,
+    /// Avoid COMBAT rather than spawn discs: weight against crossing the game's own PatrolWay
+    /// polylines, and against ground with line of sight to an AI-PMC anchor. Distinct from
+    /// `avoid_pmc` (a disc around the spawn) because being seen is a property of the geometry
+    /// between you and them, not of distance.
+    pub avoid_combat: bool,
     /// Animate the A* search wavefront converging on the next single-destination route.
     pub visualize: bool,
 }
@@ -117,6 +122,7 @@ impl Default for RouteOpts {
             avoid_boss: has("boss"),
             avoid_pmc: has("pmc"),
             avoid_scav: has("scav"),
+            avoid_combat: has("combat"),
             visualize: std::env::var("EFT_VIZ").map(|v| v.trim() == "1").unwrap_or(false),
         }
     }
@@ -329,6 +335,58 @@ const AVOID_R_SCAV: f32 = 24.0;
 /// a zone centre): "Cautious" takes modest detours; "Wide berth" strongly refuses danger zones.
 const AVOID_W_CAUTIOUS: f32 = 4.0;
 const AVOID_W_WIDE: f32 = 12.0;
+/// "Avoid combat" tuning. Patrol ways are the game's own PatrolPoint polylines, so a route that
+/// parallels one is a route that shares ground with a moving bot for a long time — weighted along
+/// the whole line, not just at its vertices. The sight radius is deliberately shorter than a real
+/// engagement range: the LOS field is a 2-D proxy (see `NavGrid::build_visibility_avoid`) and
+/// over-reaching it would paint most of an open map as dangerous, which helps nobody.
+const COMBAT_PATROL_R: f32 = 14.0;
+const COMBAT_PATROL_STEP: f32 = 6.0;
+const COMBAT_SIGHT_R: f32 = 45.0;
+/// Cap on how many PMC anchors get a LOS field. Cost is O(eyes × cells × chord); a map with dozens
+/// of anchors would otherwise stall the async solve for seconds.
+const COMBAT_MAX_EYES: usize = 40;
+
+/// Build the "avoid combat" field: patrol-line proximity merged with PMC line-of-sight.
+///
+/// Shared by the router and the loot planner so the two cannot drift — a plan that avoids combat
+/// and a route to one of its stops that does not would be worse than neither.
+pub fn build_combat_avoid(
+    grid: &crate::nav::NavGrid,
+    patrols: &[Vec<Vec3>],
+    pmc_eyes: &[Vec3],
+    strength: f32,
+) -> Option<crate::nav::AvoidMap> {
+    // Sample ALONG each patrol leg, not just at its waypoints: consecutive PatrolPoints are tens of
+    // metres apart, so vertex-only sampling would leave the corridor between them unweighted.
+    let mut pts: Vec<(Vec3, f32)> = Vec::new();
+    for way in patrols {
+        for seg in way.windows(2) {
+            let (a, b) = (seg[0], seg[1]);
+            let len = a.distance(b);
+            let steps = (len / COMBAT_PATROL_STEP).ceil().max(1.0) as usize;
+            for i in 0..=steps {
+                pts.push((a.lerp(b, i as f32 / steps as f32), COMBAT_PATROL_R));
+            }
+        }
+        if way.len() == 1 {
+            pts.push((way[0], COMBAT_PATROL_R)); // a 1-point way is a response post
+        }
+    }
+    let mut field = if pts.is_empty() {
+        crate::nav::AvoidMap::new()
+    } else {
+        grid.build_avoid(&pts, strength)
+    };
+    if !pmc_eyes.is_empty() {
+        let eyes: Vec<Vec3> = pmc_eyes.iter().copied().take(COMBAT_MAX_EYES).collect();
+        crate::nav::NavGrid::merge_avoid(
+            &mut field,
+            grid.build_visibility_avoid(&eyes, COMBAT_SIGHT_R, strength),
+        );
+    }
+    (!field.is_empty()).then_some(field)
+}
 
 /// On a request, kick off ONE async CPU route (replacing any in-flight one). Empty dests = clear.
 /// When any avoid option is on, computes Direct + Cautious + Wide-berth VARIANTS (the avoid points
@@ -344,6 +402,8 @@ fn dispatch_route(
         (&crate::poi::PoiLayer, &GlobalTransform, Option<&crate::poi::PlayerStart>),
         Without<crate::poi::ZoneWall>,
     >,
+    // PatrolWay polylines (the game's own PatrolPoint transforms) for the "avoid combat" field.
+    zones: Res<crate::poi::GameDataZones>,
     mut task: ResMut<PathfindTask>,
     mut result: ResMut<RouteResult>,
 ) {
@@ -386,6 +446,21 @@ fn dispatch_route(
             avoid_pts.push((gt.translation(), r));
         }
     }
+    // "Avoid combat" is gathered separately: it is not a spawn disc but the game's patrol lines
+    // plus the ground an AI-PMC anchor can actually SEE, so it needs the patrol polylines and the
+    // anchor positions rather than a radius per marker.
+    let (combat_patrols, combat_eyes): (Vec<Vec<Vec3>>, Vec<Vec3>) = if opts.avoid_combat {
+        (
+            zones.patrols.clone(),
+            spawns
+                .iter()
+                .filter(|(l, _, ps)| **l == crate::poi::PoiLayer::PmcSpawn && ps.is_none())
+                .map(|(_, gt, _)| gt.translation())
+                .collect(),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let dests = req.dests.clone();
     let labels = req.labels.clone();
     let optimize = req.optimize_order;
@@ -455,11 +530,24 @@ fn dispatch_route(
             let direct = run(&mut s, None);
             push(&mut options, "Direct", direct, &mut label);
         }
-        if !avoid_pts.is_empty() {
-            let cautious = grid.build_avoid(&avoid_pts, AVOID_W_CAUTIOUS);
+        // Combat field, built once and merged into BOTH variants: the patrol/LOS penalty is the
+        // same danger at either caution level, only the spawn-disc weight differs between them.
+        let combat = if combat_patrols.is_empty() && combat_eyes.is_empty() {
+            None
+        } else {
+            build_combat_avoid(&grid, &combat_patrols, &combat_eyes, AVOID_W_CAUTIOUS)
+        };
+        if !avoid_pts.is_empty() || combat.is_some() {
+            let mut cautious = grid.build_avoid(&avoid_pts, AVOID_W_CAUTIOUS);
+            if let Some(c) = combat.clone() {
+                crate::nav::NavGrid::merge_avoid(&mut cautious, c);
+            }
             let r = run(&mut s, Some(&cautious));
             push(&mut options, "Cautious", r, &mut label);
-            let wide = grid.build_avoid(&avoid_pts, AVOID_W_WIDE);
+            let mut wide = grid.build_avoid(&avoid_pts, AVOID_W_WIDE);
+            if let Some(c) = combat {
+                crate::nav::NavGrid::merge_avoid(&mut wide, c);
+            }
             let r = run(&mut s, Some(&wide));
             push(&mut options, "Wide berth", r, &mut label);
         }
