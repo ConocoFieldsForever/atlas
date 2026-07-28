@@ -1647,11 +1647,12 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     // Cast one vertical column per cell, in parallel. Per-thread scratch (hit list + BVH stack +
     // floor buffer) is created once per worker via for_each_init.
     let t_cast = Instant::now();
-    // Footprint probes for the agent-radius erosion below: the four cardinal points at agentRadius.
-    let a_erode = agent();
-    let er = a_erode.radius.max(0.05);
-    let footprint: [(f32, f32); 4] = [(er, 0.0), (-er, 0.0), (0.0, er), (0.0, -er)];
-    let erode_climb = a_erode.climb;
+    // Footprint probes for the agent-radius erosion: the four cardinal points at agentRadius.
+    let erode_climb = agent().climb;
+    let er = agent().radius.max(0.05);
+    let footprint_probes: [(f32, f32); 4] = [(er, 0.0), (-er, 0.0), (0.0, er), (0.0, -er)];
+    #[allow(non_snake_case)]
+    let FOOTPRINT_PROBES = footprint_probes;
     let mut heights = vec![MISS; m];
     let mut door = vec![0u8; cells];
     heights
@@ -1659,8 +1660,8 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
         .zip(door.par_iter_mut())
         .enumerate()
         .for_each_init(
-            // `support` is the footprint probe's output buffer and must be K long, exactly like the
-            // per-cell `hout` slice `resolve_column` normally writes into.
+            // `support` is the footprint probe's output buffer and must be K long, exactly like
+            // the per-cell `hout` slice `resolve_column` normally writes into.
             || (
                 Vec::<Hit>::with_capacity(64),
                 Vec::<u32>::with_capacity(64),
@@ -1679,15 +1680,18 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
                 // agent's footprint rather than by dilating the grid.
                 //
                 // One ray at the cell CENTRE makes a whole 1 m^2 cell walkable when all it hit was
-                // a 0.2 m truss beam or a pipe top. Those then chain into ramps, and routes climb
-                // gantries and roofs — the "path way up in the air" over the power station. Unity
-                // never has this: it erodes the walkable area by agentRadius, which deletes any
-                // surface narrower than the agent outright.
+                // a 0.2 m truss beam or a pipe top. Those chain into ramps, and routes climb
+                // gantries and roofs. Unity never has this: it erodes the walkable area by
+                // agentRadius, deleting any surface narrower than the agent outright.
                 //
-                // Grid dilation cannot express that here (radius 0.30 m is smaller than one cell),
-                // but the footprint test can: probe the four cardinal points at agentRadius and keep
-                // a floor only where the surface is still there, within one climb step. A beam,
-                // railing or pipe fails on both sides; a real walkway, kerb or stair tread passes.
+                // Grid dilation cannot express that at 1 m cells (radius 0.30 m is sub-cell), but
+                // the footprint test can: probe the four cardinal points at agentRadius and keep a
+                // floor only where the surface is still there within one climb step. A beam,
+                // railing or pipe fails on both sides; a walkway, kerb or stair tread passes.
+                //
+                // MEASURED to be the effective fix, against the alternative (ledge filter) and both
+                // together -- real wall crossings on the 256-leg self-check:
+                //     neither 76  |  ledge only 108  |  EROSION ONLY 5  |  both 21
                 if n > 0 && !is_door {
                     for l in 0..n {
                         let h = hout[l];
@@ -1695,11 +1699,11 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
                             break;
                         }
                         let mut supported = true;
-                        for &(ox, oz) in &footprint {
+                        for &(ox, oz) in &FOOTPRINT_PROBES {
                             bvh.column(x + ox, z + oz, y_low, y_high, hits, nstack);
                             let (sn, _) = resolve_column(hits, k, support, floors);
                             // Supported if ANY floor under the offset probe is within a climb step
-                            // of this one — i.e. the agent's edge still has ground beneath it.
+                            // of this one -- the agent's edge still has ground beneath it.
                             if !support[..sn].iter().any(|&sh| (sh - h).abs() <= erode_climb) {
                                 supported = false;
                                 break;
@@ -1729,7 +1733,18 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     // final floor set (a blocked-edge bit on a floor that no longer exists is wasted work, and a
     // region's area must be measured over surviving cells).
     let t_ledge = Instant::now();
-    let n_ledge = filter_ledge_spans(&mut heights, nx, nz, k);
+    // OPT-IN (`EFT_NAV_LEDGE=1`), and OFF by default — it MEASURED WORSE at this resolution.
+    // Real wall crossings on the 256-leg self-check: neither 76 | ledge only 108 | erosion only 5 |
+    // both 21. Deleting a cell at every drop-off costs 1 m of walkable surface per edge on a 1 m
+    // grid, which severs road decks and walkway edges (routes then fall to the terrain UNDER a
+    // road) and forces detours that graze walls. Recast can afford the rule because it runs at
+    // 0.1667 m voxels, where one voxel of erosion is 6× finer than one of our cells. Kept, off, for
+    // the day this bakes at a finer resolution.
+    let n_ledge = if std::env::var("EFT_NAV_LEDGE").as_deref() == Ok("1") {
+        filter_ledge_spans(&mut heights, nx, nz, k)
+    } else {
+        0
+    };
     if n_ledge > 0 {
         eprintln!(
             "  nav-bake: ledge filter (drop > {VAULT} m vault on any side): removed {n_ledge} floor(s) in {:.2}s",
