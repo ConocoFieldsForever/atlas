@@ -919,7 +919,8 @@ def scan_level(lv, sink, ai=False):
                 "Minefield", "SniperFiringZone", "TransitPoint", "StationaryWeapon",
                 "SpawnPointMarker", "MineDirectional", "LootPoint", "LootPointsGroup",
                 "LighthouseTraderZone", "BufferGateSwitcher", "LootableContainer",
-                "LootableContainersGroup",
+                "LootableContainersGroup", "BarbedWire", "WindowBreaker",
+                "ShootableQuestLocationObject",
                 "CardReader", "RaidDialogEntryPoint",
                 "BotZone", "PatrolWay", "PatrolWayWithName", "PatrolWayWithConditions",
                 "AirdropPoint", "IndoorTrigger", "TOD_Sky", "LevelBorder",
@@ -1006,6 +1007,26 @@ def scan_level(lv, sink, ai=False):
             if aim:
                 rec.update(aim)
             sink["stationary"].append(rec)
+        elif cls == "BarbedWire":
+            # A hard movement obstacle the nav bake has no other way to see: the wire's own collider
+            # is thin and often sits on a non-nav layer, so routes cross it freely today.
+            sink["barbed_wire"].append({"pos": tpos, "name": name, "active": active, "lv": lv})
+        elif cls == "WindowBreaker":
+            # A breakable window is a SHORTCUT the nav grid treats as solid wall. Shipping the
+            # positions lets a route explain "you can go through here", and eventually lets the bake
+            # punch a door-like hole. The payload carries a scene id string; keep it for joins.
+            wid, _ = read_cstr(pl, 0)
+            rec = {"pos": tpos, "name": name, "active": active, "lv": lv}
+            if wid:
+                rec["id"] = wid
+            sink["windows"].append(rec)
+        elif cls == "ShootableQuestLocationObject":
+            # Quest targets you SHOOT. quest_triggers already carries visit/place_item/flare; this
+            # is the missing fourth kind, so it goes in the same list rather than a parallel one.
+            sink["quest_triggers"].append({
+                "pos": tpos, "name": name, "kind": "shoot", "outline": [],
+                "active": active, "lv": lv,
+            })
         elif cls == "LootableContainersGroup":
             gid, lo, hi = dec_lootgroup(pl)
             rec = {"pos": tpos, "name": name, "active": active, "lv": lv}
@@ -1720,6 +1741,9 @@ def main():
                             # typed additions (2026-07 audit); OMITTED from the output when
                             # empty so maps without them keep byte-identical gamedata.json.
                             "containers", "damage_zones", "card_readers", "dialogs",
+                            # movement/progression additions (2026-07): barbed wire + breakable
+                            # windows shape ROUTES; xp triggers are progression value.
+                            "barbed_wire", "windows",
                             # AI-scene additions (spawn/patrol audit): _zones_reg is internal
                             # (name registry per scan), consumed by the bot_zones build below.
                             "patrol_ways", "bot_zones", "_zones_reg",
@@ -1766,7 +1790,8 @@ def main():
     sink["doors"] = dedupe(sink["doors"], lambda r: r["id"] or (r["name"], tuple(r["pos"])))
     for k in ("minefields", "sniper_zones", "transit_points", "stationary", "mines_directional",
               "quest_triggers", "trader_zones", "buffer_switches", "buffer_zones", "loot_groups",
-              "damage_zones", "card_readers", "dialogs"):
+              "damage_zones", "card_readers", "dialogs",
+              "barbed_wire", "windows"):
         sink[k] = dedupe(sink[k], lambda r: (r.get("name"), tuple(r["pos"])))
     # containers re-serialize across scene variants; the Id string is the stable key.
     sink["containers"] = dedupe(sink["containers"],
@@ -1835,6 +1860,7 @@ def main():
     # New sinks are dropped entirely (data AND count) when empty: a map without them keeps a
     # byte-identical gamedata.json across this extractor change.
     NEW_SINKS = ("containers", "damage_zones", "card_readers", "dialogs",
+                 "barbed_wire", "windows",
                  "patrol_ways", "bot_zones",
                  "airdrop_points", "indoor_volumes", "door_links", "core_points",
                  "ai_places", "cultist_signs", "rooms", "room_portals")
