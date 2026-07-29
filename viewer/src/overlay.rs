@@ -25,12 +25,40 @@
 //! which minimises Atlas so Windows hands the foreground back to the game.
 
 use bevy::prelude::*;
+use bevy::camera::SubCameraView;
 use bevy::window::{MonitorSelection, PrimaryWindow, WindowLevel, WindowPosition};
 use bevy::winit::UpdateMode;
 
 /// Where the overlay should place itself: the GAME's window rect when we can see it, else the
 /// monitor. `(origin, size)` in physical desktop pixels.
 type TargetRect = (IVec2, Vec2);
+
+/// The part of Tarkov's full camera image covered by the Atlas window. Bevy turns this into an
+/// asymmetric perspective frustum, so every visible 3D pixel is projected at the same screen
+/// coordinate it occupied in the game instead of treating the smaller overlay as a new full view.
+///
+/// Retained while hidden because Tarkov may be briefly iconic during the next screenshot/focus
+/// handoff; `OverlayState::shown` decides whether it is active.
+#[derive(Resource, Default)]
+struct OverlayViewSlice(Option<SubCameraView>);
+
+fn view_slice(
+    game_origin: IVec2,
+    game_size: Vec2,
+    overlay_origin: IVec2,
+    overlay_size: UVec2,
+) -> Option<SubCameraView> {
+    let full_size = game_size.round().as_uvec2();
+    if full_size.x == 0 || full_size.y == 0 || overlay_size.x == 0 || overlay_size.y == 0 {
+        return None;
+    }
+    Some(SubCameraView {
+        full_size,
+        // Desktop/window coordinates grow downward, matching SubCameraView's offset convention.
+        offset: (overlay_origin - game_origin).as_vec2(),
+        size: overlay_size,
+    })
+}
 
 /// Unity titles a game's window with its PRODUCT NAME, and EFT's is recorded first-party in
 /// `EscapeFromTarkov_Data/app.info` (line 1 company, line 2 product): `EscapeFromTarkov`.
@@ -152,6 +180,125 @@ fn game_window_rect() -> Option<TargetRect> {
 #[cfg(not(windows))]
 fn game_window_rect() -> Option<TargetRect> {
     None
+}
+
+/// Bring this process's real top-level window to the foreground and VERIFY that Windows granted
+/// keyboard focus.
+///
+/// Do not route this through Bevy/Winit's `Window::focused` write on Windows. Winit 0.30 implements
+/// its force-focus fallback by synthesizing an Alt keypress with `SendInput`; this project
+/// deliberately never injects input around the game. This uses only Windows activation APIs,
+/// targets Atlas's own HWND, and retries across the screenshot/fullscreen transition.
+#[cfg(windows)]
+fn request_atlas_focus() -> bool {
+    use std::ffi::c_void;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: extern "system" fn(*mut c_void, isize) -> i32, param: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn GetForegroundWindow() -> *mut c_void;
+        fn BringWindowToTop(hwnd: *mut c_void) -> i32;
+        fn ShowWindowAsync(hwnd: *mut c_void, command: i32) -> i32;
+        fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
+        fn AttachThreadInput(id_attach: u32, id_attach_to: u32, attach: i32) -> i32;
+        fn PeekMessageW(
+            message: *mut NativeMessage,
+            hwnd: *mut c_void,
+            min: u32,
+            max: u32,
+            remove: u32,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+
+    #[repr(C)]
+    struct NativeMessage {
+        hwnd: *mut c_void,
+        message: u32,
+        w_param: usize,
+        l_param: isize,
+        time: u32,
+        point_x: i32,
+        point_y: i32,
+        private: u32,
+    }
+
+    struct Found(*mut c_void);
+    extern "system" fn enum_cb(hwnd: *mut c_void, param: isize) -> i32 {
+        let found = unsafe { &mut *(param as *mut Found) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == std::process::id() && unsafe { IsWindowVisible(hwnd) } != 0 {
+            found.0 = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    let mut found = Found(std::ptr::null_mut());
+    unsafe { EnumWindows(enum_cb, &mut found as *mut Found as isize) };
+    let hwnd = found.0;
+    if hwnd.is_null() {
+        return false;
+    }
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground == hwnd {
+            return true;
+        }
+        // Activate away from Atlas's event loop. The helper briefly joins the foreground input
+        // queue, activates ONLY Atlas's HWND, and detaches. Atlas's own event queue is never joined
+        // or blocked, so it remains free to process the resulting activation messages.
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ACTIVATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+        if !ACTIVATION_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+            let hwnd_value = hwnd as usize;
+            std::thread::spawn(move || {
+                let hwnd = hwnd_value as *mut c_void;
+                let foreground = GetForegroundWindow();
+                let helper_thread = GetCurrentThreadId();
+                let foreground_thread =
+                    GetWindowThreadProcessId(foreground, std::ptr::null_mut());
+
+                // AttachThreadInput requires the caller to own a message queue. A no-remove peek
+                // creates it without consuming any message or key.
+                let mut message: NativeMessage = std::mem::zeroed();
+                PeekMessageW(
+                    &mut message,
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                );
+                let attached_foreground = foreground_thread != 0
+                    && foreground_thread != helper_thread
+                    && AttachThreadInput(helper_thread, foreground_thread, 1) != 0;
+
+                const SW_RESTORE: i32 = 9;
+                ShowWindowAsync(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+                BringWindowToTop(hwnd);
+
+                if attached_foreground {
+                    AttachThreadInput(helper_thread, foreground_thread, 0);
+                }
+                // Rate-limit retries if the foreground changes during the handoff.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                ACTIVATION_IN_FLIGHT.store(false, Ordering::Release);
+            });
+        }
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn request_atlas_focus() -> bool {
+    false
 }
 
 /// Everything the overlay's behaviour is configured by — ONE struct so the menu UI can bind to it
@@ -341,12 +488,41 @@ impl Plugin for OverlayPlugin {
             // The handoff's EFT_POSE has done its job once `setup` (Startup) read it. Drop it in
             // PostStartup so the camera is free afterwards (main.rs gates on its presence) and a
             // later PLAY relaunch doesn't inherit a stale pose.
-            app.add_systems(PostStartup, || std::env::remove_var("EFT_POSE"));
+            app.add_systems(PostStartup, || {
+                std::env::remove_var("EFT_POSE");
+                std::env::remove_var("EFT_GAME_FOV");
+            });
         }
         app.insert_resource(OverlayConfig::load().sanitized())
             .insert_resource(OverlayState { shown: summon, raise_nonce: 0 })
-            .add_systems(Update, (toggle_overlay, apply_overlay).chain());
+            .init_resource::<OverlayViewSlice>()
+            .add_systems(
+                Update,
+                (
+                    focus_atlas_on_startup,
+                    toggle_overlay,
+                    apply_overlay,
+                    apply_overlay_view_slice,
+                )
+                    .chain(),
+            );
         app.add_systems(bevy_egui::EguiPrimaryContextPass, overlay_return_button);
+    }
+}
+
+/// A normal process launch should own the keyboard just as surely as a screenshot summon. Bevy's
+/// initial focused flag describes the desired/cache state, not what Windows actually granted, so
+/// verify the real foreground HWND for up to two seconds while the native window is appearing.
+fn focus_atlas_on_startup(mut retries: Local<Option<u8>>) {
+    let remaining = retries.get_or_insert(120);
+    if *remaining == 0 {
+        return;
+    }
+    if request_atlas_focus() {
+        *remaining = 0;
+        info!("startup: Atlas foreground focus confirmed");
+    } else {
+        *remaining = remaining.saturating_sub(1);
     }
 }
 
@@ -383,12 +559,30 @@ fn apply_overlay(
     mut winit: ResMut<bevy::winit::WinitSettings>,
     mut last: Local<Option<bool>>,
     mut last_nonce: Local<Option<u32>>,
-    mut saved: Local<Option<(WindowPosition, Vec2)>>,
+    mut raise_retries: Local<u8>,
+    mut focus_confirmed: Local<bool>,
+    mut saved: Local<Option<(WindowPosition, UVec2)>>,
+    mut overlay_rect: Local<Option<(WindowPosition, UVec2)>>,
+    mut view: ResMut<OverlayViewSlice>,
 ) {
     // Re-run on a shown/hidden transition, on a settings change, OR on an explicit re-raise
     // request (see `OverlayState::raise_nonce`) -- the last one is what makes a second screenshot
     // pull the window back to the front after the game has taken the foreground.
-    if *last == Some(state.shown) && !cfg.is_changed() && *last_nonce == Some(state.raise_nonce) {
+    let shown_changed = *last != Some(state.shown);
+    let nonce_changed = *last_nonce != Some(state.raise_nonce);
+    let config_changed = cfg.is_changed();
+    if state.shown && nonce_changed {
+        // A screenshot arrives while Tarkov is still finishing its own capture/fullscreen
+        // transition. One immediate raise can be overwritten by the game a frame later, leaving
+        // OverlayState::shown true but the OS window minimized/behind. Retry for up to roughly two
+        // seconds at 60 fps, stopping immediately once Windows confirms Atlas owns the keyboard.
+        *raise_retries = 120;
+        *focus_confirmed = false;
+    } else if !state.shown {
+        *raise_retries = 0;
+        *focus_confirmed = false;
+    }
+    if !shown_changed && !config_changed && !nonce_changed && *raise_retries == 0 {
         return;
     }
     *last_nonce = Some(state.raise_nonce);
@@ -400,10 +594,35 @@ fn apply_overlay(
     *last = Some(state.shown);
     let Ok(mut win) = q.single_mut() else { return };
 
+    // Follow-up raises after the full transition. Re-applying size/position/window level every
+    // frame would churn the swapchain — exactly the surface path we are trying to keep stable.
+    if state.shown && !shown_changed && !config_changed {
+        win.visible = true;
+        win.set_minimized(false);
+        // `win.focused = true` is not a native-focus guarantee: it mutates Bevy's event-fed cache,
+        // and Winit only acts on a false->true cache transition. Ask Windows directly every retry,
+        // then stop as soon as the foreground HWND proves Atlas owns keyboard input.
+        if request_atlas_focus() {
+            *raise_retries = 0;
+            if !*focus_confirmed {
+                info!("overlay: Atlas foreground focus confirmed");
+                *focus_confirmed = true;
+            }
+        } else {
+            *raise_retries = raise_retries.saturating_sub(1);
+        }
+        return;
+    }
+
     if state.shown {
+        // Reopens after BACK TO TARKOV use the exact previous overlay rectangle. Re-querying the
+        // game here made placement depend on a focus race: Tarkov was sometimes visible (anchor to
+        // the game) and sometimes briefly iconic (fall back to the monitor).
+        let reuse_overlay_rect =
+            saved.is_some() && overlay_rect.is_some() && !config_changed;
         // Remember the desktop layout ONCE (a config change while shown must not overwrite it).
         if saved.is_none() {
-            *saved = Some((win.position, Vec2::new(win.resolution.width(), win.resolution.height())));
+            *saved = Some((win.position, win.resolution.physical_size()));
         }
         if cfg.borderless {
             win.decorations = false;
@@ -413,7 +632,17 @@ fn apply_overlay(
         // window that never asks for focus would appear without receiving the WASD that follows.
         win.visible = true;
         win.set_minimized(false); // we may have minimised ourselves to hand the game focus back
-        win.focused = true;       // ask Windows to raise + give US the keyboard
+        // The native request may be one frame early (before Winit applies visible/unminimized), so
+        // the retry branch above keeps asking until Windows confirms Atlas is the foreground HWND.
+        if request_atlas_focus() {
+            *raise_retries = 0;
+            if !*focus_confirmed {
+                info!("overlay: Atlas foreground focus confirmed");
+                *focus_confirmed = true;
+            }
+        } else {
+            *raise_retries = raise_retries.saturating_sub(1);
+        }
         // Panel geometry is measured against THE GAME'S WINDOW when we can see it, and the monitor
         // otherwise. Anchoring to the monitor was subtly wrong in two ways the user hits in
         // practice: on a multi-monitor desk the overlay landed on the PRIMARY monitor even when EFT
@@ -443,7 +672,10 @@ fn apply_overlay(
             // rather than one that overhangs.
             let w = (size.x * cfg.size_frac.x).round().max(320.0).min(size.x.max(320.0));
             let h = (size.y * cfg.size_frac.y).round().max(240.0).min(size.y.max(240.0));
-            win.resolution.set(w, h);
+            // The game rect and window position are PHYSICAL desktop pixels. `WindowResolution::set`
+            // takes logical pixels and silently multiplies by DPI, making both placement and the
+            // view crop drift on a scaled monitor. Keep this entire calculation in physical pixels.
+            win.resolution.set_physical_resolution(w as u32, h as u32);
             // `anchor` still slides the panel inside the leftover space, so a user who prefers a
             // corner keeps it; the DEFAULT is now the centre.
             let x = ((size.x - w) * cfg.anchor.x).round() as i32 + origin.x;
@@ -451,6 +683,27 @@ fn apply_overlay(
             win.position = WindowPosition::At(IVec2::new(x, y));
         } else {
             win.position = WindowPosition::Centered(MonitorSelection::Primary);
+        }
+        if reuse_overlay_rect {
+            let (pos, res) = overlay_rect.as_ref().expect("checked above");
+            win.position = *pos;
+            win.resolution.set_physical_resolution(res.x, res.y);
+        }
+        *overlay_rect = Some((win.position, win.resolution.physical_size()));
+        // Build the exact game-screen crop after FINAL overlay geometry (including a cached reopen).
+        // If Tarkov is briefly minimized during the focus handoff, retain the previous slice and
+        // reuse it; the overlay rectangle itself is deliberately retained for the same reason.
+        if let (Some((game_origin, game_size)), WindowPosition::At(overlay_origin)) =
+            (on_game, win.position)
+        {
+            if let Some(slice) = view_slice(
+                game_origin,
+                game_size,
+                overlay_origin,
+                win.resolution.physical_size(),
+            ) {
+                view.0 = Some(slice);
+            }
         }
         // Leave the GAME headroom: once the user clicks back to EFT we are unfocused, and an
         // unthrottled Atlas would keep rendering the map at full rate on the same GPU. `fps_cap`
@@ -474,14 +727,18 @@ fn apply_overlay(
             cfg.always_on_top,
             cfg.size_frac.x * 100.0,
             cfg.size_frac.y * 100.0,
-            match (on_game, target) {
-                (Some(_), Some((o, s))) =>
-                    format!("the GAME window {}x{} at {},{}", s.x as i32, s.y as i32, o.x, o.y),
-                (None, Some((o, s))) => format!(
-                    "the monitor {}x{} at {},{} (game window not found)",
-                    s.x as i32, s.y as i32, o.x, o.y
-                ),
-                _ => "the primary monitor (size unknown)".to_string(),
+            if reuse_overlay_rect {
+                "the previous overlay rectangle".to_string()
+            } else {
+                match (on_game, target) {
+                    (Some(_), Some((o, s))) =>
+                        format!("the GAME window {}x{} at {},{}", s.x as i32, s.y as i32, o.x, o.y),
+                    (None, Some((o, s))) => format!(
+                        "the monitor {}x{} at {},{} (game window not found)",
+                        s.x as i32, s.y as i32, o.x, o.y
+                    ),
+                    _ => "the primary monitor (size unknown)".to_string(),
+                }
             },
             cfg.fps_cap
         );
@@ -498,23 +755,24 @@ fn apply_overlay(
         // never because a settings checkbox redrew us.
         if was_shown {
             win.window_level = WindowLevel::Normal;
-            // Always restore chrome + desktop geometry first, so if the user brings Atlas back
-            // from the taskbar by hand they get a normal draggable window, not a chromeless
-            // overlay-shaped slab.
-            win.decorations = true;
-            if let Some((pos, res)) = saved.take() {
-                win.position = pos;
-                win.resolution.set(res.x, res.y);
-            }
             if cfg.return_focus_to_game {
-                // GIVE THE GAME THE KEYBOARD BACK. Windows won't let an app hand focus to another
-                // process directly, but MINIMISING ourselves makes the OS activate whatever is
-                // behind us -- which, summoned from a raid, is Tarkov. Without this the user
-                // dismisses the overlay and their WASD still goes nowhere.
+                // Minimize in place. Restoring the desktop geometry before minimizing is what made
+                // the next screenshot reopen in a different position. Windows still gives Tarkov
+                // the keyboard, while `overlay_rect` retains the exact rectangle for the reopen.
                 win.set_minimized(true);
+            } else {
+                // No automatic handoff: restore the ordinary desktop window immediately.
+                win.decorations = true;
+                if let Some((pos, res)) = saved.take() {
+                    win.position = pos;
+                    win.resolution.set_physical_resolution(res.x, res.y);
+                }
+                *overlay_rect = None;
+                view.0 = None;
             }
             info!(
-                "overlay: hidden (desktop window restored, focus to game={}, unfocused idle={})",
+                "overlay: hidden (rectangle preserved={}, focus to game={}, unfocused idle={})",
+                cfg.return_focus_to_game,
                 cfg.return_focus_to_game, cfg.pause_when_hidden
             );
         }
@@ -530,6 +788,27 @@ fn apply_overlay(
         } else {
             UpdateMode::Continuous
         };
+    }
+}
+
+/// Apply the asymmetric projection only while the overlay is visible. The camera position,
+/// rotation, and Tarkov FOV still come from `game_watch`; this supplies the final missing datum:
+/// which rectangle of the full game image the Atlas window has replaced.
+fn apply_overlay_view_slice(
+    cfg: Res<OverlayConfig>,
+    state: Res<OverlayState>,
+    view: Res<OverlayViewSlice>,
+    mut cameras: Query<&mut Camera, With<crate::render::CullCamera>>,
+) {
+    let desired = if cfg.enabled && state.shown {
+        view.0
+    } else {
+        None
+    };
+    for mut camera in &mut cameras {
+        if camera.sub_camera_view != desired {
+            camera.sub_camera_view = desired;
+        }
     }
 }
 
@@ -578,6 +857,31 @@ fn overlay_return_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centered_overlay_maps_to_the_same_game_pixels() {
+        let slice = view_slice(
+            IVec2::new(100, 50),
+            Vec2::new(1920.0, 1080.0),
+            IVec2::new(532, 266),
+            UVec2::new(1056, 648),
+        )
+        .expect("valid slice");
+        assert_eq!(slice.full_size, UVec2::new(1920, 1080));
+        assert_eq!(slice.offset, Vec2::new(432.0, 216.0));
+        assert_eq!(slice.size, UVec2::new(1056, 648));
+    }
+
+    #[test]
+    fn rejects_degenerate_view_slices() {
+        assert!(
+            view_slice(IVec2::ZERO, Vec2::ZERO, IVec2::ZERO, UVec2::new(800, 600)).is_none()
+        );
+        assert!(
+            view_slice(IVec2::ZERO, Vec2::new(1920.0, 1080.0), IVec2::ZERO, UVec2::ZERO)
+                .is_none()
+        );
+    }
 
     /// The window title we match on is the game's own Unity PRODUCT NAME, which it records in
     /// `EscapeFromTarkov_Data/app.info` (line 1 company, line 2 product). Assert the matcher

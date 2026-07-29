@@ -36,9 +36,27 @@ pub const PLAYER_HEIGHT: f32 = 1.8;
 pub const STEP_UP: f32 = 0.5;
 /// Snappy game-feel gravity (not real 9.8) (m/s²).
 pub const GRAVITY: f32 = 20.0;
-/// Jump apex height per unit walk-speed (m per m/s) — apex = JUMP_K·walk_speed, so one scroll
-/// gesture juices both movement speed and hop height together.
-pub const JUMP_K: f32 = 0.12;
+/// Fixed jump apex (m). EFT treats jump as a movement-state transition; the speed wheel does not
+/// turn it into an arcade jump-height control. 0.6 m preserves the old default-speed jump.
+pub const JUMP_APEX_HEIGHT: f32 = 0.6;
+/// EFT's normalized walk-speed range mapped onto the viewer's world-space scale (m/s).
+pub const MIN_WALK_SPEED: f32 = 0.8;
+pub const MAX_WALK_SPEED: f32 = 5.0;
+/// Viewer world-space sprint scale. Absolute EFT speeds are profile/server data, so this preserves
+/// the viewer's established top speed while the transition behavior comes from the game settings.
+pub const SPRINT_MULTIPLIER: f32 = 1.8;
+/// Values extracted from the installed 1.0.6.5-46221 `eftsettings` EFTHardSettings asset.
+///
+/// `MovementAccelerationRange` reaches 1 at 0.7053492; we use that endpoint as the time for a
+/// full-speed velocity change. `DecelerationSpeed` is normalized speed per second.
+pub const MOVEMENT_ACCEL_TIME: f32 = 0.705_349_2;
+pub const DECELERATION_SPEED: f32 = 1.2;
+pub const STARTING_SPRINT_SPEED: f32 = 0.5;
+/// `EFT.MovementContext::SPRINT_RESTART_DELAY`.
+pub const SPRINT_RESTART_DELAY: f32 = 0.4;
+/// The original has separate same/back/orthogonal air-control settings. With no profile/animation
+/// inputs available, retain takeoff momentum and allow only a small fraction of ground steering.
+pub const AIR_CONTROL_FRACTION: f32 = 0.15;
 /// XZ grid cell size (m).
 const CELL: f32 = 3.0;
 /// Only faces at least this upward (n.y/|n|) are walkable (~≤60° from horizontal).
@@ -64,6 +82,9 @@ pub const BOB_RATE: f32 = 6.5;
 /// Per-camera walk locomotion state (lives on the CullCamera+FlyCam entity).
 #[derive(Component, Default)]
 pub struct WalkState {
+    /// Persistent world-XZ velocity (m/s). Input changes the target; acceleration changes this
+    /// value, which is what gives starts, stops, strafes, and reversals momentum.
+    pub horizontal_velocity: Vec2,
     /// Vertical velocity (m/s); gravity integrates it, jump sets it.
     pub vy: f32,
     /// Standing on a surface this frame (vs airborne).
@@ -77,6 +98,10 @@ pub struct WalkState {
     /// The cosmetic head-bob Y offset applied last frame — removed at the start of the next frame so
     /// the bob never feeds back into the ground/step physics (which run on the un-bobbed eye height).
     pub last_bob: f32,
+    /// True after the sprint transition has crossed EFT's starting-speed threshold.
+    pub sprinting: bool,
+    /// Time before sprint may be entered again after leaving it.
+    pub sprint_restart: f32,
 }
 
 /// One XZ-bucketed triangle grid. `tris` stores each world triangle ONCE (36 B); `cells` holds only
@@ -565,8 +590,216 @@ fn closest_point_on_tri(p: Vec3, t: &[Vec3; 3]) -> Vec3 {
     a + ab * v + ac * w
 }
 
-/// Initial upward velocity for a jump, derived from walk speed so scrolling faster also jumps
-/// higher (apex = JUMP_K·walk_speed): vy = sqrt(2·G·JUMP_K·walk_speed).
-pub fn jump_velocity(walk_speed: f32) -> f32 {
-    (2.0 * GRAVITY * JUMP_K * walk_speed.max(0.0)).sqrt()
+/// Advance EFT-style horizontal locomotion by one frame and return the XZ displacement.
+///
+/// The game owns considerably more state (pose, weight, stamina, injuries, skills, animation root
+/// motion). The walk camera has none of those inputs, so this ports the invariant core: persistent
+/// velocity, a finite acceleration envelope, a separate deceleration rate, sprint entry/restart,
+/// and a speed wheel that controls normal walking without changing sprint or jump physics.
+pub fn advance_horizontal(
+    state: &mut WalkState,
+    wish_direction: Vec2,
+    selected_walk_speed: f32,
+    sprint_requested: bool,
+    grounded: bool,
+    dt: f32,
+) -> Vec2 {
+    let dt = dt.clamp(0.0, 0.05);
+    if dt == 0.0 {
+        return Vec2::ZERO;
+    }
+    state.sprint_restart = (state.sprint_restart - dt).max(0.0);
+
+    let has_input = wish_direction.length_squared() > 1e-6;
+    if !grounded {
+        if state.sprinting {
+            state.sprint_restart = SPRINT_RESTART_DELAY;
+        }
+        state.sprinting = false;
+        // No-input air motion coasts exactly. Input can bend the trajectory, but only slowly; a
+        // mid-air 180 can no longer replace takeoff momentum with full reverse speed.
+        if has_input {
+            let wish = wish_direction.normalize();
+            let target_speed = state
+                .horizontal_velocity
+                .length()
+                .max(selected_walk_speed.clamp(MIN_WALK_SPEED, MAX_WALK_SPEED));
+            state.horizontal_velocity = move_towards(
+                state.horizontal_velocity,
+                wish * target_speed,
+                (MAX_WALK_SPEED / MOVEMENT_ACCEL_TIME) * AIR_CONTROL_FRACTION * dt,
+            );
+        }
+        return state.horizontal_velocity * dt;
+    }
+
+    if !has_input {
+        if state.sprinting {
+            state.sprint_restart = SPRINT_RESTART_DELAY;
+        }
+        state.sprinting = false;
+        state.horizontal_velocity = move_towards(
+            state.horizontal_velocity,
+            Vec2::ZERO,
+            MAX_WALK_SPEED * DECELERATION_SPEED * dt,
+        );
+        return state.horizontal_velocity * dt;
+    }
+
+    let wish = wish_direction.normalize();
+    let walk_speed = selected_walk_speed.clamp(MIN_WALK_SPEED, MAX_WALK_SPEED);
+    // `StartingSprintSpeed` is normalized in EFT. Requiring that fraction of the selected walk
+    // speed creates the short run-up visible in-game instead of an instantaneous speed multiplier.
+    let sprint_entry_speed = walk_speed * STARTING_SPRINT_SPEED;
+    let can_enter_sprint = state.sprinting
+        || (state.sprint_restart <= 0.0
+            && state.horizontal_velocity.dot(wish) >= sprint_entry_speed);
+    let next_sprinting = sprint_requested && can_enter_sprint;
+    if state.sprinting && !next_sprinting {
+        state.sprint_restart = SPRINT_RESTART_DELAY;
+    }
+    state.sprinting = next_sprinting;
+
+    let target_speed = if state.sprinting {
+        MAX_WALK_SPEED * SPRINT_MULTIPLIER
+    } else {
+        walk_speed
+    };
+    let target = wish * target_speed;
+
+    // MovementAccelerationRange reaches full response at 0.7053492. Mapping the viewer's maximum
+    // walk speed over that interval gives a world-space acceleration while keeping velocity as the
+    // source of truth. Reversals therefore have to brake the old vector before building the new
+    // one. Slowing down uses EFT's independent normalized DecelerationSpeed.
+    let aligned = state.horizontal_velocity.dot(wish);
+    let decelerating = aligned > target_speed
+        && state.horizontal_velocity.dot(target) >= 0.0;
+    let rate = if decelerating {
+        MAX_WALK_SPEED * DECELERATION_SPEED
+    } else {
+        MAX_WALK_SPEED / MOVEMENT_ACCEL_TIME
+    };
+    state.horizontal_velocity = move_towards(state.horizontal_velocity, target, rate * dt);
+    state.horizontal_velocity * dt
+}
+
+/// Remove the velocity component that was trying to enter a wall, keeping tangential momentum so
+/// the capsule slides naturally along the surface instead of sticking or losing all speed.
+pub fn cancel_velocity_into_wall(state: &mut WalkState, correction: Vec2) {
+    if correction.length_squared() <= 1e-8 {
+        return;
+    }
+    let outward = correction.normalize();
+    let into_wall = state.horizontal_velocity.dot(outward);
+    if into_wall < 0.0 {
+        state.horizontal_velocity -= outward * into_wall;
+    }
+}
+
+#[inline]
+fn move_towards(current: Vec2, target: Vec2, max_delta: f32) -> Vec2 {
+    let delta = target - current;
+    let distance = delta.length();
+    if distance <= max_delta || distance <= f32::EPSILON {
+        target
+    } else {
+        current + delta * (max_delta / distance)
+    }
+}
+
+/// Initial upward velocity for the fixed ballistic jump:
+/// `vy = sqrt(2 * gravity * apex_height)`.
+pub fn jump_velocity() -> f32 {
+    (2.0 * GRAVITY * JUMP_APEX_HEIGHT).sqrt()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn movement_accelerates_instead_of_teleporting_to_target_speed() {
+        let mut state = WalkState::default();
+        let displacement = advance_horizontal(
+            &mut state,
+            Vec2::X,
+            MAX_WALK_SPEED,
+            false,
+            true,
+            1.0 / 60.0,
+        );
+        assert!(state.horizontal_velocity.x > 0.0);
+        assert!(state.horizontal_velocity.x < MAX_WALK_SPEED);
+        assert_eq!(state.horizontal_velocity.y, 0.0);
+        assert_eq!(displacement, state.horizontal_velocity / 60.0);
+    }
+
+    #[test]
+    fn release_and_reversal_preserve_momentum() {
+        let mut state = WalkState {
+            horizontal_velocity: Vec2::new(MAX_WALK_SPEED, 0.0),
+            ..default()
+        };
+        advance_horizontal(&mut state, Vec2::ZERO, MAX_WALK_SPEED, false, true, 0.05);
+        assert!(state.horizontal_velocity.x > 0.0);
+        assert!(state.horizontal_velocity.x < MAX_WALK_SPEED);
+
+        state.horizontal_velocity = Vec2::new(MAX_WALK_SPEED, 0.0);
+        advance_horizontal(&mut state, -Vec2::X, MAX_WALK_SPEED, false, true, 0.05);
+        assert!(
+            state.horizontal_velocity.x > 0.0,
+            "a 180-degree reversal must brake before moving backward"
+        );
+    }
+
+    #[test]
+    fn airborne_motion_keeps_takeoff_momentum() {
+        let initial = Vec2::new(5.0, 0.0);
+        let mut state = WalkState {
+            horizontal_velocity: initial,
+            ..default()
+        };
+        advance_horizontal(&mut state, Vec2::ZERO, MAX_WALK_SPEED, false, false, 0.05);
+        assert_eq!(state.horizontal_velocity, initial);
+
+        advance_horizontal(&mut state, -Vec2::X, MAX_WALK_SPEED, false, false, 0.05);
+        assert!(
+            state.horizontal_velocity.x > 0.0,
+            "air steering must not erase and reverse takeoff momentum in one frame"
+        );
+    }
+
+    #[test]
+    fn sprint_has_a_run_up_and_restart_delay() {
+        let mut state = WalkState::default();
+        advance_horizontal(&mut state, Vec2::X, MAX_WALK_SPEED, true, true, 0.05);
+        assert!(!state.sprinting);
+        for _ in 0..10 {
+            advance_horizontal(&mut state, Vec2::X, MAX_WALK_SPEED, true, true, 0.05);
+        }
+        assert!(state.sprinting);
+
+        advance_horizontal(&mut state, Vec2::X, MAX_WALK_SPEED, false, true, 0.05);
+        assert!(!state.sprinting);
+        assert!(state.sprint_restart > 0.0);
+        advance_horizontal(&mut state, Vec2::X, MAX_WALK_SPEED, true, true, 0.05);
+        assert!(!state.sprinting);
+    }
+
+    #[test]
+    fn wall_response_keeps_tangent_and_cancels_inward_speed() {
+        let mut state = WalkState {
+            horizontal_velocity: Vec2::new(-3.0, 4.0),
+            ..default()
+        };
+        cancel_velocity_into_wall(&mut state, Vec2::X);
+        assert!(state.horizontal_velocity.x.abs() < 1e-6);
+        assert_eq!(state.horizontal_velocity.y, 4.0);
+    }
+
+    #[test]
+    fn jump_is_independent_of_walk_speed() {
+        let apex = jump_velocity().powi(2) / (2.0 * GRAVITY);
+        assert!((apex - JUMP_APEX_HEIGHT).abs() < 1e-5);
+    }
 }

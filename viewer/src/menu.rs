@@ -1057,6 +1057,34 @@ pub fn save_config_f32_pub(key: &str, val: f32) -> bool {
     }
 }
 
+/// Persist a named quality preset and the texture tier it owns in ONE read-modify-write.
+///
+/// These used to be two independent config writes. A second Atlas process or another settings
+/// system could update the file between them, leaving combinations such as `Ultra + Quarter`.
+/// Rendering already treated the preset as authoritative, but the menu then displayed the stale
+/// texture tier and looked broken. One write makes the pair indivisible.
+#[must_use]
+pub fn save_quality_preset_pub(preset: crate::render::QualityPreset) -> bool {
+    let path = config_path();
+    let mut v: serde_json::Value = read_config_text()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v["qualityPreset"] = serde_json::json!(preset.index() as f32);
+    if let Some(q) = preset.tex_quality() {
+        v["textureQuality"] = serde_json::json!(q as f32);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()) {
+        Ok(()) => true,
+        Err(e) => {
+            error!("menu: could not save quality preset to {}: {e}", path.display());
+            false
+        }
+    }
+}
+
 fn config_bool(key: &str) -> Option<bool> {
     let v: serde_json::Value =
         serde_json::from_str(&read_config_text()?).ok()?;
@@ -1519,9 +1547,19 @@ pub fn build_state() -> MenuState {
         force_cpu_process: config_force_cpu_process(),
         screenshot_locate: config_screenshot_locate(),
         overlay: crate::overlay::OverlayConfig::load().sanitized(),
-        // Clamp: a hand-edited config value outside 0..=2 would leave no button selected while
-        // `set_tex_mip_skip` silently clamped to Quarter.
-        tex_quality: (config_f32_pub("textureQuality").unwrap_or(1.0) as u8).min(2), // Half (see main.rs)
+        // A named preset owns texture quality. Derive the visible texture button from it too, so
+        // even a stale/hand-edited file cannot show (for example) Ultra + Quarter for one frame.
+        tex_quality: {
+            let preset = crate::render::QualityPreset::from_index(
+                (config_f32_pub("qualityPreset").unwrap_or(2.0) as u8).min(4),
+            );
+            preset
+                .tex_quality()
+                .unwrap_or_else(|| {
+                    // Clamp: an out-of-range hand edit must not leave every button unselected.
+                    (config_f32_pub("textureQuality").unwrap_or(1.0) as u8).min(2)
+                })
+        },
         quality_preset: (config_f32_pub("qualityPreset").unwrap_or(2.0) as u8).min(4), // High
         // EFT_SETTINGS_TAB=<0|1|2> opens a settings tab on launch (0 Overlay, 1 Live link,
         // 2 General) — screenshots / QA of the menu without hand-driving the UI.
@@ -2458,17 +2496,16 @@ pub fn menu_ui(
                                     .clicked()
                                 {
                                     state.quality_preset = p.index();
-                                    if !save_config_f32_pub("qualityPreset", p.index() as f32) {
-                                        state.config_err = Some(
-                                            "settings could not be saved (read-only folder?)".to_string(),
-                                        );
-                                    }
                                     // A non-Custom preset owns texture quality; keep the persisted
                                     // value and the visible Texture-quality row in agreement.
                                     if let Some(q) = p.tex_quality() {
                                         state.tex_quality = q;
                                         crate::render::gpu_driven::set_tex_mip_skip(q);
-                                        save_config_f32_pub("textureQuality", q as f32);
+                                    }
+                                    if !save_quality_preset_pub(p) {
+                                        state.config_err = Some(
+                                            "settings could not be saved (read-only folder?)".to_string(),
+                                        );
                                     }
                                 }
                             }
@@ -2513,10 +2550,15 @@ pub fn menu_ui(
                                     {
                                         state.quality_preset =
                                             crate::render::QualityPreset::Custom.index();
-                                        save_config_f32_pub(
+                                        if !save_config_f32_pub(
                                             "qualityPreset",
                                             crate::render::QualityPreset::Custom.index() as f32,
-                                        );
+                                        ) {
+                                            state.config_err = Some(
+                                                "settings could not be saved (read-only folder?)"
+                                                    .to_string(),
+                                            );
+                                        }
                                     }
                                     if !save_config_f32_pub("textureQuality", i as f32) {
                                         state.config_err = Some(
