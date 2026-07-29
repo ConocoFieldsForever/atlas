@@ -2701,16 +2701,34 @@ pub fn menu_ui(
                                             if e.valid {
                                                 // Force a tarkov.dev sync before playing: PLAY is
                                                 // disabled until intel has been synced at least once.
+                                                //
+                                                // ALSO disabled while ANY map build runs, and that
+                                                // one is about the GPU, not about data. The build's
+                                                // SH bake is a separate `atlas bake-sh` worker that
+                                                // wants the GPU; the viewer takes an exclusive
+                                                // interactive-GPU lease for its whole lifetime
+                                                // (gpu_lease.rs). Playing mid-build therefore costs
+                                                // one of two ways: start the viewer first and the
+                                                // bake quietly drops to the CPU path (observed: 70
+                                                // CPU-minutes and 9 GB on interchange instead of a
+                                                // GPU pass), or start it during a GPU bake and both
+                                                // saturate one adapter — which is the Windows TDR
+                                                // reset that lost the viewer's device and aborted
+                                                // the process. The lease already prevents the
+                                                // crash; this stops the user walking into either.
                                                 let play = theme::primary_button(t(lg, K::Play));
+                                                let playable = intel_synced && !any_building;
                                                 let resp = ui
-                                                    .add_enabled_ui(intel_synced, |ui| {
+                                                    .add_enabled_ui(playable, |ui| {
                                                         ui.add_sized([84.0, 30.0], play)
                                                     })
                                                     .inner;
-                                                if intel_synced {
+                                                if playable {
                                                     if resp.clicked() {
                                                         switch.0 = e.pack_dir.clone();
                                                     }
+                                                } else if any_building {
+                                                    resp.on_disabled_hover_text(t(lg, K::PlayBusyBuilding));
                                                 } else {
                                                     resp.on_disabled_hover_text(t(lg, K::PlayNeedsSync));
                                                 }

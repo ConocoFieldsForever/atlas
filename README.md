@@ -237,7 +237,7 @@ cargo run --release -p atlas -- .\packs\interchange.eftpack   # open a pack dire
 ```
 
 Needs stable Rust 1.88+. A fuller list of environment toggles is in
-[README_DIST.md](README_DIST.md).
+[README.md](README.md).
 
 ### Linux
 

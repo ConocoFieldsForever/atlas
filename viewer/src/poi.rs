@@ -585,11 +585,29 @@ struct Poi {
 /// tasks.json (build_tasks.py) — the global quest catalog. One entry per task; each task's
 /// objectives carry map-located `zones` (positions already bridged to viewer space).
 #[derive(Deserialize)]
-struct QuestFile {
-    tasks: Vec<QuestTask>,
+pub(crate) struct QuestFile {
+    pub(crate) tasks: Vec<QuestTask>,
+    /// First-party quest triggers no upstream task accounts for, keyed by map id. The game ships
+    /// these; tarkov.dev has no row for them. Used to give an unclaimed trigger marker an honest
+    /// label (its family) instead of only its raw scene id.
+    #[serde(default, rename = "unlinkedZones")]
+    unlinked: std::collections::HashMap<String, Vec<UnlinkedZone>>,
+}
+
+/// One first-party quest trigger with no upstream task.
+#[derive(Deserialize)]
+struct UnlinkedZone {
+    #[serde(default)]
+    name: String,
+    /// Name-derived grouping: quest / event / achievement / transit / extract. Presentation only.
+    #[serde(default)]
+    family: String,
+    /// Number of separate boxes sharing this trigger id (absent = 1).
+    #[serde(default)]
+    parts: u32,
 }
 #[derive(Deserialize)]
-struct QuestTask {
+pub(crate) struct QuestTask {
     #[serde(default)]
     id: String,
     #[serde(default)]
@@ -607,17 +625,17 @@ struct QuestTask {
     #[serde(default)]
     requires: Vec<String>,
     #[serde(default)]
-    objectives: Vec<QuestObjective>,
+    pub(crate) objectives: Vec<QuestObjective>,
 }
 #[derive(Deserialize)]
-struct QuestObjective {
+pub(crate) struct QuestObjective {
     #[serde(default)]
     desc: String,
     #[serde(default)]
-    zones: Vec<QuestZone>,
+    pub(crate) zones: Vec<QuestZone>,
 }
 #[derive(Deserialize)]
-struct QuestZone {
+pub(crate) struct QuestZone {
     /// Map id this zone belongs to (a task can span maps).
     #[serde(default)]
     map: String,
@@ -625,11 +643,26 @@ struct QuestZone {
     #[serde(default)]
     pos: Option<[f32; 3]>,
     /// Footprint polygon (bridged viewer-space verts); empty for point-only zones.
+    ///
+    /// `Option` rather than a bare `Vec` on purpose: serde's `default` covers a MISSING key but
+    /// still rejects an explicit `null`, and one rejected field fails the WHOLE file. A single
+    /// `"outline": null` did exactly that here — every task silently vanished from the map.
     #[serde(default)]
-    outline: Vec<[f32; 3]>,
-    /// Upper bound of the zone volume.
+    outline: Option<Vec<[f32; 3]>>,
+    /// Upper bound of the zone volume. `Option` for the same reason as `outline`.
     #[serde(default)]
-    top: f32,
+    top: Option<f32>,
+    /// The GAME trigger this zone was joined to (`quest_triggers[].name`), when it was. Absent
+    /// means the geometry is still upstream's. Used to suppress the anonymous gamedata marker
+    /// that would otherwise sit on top of this task's marker.
+    #[serde(default)]
+    game: Option<String>,
+    /// Provenance: "game" (first-party geometry) / "dev" (tarkov.dev) / "patch" (supplemental).
+    #[serde(default)]
+    src: String,
+    /// 1-based index when one trigger id owns several boxes ("kill in any of these 8 areas").
+    #[serde(default)]
+    part: u32,
 }
 
 /// gamedata.json (extract_gamedata.py) — TYPED gameplay data read from the map's Unity logic
@@ -1140,17 +1173,36 @@ fn gd_mine_info(z: &GdZone) -> MarkerInfo {
     }
 }
 
-/// Card for a typed quest/visit trigger zone (gamedata.json `quest_triggers`). The title is
-/// the RAW zone id ("qlight_pc1_ucot_kill") — it's the game's quest-zone key, so search hits
-/// it directly.
-fn gd_trigger_info(z: &GdZone) -> MarkerInfo {
+/// Card for a quest/visit trigger zone NO task claims (gamedata.json `quest_triggers` minus the
+/// ones tasks.json joined by name). The title stays the RAW zone id ("qlight_pc1_ucot_kill") —
+/// it's the game's own quest-zone key, so search hits it directly — but the subtitle now says
+/// which FAMILY it belongs to, because "no task references this" is the useful fact about it and
+/// a bare id gave the reader nothing to go on.
+fn gd_trigger_info(z: &GdZone, unlinked: Option<&UnlinkedZone>) -> MarkerInfo {
     let kind_line = match z.kind.as_deref() {
         Some("place_item") => "Place-item zone",
         Some("visit") => "Visit / exploration zone",
         Some("flare") => "Flare-signal zone",
+        Some("shoot") => "Shootable quest target",
         _ => "Quest trigger",
     };
     let mut detail = vec![kind_line.to_string()];
+    // Family is NAME-DERIVED (build_tasks.py ZONE_FAMILIES) and presentation only — say so rather
+    // than let it read as first-party classification.
+    let subtitle = match unlinked.map(|u| u.family.as_str()) {
+        Some("event") => "Seasonal event zone \u{00B7} game files, no task",
+        Some("achievement") => "Achievement zone \u{00B7} game files, no task",
+        Some("transit") => "Transit zone \u{00B7} game files, no task",
+        Some("extract") => "Extract-related zone \u{00B7} game files, no task",
+        Some(_) => "Quest zone \u{00B7} game files, no task",
+        None => "Quest zone \u{00B7} game files",
+    };
+    if let Some(u) = unlinked {
+        if u.parts > 1 {
+            detail.push(format!("{} separate boxes share this zone id", u.parts));
+        }
+        detail.push("No tarkov.dev task references this zone".into());
+    }
     if let Some(ext) = zone_extent_line(z) {
         detail.push(ext);
     }
@@ -1159,7 +1211,7 @@ fn gd_trigger_info(z: &GdZone) -> MarkerInfo {
     }
     MarkerInfo {
         title: z.name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "Quest zone".into()),
-        subtitle: "Quest zone \u{00B7} game files".into(),
+        subtitle: subtitle.into(),
         detail,
         accent: poi_look(PoiLayer::Quest).0,
     }
@@ -1225,7 +1277,7 @@ fn gd_door_info(d: &GdDoor, dev_key: Option<&str>) -> MarkerInfo {
 }
 
 /// Card for a quest objective located on this map (tasks.json).
-fn quest_info(t: &QuestTask, o: &QuestObjective) -> MarkerInfo {
+fn quest_info(t: &QuestTask, o: &QuestObjective, z: &QuestZone) -> MarkerInfo {
     let mut detail = Vec::new();
     if !o.desc.is_empty() {
         detail.push(o.desc.clone());
@@ -1237,9 +1289,24 @@ fn quest_info(t: &QuestTask, o: &QuestObjective) -> MarkerInfo {
     if t.kappa {
         tags.push("Kappa".into());
     }
+    // "Any of N areas" is the difference between a single objective box and the game's real
+    // multi-box zone (woods ships 8 'kill_in_forest_woods' boxes for one objective) — without it
+    // the reader has no way to tell why the same task has several markers.
+    if z.part > 0 {
+        tags.push(format!("area {}", z.part));
+    }
     if !tags.is_empty() {
         detail.push(tags.join("  \u{00B7}  "));
     }
+    // Provenance, so a position the game did not supply never reads as if it did.
+    detail.push(match z.src.as_str() {
+        "game" => match z.game.as_deref() {
+            Some(g) => format!("Zone from game files \u{00B7} {g}"),
+            None => "Zone from game files".into(),
+        },
+        "patch" => "Zone position derived from map geometry (upstream has none)".into(),
+        _ => "Zone position from tarkov.dev (no game trigger matched)".into(),
+    });
     MarkerInfo {
         title: if t.name.is_empty() { "Task".into() } else { t.name.clone() },
         subtitle: if t.trader.is_empty() { "Task".into() } else { format!("Task \u{00B7} {}", t.trader) },
@@ -2169,6 +2236,50 @@ fn spawn_pois(
         }
     }
 
+    // ---- QUEST CATALOG (tasks.json) ----
+    // Parsed HERE, before the gamedata block, because the raw quest-trigger markers need to know
+    // which triggers a task already accounts for. build_tasks.py joins upstream task zones to the
+    // scene's triggers BY NAME (upstream's zone id IS the game's trigger id), and records the
+    // match in `zone.game`. Without that index this system spawns two markers per claimed trigger
+    // — the task's (named, trackable) and an anonymous one showing only the raw scene id — sitting
+    // in the exact same spot. The task marker is strictly better, so the raw one is suppressed.
+    // NEVER swallow the parse error. It used to be `.ok()`, and the cost was a whole feature
+    // disappearing in silence: one bad field failed the document, `quest_tasks` came out empty,
+    // and the only symptom was that tracked tasks drew no zones. serde's message carries the exact
+    // line, column and field.
+    let quest_file: Option<QuestFile> =
+        resolve_sidecar("EFT_TASKS_JSON", "tasks.json", root, "quest tracker empty")
+            .and_then(|p| match std::fs::read_to_string(&p) {
+                Ok(s) => match serde_json::from_str::<QuestFile>(&s) {
+                    Ok(qf) => Some(qf),
+                    Err(e) => {
+                        error!("poi: failed to parse {}: {e} — NO quest zones will be drawn", p.display());
+                        None
+                    }
+                },
+                Err(e) => {
+                    warn!("poi: failed to read {}: {e}", p.display());
+                    None
+                }
+            });
+    // trigger id -> the task that owns it on THIS map.
+    let claimed_triggers: std::collections::HashMap<&str, &QuestTask> = quest_file
+        .iter()
+        .flat_map(|qf| &qf.tasks)
+        .flat_map(|t| t.objectives.iter().map(move |o| (t, o)))
+        .flat_map(|(t, o)| o.zones.iter().map(move |z| (t, z)))
+        .filter(|(_, z)| z.map == key)
+        .filter_map(|(t, z)| z.game.as_deref().map(|g| (g, t)))
+        .collect();
+    // trigger id -> its family, for the ones NO task claims (first-party zones upstream has no
+    // row for: seasonal events, achievements, transits, and genuinely unknown quests).
+    let unlinked_family: std::collections::HashMap<&str, &UnlinkedZone> = quest_file
+        .iter()
+        .filter_map(|qf| qf.unlinked.get(&key))
+        .flatten()
+        .map(|u| (u.name.as_str(), u))
+        .collect();
+
     // ---- TYPED game data markers + zone outlines (gamedata.json) ----
     // Exfil markers REPLACE extracts_dev (gated above); minefields / sniper zones are their
     // own layers; typed doors replace the semantics door layer and carry KeyId/DoorState.
@@ -2338,12 +2449,27 @@ fn spawn_pois(
             }
         }
         // Quest TRIGGER markers only. The zone FOOTPRINTS (walls + outlines) are intentionally NOT
-        // built here: gamedata triggers carry no task id, so they can't be limited to the currently
+        // built here: an unclaimed trigger has no task id, so it can't be limited to the currently
         // tracked quest. Tracked-quest zones come from the tasks.json path below (`QuestMarkerTask`
         // walls + `draw_quest_outlines`), which the tracker focuses. (User: only show tracked
         // quests' zones — a raw scene-truth footprint for every quest is exactly the clutter to avoid.)
+        //
+        // A trigger a TASK claims is skipped entirely: the tasks.json loop below spawns a marker at
+        // the same position carrying the task's real name and a `QuestMarkerTask` the tracker can
+        // focus. Spawning both put two markers on one spot, and the raw one titled the card with a
+        // scene id ("place_SALE_03_KOSTIN") where the task marker says what the quest is.
         for z in &gd.quest_triggers {
-            let ent = spawn(&mut commands, PoiLayer::Quest, z.pos, gd_trigger_info(z), None);
+            let name = z.name.as_deref().unwrap_or_default();
+            if claimed_triggers.contains_key(name) {
+                continue;
+            }
+            let ent = spawn(
+                &mut commands,
+                PoiLayer::Quest,
+                z.pos,
+                gd_trigger_info(z, unlinked_family.get(name).copied()),
+                None,
+            );
             if !z.active {
                 commands.entity(ent).insert(SceneInactive);
             }
@@ -2692,10 +2818,7 @@ fn spawn_pois(
     // zone's point + footprint outline. Each marker gets a `QuestMarkerTask` so the tracker can
     // focus visibility to selected tasks.
     let mut quest_tasks: Vec<QuestEntry> = Vec::new();
-    if let Some(qf) = resolve_sidecar("EFT_TASKS_JSON", "tasks.json", root, "quest tracker empty")
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<QuestFile>(&s).ok())
-    {
+    if let Some(qf) = &quest_file {
         for t in &qf.tasks {
             let mut objs: Vec<QuestObj> = Vec::new();
             for o in &t.objectives {
@@ -2705,10 +2828,14 @@ fn spawn_pois(
                         continue;
                     }
                     let Some(p) = z.pos else { continue };
-                    let e = spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o), None);
+                    let e = spawn(&mut commands, PoiLayer::Quest, p, quest_info(t, o, z), None);
                     commands.entity(e).insert(QuestMarkerTask(t.id.clone()));
-                    let outline: Vec<Vec3> =
-                        z.outline.iter().map(|a| Vec3::from(*a)).collect();
+                    let outline: Vec<Vec3> = z
+                        .outline
+                        .iter()
+                        .flatten()
+                        .map(|a| Vec3::from(*a))
+                        .collect();
                     // Wall on the objective footprint too; the `QuestMarkerTask` hands its
                     // visibility to the tracker-aware pass, exactly like the marker's.
                     if let Some(w) = wall(&mut commands, &mut meshes, PoiLayer::Quest, &outline,
@@ -2718,7 +2845,7 @@ fn spawn_pois(
                     zones.push(QuestZoneW {
                         pos: Vec3::new(p[0], p[1], p[2]),
                         outline,
-                        top: z.top,
+                        top: z.top.unwrap_or_default(),
                     });
                 }
                 if !zones.is_empty() {
@@ -2945,6 +3072,11 @@ fn build_patrol_contours(
     // fallback leg is drawn as a height-snapped STRAIGHT line, which is exactly what produces
     // connectors that cut through floors and walls.
     let (n_legs, n_routed, n_detour) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let n_jump = AtomicUsize::new(0); // leg joins the router relocated (see the j == 0 arm below)
+    // Every fallback leg is a straight 3D chord, so each one is a candidate "line through a
+    // ceiling". Record them so the log names PLACES to go look at, not just a count.
+    let bad: std::sync::Mutex<Vec<(Vec3, Vec3, f32, f32, &'static str)>> =
+        std::sync::Mutex::new(Vec::new());
     let out: Vec<(Vec<(Vec3, f32, f32, bool)>, f32)> = ways.par_iter()
         .map_init(
             || nav.map(|g| crate::nav::pooled_scratch(g.nodes())),
@@ -2967,16 +3099,30 @@ fn build_patrol_contours(
                     .collect();
                 (stamped, arc)
             };
+            // Where the PREVIOUS leg actually ended. Legs used to be routed independently, each
+            // from its own raw waypoint, and consecutive legs then disagreed about which storey the
+            // shared waypoint sits on: leg i settles for whichever layer it could reach, leg i+1
+            // snaps its start to the layer nearest the waypoint's own y. The contour joined those
+            // two points with a straight line, so a mall waypoint reachable on two floors produced
+            // a 15 m vertical plunge across one cell — a drawn line straight through two storey
+            // slabs. Measured on interchange: worst 7.7 m off-floor at (-26.6, 34.8, -235.2), on a
+            // 1.4 m segment dropping 42.4 -> 27.1.
+            //
+            // Chaining from the previous leg's endpoint makes the contour ONE connected walk, so
+            // the join is always a real routed step rather than an inter-leg teleport.
+            let mut cursor: Option<Vec3> = None;
             for i in 0..n.saturating_sub(1) {
-                let (a, b) = (way[i], way[i + 1]);
+                let (a, b) = (cursor.unwrap_or(way[i]), way[i + 1]);
                 let t0 = i as f32 / (n - 1).max(1) as f32;
                 let t1 = (i + 1) as f32 / (n - 1).max(1) as f32;
                 let straight = a.distance(b);
                 n_legs.fetch_add(1, Ordering::Relaxed);
                 // Preferred: the real walkable route for this leg (how a bot would move).
                 let mut leg: Option<Vec<Vec3>> = None;
+                let mut got_dist = -1.0f32;
                 if let (Some(g), Some(s)) = (nav, scratch.as_deref_mut()) {
                     if let Some((pts, dist)) = g.path(a, b, s, None) {
+                        got_dist = dist;
                         if !(pts.len() >= 2 && dist <= (straight * 8.0).max(straight + 60.0)) {
                             n_detour.fetch_add(1, Ordering::Relaxed);
                         } else {
@@ -3004,6 +3150,16 @@ fn build_patrol_contours(
                 // tanker and read as a real patrol route across it. Draping invents geometry the
                 // leg was never shown to have; a straight chord at interpolated height does not.
                 let unrouted = leg.is_none();
+                // Continue from where this leg really finished. A fallback chord ends AT the
+                // waypoint by construction, so it resets the cursor rather than propagating a
+                // position the router never confirmed.
+                cursor = if unrouted { None } else { leg.as_ref().and_then(|l| l.last().copied()) };
+                if unrouted {
+                    let why = if got_dist < 0.0 { "no route" } else { "detour" };
+                    if let Ok(mut v) = bad.lock() {
+                        v.push((a, b, straight, got_dist, why));
+                    }
+                }
                 let leg = leg.unwrap_or_else(|| {
                     let steps = (straight / 2.0).ceil().max(1.0) as usize;
                     (0..=steps).map(|k| a.lerp(b, k as f32 / steps as f32)).collect()
@@ -3018,7 +3174,25 @@ fn build_patrol_contours(
                         acc += leg[j - 1].distance(*p);
                     }
                     if i > 0 && j == 0 {
-                        continue;
+                        // A leg's first vertex is NOT necessarily where the previous leg ended:
+                        // `NavGrid::path` snaps the start with a 16-cell search that can land on a
+                        // different storey when the waypoint's column holds several floors.
+                        // Dropping this vertex unconditionally hid that relocation and drew a
+                        // straight line across it — on interchange, a 1 m step falling 36.6 -> 18.4,
+                        // i.e. a patrol line through two storey slabs.
+                        //
+                        // Drop it only when it really does coincide with the previous endpoint.
+                        // Otherwise keep it (so the leg's own geometry stays intact) and mark the
+                        // JOIN unrouted, which makes the draw loop skip that one segment: we cannot
+                        // show a walk we never found, and we will not invent one.
+                        match out.last_mut() {
+                            Some(prev) if prev.0.distance(*p) <= 1.5 => continue,
+                            Some(prev) => {
+                                prev.2 = true;
+                                n_jump.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {}
+                        }
                     }
                     out.push((*p, t0 + (t1 - t0) * (acc / total), unrouted));
                 }
@@ -3027,7 +3201,65 @@ fn build_patrol_contours(
             },
         )
         .collect();
-    if nav.is_some() {
+    if let Some(g) = nav {
+        // Floor adherence of the FINISHED contours - the geometry actually drawn on screen.
+        let (mut fs_total, mut fs_bad, mut fs_worst, mut fs_at) = (0usize, 0usize, 0.0f32, Vec3::ZERO);
+        // Split by provenance: a violation on a ROUTED leg is a router bug; one on a fallback chord
+        // is the straight line we drew ourselves. Only the split says which.
+        let (mut rt_total, mut rt_bad, mut fb_total, mut fb_bad) = (0usize, 0usize, 0usize, 0usize);
+        // Worst offender among the geometry that is actually DRAWN (routed legs only - fallback
+        // chords are cached but skipped by the draw loop, so they cannot be what a user sees).
+        let (mut rt_worst, mut rt_at) = (0.0f32, Vec3::ZERO);
+        let mut rt_seg = (Vec3::ZERO, Vec3::ZERO);
+        for (verts, _) in &out {
+            for w in verts.windows(2) {
+                let (a, b) = (w[0].0, w[1].0);
+                let chord = w[0].3 || w[1].3;
+                let n = (a.distance(b) / 1.0).ceil().max(1.0) as usize;
+                for i in 0..=n {
+                    let p = a.lerp(b, i as f32 / n as f32);
+                    fs_total += 1;
+                    if chord { fb_total += 1 } else { rt_total += 1 }
+                    // 3x3 neighbourhood: a diagonal step between two cells that both hold a
+                    // floor can pass over a corner cell that does not, and sampling that one cell
+                    // reports a large violation for a line that is on the floor at both ends.
+                    let d = if g.on_floor(p.x, p.z, p.y, 1.5) {
+                        0.0
+                    } else {
+                        g.floor_near(p.x, p.z, p.y).map_or(99.0, |f| (p.y - f).abs())
+                    };
+                    if d > 1.5 {
+                        fs_bad += 1;
+                        if chord {
+                            fb_bad += 1
+                        } else {
+                            rt_bad += 1;
+                            if d > rt_worst {
+                                rt_worst = d;
+                                rt_at = p;
+                                rt_seg = (a, b);
+                            }
+                        }
+                        if d > fs_worst {
+                            fs_worst = d;
+                            fs_at = p;
+                        }
+                    }
+                }
+            }
+        }
+        // Only DRAWN geometry can be what a user sees: the draw loop skips fallback chords
+        // entirely, so an off-floor sample there is invisible and not a fault worth reporting.
+        // Silent when clean — an invariant that logs every run stops being read.
+        let _ = (fs_bad, fs_total, fs_worst, fs_at, fb_bad, fb_total);
+        if rt_bad > 0 {
+            warn!(
+                "patrol contours leave the floor: {rt_bad}/{rt_total} drawn metres are >1.5 m from                  any floor, worst {rt_worst:.1} m at ({:.1},{:.1},{:.1}) on segment                  ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1}); floors there {:?}",
+                rt_at.x, rt_at.y, rt_at.z,
+                rt_seg.0.x, rt_seg.0.y, rt_seg.0.z, rt_seg.1.x, rt_seg.1.y, rt_seg.1.z,
+                g.floors_at(rt_at.x, rt_at.z)
+            );
+        }
         let (l, r, d) = (
             n_legs.load(Ordering::Relaxed),
             n_routed.load(Ordering::Relaxed),
@@ -3040,6 +3272,21 @@ fn build_patrol_contours(
             l - r,
             l - r - d
         );
+        let j = n_jump.load(Ordering::Relaxed);
+        if j > 0 {
+            info!(
+                "  {j} leg join(s) had the start relocated by the router onto a different spot or                  storey; those joins are left undrawn rather than bridged with a straight line"
+            );
+        }
+        if let Ok(v) = bad.lock() {
+            for (a, b, straight, dist, why) in v.iter() {
+                info!(
+                    "  fallback leg [{why}]: ({:.0},{:.0},{:.0}) -> ({:.0},{:.0},{:.0}) straight \
+                     {straight:.0} m, dy {:.1} m, routed {:.0} m",
+                    a.x, a.y, a.z, b.x, b.y, b.z, b.y - a.y, dist
+                );
+            }
+        }
     }
     out
 }

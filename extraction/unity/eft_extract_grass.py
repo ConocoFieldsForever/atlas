@@ -40,7 +40,7 @@ import os, json, argparse, struct, re
 import numpy as np
 import UnityPy
 
-# portable kit: paths come from the environment (see extraction/README.md)
+# portable kit: paths come from the environment (see README.md)
 #   EFT_GAME_DATA   = the game's EscapeFromTarkov_Data dir (default: standard install path)
 #   EFT_ASSETS_ROOT = where extracted datasets are written (default: <EFT_TARKMAP_ROOT>/../eft_assets, else ./eft_assets)
 EFTDATA = os.environ.get("EFT_GAME_DATA",

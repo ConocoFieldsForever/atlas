@@ -448,7 +448,27 @@ def load_static_tasks():
     ten = _get("tasks_en").get("data", {})        # task names, objective descriptions, quest-item names
     ien = _get("items_en").get("data", {})
     tren = _get("traders_en").get("data", {})     # trader "<id> Nickname" -> "Prapor"
-    map_nn = {m["id"]: m.get("normalizedName") for m in _list(_get("maps")["data"]["maps"])}
+    MAPS = _get("maps")["data"]
+    men = _get("maps_en").get("data", {})         # mob role id -> display name ("bossKojaniy" -> "Shturman")
+    map_nn = {m["id"]: m.get("normalizedName") for m in _list(MAPS["maps"])}
+
+    # Kill-objective targets arrive as the GAME's internal bot role ids. The maps dump ships a
+    # `mobs` catalog whose ids ARE those roles, and maps_en translates them, so named bosses and
+    # followers resolve straight from data ("bossKojaniy" -> "Shturman", "PmcBot" -> "Raider").
+    # Nine role ids have no mob row because they are generic CATEGORIES rather than named mobs;
+    # for those alone the label below is a display alias, and unresolved ids are passed through
+    # verbatim rather than invented.
+    GENERIC_ROLES = {"Any": "Anyone", "AnyPmc": "PMC", "Savage": "Scav", "Usec": "USEC",
+                     "Bear": "BEAR", "Marksman": "Scav sniper"}
+    mob_name = {m: men.get(m) for m in _list(MAPS.get("mobs") or {}) if isinstance(m, str)}
+
+    def target_name(role):
+        return men.get(role) or GENERIC_ROLES.get(role) or mob_name.get(role) or role
+
+    # Body parts arrive as full localization KEYS
+    # ("QuestCondition/Elimination/Kill/BodyPart/Stomach"); the leaf is the value.
+    def body_part(key):
+        return (key or "").rsplit("/", 1)[-1]
 
     item_by = {it["id"]: it for it in _list(I["items"])}
     qitem = {q["id"]: (ten.get(q.get("name")) or q.get("normalizedName")) for q in _list(T.get("questItems") or [])}
@@ -487,7 +507,13 @@ def load_static_tasks():
               "description": ten.get(o.get("description")) or o.get("description"),
               "optional": o.get("optional", False),
               "maps": [mapref(mid) for mid in (o.get("maps") or [])],
-              "zones": [{"map": mapref(z.get("map")), "position": z.get("position"),
+              # z["id"] IS THE GAME'S TRIGGER NAME ("place_SALE_03_KOSTIN",
+              # "Sandbox_1_MedicalArea_exploration") — the same string the scene's
+              # PlaceItemTrigger/ExperienceTrigger serializes as its zone id and that
+              # extract_gamedata.py stores as quest_triggers[].name. Carrying it through turns
+              # build_tasks.py's first-party join from a 12 m nearest-neighbour GUESS into an
+              # EXACT key match. Dropping it here is what forced the positional fallback before.
+              "zones": [{"id": z.get("id"), "map": mapref(z.get("map")), "position": z.get("position"),
                          "outline": z.get("outline"), "top": z.get("top"), "bottom": z.get("bottom")}
                         for z in (o.get("zones") or [])]}
         if o.get("items"):        oo["items"] = resolve_items(o["items"])
@@ -497,10 +523,14 @@ def load_static_tasks():
         for k in ("usingWeapon", "usingWeaponMods", "wearing", "notWearing", "useAny"):
             if o.get(k):          oo[k] = resolve_items(o[k])
         # scalars main() reads straight through
-        for k in ("targetNames", "count", "foundInRaid", "exitName", "distance", "bodyParts", "shotType",
+        for k in ("count", "foundInRaid", "exitName", "distance", "shotType",
                   "timeFromHour", "timeUntilHour", "minDurability", "maxDurability"):
             if o.get(k) is not None:
                 oo[k] = o[k]
+        if o.get("targetNames"):
+            oo["targetNames"] = [target_name(r) for r in o["targetNames"]]
+        if o.get("bodyParts"):
+            oo["bodyParts"] = [body_part(b) for b in o["bodyParts"]]
         if o.get("possibleLocations"):
             oo["possibleLocations"] = [{"map": mapref(pl.get("map")), "positions": pl.get("positions")}
                                        for pl in o["possibleLocations"]]
@@ -516,7 +546,13 @@ def load_static_tasks():
             "offerUnlock": [{"trader": {"name": trader.get(x.get("trader"))} if x.get("trader") else None,
                              "level": x.get("level"), "item": item_obj(x.get("item"))}
                             for x in (r.get("offerUnlock") or [])],
-            "skillLevelReward": [{"name": ten.get(x.get("name")) or x.get("name"), "level": x.get("level")}
+            # The static dump names this field "skill", not "name" — reading "name" yielded null on
+            # all 79 skill rewards across 30 tasks, so "Consolation Prize" shipped 15 rows of
+            # "Skill: skill +1". Prefer "skill", keep "name" as the fallback in case the schema
+            # gains it later, and translate through tasks_en like every other display string.
+            "skillLevelReward": [{"name": (ten.get(x.get("skill") or x.get("name"))
+                                           or x.get("skill") or x.get("name")),
+                                  "level": x.get("level")}
                                  for x in (r.get("skillLevelReward") or [])],
             # traderUnlock is a bare trader id in the static dump -> wrap as {name} so conv_rewards() reads it
             "traderUnlock": [{"name": trader.get(x)} for x in (r.get("traderUnlock") or []) if trader.get(x)],

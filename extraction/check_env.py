@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Smoke-check for the portable EFT extraction kit (see extraction/README.md).
+"""Smoke-check for the portable EFT extraction kit (see README.md).
 
   python extraction/check_env.py                     verify python deps + env vars + paths
   python extraction/check_env.py --init D:\\eft_work  ALSO scaffold the workspace there

@@ -41,7 +41,7 @@ except Exception: pass
 
 # portable kit: the correctness core (MapConfig/Culls/matsig/objio) is the copy VENDORED in this
 # repo at eft_pipeline/tarkmap_core (same code the pack emitter uses). config.py there honors
-# EFT_TARKMAP_ROOT for maps/<id>/config.json + dataset resolution -- set it (see extraction/README.md).
+# EFT_TARKMAP_ROOT for maps/<id>/config.json + dataset resolution -- set it (see README.md).
 HERE = os.path.dirname(os.path.abspath(__file__))          # <repo>/extraction/bake
 REPO = os.path.dirname(os.path.dirname(HERE))              # <repo> (eft_native_viewer)
 sys.path.insert(0, REPO)
@@ -54,7 +54,7 @@ TK = os.environ.get("EFT_TARKMAP_ROOT")                    # <workspace>/tarkmap
 if not TK:
     raise SystemExit("bake_volume2: EFT_TARKMAP_ROOT is not set. Point it at your workspace tarkmap dir "
                      "(the one holding maps/ and out/), e.g.  setx EFT_TARKMAP_ROOT D:\\eft_work\\tarkmap  "
-                     "-- see extraction/README.md")
+                     "-- see README.md")
 ROOT = os.path.dirname(TK)                                 # workspace root (holds eft_assets/)
 
 MAP = next((a for a in sys.argv[1:] if not a.startswith('-')), 'interchange')

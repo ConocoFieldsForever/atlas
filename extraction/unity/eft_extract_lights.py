@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eft_scene_extract import trs               # local TRS helper (quat+pos+scale -> 4x4)
 from eft_extract_v2 import g
 
-# portable kit: paths come from the environment (see extraction/README.md)
+# portable kit: paths come from the environment (see README.md)
 #   EFT_GAME_DATA   = the game's EscapeFromTarkov_Data dir (default: standard install path)
 #   EFT_ASSETS_ROOT = where extracted datasets are written (default: <EFT_TARKMAP_ROOT>/../eft_assets, else ./eft_assets)
 EFTDATA = os.environ.get("EFT_GAME_DATA",

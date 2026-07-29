@@ -72,9 +72,27 @@ struct CullGlobals {
 @group(0) @binding(5) var<storage, read_write>  indirect_blend: array<DrawArgs>;  // P2 per-mesh blend draws
 @group(0) @binding(6) var<storage, read>        lod_centers: array<vec4<f32>>;    // B1 per-group ref center (indexed by ids.z>>13)
 
+// LINEAR INVOCATION INDEX ACROSS A 2-D DISPATCH.
+//
+// `max_compute_workgroups_per_dimension` is 65,535 on essentially every adapter — a hard Vulkan /
+// D3D limit, not a soft wgpu default. At @workgroup_size(64) a 1-D dispatch therefore tops out at
+// 4,194,240 invocations, and woods ships 11,572,828 instances once its grass is built (883 MiB of
+// them). Dispatching 180,826 groups in X was a validation error: wgpu invalidated the encoder and
+// every later pass reported only "Encoder is invalid", so the map rendered at 2 fps with no
+// message naming the real cause.
+//
+// The host now splits the group count over X and Y (see `dispatch_2d` in gpu_driven.rs) and each
+// entry point reconstructs its index from BOTH. The X stride is read from `num_workgroups` rather
+// than passed in a uniform, so the shader and the host cannot drift apart — there is no new struct
+// field to keep in sync.
+fn linear_index(gid: vec3<u32>, ng: vec3<u32>) -> u32 {
+    return gid.y * (ng.x * 64u) + gid.x;
+}
+
 @compute @workgroup_size(64)
-fn cs_reset(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let m = gid.x;
+fn cs_reset(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(num_workgroups) ng: vec3<u32>) {
+    let m = linear_index(gid, ng);
     if (m >= G.counts.y) { return; }
     let mm = mesh_meta[m];
     // Class-split indirect args: the OPAQUE buffer zeroes blend-only meshes (P1 + the shadow
@@ -124,8 +142,9 @@ fn world_sphere_from_affine(inst: InstanceGpu) -> vec4<f32> {
 #endif
 
 @compute @workgroup_size(64)
-fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>,
+           @builtin(num_workgroups) ng: vec3<u32>) {
+    let i = linear_index(gid, ng);
     if (i >= G.counts.x) { return; }
     let inst = instances[i];
 #ifdef CULL_COMPUTE_SPHERE
@@ -212,8 +231,9 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 const SORT_MAX: u32 = 1024u;
 
 @compute @workgroup_size(64)
-fn cs_sort_blend(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let k = gid.x;
+fn cs_sort_blend(@builtin(global_invocation_id) gid: vec3<u32>,
+                 @builtin(num_workgroups) ng: vec3<u32>) {
+    let k = linear_index(gid, ng);
     if (k >= arrayLength(&blend_mesh_ids)) { return; }
     let mesh_id = min(blend_mesh_ids[k], arrayLength(&mesh_meta) - 1u);
     let base = mesh_meta[mesh_id].instance_base;

@@ -6,12 +6,14 @@
 //!
 //! The model is a deliberately honest small-quad simulation (5" freestyle class), not an arcade
 //! glide: real gravity (9.81, unlike the walk camera's game-feel 20), thrust only along body-up,
-//! quadratic airframe drag (top speed ~50 m/s and dead-stick terminal fall ~25 m/s both emerge
-//! from the same thrust/gravity/drag balance), first-order
+//! ANISOTROPIC body-frame airframe drag (the prop-disk axis has ~6× the frontal area of the
+//! edge-on axes, so top speed ~26 m/s and dead-stick terminal fall ~12.5 m/s emerge from the same
+//! thrust/gravity/drag balance without fighting each other), first-order
 //! motor/attitude response (commands are chased, never teleported), angle- and rate-(acro-)mode
 //! control, and sphere collision against the map's ground/wall/ceiling grids with a crash
 //! threshold on impact speed. What it does NOT model (documented in docs/AGENT_LINK.md): motor
-//! torques/inertia tensor asymmetry, prop wash / ground effect, battery sag.
+//! torques/inertia tensor asymmetry, ground effect, battery sag. (Propwash IS modelled — see
+//! `propwash` below.)
 //!
 //! Conventions: viewer world is Y-up, metres, right-handed; body frame = camera frame (+X right,
 //! +Y up = thrust axis, -Z forward). Stick signs follow Mode-2 RC convention: pitch + = nose
@@ -33,12 +35,22 @@ pub struct DroneParams {
     pub gravity: f32,
     /// Max total thrust (N). Default ≈ 4.2:1 thrust-to-weight.
     pub max_thrust: f32,
-    /// Quadratic drag coefficient (N per (m/s)²). Sets BOTH the flat-out top speed
-    /// (sqrt(max_thrust/drag_q) ≈ 50 m/s ≈ 180 km/h) and the dead-stick terminal fall speed
-    /// (sqrt(mass·g/drag_q) ≈ 25 m/s, approached over several seconds — a cut quad must visibly
-    /// keep accelerating as it drops, not plateau instantly).
-    pub drag_q: f32,
-    /// Linear drag (N per m/s) — rotor-disk drag, dominates at low speed.
+    /// Parasitic quadratic drag ACROSS the prop disks — body +Y, the airframe's high-drag axis
+    /// (four 5" disks + the frame's plan area ≈ 0.06 m², Cd ≈ 1.15). Sets the dead-stick terminal
+    /// fall, sqrt(mass·g/drag_q_axial) ≈ 12.5 m/s, approached over several seconds — a cut quad
+    /// must visibly keep accelerating as it drops, not plateau instantly. It also sets the flat-out
+    /// top speed (≈ 26 m/s ≈ 95 km/h), because holding altitude at speed forces ~50° of pitch and
+    /// that swings this axis into the airflow.
+    pub drag_q_axial: f32,
+    /// Parasitic quadratic drag EDGE-ON to the disks — body X (lateral) and Z (fore/aft), where
+    /// only the frame edge faces the flow (≈ 0.01 m², ~6× less area than the disk axis). This is
+    /// the axis a level quad coasts on after a throttle chop, so it — not `drag_q_axial` — governs
+    /// how far a dead-stick quad carries its forward momentum.
+    pub drag_q_side: f32,
+    /// Rotor H-force at FULL throttle (N per m/s): the spinning discs' in-plane drag, linear in
+    /// airspeed. Scales with rpm (≈ sqrt of the spooled thrust) and acts only in the disk PLANE
+    /// (body X/Z), which is where the H-force physically points — so it fades out with the motors
+    /// and leaves a dead-stick quad nothing extra to brake against.
     pub drag_l: f32,
     /// Max commanded body rates (rad/s): (pitch, yaw, roll). FPV-typical ~700°/s pitch/roll.
     pub max_rate: Vec3,
@@ -60,8 +72,13 @@ pub struct DroneParams {
     pub tilt_tau: f32,
     /// FPV camera uptilt (rad) used for the agent's target-projection math.
     pub cam_tilt: f32,
-    /// Velocity kept along the surface tangent after a soft contact (0..1).
+    /// Fraction of the impact (surface-normal) speed thrown back on a bounce: 0 = stick, 1 =
+    /// perfectly elastic.
     pub restitution: f32,
+    /// Time constant (s) for tangential speed rubbing off while in contact, so a downed quad
+    /// skids to a stop in ~0.5 s instead of ice-skating. Applied as exp(-dt/τ), which makes ground
+    /// friction SUBSTEP-INVARIANT — the same contact costs the same speed at 30 fps and 240 fps.
+    pub contact_tau: f32,
     /// Impact speed (m/s, into the surface) above which the drone is CRASHED.
     pub crash_speed: f32,
 }
@@ -72,8 +89,9 @@ impl Default for DroneParams {
             mass: 0.68,
             gravity: 9.81,
             max_thrust: 28.0,
-            drag_q: 0.011,
-            drag_l: 0.06,
+            drag_q_axial: 0.043,
+            drag_q_side: 0.0075,
+            drag_l: 0.12,
             max_rate: Vec3::new(
                 860f32.to_radians(),
                 400f32.to_radians(),
@@ -87,6 +105,7 @@ impl Default for DroneParams {
             tilt_tau: 0.12,
             cam_tilt: 18f32.to_radians(),
             restitution: 0.25,
+            contact_tau: 0.15,
             crash_speed: 7.0,
         }
     }
@@ -209,7 +228,9 @@ pub fn step(
     let wash = if p.propwash > 0.0 {
         let sink = (-air.dot(up)).max(0.0); // m/s falling through the disk
         let fwd_speed = (air - up * air.dot(up)).length();
-        let i = (sink * 0.28).min(1.0) * (1.0 - fwd_speed / 9.0).max(0.0) * st.thrust.max(0.15);
+        // Scales with the SPOOLED thrust with no floor: wash is the props' own wake, so motors
+        // that have spooled down have no wake to fall into and a dead-stick quad rides smooth.
+        let i = (sink * 0.28).min(1.0) * (1.0 - fwd_speed / 9.0).max(0.0) * st.thrust;
         let t = st.t;
         Vec3::new(
             (t * 47.0).sin() + 0.6 * (t * 113.0 + 1.3).sin(),
@@ -264,7 +285,24 @@ pub fn step(
     // --- Translation ------------------------------------------------------------------------
     let thrust_dir = st.quat * Vec3::Y;
     let thrust = st.thrust * p.max_thrust;
-    let drag = -(air * (air.length() * p.drag_q + p.drag_l));
+    // Parasitic drag is ANISOTROPIC and lives in the BODY frame — the standard multirotor form
+    // D = -C·|v|·v with C = diag(side, axial, side). A quad presents ~6× the area through its prop
+    // disks as it does edge-on, so a single isotropic coefficient cannot set the dead-stick fall
+    // and the forward coast at once: tuning it for the fall makes a cut quad brake absurdly hard,
+    // and tuning it for the coast makes it drop like a stone. Orientation now decides, which is
+    // also why nosing over to shed drag finally does something.
+    // On top of that, the rotors' in-plane H-force: linear in airspeed, proportional to rpm
+    // (≈ sqrt of spooled thrust), and confined to the disk plane — it dies with the motors, so a
+    // dead-stick quad coasts on frame drag alone.
+    let air_b = st.quat.inverse() * air;
+    let speed = air.length();
+    let rotor_h = p.drag_l * st.thrust.max(0.0).sqrt();
+    let drag_b = -Vec3::new(
+        air_b.x * (speed * p.drag_q_side + rotor_h),
+        air_b.y * (speed * p.drag_q_axial),
+        air_b.z * (speed * p.drag_q_side + rotor_h),
+    );
+    let drag = st.quat * drag_b;
     let accel = thrust_dir * (thrust / p.mass) + drag / p.mass - Vec3::Y * p.gravity;
     st.vel += accel * dt; // semi-implicit Euler
     st.pos += st.vel * dt;
@@ -276,10 +314,7 @@ pub fn step(
             let vn = st.vel.dot(n);
             if vn < 0.0 {
                 out.impact = -vn;
-                st.vel -= n * vn * (1.0 + p.restitution);
-                // Ground friction-ish damping on the tangential remainder so a downed quad
-                // doesn't ice-skate forever.
-                st.vel *= 0.92;
+                st.vel = resolve_contact(st.vel, n, p, dt);
             }
             st.pos = fixed;
             out.collided = true;
@@ -289,6 +324,20 @@ pub fn step(
         }
     }
     out
+}
+
+/// Resolve one surface contact: bounce the normal component off `restitution`, rub the tangential
+/// remainder off on `contact_tau` so a downed quad doesn't ice-skate forever.
+///
+/// The tangential decay MUST be exponential in `dt`. A flat per-call multiplier ties ground
+/// friction to the substep count and therefore to framerate, and since gravity re-presses the hull
+/// into the surface on every substep it fires ~1000×/s — enough to erase all horizontal speed the
+/// instant a skid begins. Split out from `step` so that invariance is directly testable.
+#[inline]
+fn resolve_contact(vel: Vec3, n: Vec3, p: &DroneParams, dt: f32) -> Vec3 {
+    let vn = vel.dot(n);
+    let tangent = (vel - n * vn) * (-dt / p.contact_tau).exp();
+    tangent - n * (vn * p.restitution)
 }
 
 /// Betaflight-style rate curve: stick deflection in [-1,1] → commanded body rate (rad/s).
@@ -321,4 +370,141 @@ pub struct DroneRig {
     pub kb_stick: Vec3,
     /// Acro-mode throttle STICK position (0..1) — keyboard ramps it, gamepad sets it directly.
     pub throttle: f32,
+}
+
+/// Pins the EMERGENT numbers of the flight model — the ones a pilot actually feels — rather than
+/// the coefficients, which are only a means to them. Every figure below is quoted for a ~680 g 5"
+/// freestyle quad and can be checked against a real one.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Params with propwash off, so the drag tests measure drag and nothing else.
+    fn quiet() -> DroneParams {
+        DroneParams { propwash: 0.0, ..DroneParams::default() }
+    }
+
+    /// Fly with no collision grid for `secs` at a true 1 kHz, holding `action`.
+    fn fly(st: &mut DroneState, p: &DroneParams, action: DroneAction, secs: f32) {
+        for _ in 0..(secs / 0.001) as u32 {
+            step(st, p, action, ControlMode::Rates, Vec3::ZERO, None, 0.001);
+        }
+    }
+
+    /// Motors dead, belly-flat: the quad falls through its own prop disks, the airframe's
+    /// highest-drag axis. Real 5" quads settle at 12-14 m/s. The old isotropic model gave 22 —
+    /// and that excess sink is what dragged forward speed off a coasting quad, since quadratic
+    /// drag couples the axes through |air|.
+    #[test]
+    fn dead_stick_terminal_fall_is_realistic() {
+        let p = quiet();
+        let mut st = DroneState::default();
+        fly(&mut st, &p, DroneAction::default(), 15.0);
+        let fall = -st.vel.y;
+        assert!((11.0..14.0).contains(&fall), "flat-fall terminal {fall:.1} m/s, want 11-14");
+    }
+
+    /// THE regression this model exists to fix: chop the throttle at 25 m/s and the quad must
+    /// coast, not brake. The old isotropic drag left 7.7 m/s after 3 s; anisotropic leaves ~13.
+    #[test]
+    fn cut_power_keeps_forward_momentum() {
+        let p = quiet();
+        let mut st = DroneState { vel: Vec3::new(0.0, 0.0, -25.0), thrust: p.hover_throttle(), ..default() };
+        fly(&mut st, &p, DroneAction::default(), 3.0);
+        let fwd = -st.vel.z;
+        assert!(fwd > 12.0, "kept only {fwd:.1} m/s of 25 after a 3 s dead-stick coast");
+        assert!(fwd < 18.0, "kept {fwd:.1} m/s — drag has gone too soft to feel like an airframe");
+    }
+
+    /// Drag must depend on ATTITUDE: the same airspeed costs far more through the disks (body +Y)
+    /// than edge-on. Without this the whole model collapses back to one isotropic coefficient and
+    /// nosing over to shed drag does nothing.
+    #[test]
+    fn drag_is_orientation_dependent() {
+        let p = quiet();
+        let v = Vec3::new(0.0, 0.0, -25.0);
+        let mut edge = DroneState { vel: v, ..default() };
+        // Pitched 90° nose-up puts body +Y — the prop-disk axis — straight into the airflow.
+        let mut disk =
+            DroneState { vel: v, quat: Quat::from_axis_angle(Vec3::X, -std::f32::consts::FRAC_PI_2), ..default() };
+        fly(&mut edge, &p, DroneAction::default(), 0.25);
+        fly(&mut disk, &p, DroneAction::default(), 0.25);
+        let (lost_edge, lost_disk) = (25.0 + edge.vel.z, 25.0 + disk.vel.z);
+        assert!(
+            lost_disk > lost_edge * 3.0,
+            "disk-on lost {lost_disk:.2} m/s vs edge-on {lost_edge:.2} — attitude barely matters"
+        );
+    }
+
+    /// Ground friction must not depend on the host's framerate. One 16 ms contact has to cost the
+    /// same tangential speed as sixteen 1 ms ones; the old per-call 0.92 multiplier made a 30 fps
+    /// machine ~4× grippier than a 240 fps one.
+    #[test]
+    fn contact_friction_is_substep_invariant() {
+        let p = quiet();
+        let (n, slide) = (Vec3::Y, Vec3::new(10.0, 0.0, 0.0));
+        let coarse = resolve_contact(slide, n, &p, 0.016);
+        let mut fine = slide;
+        for _ in 0..16 {
+            fine = resolve_contact(fine, n, &p, 0.001);
+        }
+        assert!(
+            (coarse.x - fine.x).abs() < 0.01,
+            "16 ms in one step leaves {:.3} m/s but in sixteen leaves {:.3}",
+            coarse.x,
+            fine.x
+        );
+    }
+
+    /// The other end of the drag calibration. `drag_q_axial` is pinned by the terminal fall, but it
+    /// also caps top speed, because holding altitude at speed forces the quad to pitch far over and
+    /// swing its disks into the airflow — so once the fall is pinned this has to come out plausible
+    /// on its own or the anisotropy is wrong. It lands at ~96 km/h (52° of pitch): the conservative
+    /// end of the real 5" range, which runs ~100-130 km/h for a fast build. The old isotropic model
+    /// let it run to 169 km/h, which no 680 g freestyle quad does.
+    #[test]
+    fn top_speed_stays_in_the_real_5in_envelope() {
+        let p = quiet();
+        // Full throttle, hold a pitch, run to steady state. Bisect for the pitch whose steady
+        // state exactly holds altitude — that is the max SUSTAINED level speed.
+        let steady = |pitch: f32| {
+            let q = Quat::from_axis_angle(Vec3::X, -pitch);
+            let mut st = DroneState { quat: q, thrust: 1.0, ..default() };
+            for _ in 0..40000 {
+                step(&mut st, &p, DroneAction { throttle: 1.0, ..default() }, ControlMode::Rates, Vec3::ZERO, None, 0.001);
+                st.quat = q; // hold the attitude
+            }
+            st.vel
+        };
+        let (mut lo, mut hi) = (0.05f32, 1.5f32);
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            if steady(mid).y > 0.0 { lo = mid } else { hi = mid }
+        }
+        let top = -steady(0.5 * (lo + hi)).z;
+        assert!(
+            (22.0..32.0).contains(&top),
+            "flat-out level speed {top:.1} m/s ({:.0} km/h), want 22-32 (80-115 km/h)",
+            top * 3.6
+        );
+    }
+
+    /// Propwash is the props' own wake, so motors that have spooled down have none to fall into.
+    /// A dead-stick quad must ride smooth even while sinking hard — the condition that otherwise
+    /// maximises wash.
+    #[test]
+    fn propwash_dies_with_the_motors() {
+        let p = DroneParams::default(); // propwash ON — that is the point
+        let sinking = |thrust: f32| {
+            let mut st = DroneState { vel: Vec3::new(0.0, -8.0, 0.0), thrust, ..default() };
+            let mut peak: f32 = 0.0;
+            for _ in 0..500 {
+                step(&mut st, &p, DroneAction { throttle: thrust, ..default() }, ControlMode::Rates, Vec3::ZERO, None, 0.001);
+                peak = peak.max(st.rate.length());
+            }
+            peak
+        };
+        assert!(sinking(0.0) < 1e-3, "dead motors still shook the airframe");
+        assert!(sinking(0.5) > 0.5, "half-throttle descent lost its propwash entirely");
+    }
 }

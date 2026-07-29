@@ -1056,19 +1056,57 @@ impl Pack {
         // Realtime lights (best-effort; empty vec on any failure — never fatal). Parse+merge EVERY
         // sidecar in `lightsAll` (finding 3b); fall back to the single `lights` field when the list
         // is empty (older packs). De-dup identical entries so `lights` + `lightsAll` overlap once.
-        let mut light_files: Vec<&str> = manifest
-            .sidecars
-            .lights_all
-            .iter()
-            .map(String::as_str)
-            .collect();
+        //
+        // A pack that CARRIES a sidecar uses its own copy. A non-self-contained pack records these
+        // as absolute paths into the build tree by design (assemble_bevy references them in place),
+        // so a pack moved to another machine — or one whose local copy has been refreshed — must
+        // still resolve. Matching on file name keeps that decision in one place.
+        let mut light_files: Vec<String> = manifest.sidecars.lights_all.to_vec();
         if light_files.is_empty() {
             if let Some(s) = manifest.sidecars.lights.as_deref() {
-                light_files.push(s);
+                light_files.push(s.to_string());
+            }
+        }
+        for f in &mut light_files {
+            if let Some(name) = Path::new(f.as_str()).file_name() {
+                if root.join(name).is_file() {
+                    *f = name.to_string_lossy().into_owned();
+                }
             }
         }
         light_files.sort_unstable();
         light_files.dedup();
+        // A sidecar sitting in the pack that the manifest never mentions means the pack and its
+        // manifest disagree — the file was refreshed without re-running the build. Say so loudly
+        // rather than quietly adopting it: the consequence is invisible otherwise (interchange
+        // carried a whole switch-controlled light bank this way, so its power lever resolved to
+        // zero groups and the Level Controls panel just read "Power (no lights)"), and the fix
+        // belongs in the pack, not in a rule here that guesses which stray files are ours.
+        if let Ok(rd) = std::fs::read_dir(&root) {
+            let listed: std::collections::HashSet<String> = light_files
+                .iter()
+                .filter_map(|f| Path::new(f.as_str()).file_name())
+                .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                .collect();
+            let stray: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter(|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.starts_with("lights_") && l.ends_with(".json") && !listed.contains(&l)
+                })
+                .collect();
+            if !stray.is_empty() {
+                eprintln!(
+                    "  lights: WARNING pack contains {} light sidecar(s) its manifest does not \
+                     list ({}) — they will NOT be loaded, and any switch that controls them will \
+                     resolve to no light group. Rebuild the map so the manifest matches the pack.",
+                    stray.len(),
+                    stray.join(", ")
+                );
+            }
+        }
+        let light_files: Vec<&str> = light_files.iter().map(String::as_str).collect();
         let mut lights = Vec::new();
         let mut unsupported = 0usize;
         // Group table: light `group` string -> dense index, shared with the switch table so a

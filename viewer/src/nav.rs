@@ -165,6 +165,29 @@ impl Scratch {
     }
 }
 
+/// Bumped whenever a baker change alters the CONTENT of nav.bin / nav_blk.bin / nav_wallcell.bin
+/// for the same input map. `nav.json` records the version that produced the data; [`NavGrid::load`]
+/// compares and warns loudly when they disagree.
+///
+/// This exists because a stale grid does not FAIL — it silently routes through walls and floors,
+/// which is indistinguishable from a router bug and sends you hunting in the wrong file. Five baker
+/// bugs were fixed in 79e554c at 00:38; the pack's nav.bin had been built at 00:33; nav.bin is not
+/// tracked by git, so nothing rebaked it and the fixed code shipped on broken DATA for hours with
+/// no hint. Two of those bugs (blk/height desync during region pruning; unconjugated collider
+/// centres, up to 4.02 m off) produce exactly "routes pass through solid geometry".
+///
+/// Bump this in the SAME commit as any baker change that affects output. Do NOT bump for
+/// router-side or cosmetic changes — nav.bin is unaffected by those, and a spurious bump trains
+/// people to ignore the warning.
+///
+/// 1 = first versioned bake (post-79e554c: collider centres conjugated, `blk` compacted in lockstep
+///     with heights during region pruning, sphere/capsule primitives wound outward).
+/// 2 = agent-clearance pass (a floor is walkable only where the player capsule FITS -- the old
+///     footprint erosion checked for floor beside a cell but never for a WALL next to it), and a
+///     default bake resolution of 0.5 m. Zero wall crossings and zero illegal steps on the
+///     self-check, against 14 and 1013 before.
+pub const BAKER_VERSION: u32 = 2;
+
 impl NavGrid {
     /// Load the nav grid from a directory holding nav.json + nav.bin (+ optional door/blk). Returns
     /// None (with a log) if no grid is present — the caller then reports "no route data for this map".
@@ -176,6 +199,17 @@ impl NavGrid {
         let (min_x, min_z, res) = (f("min_x")? as f32, f("min_z")? as f32, f("res")? as f32);
         let (nx, nz, k) = (i("nx")? as usize, i("nz")? as usize, i("n_layers")? as usize);
         let miss = f("miss").unwrap_or(-1.0e9) as f32;
+        // Stale-data guard: a grid baked by older code loads perfectly and routes WRONGLY. Only the
+        // version distinguishes the two, so report it at error level with the fix in the message.
+        match i("baker_version") {
+            Some(v) if v as u32 == BAKER_VERSION => {}
+            other => error!(
+                "nav data in {} was baked by baker_version {:?} but this build expects                  {BAKER_VERSION} — routes may pass through walls and floors. Re-bake with                  `atlas bake-nav {}`",
+                dir.display(),
+                other,
+                dir.display()
+            ),
+        }
         let climb = f("climb").unwrap_or(1.2) as f32;
         let drop_max = f("drop_max").unwrap_or(2.0) as f32;
         let vault = f("vault").unwrap_or(1.2) as f32;
@@ -505,6 +539,82 @@ impl NavGrid {
     /// point is off-grid or the cell has no floor. Multi-floor aware — the reference Y picks the
     /// mall's 2nd storey over the ground beneath it. Used to CONTOUR overlay polylines (patrol
     /// connectors) to the walkable surface; never a routing primitive.
+    /// The floor nearest `near_y` in the 3x3 cell neighbourhood of (x, z).
+    ///
+    /// For TRACKING a surface along a path. `floor_near` looks at one cell, and a route sampled
+    /// finely crosses cells that are missing a layer its neighbours have (a mezzanine's edge notch,
+    /// a diagonal corner). Asking only that cell makes the tracked surface teleport to another
+    /// storey and reads as a huge illegal step where the walk is in fact continuous.
+    pub fn surface_near(&self, x: f32, z: f32, near_y: f32) -> Option<f32> {
+        let ix = ((x - self.min_x) / self.res).round() as i64;
+        let iz = ((z - self.min_z) / self.res).round() as i64;
+        let mut best: Option<f32> = None;
+        for dz in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (cx, cz) = (ix + dx, iz + dz);
+                if cx < 0 || cz < 0 || cx >= self.nx as i64 || cz >= self.nz as i64 {
+                    continue;
+                }
+                let c = (cz * self.nx as i64 + cx) as usize;
+                for l in 0..self.k {
+                    let h = self.h_lay(c, l);
+                    if h == self.miss {
+                        continue;
+                    }
+                    if best.map_or(true, |b: f32| (h - near_y).abs() < (b - near_y).abs()) {
+                        best = Some(h);
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Is `y` within `tol` of a walkable floor at or immediately around (x, z)?
+    ///
+    /// Deliberately samples the 3x3 cell neighbourhood, not just the containing cell. A polyline
+    /// sampled at fixed intervals crosses cell corners, and a diagonal step between two cells that
+    /// both hold a floor can pass over a corner cell that does not — reporting a large violation
+    /// for a line that is on the floor at both ends. Verified: both worst offenders found by the
+    /// route and patrol floor-adherence checks were exactly this, not real geometry violations.
+    ///
+    /// A line genuinely through a storey slab has no floor at that height anywhere nearby, so it
+    /// still fails this.
+    pub fn on_floor(&self, x: f32, z: f32, y: f32, tol: f32) -> bool {
+        let ix = ((x - self.min_x) / self.res).round() as i64;
+        let iz = ((z - self.min_z) / self.res).round() as i64;
+        for dz in -1..=1i64 {
+            for dx in -1..=1i64 {
+                let (cx, cz) = (ix + dx, iz + dz);
+                if cx < 0 || cz < 0 || cx >= self.nx as i64 || cz >= self.nz as i64 {
+                    continue;
+                }
+                let c = (cz * self.nx as i64 + cx) as usize;
+                for l in 0..self.k {
+                    let h = self.h_lay(c, l);
+                    if h != self.miss && (h - y).abs() <= tol {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Every walkable floor height stacked at this XZ, ascending. Diagnostics: lets a failure
+    /// report say WHICH storeys exist where a route floated, instead of just how far off it was.
+    pub fn floors_at(&self, x: f32, z: f32) -> Vec<f32> {
+        let c = self.cell_of(x, z);
+        if c < 0 {
+            return Vec::new();
+        }
+        (0..self.k)
+            .map(|l| self.h_lay(c as usize, l))
+            .filter(|h| *h != self.miss)
+            .map(|h| (h * 10.0).round() / 10.0)
+            .collect()
+    }
+
     pub fn floor_near(&self, x: f32, z: f32, near_y: f32) -> Option<f32> {
         let c = self.cell_of(x, z);
         if c < 0 {
@@ -1378,6 +1488,13 @@ impl NavGrid {
         let mut prev = 0usize;
         for kk in order {
             let Some((pts, d)) = legs.get(&(prev, kk)) else { break };
+            // Never splice across a relocated start (see JOIN_TOL): stop the chain instead of
+            // drawing a line through the building to reach where this leg really begins.
+            if let (Some(&last), Some(&first)) = (full.last(), pts.first()) {
+                if last.distance(first) > JOIN_TOL {
+                    break;
+                }
+            }
             if full.is_empty() {
                 full.extend_from_slice(pts);
             } else {
@@ -1406,7 +1523,13 @@ impl NavGrid {
         for i in 1..points.len() {
             let a = prev.unwrap_or(points[i - 1]);
             if let Some((pts, d)) = self.path(a, points[i], s, avoid) {
-                if pts.len() > 1 {
+                // A leg whose start was relocated is not continuous with what we have drawn so
+                // far; skip it rather than bridge it (see JOIN_TOL).
+                let joins = full
+                    .last()
+                    .zip(pts.first())
+                    .is_none_or(|(l, f)| l.distance(*f) <= JOIN_TOL);
+                if pts.len() > 1 && joins {
                     if full.is_empty() {
                         full.extend_from_slice(&pts);
                     } else {
@@ -1420,6 +1543,15 @@ impl NavGrid {
         (full.len() > 1).then_some((full, total))
     }
 }
+
+/// How far a leg's first vertex may sit from the previous leg's last before the join is a lie.
+///
+/// `path` snaps its start with a 16-cell search that can land on a DIFFERENT storey when the
+/// column holds several floors. Stitching legs with `&pts[1..]` drops that first vertex, which
+/// splices the previous endpoint straight onto the relocated one — the drawn line then crosses
+/// whatever lies between, and on interchange's stacked floors that is a ceiling. Grid res is 1 m,
+/// so a genuine join is ~0.
+const JOIN_TOL: f32 = 1.5;
 
 fn polyline_len(p: &[Vec3]) -> f32 {
     p.windows(2).map(|w| (w[1] - w[0]).length()).sum()

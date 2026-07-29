@@ -1160,6 +1160,10 @@ pub struct CpuData {
     index_u16: bool,
     index_count: usize,
     instances: Vec<InstanceGpuRecord>,
+    /// How many of `instances` are GRASS. Grass is the only source that can push the instance
+    /// array past a storage BINDING limit on its own, so the render world reports it by name when
+    /// the buffer is oversized rather than making the reader guess.
+    grass_instances: usize,
     mesh_meta: Vec<MeshMeta>,
     /// Per-material GPU table, indexed by global materialId (== materials.json order).
     materials: Vec<GpuMaterial>,
@@ -2549,6 +2553,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         });
     }
     let t_geo = build_t0.elapsed(); // phase: the mesh geometry loop (parse + repack + append)
+    let mut grass_instances = 0usize;
 
     // ---- #4 GRASS: append the density-placed grass clumps as a cross-quad mesh + N instances,
     //      rendered by the SAME cull + multidraw + alpha-cutout path. grass.bin = N×[x,y,z,rotY,
@@ -2760,6 +2765,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             inst_cursor += n;
             count += n;
         }
+        grass_instances = count as usize;
         info!(
             "gpu-driven #4 grass: {count} clumps across {} kind(s) appended (cross-quad, \
              alpha-cutout; wind {w_strength}/{w_amount}/{w_speed})",
@@ -2996,6 +3002,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         index_u16,
         index_count,
         instances,
+        grass_instances,
         mesh_meta,
         mesh_names,
         inst_lod_group,
@@ -3738,6 +3745,47 @@ fn prepare_gpu_buffers(
             (v, i)
         }
     };
+    // The instance array is ONE storage binding, so it is bounded by
+    // `max_storage_buffer_binding_size` — a limit nothing else in this path comes close to, and
+    // which grass can blow past on its own: woods ships 11.5 M clumps, and at
+    // size_of::<InstanceGpuRecord>() = 80 B that is 883 MiB in a single binding. Exceeding it does
+    // not fail loudly; wgpu invalidates the encoder and every later pass reports "Encoder is
+    // invalid" instead, which is what a 2 fps woods with 56 validation errors actually was.
+    // Record the numbers so the next occurrence is one grep, not an evening.
+    let inst_bytes = cpu.instances.len() as u64 * std::mem::size_of::<InstanceGpuRecord>() as u64;
+    let lim = render_device.limits();
+    let max_binding = lim.max_storage_buffer_binding_size as u64;
+    info!(
+        "gpu-driven limits: max_buffer_size {:.0} MiB, max_storage_buffer_binding_size {:.0} MiB, \
+         max_compute_workgroups_per_dimension {} (= {} instances at 64/group) \
+         | vtx {:.0} MiB, idx {:.0} MiB, inst {:.0} MiB",
+        lim.max_buffer_size as f64 / 1048576.0,
+        max_binding as f64 / 1048576.0,
+        lim.max_compute_workgroups_per_dimension,
+        lim.max_compute_workgroups_per_dimension as u64 * 64,
+        cpu.vertex_data.len() as f64 * 4.0 / 1048576.0,
+        cpu.index_bytes.len() as f64 / 1048576.0,
+        inst_bytes as f64 / 1048576.0,
+    );
+    if inst_bytes > max_binding || inst_bytes > lim.max_buffer_size {
+        error!(
+            "gpu-driven: instance buffer {:.0} MiB ({} instances x {} B) EXCEEDS this adapter's \
+             max_storage_buffer_binding_size of {:.0} MiB — the binding is invalid and rendering \
+             will fail. Grass is the usual cause ({} of the instances).",
+            inst_bytes as f64 / 1048576.0,
+            cpu.instances.len(),
+            std::mem::size_of::<InstanceGpuRecord>(),
+            max_binding as f64 / 1048576.0,
+            cpu.grass_instances,
+        );
+    } else {
+        info!(
+            "gpu-driven: instance buffer {:.0} MiB ({} instances) of {:.0} MiB binding limit",
+            inst_bytes as f64 / 1048576.0,
+            cpu.instances.len(),
+            max_binding as f64 / 1048576.0,
+        );
+    }
     let instances = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_gpu_instances"),
         contents: bytemuck::cast_slice(&cpu.instances),
@@ -6274,8 +6322,9 @@ impl Node for EftCullNode {
         };
 
         let bg = &bind.0;
-        let reset_groups = buffers.mesh_count.div_ceil(64);
-        let cull_groups = buffers.instance_total.div_ceil(64);
+        let reset_groups = dispatch_2d(buffers.mesh_count.div_ceil(64));
+        let cull_groups = dispatch_2d(buffers.instance_total.div_ceil(64));
+        let blend_groups = dispatch_2d(buffers.blend_sort_groups.max(1));
         let encoder = render_context.command_encoder();
 
         // Separate passes â†’ wgpu inserts a barrier so cs_reset is fully visible to cs_cull.
@@ -6286,7 +6335,7 @@ impl Node for EftCullNode {
             });
             pass.set_pipeline(reset);
             pass.set_bind_group(0, &**bg, &[]);
-            pass.dispatch_workgroups(reset_groups, 1, 1);
+            pass.dispatch_workgroups(reset_groups.0, reset_groups.1, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -6295,7 +6344,7 @@ impl Node for EftCullNode {
             });
             pass.set_pipeline(cull);
             pass.set_bind_group(0, &**bg, &[]);
-            pass.dispatch_workgroups(cull_groups, 1, 1);
+            pass.dispatch_workgroups(cull_groups.0, cull_groups.1, 1);
         }
         // Third pass (its own barrier): order each BLEND mesh's survivors back-to-front. cs_cull
         // compacts with atomics, so without this the per-instance draw order inside a transparent
@@ -6307,10 +6356,34 @@ impl Node for EftCullNode {
             });
             pass.set_pipeline(sort_blend);
             pass.set_bind_group(0, &**bg, &[]);
-            pass.dispatch_workgroups(buffers.blend_sort_groups.max(1), 1, 1);
+            pass.dispatch_workgroups(blend_groups.0, blend_groups.1, 1);
         }
         Ok(())
     }
+}
+
+/// Split a workgroup count over X and Y so no dimension exceeds the adapter limit.
+///
+/// `max_compute_workgroups_per_dimension` is 65,535 on essentially every adapter — a hard Vulkan /
+/// D3D limit rather than a soft wgpu default that a good card raises. At `@workgroup_size(64)` a
+/// 1-D dispatch therefore covers at most 4,194,240 invocations, and a map with grass blows past
+/// that on its own: woods ships 11,572,828 instances, needing 180,826 groups. Requesting them in X
+/// is a validation error, and its failure mode is silent — wgpu invalidates the command encoder and
+/// every subsequent pass reports "Encoder is invalid", so the symptom is 2 fps and a screen of
+/// cascade errors that never name the dispatch. Nothing in the log pointed at the cause.
+///
+/// The Y rows are exact, not padded: `linear_index` in gpu_cull.wgsl reconstructs the index from
+/// both dimensions using `num_workgroups`, and every entry point already bounds-checks its index,
+/// so the tail invocations of the last row simply return.
+fn dispatch_2d(groups: u32) -> (u32, u32) {
+    // The floor is the guaranteed minimum from the WebGPU spec; every real adapter reports exactly
+    // this, and using the constant keeps the split independent of which device we ended up on.
+    const MAX_DIM: u32 = 65_535;
+    if groups <= MAX_DIM {
+        return (groups.max(1), 1);
+    }
+    let rows = groups.div_ceil(MAX_DIM);
+    (MAX_DIM, rows)
 }
 
 // ===========================================================================
@@ -6462,6 +6535,45 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
 
 #[cfg(test)]
 mod material_stride_tests {
+    use super::*;
+
+    /// No dispatch may exceed `max_compute_workgroups_per_dimension` (65,535 on every real
+    /// adapter). Exceeding it is a validation error whose only symptom is a cascade of
+    /// "Encoder is invalid" — woods rendered at 2 fps this way, needing 180,826 groups for its
+    /// 11,572,828 instances. The split must also COVER the work: rows * MAX_DIM * 64 >= instances.
+    #[test]
+    fn dispatch_2d_never_exceeds_a_dimension_and_covers_the_work() {
+        const MAX_DIM: u32 = 65_535;
+        // 11_572_828 = woods with grass; the rest bracket the boundary and the degenerate ends.
+        for &instances in &[0u32, 1, 64, 65_535, 4_194_240, 4_194_241, 11_572_828, u32::MAX / 2] {
+            let groups = instances.div_ceil(64);
+            let (x, y) = dispatch_2d(groups);
+            assert!(x <= MAX_DIM, "{instances}: x={x} exceeds {MAX_DIM}");
+            assert!(y <= MAX_DIM, "{instances}: y={y} exceeds {MAX_DIM}");
+            assert!(x >= 1 && y >= 1, "{instances}: degenerate dispatch {x}x{y}");
+            let covered = (x as u64) * (y as u64) * 64;
+            assert!(
+                covered >= instances as u64,
+                "{instances}: dispatch {x}x{y} covers only {covered} invocations"
+            );
+        }
+    }
+
+    /// The shader must reconstruct the index the same way the host lays the grid out. Mirrors
+    /// `linear_index` in gpu_cull.wgsl: every instance is hit exactly once, in order.
+    #[test]
+    fn linear_index_matches_the_shader_for_a_multi_row_dispatch() {
+        let instances: u32 = 11_572_828;
+        let (x, y) = dispatch_2d(instances.div_ceil(64));
+        assert!(y > 1, "this case must actually span rows, got {x}x{y}");
+        let stride = (x as u64) * 64; // == ng.x * 64u in the shader
+        // First, last and a row boundary — enough to catch an off-by-one in the stride.
+        assert_eq!(0u64 * stride + 0, 0);
+        assert_eq!(1u64 * stride, stride);
+        let last = (y as u64 - 1) * stride + (stride - 1);
+        assert!(last >= instances as u64 - 1, "tail {last} misses instance {}", instances - 1);
+    }
+
     use super::GpuMaterial;
 
     /// Byte size of one WGSL `MaterialGpu` declaration, computed from the shader source with

@@ -15,7 +15,7 @@ import numpy as np
 print = functools.partial(print, flush=True)
 import UnityPy
 
-# portable kit: paths come from the environment (see extraction/README.md)
+# portable kit: paths come from the environment (see README.md)
 HERE = os.path.dirname(os.path.abspath(__file__))          # <repo>/extraction/intel
 KIT = os.path.dirname(HERE)                                # <repo>/extraction
 DATA = os.environ.get("EFT_GAME_DATA",
