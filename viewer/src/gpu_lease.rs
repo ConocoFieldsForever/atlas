@@ -71,6 +71,30 @@ pub fn acquire() -> Option<File> {
     None
 }
 
+/// Process-wide lease handle. `OnceLock` so the first `hold()` wins and the file stays open for
+/// the rest of the process — the OS releases it on exit by any means, including an abort.
+static HELD: std::sync::OnceLock<Option<File>> = std::sync::OnceLock::new();
+
+/// Take the lease if we haven't already. Idempotent, so every entry point that starts RENDERING A
+/// MAP can call it without coordinating.
+///
+/// Why this exists rather than one `acquire()` at startup: the menu and the viewer are the SAME
+/// process, and the lease used to be taken unconditionally for its whole lifetime. So a build
+/// launched from the menu always found the GPU "busy" — held by an idle settings screen — and every
+/// such bake silently took the CPU backend. Interchange cost 6m34s of CPU that way. The lease is
+/// meant to protect an interactive MAP view from a TDR, and a menu is not that; it is now taken
+/// when a map actually loads (`hold`), including the in-place PLAY switch out of the menu.
+pub fn hold(reason: &str) {
+    let first = HELD.get().is_none();
+    let _ = HELD.set(acquire());
+    if first {
+        eprintln!(
+            "[gpu-lease] holding = {} ({reason})",
+            HELD.get().map(|o| o.is_some()).unwrap_or(false)
+        );
+    }
+}
+
 /// Is an interactive viewer currently holding the GPU? Called by the bake worker to decide
 /// between the GPU and CPU backends.
 #[cfg(windows)]

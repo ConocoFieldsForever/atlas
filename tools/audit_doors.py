@@ -19,7 +19,7 @@ Exit code 0 = clean, 1 = at least one MISMATCH (so CI/a build script can gate on
   python tools/audit_doors.py <map> [--levels a,b,c] [--limit N] [--pack DIR]
 
 Env: EFT_GAME_DATA (game dir), EFT_TARKMAP_ROOT (maps/ + out/) -- same contract as the
-extraction kit; see extraction/README.md. ASCII output only.
+extraction kit; see README.md. ASCII output only.
 """
 import argparse
 import json

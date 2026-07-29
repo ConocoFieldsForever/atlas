@@ -382,6 +382,16 @@ impl GroundData {
                         }
                         for &ti in &g.cells[(gz as u32 * g.nx + gx as u32) as usize] {
                             let t = &g.tris[ti as usize];
+                            // AABB reject before the closest-point solve. This is not a micro-
+                            // optimisation: the grid buckets by XZ ONLY, so one cell holds every
+                            // triangle at that footprint at EVERY height — every floor, ceiling and
+                            // wall segment of a multi-storey building stacked together. On factory
+                            // that is thousands of triangles per cell, nearly all of them tens of
+                            // metres above or below a 0.16 m hull, and the drone pays the full
+                            // solve for each one on every 1 ms substep.
+                            if !tri_aabb_touches_sphere(t, p, r) {
+                                continue;
+                            }
                             let q = closest_point_on_tri(p, t);
                             let d = p - q;
                             let dist = d.length();
@@ -398,6 +408,7 @@ impl GroundData {
         }
         (p, if hit { Some(norm.normalize_or_zero()) } else { None })
     }
+
 
     /// Count geometry crossings of the segment a→b (all three classes: walls, floors, ceilings),
     /// capped at `cap`. This is the RF-occlusion query for the FPV video-link model: each
@@ -485,6 +496,28 @@ fn tri_height_at(t: &[Vec3; 3], x: f32, z: f32) -> Option<f32> {
         return None;
     }
     Some(a.y + s * (b.y - a.y) + w * (c.y - a.y))
+}
+
+/// Cheap conservative reject: does triangle `t`'s AABB come within `r` of the sphere at `p`?
+///
+/// EXACT, not approximate — a triangle whose bounding box is further than `r` from the centre on
+/// any axis cannot possibly have a point within `r`, so skipping it changes no result. It exists
+/// purely to keep `closest_point_on_tri` (a dozen dots, crosses and clamps) off the ~99% of a
+/// cell's triangles that belong to some other storey of the building.
+#[inline]
+fn tri_aabb_touches_sphere(t: &[Vec3; 3], p: Vec3, r: f32) -> bool {
+    // Y first: the grid is XZ-bucketed, so vertical separation is what rejects the overwhelming
+    // majority and it is worth testing before touching the other two axes.
+    if p.y + r < t[0].y.min(t[1].y).min(t[2].y) || p.y - r > t[0].y.max(t[1].y).max(t[2].y) {
+        return false;
+    }
+    if p.x + r < t[0].x.min(t[1].x).min(t[2].x) || p.x - r > t[0].x.max(t[1].x).max(t[2].x) {
+        return false;
+    }
+    if p.z + r < t[0].z.min(t[1].z).min(t[2].z) || p.z - r > t[0].z.max(t[1].z).max(t[2].z) {
+        return false;
+    }
+    true
 }
 
 /// Closest point on triangle `t` to point `p` (Ericson, Real-Time Collision Detection §5.1.5).

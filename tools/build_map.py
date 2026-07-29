@@ -9,7 +9,7 @@ progress panel can display them live. Exit 0 = pack ready (stamped). ASCII outpu
 Usage: python tools/build_map.py <map> [--dry-run] [--self-contained]
   --self-contained: redistribution PR3 — passed through to assemble_bevy + build_grass so
   the emitted pack copies its textures/sidecars in and references them pack-relative.
-Env (contract per extraction/README.md; unset -> legacy dev-machine defaults):
+Env (contract per README.md; unset -> legacy dev-machine defaults):
   EFT_TARKMAP_ROOT = the dir CONTAINING maps/ and out/ (a "tarkmap dir")
   EFT_ASSETS_ROOT  = the datasets dir (default: <EFT_TARKMAP_ROOT>/../eft_assets)
   EFT_PY_UNITY / EFT_PY_BAKE = UnityPy / CUDA-warp pythons (default: legacy anaconda
@@ -349,6 +349,160 @@ def derive_sea_level(dataset):
     return round(best[1] + 0.05, 3)
 
 
+def finalize_pack_manifest(pack, dataset):
+    """Reconcile the assembled manifest with what the pack + dataset ACTUALLY contain.
+
+    assemble_bevy writes the sidecar table at stage 4, but several producers run AFTER it: the
+    portable SH bake writes volume.bin/volume.json/volume_valid.bin straight into the pack, and a
+    light sidecar can be extracted (or refreshed) later. Whatever the manifest recorded at assemble
+    time is then permanently wrong, and every symptom is silent:
+
+      * volume sidecars null  -> load_sh_volume finds nothing, real_volume=false, and the map
+        renders with NO baked GI. Observed on factory_rework: the pack shipped a valid 1.6 MB
+        indirect-only volume that the manifest never referenced, so interiors were near-black.
+      * a light sidecar missing from lightsAll -> that whole bank never loads, and any power switch
+        controlling it resolves to zero light groups ("Power (no lights)"). Observed on interchange,
+        whose entire switch-controlled bank lived in an unreferenced sidecar.
+
+    So this runs LAST and points every sidecar at the file that exists, preferring the pack's own
+    copy. Absolute in-place references (the non-self-contained default) are left alone when they
+    still resolve — this only repairs what is null, missing, or superseded by a pack-local file.
+    """
+    import glob as _glob
+    mp = os.path.join(pack, "manifest.json")
+    if not os.path.isfile(mp):
+        return
+    try:
+        with open(mp, encoding="utf-8") as f:
+            man = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"  manifest: WARNING could not reconcile sidecars ({e})", flush=True)
+        return
+    sc = man.setdefault("sidecars", {})
+    fixed = []
+
+    def _pack_has(name):
+        return os.path.isfile(os.path.join(pack, name))
+
+    # --- SH irradiance volume + probe validity -------------------------------------------------
+    # volume_valid.bin is read by FIXED NAME (render/gpu_driven.rs), so recording it is
+    # documentation rather than plumbing — but a null field next to a present file reads as "this
+    # map has no validity data", which is exactly the confusion to avoid.
+    # THE PACK'S OWN VOLUME ALWAYS WINS, and the reason is correctness rather than tidiness: the
+    # bake writes volume.bin, volume.json and volume_valid.bin together, so those three AGREE about
+    # the probe grid. Point `volume` at a copy from a different bake and the validity mask is
+    # applied to the wrong grid — and it is not rejected, because the probe COUNT can match while
+    # the origin and spacing do not. Interchange was in exactly that state: it loaded a build-tree
+    # volume from 2026-07-19 while the pack's own volume_valid.bin came from the 07-27 re-bake,
+    # same 401x13x302 count, origin off by 7.6 m in Z and spacing off by 0.05 m/cell — about 20 m
+    # of drift by the far edge, masking 677,882 probes against geometry that is not where the mask
+    # thinks it is. The visible result was a mall interior that read flat and unlit.
+    #
+    # An outside reference is by definition the one that can go stale; the pack is the shipping
+    # unit. So: if the pack carries the file, use the pack's.
+    for key, name in (("volume", "volume.bin"), ("volumeMeta", "volume.json"),
+                      ("volumeVis", "volume_valid.bin")):
+        # Compare the WHOLE value — an absolute path into the build tree ends in the same file
+        # name as the pack's own, so a basename test would silently keep the stale one.
+        if _pack_has(name) and sc.get(key) != name:
+            sc[key] = name
+            fixed.append(f"{key}={name}")
+
+    # --- realtime light sidecars ---------------------------------------------------------------
+    # Union of what the manifest lists, what the pack carries and what the dataset produced, keyed
+    # by file name (the one thing an absolute path and a pack-relative one share). A pack-local
+    # copy always wins so the pack stays movable.
+    listed = list(sc.get("lightsAll") or ([sc["lights"]] if sc.get("lights") else []))
+    by_name = {}
+    for p in listed:
+        by_name.setdefault(os.path.basename(p), p)
+    for p in sorted(_glob.glob(os.path.join(dataset, "lights_*.json"))):
+        if not p.endswith("_all.json"):
+            by_name.setdefault(os.path.basename(p), p.replace("\\", "/"))
+    for name in sorted(os.path.basename(p) for p in _glob.glob(os.path.join(pack, "lights_*.json"))):
+        by_name[name] = name                    # pack-local copy supersedes any outside reference
+    merged = [by_name[k] for k in sorted(by_name)]
+    if merged and merged != listed:
+        sc["lightsAll"] = merged
+        if not sc.get("lights") or os.path.basename(str(sc["lights"])) not in by_name:
+            sc["lights"] = merged[0]
+        fixed.append(f"lightsAll={len(merged)} sidecar(s)")
+
+    if not fixed:
+        return
+    try:
+        with open(mp, "w", encoding="utf-8") as f:
+            json.dump(man, f)
+        print(f"  manifest: reconciled sidecars -> {', '.join(fixed)}", flush=True)
+    except OSError as e:
+        print(f"  manifest: WARNING could not write reconciled sidecars ({e})", flush=True)
+
+
+def verify_pack_lighting(pack):
+    """Assert the pack ships a COHERENT lighting set, and say plainly what is wrong if not.
+
+    Every symptom in this area is silent: nothing crashes, nothing logs an error, the map just
+    renders wrong. Three failures have actually happened, so each gets an explicit check:
+
+      * volume sidecars null while the pack holds a bake  -> no baked GI at all (factory_rework
+        rendered near-black interiors this way).
+      * volume from one bake, volume_valid.bin from another -> the validity mask is applied to a
+        grid it was not computed for. NOT caught by any size check, because the probe COUNT can
+        match while the origin and spacing do not; interchange drifted ~20 m at the far edge and
+        masked 677,882 probes against geometry that was not there.
+      * no volume_valid.bin -> every probe treated as valid, so light leaks through walls.
+
+    Warn-only: a pack with imperfect lighting is still valid geometry, and failing the build over
+    it would be worse than shipping it with a loud note.
+    """
+    mp = os.path.join(pack, "manifest.json")
+    try:
+        with open(mp, encoding="utf-8") as f:
+            sc = json.load(f).get("sidecars", {})
+    except (OSError, ValueError):
+        return
+    has = lambda n: os.path.isfile(os.path.join(pack, n))
+    if not has("volume.bin"):
+        print("[BUILD WARN] lighting: no SH volume in the pack - the map will render with the flat "
+              "realtime fallback. Build the viewer (`cargo build --release`) so `atlas bake-sh` can "
+              "run, then rebuild.", flush=True)
+        return
+    problems = []
+    for key, name in (("volume", "volume.bin"), ("volumeMeta", "volume.json"),
+                      ("volumeVis", "volume_valid.bin")):
+        if has(name) and sc.get(key) != name:
+            problems.append(f"manifest.{key} is {sc.get(key)!r}, not the pack's own {name}")
+    if not has("volume_valid.bin"):
+        problems.append("no volume_valid.bin - probe validity missing, so light leaks through "
+                        "geometry (this pack predates validity; a rebuild produces it)")
+    else:
+        # One byte per probe. A length that disagrees with volume.json's dims means the two came
+        # from different bakes -- the exact mismatch the viewer cannot detect.
+        try:
+            with open(os.path.join(pack, "volume.json"), encoding="utf-8") as f:
+                meta = json.load(f)
+            dims = meta.get("dims") or []
+            want = dims[0] * dims[1] * dims[2] if len(dims) == 3 else None
+            got = os.path.getsize(os.path.join(pack, "volume_valid.bin"))
+            if want and got != want:
+                problems.append(f"volume_valid.bin is {got} bytes but volume.json describes "
+                                f"{want} probes - the two are from different bakes")
+            if meta.get("direct") is not False:
+                problems.append("volume.json has no \"direct\": false - this is a FULL bake, so the "
+                                "viewer disables realtime practicals (EFT_BAKE=warp does this; the "
+                                "default `atlas bake-sh --indirect-only` is what ships the "
+                                "direct/indirect split)")
+        except (OSError, ValueError, IndexError, TypeError) as e:
+            problems.append(f"could not compare volume.json against volume_valid.bin ({e})")
+    if problems:
+        print("[BUILD WARN] lighting is incoherent in this pack:", flush=True)
+        for p in problems:
+            print(f"[BUILD WARN]   - {p}", flush=True)
+    else:
+        print("  lighting: volume + probe validity coherent, manifest points at the pack's own bake",
+              flush=True)
+
+
 def merge_gamedata_interactables(gd_path, dataset_dir, switch_levels=None):
     """Stage-6 gamedata ENRICHMENT, callable standalone. A freshly extracted gamedata.json
     lacks the pack's merged `switches` array, power tags and switch->door links — so any tool
@@ -570,7 +724,7 @@ def main():
         levels = dataset_levels(m)
         if not levels:
             print(f"[BUILD FAILED] no dataset at {dataset} and no source.levels in the map config "
-                  f"- cannot auto-extract (see extraction/README.md)", flush=True)
+                  f"- cannot auto-extract (see README.md)", flush=True)
             sys.exit(3)
         print(f"[STAGE 1/{total}] no dataset yet - running the ONE-TIME full extraction. CLOSE the "
               f"game and launcher first (file locks). This can take a long time.", flush=True)
@@ -713,24 +867,10 @@ def main():
                   flush=True)
     if os.path.isfile(os.path.join(pack, "volume.bin")):
         print("  lighting: SH irradiance volume baked into pack", flush=True)
-        # The portable CPU bake writes volume.bin/json into the pack AFTER assemble_bevy wrote the
-        # manifest, whose volume sidecars came out NULL (assemble derives them from a legacy
-        # tarkmap/out/<map> path that doesn't exist for the in-pack bake). Point the sidecars at the
-        # pack-relative files so the viewer's load_sh_volume actually finds the volume -- otherwise
-        # real_volume=false and the map renders with NO baked GI (flat + realtime-only).
-        try:
-            import json as _json
-            _mp = os.path.join(pack, "manifest.json")
-            _m = _json.load(open(_mp, encoding="utf-8"))
-            _sc = _m.setdefault("sidecars", {})
-            _sc["volume"] = "volume.bin"
-            _sc["volumeMeta"] = "volume.json"
-            if os.path.isfile(os.path.join(pack, "volume.vis.bin")):
-                _sc["volumeVis"] = "volume.vis.bin"
-            _json.dump(_m, open(_mp, "w", encoding="utf-8"))
-            print("  lighting: manifest volume sidecars -> volume.bin / volume.json (in-pack)", flush=True)
-        except Exception as _e:
-            print(f"  lighting: WARNING manifest volume-sidecar patch failed ({_e})", flush=True)
+        # The manifest is reconciled against the pack's real contents by finalize_pack_manifest()
+        # at the end of the build — one place, covering the volume AND the light sidecars. (This
+        # used to be an inline volume-only patch here, which is why a light sidecar that appeared
+        # after assemble stayed invisible.)
     else:
         print("  lighting: none (flat realtime fallback until the baker runs)", flush=True)
 
@@ -824,6 +964,13 @@ def main():
     else:
         print("  nav grid: none (routing disabled for this map until the baker runs)", flush=True)
 
+    # Reconcile the manifest with the pack LAST — after the post-assemble SH bake, the gamedata
+    # merge and the icon fetch have all had their say. Everything that writes into the pack after
+    # stage 4 lands before this point, so a freshly built map never ships a sidecar table that
+    # disagrees with its own directory.
+    finalize_pack_manifest(pack, dataset)
+    verify_pack_lighting(pack)
+
     # 9: stamp the game fingerprint (menu update detection)
     run(9, total, "stamp fingerprint",
         [PY, os.path.join(HERE, "stamp_fingerprint.py"), pack], VIEWER)
@@ -840,7 +987,7 @@ def main():
     if expects_light and not (have_lights or have_sh):
         print(f"[BUILD WARN] no lighting for {m}: no *_Light extract and no SH bake - interiors "
               f"will be dark/flat. Run the light extract and/or the CUDA SH bake "
-              f"(see extraction/README.md) then rebuild.", flush=True)
+              f"(see README.md) then rebuild.", flush=True)
         print(f"[BUILD OK] pack ready (WARNING: no lighting for {m})", flush=True)
     else:
         print("[BUILD OK] pack ready", flush=True)

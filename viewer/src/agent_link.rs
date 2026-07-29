@@ -401,13 +401,14 @@ fn params_json(p: &DroneParams) -> Value {
     json!({
         "mass": p.mass, "gravity": p.gravity, "max_thrust": p.max_thrust,
         "hover_throttle": p.hover_throttle(),
-        "drag_q": p.drag_q, "drag_l": p.drag_l,
+        "drag_q_axial": p.drag_q_axial, "drag_q_side": p.drag_q_side, "drag_l": p.drag_l,
         "max_rate_rad": [p.max_rate.x, p.max_rate.y, p.max_rate.z],
         "rate_tau": p.rate_tau, "rate_tau_yaw": p.rate_tau_yaw, "thrust_tau": p.thrust_tau,
         "propwash": p.propwash,
         "max_tilt_rad": p.max_tilt, "tilt_tau": p.tilt_tau,
         "cam_tilt_rad": p.cam_tilt, "radius": drone::DRONE_RADIUS,
-        "restitution": p.restitution, "crash_speed": p.crash_speed,
+        "restitution": p.restitution, "contact_tau": p.contact_tau,
+        "crash_speed": p.crash_speed,
     })
 }
 

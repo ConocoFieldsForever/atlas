@@ -100,6 +100,7 @@ pub enum K {
     FirstRunBanner,
     FirstBuildHint,
     PlayNeedsSync,
+    PlayBusyBuilding,
     LanguageTip,
     ProcessInBackground,
     ProcessInBackgroundTip,
@@ -292,6 +293,10 @@ fn pair(k: K) -> [&'static str; 2] {
             "Sync tarkov.dev before playing (SYNC NOW, top) - loot/spawns/intel come from it.",
             "Синхронизируйте tarkov.dev перед игрой (SYNC NOW, сверху) - оттуда лут/спавны/данные.",
         ],
+        PlayBusyBuilding => [
+            "A map is building - the lighting bake needs the GPU. PLAY unlocks when it finishes.",
+            "Идёт сборка карты - запеканию света нужен GPU. PLAY разблокируется после её окончания.",
+        ],
         LanguageTip => ["Language / Язык (override auto-detect)", "Язык / Language (переопределить)"],
         ProcessInBackground => ["Process in background", "Обрабатывать в фоне"],
         ProcessInBackgroundTip => [
@@ -382,8 +387,8 @@ Atlas читает только файлы, которые игра уже за�
             "EFT записывает полноразмерный PNG при каждом нажатии клавиши скриншота и никогда их не удаляет. Atlas удаляет ТОЛЬКО те скриншоты, из которых уже прочитал позицию; всё, что не удалось разобрать, остаётся на месте.",
         ],
         OverlayBorderlessNote => [
-            "Tarkov must run BORDERLESS - nothing can draw over exclusive fullscreen.",
-            "Тарков должен работать В РЕЖИМЕ ОКНА БЕЗ РАМКИ - поверх полноэкранного режима ничего показать нельзя.",
+            "Works with Tarkov in WINDOWED or BORDERLESS - nothing can draw over exclusive fullscreen.",
+            "Работает, если Тарков запущен В ОКНЕ или БЕЗ РАМКИ - поверх полноэкранного режима ничего показать нельзя.",
         ],
         LiveLinkNote => [
             "Atlas follows your raid from the game's own logs and turns each in-raid screenshot into a position fix. It only reads files the game already wrote.",

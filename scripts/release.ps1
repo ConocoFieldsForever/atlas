@@ -62,9 +62,9 @@ foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","g
     Copy-Item "viewer\assets\shaders\$sh" "$dist\assets\shaders\"
 }
 # README.md is the friendly non-dev guide (first-run + SmartScreen "Run anyway" steps);
-# README_DIST.md is the technical/env-toggle reference. Ship both.
+# README.md is the technical/env-toggle reference. Ship both.
 Copy-Item "README.md" $dist -ErrorAction SilentlyContinue
-Copy-Item "README_DIST.md" $dist -ErrorAction SilentlyContinue
+Copy-Item "README.md" $dist -ErrorAction SilentlyContinue
 Copy-Item "LICENSE-NOTES.md" $dist -ErrorAction SilentlyContinue
 # Field-test protocol for the target-GPU testers (RTX 4060 / RX 6800 round): ships at the zip
 # root so a tester can't miss it.

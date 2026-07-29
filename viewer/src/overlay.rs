@@ -9,10 +9,12 @@
 //! per-pixel alpha under the Vulkan-only + `panic = "abort"` policy is an ABORT risk rather than a
 //! degraded look, and click-through sets the documented external-ESP window fingerprint.
 //!
-//! EFT MUST RUN BORDERLESS. No ordinary window can appear over exclusive fullscreen; that is a
-//! platform rule, not a bug we can code around. The failure is nasty (the user presses `~`, gets
-//! nothing visible, and their WASD is flying a camera they cannot see) so `OverlayConfig` carries
-//! the notice the UI shows.
+//! EFT MUST NOT BE IN EXCLUSIVE FULLSCREEN. No ordinary window can appear over it; that is a
+//! platform rule, not a bug we can code around. WINDOWED and BORDERLESS both work: the panel is
+//! placed against the game's CLIENT rect, so it centres on the picture in either mode (in windowed
+//! the frame's title bar and borders are excluded, which a window-rect placement got wrong). The
+//! exclusive-fullscreen failure is nasty — the user presses `~`, sees nothing, and their WASD is
+//! flying a camera they cannot see — so `OverlayConfig` carries the notice the UI shows.
 //!
 //! HOW IT IS SUMMONED: the player's own IN-GAME SCREENSHOT KEY. EFT writes the position into the
 //! screenshot filename, the game-watch thread turns it into a fix, and the fix raises the overlay
@@ -25,6 +27,132 @@
 use bevy::prelude::*;
 use bevy::window::{MonitorSelection, PrimaryWindow, WindowLevel, WindowPosition};
 use bevy::winit::UpdateMode;
+
+/// Where the overlay should place itself: the GAME's window rect when we can see it, else the
+/// monitor. `(origin, size)` in physical desktop pixels.
+type TargetRect = (IVec2, Vec2);
+
+/// Unity titles a game's window with its PRODUCT NAME, and EFT's is recorded first-party in
+/// `EscapeFromTarkov_Data/app.info` (line 1 company, line 2 product): `EscapeFromTarkov`.
+/// Case-insensitive and space-insensitive so a spaced or differently-cased variant still matches,
+/// but anchored at the start so an unrelated window that merely mentions the game — a browser tab,
+/// a wiki page, our own title bar — can never be mistaken for it.
+fn title_is_game(title: &str) -> bool {
+    let norm = title.trim().to_ascii_lowercase().replace(' ', "");
+    let Some(rest) = norm.strip_prefix("escapefromtarkov") else {
+        return false;
+    };
+    // The token must END the title or be followed by a separator. A bare `starts_with` also
+    // accepted "Escape From Tarkov Wiki - Chrome" (spaces removed: "escapefromtarkovwiki..."),
+    // which would have parked the overlay on a browser window; Unity's own suffixes are
+    // punctuation-led (" - Direct3D 11"), so they still match.
+    rest.is_empty() || !rest.starts_with(|c: char| c.is_ascii_alphanumeric())
+}
+
+/// Locate EFT's top-level window so the overlay can centre itself ON THE GAME rather than on the
+/// monitor. Returns its physical rect, or `None` when the game isn't up.
+///
+/// This is a WINDOW-MANAGER query, deliberately not a process one: it enumerates top-level windows
+/// and reads a title and a rectangle. It opens no process handle, reads no game memory, installs no
+/// hook and synthesises no input — so it stays on the right side of the line this module and
+/// `game_watch` draw (see the module header: the rejected techniques are click-through, per-pixel
+/// alpha, `RegisterHotKey`, keyboard hooks and `SendInput`). Any window manager, capture tool or
+/// screen recorder makes exactly these calls.
+///
+/// Declared against user32 directly rather than pulling in the `windows` crate: two functions and a
+/// callback do not justify a dependency, and this file is the only caller.
+#[cfg(windows)]
+fn game_window_rect() -> Option<TargetRect> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: extern "system" fn(*mut c_void, isize) -> i32, param: isize) -> i32;
+        fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, len: i32) -> i32;
+        fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
+        fn ClientToScreen(hwnd: *mut c_void, pt: *mut Point) -> i32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn IsIconic(hwnd: *mut c_void) -> i32;
+    }
+
+    /// Collected by the callback: the first visible window whose title matches the game.
+    struct Found(Option<Rect>);
+
+    extern "system" fn enum_cb(hwnd: *mut c_void, param: isize) -> i32 {
+        // SAFETY: `param` is the &mut Found we passed to EnumWindows, valid for the whole call.
+        let found = unsafe { &mut *(param as *mut Found) };
+        if found.0.is_some() {
+            return 0; // stop enumerating
+        }
+        unsafe {
+            // A minimised game is not something to centre on — fall through to the monitor.
+            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return 1;
+            }
+            let mut buf = [0u16; 256];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n <= 0 {
+                return 1;
+            }
+            let title = String::from_utf16_lossy(&buf[..n as usize]);
+            if title_is_game(&title) {
+                // CLIENT area, not the window frame. In WINDOWED mode GetWindowRect includes the
+                // title bar and borders, so centring on it puts the panel a title-bar's height too
+                // high and off-centre by the border widths — visibly wrong against the game's
+                // picture. GetClientRect gives the render area; ClientToScreen puts its origin on
+                // the desktop. Borderless collapses to the same rect, so one path covers both.
+                let mut c = Rect::default();
+                if GetClientRect(hwnd, &mut c) == 0 {
+                    return 1;
+                }
+                let mut origin = Point { x: 0, y: 0 };
+                if ClientToScreen(hwnd, &mut origin) == 0 {
+                    return 1;
+                }
+                found.0 = Some(Rect {
+                    left: origin.x,
+                    top: origin.y,
+                    right: origin.x + (c.right - c.left),
+                    bottom: origin.y + (c.bottom - c.top),
+                });
+                return 0;
+            }
+        }
+        1
+    }
+
+    let mut found = Found(None);
+    unsafe { EnumWindows(enum_cb, &mut found as *mut Found as isize) };
+    let r = found.0?;
+    let (w, h) = ((r.right - r.left) as f32, (r.bottom - r.top) as f32);
+    // A minimised window reports a degenerate/off-screen rect; treat anything implausible as "no
+    // game window" so we fall back to the monitor instead of placing the overlay off-screen.
+    if w < 320.0 || h < 240.0 {
+        return None;
+    }
+    Some((IVec2::new(r.left, r.top), Vec2::new(w, h)))
+}
+
+#[cfg(not(windows))]
+fn game_window_rect() -> Option<TargetRect> {
+    None
+}
 
 /// Everything the overlay's behaviour is configured by — ONE struct so the menu UI can bind to it
 /// directly and `atlas.config.json` has one obvious home for these keys. Runtime state (is it up
@@ -86,7 +214,11 @@ impl Default for OverlayConfig {
             always_on_top: true,
             borderless: true,
             size_frac: Vec2::new(0.55, 0.6),
-            anchor: Vec2::new(1.0, 0.0), // top-right: out of the way of most HUDs
+            // CENTRED over the game window. The old top-right default put the panel under the
+            // stamina/hydration cluster on wide monitors, and on a multi-monitor desk it anchored
+            // to the primary screen rather than the one EFT was on. Centre is where the eye already
+            // is when you summon a map, and `anchor` still moves it if you want a corner.
+            anchor: Vec2::splat(0.5),
             fps_cap: 60,
             pause_when_hidden: true,
             show_on_screenshot: true,
@@ -94,6 +226,35 @@ impl Default for OverlayConfig {
             delete_processed_shots: true,
         }
     }
+}
+
+/// The anchor the overlay shipped with before it centred on the game window.
+const LEGACY_ANCHOR: Vec2 = Vec2::new(1.0, 0.0); // top-right
+
+/// Read the persisted anchor, migrating anyone still sitting on the OLD default exactly once.
+///
+/// Changing a `Default` does nothing for an existing install: `atlas.config.json` already holds
+/// `overlayAnchorX/Y`, so every current user kept getting the panel jammed against the right edge
+/// no matter what the code's default said. A value that is byte-for-byte the old default was never
+/// a choice — it is just what the app wrote out — so it moves to centre. Anything else is a real
+/// preference and is left alone, and the one-shot flag means a user who deliberately picks
+/// top-right afterwards keeps it.
+fn load_anchor(default: Vec2) -> Vec2 {
+    let stored = Vec2::new(
+        crate::menu::config_f32_pub("overlayAnchorX").unwrap_or(default.x),
+        crate::menu::config_f32_pub("overlayAnchorY").unwrap_or(default.y),
+    );
+    if crate::menu::config_bool_pub("overlayAnchorMigrated").unwrap_or(false) {
+        return stored;
+    }
+    let _ = crate::menu::save_config_bool_pub("overlayAnchorMigrated", true);
+    if (stored - LEGACY_ANCHOR).abs().max_element() < 1e-3 {
+        let _ = crate::menu::save_config_f32_pub("overlayAnchorX", default.x);
+        let _ = crate::menu::save_config_f32_pub("overlayAnchorY", default.y);
+        info!("overlay: anchor migrated from the old top-right default to centre-on-game");
+        return default;
+    }
+    stored
 }
 
 impl OverlayConfig {
@@ -110,10 +271,7 @@ impl OverlayConfig {
                 crate::menu::config_f32_pub("overlayWidthFrac").unwrap_or(d.size_frac.x),
                 crate::menu::config_f32_pub("overlayHeightFrac").unwrap_or(d.size_frac.y),
             ),
-            anchor: Vec2::new(
-                crate::menu::config_f32_pub("overlayAnchorX").unwrap_or(d.anchor.x),
-                crate::menu::config_f32_pub("overlayAnchorY").unwrap_or(d.anchor.y),
-            ),
+            anchor: load_anchor(d.anchor),
             fps_cap: crate::menu::config_f32_pub("overlayFpsCap").unwrap_or(d.fps_cap as f32) as u32,
             pause_when_hidden: crate::menu::config_bool_pub("overlayPauseWhenHidden")
                 .unwrap_or(d.pause_when_hidden),
@@ -256,16 +414,40 @@ fn apply_overlay(
         win.visible = true;
         win.set_minimized(false); // we may have minimised ourselves to hand the game focus back
         win.focused = true;       // ask Windows to raise + give US the keyboard
-        // Panel geometry from the monitor size: `size_frac` of it, `anchor` sliding it within the
-        // leftover space (0,0 = top-left .. 1,1 = bottom-right). Falls back to centring when the
-        // monitor size isn't known yet (first frames), which is never wrong, only less precise.
-        if let Some(mon) = monitors.iter().next().or_else(|| any_monitor.iter().next()) {
-            let (mw, mh) = (mon.physical_width as f32, mon.physical_height as f32);
-            let w = (mw * cfg.size_frac.x).round().max(320.0);
-            let h = (mh * cfg.size_frac.y).round().max(240.0);
+        // Panel geometry is measured against THE GAME'S WINDOW when we can see it, and the monitor
+        // otherwise. Anchoring to the monitor was subtly wrong in two ways the user hits in
+        // practice: on a multi-monitor desk the overlay landed on the PRIMARY monitor even when EFT
+        // was running on another one, and in borderless-windowed the panel drifted off the game
+        // entirely. Centring on the game's own rect is right in every configuration, and collapses
+        // to the old behaviour when the game isn't up (the rect then IS the monitor, since the
+        // overlay only functions over a borderless game — see the module header).
+        let on_game = game_window_rect();
+        let target: Option<TargetRect> = on_game.or_else(|| {
+            monitors
+                .iter()
+                .next()
+                .or_else(|| any_monitor.iter().next())
+                .map(|mon| {
+                    (
+                        mon.physical_position,
+                        Vec2::new(mon.physical_width as f32, mon.physical_height as f32),
+                    )
+                })
+        });
+        if let Some((origin, size)) = target {
+            // Clamp to the target as well as to a usable minimum. A WINDOWED game can be smaller
+            // than the 320x240 floor implies — at 1280x720 a 55%x60% panel is 704x432, fine, but a
+            // user running the game in a small window would otherwise get a panel wider than the
+            // thing it is supposed to sit on. `min` keeps it inside; `max` keeps it legible; the
+            // min-of-max ordering means a genuinely tiny game window yields a panel that matches it
+            // rather than one that overhangs.
+            let w = (size.x * cfg.size_frac.x).round().max(320.0).min(size.x.max(320.0));
+            let h = (size.y * cfg.size_frac.y).round().max(240.0).min(size.y.max(240.0));
             win.resolution.set(w, h);
-            let x = ((mw - w) * cfg.anchor.x).round() as i32 + mon.physical_position.x;
-            let y = ((mh - h) * cfg.anchor.y).round() as i32 + mon.physical_position.y;
+            // `anchor` still slides the panel inside the leftover space, so a user who prefers a
+            // corner keeps it; the DEFAULT is now the centre.
+            let x = ((size.x - w) * cfg.anchor.x).round() as i32 + origin.x;
+            let y = ((size.y - h) * cfg.anchor.y).round() as i32 + origin.y;
             win.position = WindowPosition::At(IVec2::new(x, y));
         } else {
             win.position = WindowPosition::Centered(MonitorSelection::Primary);
@@ -284,12 +466,23 @@ fn apply_overlay(
         } else {
             UpdateMode::Continuous
         };
+        // Say WHICH rect we anchored to. "The overlay opened somewhere unexpected" is otherwise
+        // undiagnosable from a log, and the two cases look identical on a single-monitor desk.
         info!(
-            "overlay: shown (borderless={}, always_on_top={}, {:.0}%x{:.0}% of monitor, unfocused cap {} fps)",
+            "overlay: shown (borderless={}, always_on_top={}, {:.0}%x{:.0}% of {}, unfocused cap {} fps)",
             cfg.borderless,
             cfg.always_on_top,
             cfg.size_frac.x * 100.0,
             cfg.size_frac.y * 100.0,
+            match (on_game, target) {
+                (Some(_), Some((o, s))) =>
+                    format!("the GAME window {}x{} at {},{}", s.x as i32, s.y as i32, o.x, o.y),
+                (None, Some((o, s))) => format!(
+                    "the monitor {}x{} at {},{} (game window not found)",
+                    s.x as i32, s.y as i32, o.x, o.y
+                ),
+                _ => "the primary monitor (size unknown)".to_string(),
+            },
             cfg.fps_cap
         );
     } else {
@@ -380,4 +573,72 @@ fn overlay_return_button(
                 ui.label(RichText::new(t(lg, K::OverlayReopenHint)).size(10.0).color(theme::MUTED));
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The window title we match on is the game's own Unity PRODUCT NAME, which it records in
+    /// `EscapeFromTarkov_Data/app.info` (line 1 company, line 2 product). Assert the matcher
+    /// accepts whatever that file actually says rather than a name someone typed here — if BSG
+    /// ever renames the product, this fails instead of the overlay silently drifting back to
+    /// monitor-centring. Skips cleanly where the game isn't installed.
+    #[test]
+    fn matcher_accepts_the_games_own_product_name() {
+        let dir = crate::menu::detect_game_dir();
+        let Ok(info) = std::fs::read_to_string(std::path::Path::new(&dir).join("app.info")) else {
+            return; // game not installed here — nothing to check against
+        };
+        let Some(product) = info.lines().nth(1).map(str::trim).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        assert!(
+            title_is_game(product),
+            "app.info product {product:?} no longer matches the overlay's window-title rule"
+        );
+    }
+
+    /// A window that merely mentions the game must not capture the overlay.
+    #[test]
+    fn matcher_rejects_lookalikes() {
+        assert!(title_is_game("EscapeFromTarkov"));
+        assert!(title_is_game("escape from tarkov"));
+        assert!(title_is_game("EscapeFromTarkov - Direct3D 11"));
+        assert!(!title_is_game("Atlas"));
+        assert!(!title_is_game("Escape From Tarkov Wiki - Chrome"));
+        assert!(!title_is_game(""));
+    }
+
+    /// The Win32 declarations must actually work: enumerating top-level windows has to run without
+    /// tripping the FFI and return either nothing or a plausible rect — never a degenerate one.
+    /// (The game is usually not running while tests are, so `None` is the expected pass.)
+    #[test]
+    #[cfg(windows)]
+    fn window_lookup_runs_and_returns_a_sane_rect() {
+        if let Some((_origin, size)) = game_window_rect() {
+            assert!(size.x >= 320.0 && size.y >= 240.0, "degenerate rect {size:?}");
+            assert!(size.x < 32_768.0 && size.y < 32_768.0, "implausible rect {size:?}");
+        }
+    }
+
+    /// The WINDOWED case, checked against a real window rather than reasoned about: with a stand-in
+    /// titled like the game on screen, `EFT_TEST_CLIENT_RECT="x,y,w,h"` carries that window's true
+    /// CLIENT rect and this asserts we report exactly it. That is the whole point of the
+    /// GetClientRect/ClientToScreen path — a GetWindowRect placement returns the outer frame, which
+    /// in windowed mode is offset by the title bar and wider by the borders, so the overlay would
+    /// sit visibly high and off-centre over the game's picture. Skipped when the var is unset.
+    #[test]
+    #[cfg(windows)]
+    fn windowed_lookup_reports_the_client_rect_not_the_frame() {
+        let Ok(spec) = std::env::var("EFT_TEST_CLIENT_RECT") else { return };
+        let v: Vec<i32> = spec.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+        assert_eq!(v.len(), 4, "EFT_TEST_CLIENT_RECT must be x,y,w,h");
+        let (origin, size) = game_window_rect().expect("stand-in game window not found");
+        assert_eq!(
+            (origin.x, origin.y, size.x as i32, size.y as i32),
+            (v[0], v[1], v[2], v[3]),
+            "reported rect is the window FRAME, not the client area"
+        );
+    }
 }

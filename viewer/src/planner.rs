@@ -460,8 +460,20 @@ fn solve(
         let mut legs: Vec<f32> = Vec::new();
         let mut total = 0.0f32;
         let mut unreachable: Option<usize> = None;
+        // A routed leg does not necessarily BEGIN where the previous one ended: `NavGrid::path`
+        // snaps the start with a 16-cell search that can land on a different storey when the
+        // column holds several floors. Dropping the leg's first vertex (`&p[1..]`) then splices
+        // the previous endpoint straight onto the relocated one, and the plan line jumps through
+        // whatever is between — on interchange's stacked floors, through a ceiling. If the start
+        // moved, we did not actually find a walk from the last stop to this one, so treat it as
+        // unreachable and let the existing re-thread drop the stop.
+        const JOIN_TOL: f32 = 1.5; // metres; grid res is 1 m, so a real join is ~0
         for (k, &ci) in tour.iter().enumerate() {
             match grid.path(cur, cands[ci].pos, &mut s, avoid) {
+                Some((p, _)) if !poly.is_empty() && p[0].distance(cur) > JOIN_TOL => {
+                    unreachable = Some(k);
+                    break;
+                }
                 Some((p, d)) => {
                     if poly.is_empty() {
                         poly.extend_from_slice(&p);
@@ -485,6 +497,16 @@ fn solve(
         let Some((exp, exd)) = grid.path(cur, ex.1, &mut s, avoid) else {
             return Err("no walkable path to any extract".into());
         };
+        // Same guard on the final leg. Rather than failing the whole plan, drop the last stop and
+        // re-thread — the tour is what stranded us, and a shorter plan beats a plan whose exit leg
+        // is a line through a building.
+        if exp[0].distance(cur) > JOIN_TOL {
+            if tour.len() > 1 {
+                tour.pop();
+                continue;
+            }
+            return Err("no walkable path to any extract".into());
+        }
         total += exd;
         let loot_time: f32 = tour.iter().map(|&ci| cands[ci].loot_s).sum();
         let total_time = total / WALK_MPS + loot_time + EXTRACT_BUFFER_S;
@@ -500,6 +522,35 @@ fn solve(
             continue;
         }
         poly.extend_from_slice(&exp[1..]);
+        // INVARIANT: the drawn plan never leaves the walkable floor. The failure this guards is
+        // silent by nature — a spliced leg join draws a clean straight line through a storey slab
+        // and looks like a route — so assert it on the finished polyline rather than trusting the
+        // construction. `on_floor` samples the 3x3 cell neighbourhood, so a diagonal step across a
+        // corner notch does not trip it; only a line with no floor at that height anywhere near it.
+        {
+            let mut off = 0usize;
+            let (mut worst, mut at) = (0.0f32, Vec3::ZERO);
+            for w in poly.windows(2) {
+                let n = (w[0].distance(w[1]) / 1.0).ceil().max(1.0) as usize;
+                for i in 0..=n {
+                    let p = w[0].lerp(w[1], i as f32 / n as f32);
+                    if !grid.on_floor(p.x, p.z, p.y, 1.5) {
+                        off += 1;
+                        let d = grid.floor_near(p.x, p.z, p.y).map_or(99.0, |f| (p.y - f).abs());
+                        if d > worst {
+                            worst = d;
+                            at = p;
+                        }
+                    }
+                }
+            }
+            if off > 0 {
+                warn!(
+                    "loot plan route leaves the floor at {off} sampled metre(s), worst {worst:.1} m                      at ({:.1},{:.1},{:.1}) — the drawn line is not a walkable route there",
+                    at.x, at.y, at.z
+                );
+            }
+        }
         let stops: Vec<PlanStop> = tour
             .iter()
             .zip(legs.iter())

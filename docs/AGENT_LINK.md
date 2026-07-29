@@ -91,15 +91,23 @@ the same action for N control ticks (frame-skip); `collided`/`impact` aggregate 
 ## Flight model (and its honest limits)
 
 Modeled: real gravity 9.81; thrust only along body-up (max ≈ 4.2× weight — 5" freestyle class)
-with a **motor-spool lag** (`thrust_tau` 50 ms — punch-outs ramp); quadratic + linear airframe
-drag (flat-out top speed ≈ 50 m/s and dead-stick terminal fall ≈ 25 m/s both emerge from the
-same balance — a cut quad keeps accelerating for seconds); **per-axis** first-order rate response —
+with a **motor-spool lag** (`thrust_tau` 50 ms — punch-outs ramp); **anisotropic body-frame
+airframe drag** (the standard multirotor form `D = -C·|v|·v`, `C = diag(side, axial, side)`): the
+prop-disk axis presents ~6× the frontal area of the edge-on axes, so `drag_q_axial` sets the
+dead-stick terminal fall ≈ 12.5 m/s *and* — because holding altitude at speed forces ~50° of pitch,
+swinging that axis into the flow — the flat-out top speed ≈ 26 m/s, while the much smaller
+`drag_q_side` governs how far a cut quad carries its forward momentum. Attitude therefore changes
+drag, so nosing over to shed it works. On top sits the rotors' in-plane H-force (`drag_l`, linear
+in airspeed, ∝ rpm ≈ √thrust, disk-plane only), which fades out with the motors; **per-axis**
+first-order rate response —
 pitch/roll via thrust differential (`rate_tau` 45 ms), yaw via prop torque only
 (`rate_tau_yaw` 110 ms, visibly lazier, like every real quad); **propwash** — deterministic
 band-limited attitude turbulence when descending into the prop's own wake at low forward speed
-(`propwash` reset knob, 0 disables); angle & acro control; sphere collision (r = 0.16 m) against
-the map's **ground + wall + ceiling** triangle grids with restitution and a crash threshold;
-constant wind, action noise, actuation latency.
+(`propwash` reset knob, 0 disables; scales with spooled thrust, so a dead-stick quad rides smooth);
+angle & acro control; sphere collision (r = 0.16 m) against the map's **ground + wall + ceiling**
+triangle grids, with a normal-direction `restitution`, tangential contact friction on a time
+constant (`contact_tau` — substep-invariant, so ground friction does not vary with the host's
+framerate) and a crash threshold; constant wind, action noise, actuation latency.
 
 Agent actions map **linearly** to body-rate commands (±`max_rate`); the Betaflight rate curve
 (RC rate / expo / super rate) is a manual-flight input shaping and does not apply to the wire

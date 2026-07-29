@@ -1586,6 +1586,9 @@ impl Baked {
             "min_region_area": a.min_region_area,
             "agent_source": a.source,
             "baker": "atlas-cpu-bvh",
+            // Read back by NavGrid::load; a mismatch is reported at error level. See
+            // crate::nav::BAKER_VERSION for the bump policy.
+            "baker_version": crate::nav::BAKER_VERSION,
             "index": "iz*nx+ix",
             "layout": "nav.bin: (iz*nx+ix)*K + layer -> f32 height (asc, MISS empty); nav_door.bin: u8 per cell",
             "nav_blk": "u8[nx*nz*K] 8-dir edge mask (bit d = edge to NB[d] blocked by a thin wall/fence; player-capsule second pass)",
@@ -1836,6 +1839,97 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     // reverse bit is set independently when the neighbour cell processes its own outgoing edge.
     let t_bvh_w = Instant::now();
     let wall_bvh = WallBvh::build(walls);
+
+    // ---- AGENT-CLEARANCE PASS (Recast `rcErodeWalkableArea`, done properly) --------------------
+    //
+    // The existing footprint erosion asks "is there still FLOOR beside this cell?" — it never asks
+    // "is there a WALL next to it?". A cell 0.1 m from a wall passes it: floor exists on all four
+    // sides. So the walkable set contains cells the player capsule does not fit in, and the router
+    // then needs a separate per-edge capsule mask (`blk`) to stop routes squeezing through. That
+    // mask is what severs connectivity — it takes wall-crossings from 3814 to 75 but costs 57 of
+    // 256 legs, and at finer resolutions it severs harder.
+    //
+    // Unity does not work that way. Recast erodes the walkable field by `agentRadius` ONCE, and
+    // connectivity is then plain adjacency in what survives. Do the same: delete any floor whose
+    // agent body box intersects a wall. The box is [±r] in XZ over [h+FOOT, h+agentHeight], with
+    // r = the game's own agentRadius.
+    //
+    // The payoff is structural. Once every walkable cell is >= r from any wall, two ORTHOGONALLY
+    // adjacent walkable cells cannot have a wall between them whenever `res <= 2r` — the wall would
+    // have to be within r of one of the two centres. So at res <= 0.6 m the wall-crossing guarantee
+    // comes from geometry instead of from a mask, and `blk` can go. (Diagonals span res*sqrt(2) and
+    // need res <= 0.42 for the same argument; below that they rely on the existing `diag_ok`
+    // two-orthogonal rule, which is why diagonals keep it.)
+    //
+    // MEASURED against the alternatives on interchange, every config on the same fixed,
+    // game-derived inputs (231 patrol legs BSG asserts a bot walks; 278 spawns -> Emercom):
+    //
+    //   res  clearance  blk | wall-cross  reach AFTER/BEFORE  ledge-violations  patrol  spawns
+    //   1.0    off      on  |     14          193 / 250        1013 @ 1.40 m    219/231  278/278
+    //   0.5    ON       off |    187          176 / 185              0          217/231  278/278
+    //   0.5    ON       ON  |      0          191 / 191              0          216/231  278/278
+    //   0.5    off      on  |      4          163 / 232              0             -        -
+    //
+    // Read the `191 / 191` row: with clearance on, `blk` costs NOTHING. It cost 57 legs at 1.0 m
+    // and 69 at 0.5 m without clearance. That is the whole point — once the walkable set is
+    // capsule-consistent, the per-edge mask has nothing left to block, and the two mechanisms stop
+    // fighting. Dropping `blk` instead (the 187 row) fails badly: `diag_ok` is DRIVEN by blk, so
+    // turning it off also disables the diagonal guard, and the simplifier loses its wall guard.
+    //
+    // Off with `EFT_NAV_CLEARANCE=0` for A/B.
+    let clearance_on = std::env::var("EFT_NAV_CLEARANCE").as_deref() != Ok("0");
+    if clearance_on && !wall_bvh.tris.is_empty() {
+        let t_clr = Instant::now();
+        let a = agent();
+        let (r, body) = (a.radius, a.height);
+        const FOOT: f32 = 0.05; // clear the skirting a wall's base tri sits on
+        let removed = std::sync::atomic::AtomicUsize::new(0);
+        heights.par_chunks_mut(k).enumerate().for_each_init(
+            || Vec::<u32>::with_capacity(64),
+            |wstack, (c, hs)| {
+                // Doors are exempt for the same reason they are exempt everywhere else: a doorway
+                // is narrower than the agent by design, and the game models it as passable.
+                if door[c] != 0 {
+                    return;
+                }
+                let ix = c % nx;
+                let iz = c / nx;
+                let cx = min_x + ix as f32 * res;
+                let cz = min_z + iz as f32 * res;
+                let mut w = 0usize;
+                for l in 0..k {
+                    let h = hs[l];
+                    if h <= MISS_HALF {
+                        break; // ascending, MISS trails
+                    }
+                    let bmin = Vec3::new(cx - r, h + FOOT, cz - r);
+                    let bmax = Vec3::new(cx + r, h + body, cz + r);
+                    if wall_bvh.box_overlaps(bmin, bmax, wstack) {
+                        removed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue; // capsule does not fit — not walkable
+                    }
+                    hs[w] = h;
+                    w += 1;
+                }
+                // Re-compact: the nav.bin invariant is floors ASCENDING with MISS trailing, and
+                // every reader breaks at the first MISS.
+                for l in w..k {
+                    hs[l] = MISS;
+                }
+            },
+        );
+        eprintln!(
+            "  nav-bake: agent-clearance pass (r={r:.2} m, body={body:.2} m): removed {} floor(s) \
+             the player capsule does not fit in, in {:.2}s",
+            removed.load(std::sync::atomic::Ordering::Relaxed),
+            t_clr.elapsed().as_secs_f32()
+        );
+    }
+
+    // `blk`/`wall_cell` exist to stop routes squeezing past walls the cell-centre sample missed.
+    // With the clearance pass on they are redundant by construction (see above), and they are the
+    // main cost to connectivity, so allow turning them off: `EFT_NAV_BLK=0`.
+    let blk_on = std::env::var("EFT_NAV_BLK").as_deref() != Ok("0");
     let t_blk = Instant::now();
     let mut blk = vec![0u8; m];
     // Per-cell "a wall occupies my body column" flag (see WallBvh::box_overlaps). Half-extent =
@@ -1843,7 +1937,7 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     // (±res/2) could clip within ±PLAYER_RADIUS — the sub-cell walls the per-edge blk mask misses.
     let mut wall_cell = vec![0u8; cells];
     let wc_half = res * 0.5 + PLAYER_RADIUS;
-    if !wall_bvh.tris.is_empty() {
+    if blk_on && !wall_bvh.tris.is_empty() {
         blk.par_chunks_mut(k).zip(wall_cell.par_iter_mut()).enumerate().for_each_init(
             || Vec::<u32>::with_capacity(64),
             |wstack, (c, (bout, wc))| {
@@ -1981,6 +2075,95 @@ fn percentile(v: &mut [f32], q: f32) -> f32 {
     v[idx]
 }
 
+/// Does a drawn route stay ON the floor it claims to walk?
+///
+/// The wall-crossing metric CANNOT see this. `walls` holds only near-vertical triangles
+/// (`|ny| < WALL_MAX_NY`), so every horizontal floor and ceiling is excluded from that BVH by
+/// construction — a segment that passes straight through a storey slab scores zero wall crossings.
+/// That blind spot is exactly the "route goes through a ceiling" report.
+///
+/// So sample the polyline every `STEP` metres and ask the grid what floor exists under each sample.
+/// A sample further than `TOL` from the nearest floor at its own XZ is airborne or buried: the line
+/// is not on any walkable surface there.
+type FloorWorst = Option<(Vec3, (Vec3, Vec3))>;
+fn count_floor_violations(poly: &[Vec3], grid: &NavGrid) -> (usize, usize, f32, FloorWorst) {
+    const STEP: f32 = 1.0;
+    const TOL: f32 = 1.5; // generous: the drawn line rides ~0.1 m proud, and stairs read as steps
+    let (mut samples, mut bad, mut worst) = (0usize, 0usize, 0.0f32);
+    let mut worst_at: Option<Vec3> = None;
+    let mut worst_seg: Option<(Vec3, Vec3)> = None;
+    for w in poly.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let len = a.distance(b);
+        let n = (len / STEP).ceil().max(1.0) as usize;
+        for i in 0..=n {
+            let p = a.lerp(b, i as f32 / n as f32);
+            samples += 1;
+            if !grid.on_floor(p.x, p.z, p.y, TOL) {
+                bad += 1;
+                // Depth of the miss, measured against the containing cell (None = over a void).
+                let d = grid.floor_near(p.x, p.z, p.y).map_or(99.0, |f| (p.y - f).abs());
+                if d > worst {
+                    worst = d;
+                    worst_at = Some(p);
+                    worst_seg = Some((a, b));
+                }
+            }
+        }
+    }
+    (samples, bad, worst, worst_at.map(|p| (p, worst_seg.unwrap_or((p, p)))))
+}
+
+/// Could a BOT actually walk this drawn line?
+///
+/// Floor adherence proves the line sits ON a floor; it does not prove the floor UNDER the line is
+/// continuous. A route can hug the ground the whole way and still step off a 2 m ledge, or up onto
+/// a crate — the "traverse the top of a fuel tanker" class of bug. Unity forbids both: every EFT
+/// agent has `ledgeDropHeight = 0` and `maxJumpAcrossDistance = 0`, so the navmesh contains no
+/// drop-down and no jump links at all, and a bot may only move where the surface is CONTINUOUS
+/// within one climb step (or along a slope).
+///
+/// So walk the polyline in short increments and track the floor beneath it, always taking the layer
+/// nearest the previous one so a multi-storey column cannot make the surface teleport. Any change
+/// larger than the agent's own `max_step` for that increment is a step no bot could take.
+/// Returns (samples, illegal, worst delta).
+fn count_ledge_violations(poly: &[Vec3], grid: &NavGrid) -> (usize, usize, f32) {
+    const STEP: f32 = 0.25; // short: a coarse stride hides a ledge inside one interval
+    // The floor can only change where the GRID changes, so judge a delta against the most
+    // permissive single move the router itself allows — a diagonal step, run = res*sqrt(2). Using
+    // max_step(STEP) instead would flag every legal 1 m router step as a violation and measure the
+    // sampling stride rather than the route. Anything over this is a step the router should never
+    // have taken, at any resolution.
+    let limit = agent().max_step(grid.res * std::f32::consts::SQRT_2);
+    let (mut samples, mut bad, mut worst) = (0usize, 0usize, 0.0f32);
+    let mut prev: Option<f32> = None;
+    for w in poly.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let n = (a.distance(b) / STEP).ceil().max(1.0) as usize;
+        for i in 0..=n {
+            let p = a.lerp(b, i as f32 / n as f32);
+            // Track the SAME surface: nearest layer to where we already are, not to the drawn y.
+            let here = grid.surface_near(p.x, p.z, prev.unwrap_or(p.y));
+            let Some(h) = here else {
+                prev = None;
+                continue;
+            };
+            if let Some(ph) = prev {
+                samples += 1;
+                let d = (h - ph).abs();
+                if d > limit {
+                    bad += 1;
+                    if d > worst {
+                        worst = d;
+                    }
+                }
+            }
+            prev = Some(h);
+        }
+    }
+    (samples, bad, worst)
+}
+
 // ---- headless self-check + MACHINE PROOF (FIX 5): route many legs, assert ZERO wall-crossings ---
 
 /// Extended self-check: load the freshly baked grid, route 200+ varied legs, and for EVERY segment
@@ -2031,6 +2214,14 @@ fn self_check(baked: &Baked, dir: &Path) {
     let (mut cross_after, mut cross_before) = (0usize, 0usize);
     let mut cross_raw = 0usize; // crossings on the RAW (unsimplified) A* path — attributes the gap
     let mut cross_after_door = 0usize; // AFTER crossings whose segment passes through a door cell
+    // Floor adherence: the wall metric is blind to horizontal surfaces (see
+    // `count_floor_violations`), so track how much of each drawn route is nowhere near a floor.
+    let (mut fs_total, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
+    let mut fs_at: FloorWorst = None;
+    // Ledge legality: the floor UNDER the drawn line must be continuous within one climb step.
+    let (mut lg_total, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
+    // Offending legs, so a failure is a place to go LOOK at rather than a number.
+    let mut bad_walls: Vec<(Vec3, Vec3, usize)> = Vec::new();
     let mut attempts = 0usize;
     let mut example: Option<(Vec3, Vec3)> = None;
     let mut i = 0usize;
@@ -2060,6 +2251,20 @@ fn self_check(baked: &Baked, dir: &Path) {
             cross_after_door += cr_door;
             let (_, cr_raw) = count_wall_crossings(&raw, &baked.wall_bvh);
             cross_raw += cr_raw;
+            let (ln, lb, lw) = count_ledge_violations(&simp, &grid);
+            lg_total += ln;
+            lg_bad += lb;
+            lg_worst = lg_worst.max(lw);
+            let (n, nb, w, wat) = count_floor_violations(&simp, &grid);
+            fs_total += n;
+            fs_bad += nb;
+            if w > fs_worst {
+                fs_worst = w;
+                fs_at = wat;
+            }
+            if cr > cr_door && bad_walls.len() < 8 {
+                bad_walls.push((a, b, cr - cr_door));
+            }
         }
         if let Some((poly, _)) = grid_before.path(a, b, &mut sc_b, None) {
             routes_before += 1;
@@ -2083,6 +2288,32 @@ fn self_check(baked: &Baked, dir: &Path) {
         "  [verify] attribution: AFTER RAW A* path crossings {cross_raw} (blk/connectivity gap) vs SIMPLIFIED {cross_after} (simplify adds {}); of the {cross_after} AFTER crossings, {cross_after_door} are at a DOOR (passable frame, not a violation)",
         cross_after.saturating_sub(cross_raw)
     );
+    eprintln!(
+        "  [verify] floor adherence: {fs_bad}/{fs_total} sampled metres of the SIMPLIFIED routes sit \
+         >1.5 m from any floor at their own XZ (worst {fs_worst:.1} m) — this is the metric the \
+         wall check cannot see, since walls exclude horizontal surfaces"
+    );
+    eprintln!(
+        "  [verify] ledge legality: {lg_bad}/{lg_total} sampled steps along the SIMPLIFIED routes          exceed the most permissive single router move ({:.2} m for a diagonal at res {:.2}); worst          {lg_worst:.2} m — every EFT agent has ledgeDropHeight = 0, so a bot may only move where          the surface is continuous",
+        agent().max_step(grid.res * std::f32::consts::SQRT_2),
+        grid.res
+    );
+    if let Some((p, (sa, sb))) = fs_at {
+        eprintln!(
+            "  [verify]   worst floor sample ({:.1}, {:.1}, {:.1}) lies on the chord              ({:.1},{:.1},{:.1}) -> ({:.1},{:.1},{:.1})  [chord length {:.1} m, dy {:.1} m]",
+            p.x, p.y, p.z, sa.x, sa.y, sa.z, sb.x, sb.y, sb.z,
+            sa.distance(sb),
+            sb.y - sa.y
+        );
+        let floors = grid.floors_at(p.x, p.z);
+        eprintln!("  [verify]   floors present at that XZ: {floors:?}");
+    }
+    for (a, b, c) in &bad_walls {
+        eprintln!(
+            "  [verify]   wall leg: ({:.0},{:.0},{:.0}) -> ({:.0},{:.0},{:.0})  {c} crossing(s)",
+            a.x, a.y, a.z, b.x, b.y, b.z
+        );
+    }
     let cross_after_walls = cross_after.saturating_sub(cross_after_door);
     if let Some((a, b)) = example {
         eprintln!(
@@ -2327,7 +2558,12 @@ pub fn run_check_cli(args: &[String]) -> i32 {
 /// process exit code (0 = ok). Never panics (release is panic=abort): all failures return non-zero.
 pub fn run_cli(args: &[String]) -> i32 {
     let mut pack_dir: Option<String> = None;
-    let mut res: f32 = 1.0;
+    // 0.5 m, not 1 m. At 1 m the grid cannot tell a 1.11 m LEDGE from a 48-degree ramp (the slope
+    // term allows `run * tan(slope)` per step), so routes stepped off ledges: 1013 illegal steps
+    // with a worst of 1.40 m on the self-check. At 0.5 m that is zero. It also halves the height
+    // the diagonal rule permits, which is what makes the clearance pass sufficient. Costs 4x the
+    // grid (nav.bin 43 MB -> 173 MB).
+    let mut res: f32 = 0.5;
     let mut k: usize = 8;
     let mut i = 0;
     while i < args.len() {

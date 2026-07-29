@@ -9,6 +9,13 @@
 //!      separated faction tag and a `~straight-line` distance). Clicking a row computes the walkable
 //!      route to it; ROUTE NEAREST EXTRACT solves one A* per ACTIVE extract and keeps the shortest
 //!      (true nearest-by-foot, not a tour). Rows work even while the Extracts overlay is hidden.
+//!
+//!      Each row also carries a TICK BOX — "I can use this extract this raid" — and that is the
+//!      SINGLE place extracts are selected. Both consumers read the same set: the loot plan's
+//!      "ends at" and ROUTE NEAREST EXTRACT. Empty selection means every active extract, so the
+//!      default needs no interaction at all. (This replaced a second checkbox list of the same
+//!      extracts nested inside the loot plan: two controls for one decision, with nothing to say
+//!      they were the same decision.) The tick consumes its own click so selecting never routes.
 //!   3. ROUTE — a labelled result card: WHERE the route goes + walkable metres; the matching row is
 //!      highlighted from `RouteResult::dest_label` (so "nearest" highlights its winner too).
 //!
@@ -292,9 +299,11 @@ pub fn navigate_tab(
                     .corner_radius(0.0),
                 )
                 .on_hover_text(if ui_state.plan_extracts.is_empty() {
-                    "compares the walkable route to every active extract and takes the shortest"
+                    "compares the walkable route to every active extract and takes the shortest \
+                     \u{00B7} tick extracts under EXTRACTS to narrow it to the ones you can use"
                 } else {
-                    "compares the walkable route to each SELECTED extract and takes the shortest"
+                    "compares the walkable route to each extract you ticked under EXTRACTS and \
+                     takes the shortest"
                 })
                 .clicked()
             {
@@ -349,55 +358,38 @@ pub fn navigate_tab(
                         ui.label(RichText::new("budget").size(theme::SIZE_SMALL).color(theme::MUTED));
                         ui.add(egui::Slider::new(&mut ui_state.plan_budget_min, 5.0..=50.0).suffix(" min").step_by(1.0));
                     });
-                    // EXTRACTS the run may end at. Which are open depends on side, time, keys
-                    // and the raid's random selection - none of which the viewer can know - so the
-                    // player picks and the plan honours exactly those. Empty = any active extract.
-                    {
-                        let mut opts: Vec<(String, String)> = rows
-                            .iter()
-                            .filter(|r| !r.inactive)
-                            .map(|r| (r.title.clone(), r.label.clone()))
-                            .collect();
-                        opts.sort_by(|a, b| a.1.cmp(&b.1));
-                        opts.dedup_by(|a, b| a.0 == b.0);
-                        ui_state.plan_extracts.retain(|t| opts.iter().any(|(k, _)| k == t));
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("end at").size(theme::SIZE_SMALL).color(theme::MUTED),
-                            );
-                            let sel = ui_state.plan_extracts.len();
-                            ui.label(
-                                RichText::new(if sel == 0 {
-                                    "any extract".to_string()
-                                } else {
-                                    format!("{sel} of {}", opts.len())
-                                })
-                                .size(theme::SIZE_SMALL)
-                                .color(if sel == 0 { theme::MUTED } else { theme::ACCENT }),
-                            );
-                            if ui.small_button("any").on_hover_text("clear the selection").clicked() {
-                                ui_state.plan_extracts.clear();
-                            }
-                        });
-                        egui::ScrollArea::vertical()
-                            .id_salt("plan_extracts")
-                            .max_height(92.0)
-                            .show(ui, |ui| {
-                                for (key, label) in &opts {
-                                    let mut on = ui_state.plan_extracts.contains(key);
-                                    if ui
-                                        .checkbox(&mut on, RichText::new(label).size(theme::SIZE_SMALL))
-                                        .changed()
-                                    {
-                                        if on {
-                                            ui_state.plan_extracts.insert(key.clone());
-                                        } else {
-                                            ui_state.plan_extracts.remove(key);
-                                        }
-                                    }
-                                }
-                            });
-                    }
+                    // WHERE the run ends. There used to be a second checkbox list of every extract
+                    // right here, duplicating the EXTRACTS table below it — two places to pick the
+                    // same thing, and no indication they were the same thing. The selection now
+                    // lives ONCE, on the EXTRACTS rows; this is a read-only echo of it so the plan
+                    // still says what it will do.
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("ends at").size(theme::SIZE_SMALL).color(theme::MUTED));
+                        let sel = ui_state.plan_extracts.len();
+                        ui.label(
+                            RichText::new(if sel == 0 {
+                                "any extract".to_string()
+                            } else {
+                                format!("{sel} selected")
+                            })
+                            .size(theme::SIZE_SMALL)
+                            .color(if sel == 0 { theme::MUTED } else { theme::ACCENT }),
+                        )
+                        .on_hover_text(
+                            "which extracts are open depends on your side, the time, keys and the \
+                             raid's own random selection \u{2014} none of which the viewer can \
+                             know. Tick the ones you can use under EXTRACTS below; the plan and \
+                             ROUTE NEAREST EXTRACT both honour exactly those.",
+                        );
+                        if sel > 0
+                            && ui
+                                .small_button("any")
+                                .on_hover_text("clear the extract selection")
+                                .clicked()
+                        {
+                            ui_state.plan_extracts.clear();
+                        }
+                    });
                     let full = egui::vec2(ui.available_width(), 26.0);
                     if ui
                         .add_enabled(ready, egui::Button::new(
@@ -494,14 +486,43 @@ pub fn navigate_tab(
             ui.add_space(theme::SP_MD);
 
             // ===== 2 · EXTRACTS =====
+            // The ONE place extracts are selected. A row does two independent things: its tick box
+            // says "I can use this one" (feeding the loot plan and ROUTE NEAREST EXTRACT), and the
+            // rest of the row routes there. Keeping those on one row is what removed the duplicate
+            // list that used to sit inside the loot plan.
+            // Stale titles are dropped against the live rows each frame, so a map swap cannot
+            // leave a selection that silently excludes every real extract.
+            ui_state
+                .plan_extracts
+                .retain(|t| rows.iter().any(|r| !r.inactive && &r.title == t));
+            let sel_n = ui_state.plan_extracts.len();
             ui.horizontal(|ui| {
                 ui.label(theme::section_header("EXTRACTS", rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("click a row to route there")
-                            .size(theme::SIZE_TINY)
-                            .color(theme::FAINT),
-                    );
+                    if sel_n > 0 {
+                        if ui
+                            .small_button(RichText::new("all").size(theme::SIZE_TINY))
+                            .on_hover_text("clear the selection \u{2014} treat every active extract as usable")
+                            .clicked()
+                        {
+                            ui_state.plan_extracts.clear();
+                        }
+                        ui.label(
+                            RichText::new(format!("{sel_n} usable"))
+                                .size(theme::SIZE_TINY)
+                                .color(theme::ACCENT),
+                        )
+                        .on_hover_text("the loot plan and ROUTE NEAREST EXTRACT use only these");
+                    } else {
+                        ui.label(
+                            RichText::new("tick the ones you can use")
+                                .size(theme::SIZE_TINY)
+                                .color(theme::FAINT),
+                        )
+                        .on_hover_text(
+                            "leave them all unticked to treat every active extract as usable",
+                        );
+                    }
                 });
             });
             if rows.is_empty() {
@@ -550,15 +571,43 @@ pub fn navigate_tab(
                         let is_routed = routed_label.as_deref() == Some(r.label.as_str());
                         let is_pending = route_result.status == RouteStatus::Pending
                             && ui_state.pending == Some(r.entity);
+                        let selected = ui_state.plan_extracts.contains(&r.title);
                         let border = if is_routed {
                             theme::OK
                         } else if is_pending {
                             theme::ACCENT
+                        } else if selected {
+                            theme::ACCENT
                         } else {
                             theme::BORDER
                         };
+                        // Set when the tick box took the click, so the row's own click handler
+                        // stands down: the whole card is ALSO a click target (route here), and
+                        // without this guard ticking a box would fire a route as well.
+                        let mut tick_hit = false;
                         let resp = theme::card(ui, border, |ui| {
                             ui.horizontal(|ui| {
+                                let mut on = selected;
+                                let tick = ui
+                                    .add_enabled(
+                                        !r.inactive,
+                                        egui::Checkbox::without_text(&mut on),
+                                    )
+                                    .on_hover_text(if r.inactive {
+                                        "inactive in this scene \u{2014} cannot be used"
+                                    } else if on {
+                                        "usable this raid \u{00B7} click to deselect"
+                                    } else {
+                                        "mark as usable this raid (loot plan + nearest-extract)"
+                                    });
+                                tick_hit = tick.clicked() || tick.changed();
+                                if tick.changed() {
+                                    if on {
+                                        ui_state.plan_extracts.insert(r.title.clone());
+                                    } else {
+                                        ui_state.plan_extracts.remove(&r.title);
+                                    }
+                                }
                                 dot(ui, r.accent, 4.0);
                                 let name_col = if r.inactive { theme::FAINT } else { theme::BONE };
                                 // Right side FIRST (distance + tags), then the name truncates into
@@ -630,7 +679,10 @@ pub fn navigate_tab(
                                 Color32::from_rgba_premultiplied(255, 255, 255, 5),
                             );
                         }
-                        if row.double_clicked() {
+                        if tick_hit {
+                            // The tick box owns this click — selecting an extract must not also
+                            // route to it.
+                        } else if row.double_clicked() {
                             // Fly the camera to the extract (kept OFF the single-click so a route
                             // click never yanks the camera).
                             cam_cmd.fly_to = Some(r.pos);

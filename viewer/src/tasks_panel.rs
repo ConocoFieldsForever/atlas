@@ -51,6 +51,27 @@ pub struct TaskCatalog {
     pub loaded: bool,
     /// Provenance string for the footer ("tarkov.dev").
     pub source: String,
+    /// Every map id the catalog mentions, with its task count — precomputed by build_tasks.py so
+    /// the map picker can show "Customs (73)" without walking 501 tasks per frame.
+    pub map_task_count: Vec<(String, usize)>,
+    /// First-party quest zones this map ships that NO upstream task accounts for, keyed by map.
+    pub unlinked: std::collections::HashMap<String, Vec<UnlinkedZone>>,
+    /// How many objective zones took the game's own geometry, vs. how many are still upstream's.
+    /// Drives the footer's honest provenance line instead of a flat "tarkov.dev".
+    pub zones_game: usize,
+    pub zones_dev: usize,
+}
+
+/// A first-party quest trigger with no upstream task — the game ships it, tarkov.dev has no row.
+#[cfg_attr(not(feature = "egui"), allow(dead_code))]
+pub struct UnlinkedZone {
+    pub name: String,
+    /// Name-derived grouping (quest / event / achievement / transit / extract) — presentation only.
+    pub family: String,
+    pub kind: String,
+    pub pos: Vec3,
+    /// Separate boxes sharing this trigger id (1 unless the scene repeats it).
+    pub parts: u32,
 }
 
 /// One task with every field the panel surfaces. Read only by the egui panel; the `allow` keeps the
@@ -230,6 +251,12 @@ pub struct ObjZone {
     pub pos: Option<Vec3>,
     /// true when the zone carries a footprint polygon (drawn on the map by poi.rs).
     pub has_outline: bool,
+    /// Provenance: "game" (first-party trigger geometry) / "dev" / "patch".
+    pub src: String,
+    /// The game trigger id this zone was joined to, when it was.
+    pub game: Option<String>,
+    /// 1-based box index when one trigger id owns several boxes (0 = single-box zone).
+    pub part: u32,
 }
 
 /// A quest-item find location: a map key + the candidate points (viewer space).
@@ -247,6 +274,24 @@ struct RawFile {
     source: Option<String>,
     #[serde(default)]
     tasks: Vec<RawTask>,
+    #[serde(default)]
+    map_task_count: std::collections::HashMap<String, usize>,
+    #[serde(default, rename = "unlinkedZones")]
+    unlinked_zones: std::collections::HashMap<String, Vec<RawUnlinked>>,
+}
+
+#[derive(Deserialize)]
+struct RawUnlinked {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    family: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    pos: Option<[f32; 3]>,
+    #[serde(default)]
+    parts: Option<u32>,
 }
 #[derive(Deserialize)]
 struct RawTask {
@@ -348,6 +393,12 @@ struct RawZone {
     pos: Option<[f32; 3]>,
     #[serde(default)]
     outline: Option<Vec<[f32; 3]>>,
+    #[serde(default)]
+    src: Option<String>,
+    #[serde(default)]
+    game: Option<String>,
+    #[serde(default)]
+    part: Option<u32>,
 }
 #[derive(Deserialize)]
 struct RawLoc {
@@ -380,6 +431,9 @@ fn convert_task(t: RawTask) -> TaskDef {
                     map: z.map.unwrap_or_default(),
                     pos: z.pos.map(Vec3::from),
                     has_outline: z.outline.map(|v| v.len() >= 3).unwrap_or(false),
+                    src: z.src.unwrap_or_default(),
+                    game: z.game.filter(|s| !s.is_empty()),
+                    part: z.part.unwrap_or(0),
                 })
                 .collect(),
             item_locations: o
@@ -503,8 +557,42 @@ fn load_task_catalog(
         Ok(s) => match serde_json::from_str::<RawFile>(&s) {
             Ok(rf) => {
                 cat.source = rf.source.unwrap_or_else(|| "tarkov.dev".into());
+                cat.unlinked = rf
+                    .unlinked_zones
+                    .into_iter()
+                    .map(|(m, v)| {
+                        let rows = v
+                            .into_iter()
+                            .map(|u| UnlinkedZone {
+                                name: u.name,
+                                family: u.family,
+                                kind: u.kind.unwrap_or_default(),
+                                pos: u.pos.map(Vec3::from).unwrap_or_default(),
+                                parts: u.parts.unwrap_or(1),
+                            })
+                            .collect();
+                        (m, rows)
+                    })
+                    .collect();
+                cat.map_task_count = {
+                    let mut v: Vec<(String, usize)> = rf.map_task_count.into_iter().collect();
+                    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    v
+                };
                 cat.tasks = rf.tasks.into_iter().map(convert_task).collect();
-                info!("tasks_panel: {} tasks loaded from {}", cat.tasks.len(), path.display());
+                let (mut g, mut d) = (0usize, 0usize);
+                for z in cat.tasks.iter().flat_map(|t| &t.objectives).flat_map(|o| &o.zones) {
+                    if z.src == "game" { g += 1 } else { d += 1 }
+                }
+                cat.zones_game = g;
+                cat.zones_dev = d;
+                info!(
+                    "tasks_panel: {} tasks loaded from {} ({g} objective zones from game files, \
+                     {d} from tarkov.dev; {} unlinked first-party zones)",
+                    cat.tasks.len(),
+                    path.display(),
+                    cat.unlinked.values().map(|v| v.len()).sum::<usize>(),
+                );
             }
             Err(e) => warn!("tasks_panel: failed to parse {}: {e}", path.display()),
         },
@@ -609,20 +697,110 @@ impl TaskIconCache {
 // which is exactly the desired "default to the current map" behaviour.
 // ============================================================================================
 
+/// What the list is scoped to. A two-state segmented control rather than a bare checkbox: the
+/// checkbox gave no clue what turning it off would show, so nobody turned it off. Each segment
+/// carries its own count, so the choice is legible before you make it.
+#[cfg(feature = "egui")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MapScope {
+    /// Only tasks that touch the loaded map (default).
+    ThisMap,
+    /// The whole wipe's catalog, every map.
+    AllMaps,
+}
+
 #[cfg(feature = "egui")]
 pub struct TasksUiState {
     search: String,
-    /// Requirement 2 default: show only the current map's tasks. Toggle off for all maps.
-    this_map_only: bool,
+    scope: MapScope,
+    /// Hide tasks whose every objective is ticked off.
+    hide_done: bool,
+    /// Show only tracked tasks — the "what am I actually doing this raid" view.
+    tracked_only: bool,
+    /// Show only tasks with at least one objective LOCATED on the loaded map. Without it the
+    /// list is dominated by hand-ins and find-item objectives that put nothing on the map.
+    located_only: bool,
+    /// Expand the first-party zone list (zones the game ships that no task claims).
+    show_unlinked: bool,
+    /// Expand every task's Rewards section (screenshots / "what does this wipe pay" browsing).
+    show_rewards: bool,
 }
 #[cfg(feature = "egui")]
 impl Default for TasksUiState {
     fn default() -> Self {
+        // EFT_TASK_SEARCH seeds the search box and EFT_TASK_FILTER the chips (screenshots / power
+        // users), mirroring EFT_TAB. e.g. EFT_TASK_FILTER=located,unlinked,all-maps
+        let flags = std::env::var("EFT_TASK_FILTER").unwrap_or_default().to_lowercase();
+        let has = |name: &str| flags.split(',').any(|f| f.trim() == name);
         Self {
-            // EFT_TASK_SEARCH seeds the search box (screenshots / power users), mirroring EFT_TAB.
             search: std::env::var("EFT_TASK_SEARCH").unwrap_or_default(),
-            this_map_only: true,
+            scope: if has("all-maps") { MapScope::AllMaps } else { MapScope::ThisMap },
+            hide_done: has("hide-done"),
+            tracked_only: has("tracked"),
+            located_only: has("located"),
+            show_unlinked: has("unlinked"),
+            show_rewards: has("rewards"),
         }
+    }
+}
+
+/// A flat two-segment scope switch. Returns true when the selection changed.
+#[cfg(feature = "egui")]
+fn scope_switch(
+    ui: &mut bevy_egui::egui::Ui,
+    scope: &mut MapScope,
+    this_label: &str,
+    this_n: usize,
+    all_n: usize,
+) -> bool {
+    use bevy_egui::egui::{self, Color32, RichText};
+    use crate::ui_theme as theme;
+    let mut changed = false;
+    let seg = |ui: &mut egui::Ui, on: bool, text: String, tip: &str| -> bool {
+        let btn = if on {
+            theme::button_filled(&text, theme::ACCENT, Color32::BLACK)
+        } else {
+            egui::Button::new(RichText::new(text).size(theme::SIZE_LABEL).color(theme::BONE))
+                .fill(theme::INSET)
+                .corner_radius(0.0)
+        };
+        ui.add(btn).on_hover_text(tip).clicked()
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 1.0;
+        if seg(ui, *scope == MapScope::ThisMap, format!("{this_label}  {this_n}"),
+               "only tasks that touch the loaded map")
+            && *scope != MapScope::ThisMap
+        {
+            *scope = MapScope::ThisMap;
+            changed = true;
+        }
+        if seg(ui, *scope == MapScope::AllMaps, format!("All maps  {all_n}"),
+               "the whole wipe's task catalog, every map")
+            && *scope != MapScope::AllMaps
+        {
+            *scope = MapScope::AllMaps;
+            changed = true;
+        }
+    });
+    changed
+}
+
+/// A small filter toggle rendered as a chip rather than a checkbox — four checkboxes stacked in a
+/// narrow side panel wrap badly and read as a form; chips fit one row and show state by fill.
+#[cfg(feature = "egui")]
+fn filter_chip(ui: &mut bevy_egui::egui::Ui, on: &mut bool, label: &str, tip: &str) {
+    use bevy_egui::egui::{self, Color32, RichText};
+    use crate::ui_theme as theme;
+    let btn = if *on {
+        theme::button_filled(label, theme::TRACKED, Color32::BLACK)
+    } else {
+        egui::Button::new(RichText::new(label).size(theme::SIZE_TINY).color(theme::MUTED))
+            .fill(theme::INSET)
+            .corner_radius(0.0)
+    };
+    if ui.add(btn).on_hover_text(tip).clicked() {
+        *on = !*on;
     }
 }
 
@@ -735,23 +913,25 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
         });
     });
 
-    // ---- MAP FILTER + master Quest-layer toggle ----
-    ui.horizontal(|ui| {
-        let map_name = cur_map
-            .as_deref()
-            .map(|m| titlecase_key(m))
-            .unwrap_or_else(|| "(no map)".to_string());
-        ui.checkbox(&mut ui_state.this_map_only, RichText::new("this map only").size(12.0))
-            .on_hover_text("show only tasks that touch the loaded map");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(map_name).color(ACCENT).size(12.0));
-        });
-    });
-    ui.horizontal(|ui| {
-        crate::ui_theme::swatch(ui, TRACKED);
-        ui.checkbox(&mut quests_on, RichText::new("show markers on map").size(12.0))
-            .on_hover_text("the Quest overlay layer (tracked tasks focus it to themselves)");
-    });
+    // ---- MAP SCOPE — the primary filter, so it leads. ----
+    let cur = cur_map.as_deref();
+    let on_map = |t: &TaskDef| match cur {
+        Some(m) => t.map == m || t.maps.iter().any(|x| x == m),
+        None => true,
+    };
+    let map_name = cur
+        .map(titlecase_key)
+        .unwrap_or_else(|| "(no map)".to_string());
+    // Counts come from the catalog itself so each segment says what picking it would show. The
+    // per-map figure prefers build_tasks.py's precomputed table and falls back to counting, so a
+    // pack built before the count shipped still gets a truthful number.
+    let this_n = catalog
+        .map_task_count
+        .iter()
+        .find(|(m, _)| Some(m.as_str()) == cur)
+        .map(|(_, n)| *n)
+        .unwrap_or_else(|| catalog.tasks.iter().filter(|t| on_map(t)).count());
+    scope_switch(ui, &mut ui_state.scope, &map_name, this_n, catalog.tasks.len());
 
     // ---- SEARCH ----
     ui.add(
@@ -760,27 +940,39 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             .hint_text("Search tasks / traders / items\u{2026}"),
     );
 
-    // ---- LEVEL FILTER (the Kappa / Lightkeeper toggles were dropped: niche Tarkov jargon the user
-    // didn't want. The kappa_only / lk_only flags stay in the model, defaulting off, so they can be
-    // reinstated later without touching the filter loop below.) ----
+    // ---- FILTER CHIPS + master Quest-layer toggle ----
+    // (The Kappa / Lightkeeper toggles were dropped: niche Tarkov jargon the user didn't want.
+    // The kappa_only / lk_only flags stay in the model, defaulting off, so they can be reinstated
+    // later without touching the filter loop below.)
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+        filter_chip(ui, &mut ui_state.tracked_only, "tracked", "only tasks you are tracking");
+        filter_chip(ui, &mut ui_state.hide_done, "hide done",
+                    "hide tasks whose every objective is ticked off");
+        filter_chip(ui, &mut ui_state.located_only, "on this map",
+                    "only tasks with an objective LOCATED on the loaded map \u{2014} hides hand-ins \
+                     and find-item objectives that put nothing on the map");
+    });
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Max level").size(12.0).color(MUTED));
-        ui.add(egui::DragValue::new(&mut tr.max_level).range(0..=79).speed(1.0))
-            .on_hover_text("hide tasks whose required level is above this (0 = show every level)");
-        if tr.max_level == 0 {
-            ui.label(RichText::new("(any)").size(11.0).color(theme::FAINT));
-        }
+        crate::ui_theme::swatch(ui, TRACKED);
+        ui.checkbox(&mut quests_on, RichText::new("show markers on map").size(12.0))
+            .on_hover_text("the Quest overlay layer (tracked tasks focus it to themselves)");
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add(egui::DragValue::new(&mut tr.max_level).range(0..=79).speed(1.0))
+                .on_hover_text("hide tasks whose required level is above this (0 = every level)");
+            ui.label(
+                RichText::new(if tr.max_level == 0 { "lvl any" } else { "max lvl" })
+                    .size(11.0)
+                    .color(MUTED),
+            );
+        });
     });
 
     // ---- FILTER + GROUP the catalog by trader ----
     let q = ui_state.search.trim().to_lowercase();
-    let (kappa_only, lk_only, max_level, this_map_only) =
-        (tr.kappa_only, tr.lk_only, tr.max_level, ui_state.this_map_only);
-    let cur = cur_map.as_deref();
-    let on_map = |t: &TaskDef| match cur {
-        Some(m) => t.map == m || t.maps.iter().any(|x| x == m),
-        None => true,
-    };
+    let (kappa_only, lk_only, max_level) = (tr.kappa_only, tr.lk_only, tr.max_level);
+    let this_map_only = ui_state.scope == MapScope::ThisMap;
+    let show_rewards = ui_state.show_rewards;
     let matches_q = |t: &TaskDef| {
         if q.is_empty() {
             return true;
@@ -796,8 +988,20 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                 || o.weapons.iter().chain(&o.weapon_mods).chain(&o.wearing).any(|i| i.to_lowercase().contains(&q))
         })
     };
+    // A task counts as complete when every objective is ticked; an objective-free task never is.
+    let task_done = |t: &TaskDef| {
+        !t.objectives.is_empty()
+            && t.objectives
+                .iter()
+                .enumerate()
+                .all(|(i, o)| done.contains(&obj_key(&t.id, o, i)))
+    };
+    let located_here = |t: &TaskDef| match cur {
+        Some(m) => t.objectives.iter().any(|o| obj_location(o, m).is_some()),
+        None => false,
+    };
     let mut groups: std::collections::BTreeMap<String, Vec<&TaskDef>> = std::collections::BTreeMap::new();
-    let mut shown = 0usize;
+    let (mut shown, mut shown_done, mut hidden_by_chips) = (0usize, 0usize, 0usize);
     for t in &catalog.tasks {
         if this_map_only && !on_map(t) {
             continue;
@@ -814,22 +1018,72 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
         if !matches_q(t) {
             continue;
         }
+        // The chip filters are counted separately so the summary can offer them back — a list that
+        // silently empties itself because three chips are on is the classic filter dead end.
+        let complete = task_done(t);
+        if (ui_state.tracked_only && !tr.active.contains(&t.id))
+            || (ui_state.hide_done && complete)
+            || (ui_state.located_only && !located_here(t))
+        {
+            hidden_by_chips += 1;
+            continue;
+        }
         let trader = if t.trader.is_empty() { "Other".to_string() } else { t.trader.clone() };
         groups.entry(trader).or_default().push(t);
         shown += 1;
+        if complete {
+            shown_done += 1;
+        }
     }
     for v in groups.values_mut() {
-        v.sort_by(|a, b| a.min_level.cmp(&b.min_level).then_with(|| a.name.cmp(&b.name)));
+        // Tracked first (they are what you came for), then by level gate, then name.
+        v.sort_by(|a, b| {
+            tr.active
+                .contains(&b.id)
+                .cmp(&tr.active.contains(&a.id))
+                .then_with(|| a.min_level.cmp(&b.min_level))
+                .then_with(|| a.name.cmp(&b.name))
+        });
     }
 
     // ---- SUMMARY + route-tracked controls ----
     ui.add_space(2.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.label(
-            RichText::new(format!("{shown} tasks  \u{00B7}  {} tracked", tr.active.len()))
+            RichText::new(format!("{shown} shown"))
                 .size(10.0)
-                .color(MUTED),
+                .color(if shown == 0 { theme::WARN } else { MUTED }),
         );
+        if shown_done > 0 {
+            ui.label(RichText::new(format!("\u{00B7}  {shown_done} done")).size(10.0).color(FIR));
+        }
+        if !tr.active.is_empty() {
+            ui.label(
+                RichText::new(format!("\u{00B7}  {} tracked", tr.active.len()))
+                    .size(10.0)
+                    .color(TRACKED),
+            );
+        }
+        if hidden_by_chips > 0 {
+            if ui
+                .add(
+                    egui::Label::new(
+                        RichText::new(format!("\u{00B7}  {hidden_by_chips} hidden by filters"))
+                            .size(10.0)
+                            .color(theme::WARN),
+                    )
+                    .sense(egui::Sense::click()),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("click to clear the tracked / hide-done / on-this-map filters")
+                .clicked()
+            {
+                ui_state.tracked_only = false;
+                ui_state.hide_done = false;
+                ui_state.located_only = false;
+            }
+        }
     });
     let pf_running = server.status == ServerStatus::Running;
     ui.horizontal(|ui| {
@@ -905,6 +1159,9 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                 );
                 return;
             }
+            // An empty RESULT is not an empty PANEL: the first-party zone list below is about the
+            // map, not about the filters, so it must still render when nothing matched. (It used
+            // to `return` here, which made that section unreachable from any narrow search.)
             if shown == 0 {
                 ui.label(
                     RichText::new("no tasks match the current filters")
@@ -912,7 +1169,6 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                         .italics()
                         .color(MUTED),
                 );
-                return;
             }
             for (trader, tasks) in &groups {
                 CollapsingHeader::new(theme::section_header(trader, tasks.len()))
@@ -1046,7 +1302,22 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                             if !reward.is_empty() {
                                 CollapsingHeader::new(RichText::new(format!("Rewards  {reward}")).size(10.0).color(FIR))
                                     .id_salt(format!("rewards_{}", t.id))
+                                    .default_open(show_rewards)
                                     .show(ui, |ui| {
+                                        // ITEM rewards render as an icon grid — the same cached
+                                        // <slug>.png the objective gutter uses, and fetch_icons.py
+                                        // has always collected reward item names, so this needed no
+                                        // new data. An item with no cached art degrades to a text
+                                        // chip rather than leaving a hole in the grid.
+                                        reward_icons(
+                                            ui,
+                                            icons,
+                                            icon_root.as_deref(),
+                                            icon_shared.as_deref(),
+                                            &t.rewards,
+                                        );
+                                        // Everything an icon cannot express: reputation, trader
+                                        // level unlocks, skills, achievements, customization.
                                         for line in reward_lines(&t.rewards) {
                                             ui.label(RichText::new(line).size(9.5).color(BONE));
                                         }
@@ -1183,6 +1454,13 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                                     ui.label(RichText::new(format!("@{exit}")).size(9.0).color(MUTED))
                                                         .on_hover_text("extract");
                                                 }
+                                                if let Some((label, col, tip)) =
+                                                    cur.map(|m| obj_zones_here(o, m))
+                                                        .as_deref()
+                                                        .and_then(zone_provenance)
+                                                {
+                                                    theme::chip(ui, &label, col).on_hover_text(tip);
+                                                }
                                                 if let Some(pos) = here {
                                                     // go/route AUTO-TRACK the task: tracking is what
                                                     // shows its markers + TRIGGER-REGION zones on the
@@ -1220,8 +1498,8 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                                         let restrictions = objective_restrictions(o);
                                         if !restrictions.is_empty() {
                                             ui.horizontal_wrapped(|ui| {
-                                                for r in restrictions {
-                                                    theme::chip(ui, &r, ACCENT);
+                                                for (text, hover) in restrictions {
+                                                    theme::chip(ui, &text, ACCENT).on_hover_text(hover);
                                                 }
                                             });
                                         }
@@ -1255,19 +1533,126 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                     }
                 });
             }
+
+            // ---- FIRST-PARTY ZONES WITH NO TASK ----
+            // The map ships quest triggers tarkov.dev has no row for: every Shootable_Duck, the
+            // secret extraction zone, the seasonal-event zones. They are real, positioned, shipped
+            // geometry, and the old panel simply did not know they existed — they appeared on the
+            // map as anonymous markers titled with a raw scene id. Listing them here says plainly
+            // what they are and lets you fly to one. Sorted by family, quest-like first.
+            if let Some(rows) = cur.and_then(|m| catalog.unlinked.get(m)) {
+                ui.add_space(8.0);
+                let header = format!("Game zones with no task  ({})", rows.len());
+                CollapsingHeader::new(RichText::new(header).size(11.0).strong().color(theme::SECTION))
+                    .id_salt("unlinked_zones")
+                    .default_open(ui_state.show_unlinked)
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Quest triggers this map ships that no tarkov.dev task references. \
+                                 Positions and footprints are the game's own; the grouping below is \
+                                 derived from the trigger name and is a hint, not game data.",
+                            )
+                            .size(9.0)
+                            .italics()
+                            .color(MUTED),
+                        );
+                        let mut fam = "";
+                        for u in rows {
+                            if u.family != fam {
+                                fam = &u.family;
+                                ui.add_space(3.0);
+                                ui.label(
+                                    RichText::new(match fam {
+                                        "event" => "Seasonal event",
+                                        "achievement" => "Achievement",
+                                        "transit" => "Transit",
+                                        "extract" => "Extract-related",
+                                        _ => "Quest (task unknown)",
+                                    })
+                                    .size(9.0)
+                                    .strong()
+                                    .color(theme::FAINT),
+                                );
+                            }
+                            ui.horizontal(|ui| {
+                                let (_, dot) = obj_tag(&u.kind);
+                                theme::swatch(ui, dot);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&u.name).size(10.0).color(BONE),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(format!(
+                                    "{}\nscene trigger id \u{00B7} kind: {}{}",
+                                    u.name,
+                                    if u.kind.is_empty() { "unknown" } else { &u.kind },
+                                    if u.parts > 1 {
+                                        format!("\n{} separate boxes share this id", u.parts)
+                                    } else {
+                                        String::new()
+                                    }
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button(RichText::new("go").size(9.0))
+                                            .on_hover_text("fly to this zone")
+                                            .clicked()
+                                        {
+                                            cam_cmd.fly_to = Some(u.pos);
+                                            quests_on = true;
+                                        }
+                                        if u.parts > 1 {
+                                            ui.label(
+                                                RichText::new(format!("\u{00D7}{}", u.parts))
+                                                    .size(9.0)
+                                                    .color(MUTED),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    });
+            }
         });
 
     // ---- footer provenance ----
+    // Split by WHAT each source actually supplies. "tasks: tarkov.dev" alone was misleading once
+    // the geometry became first-party, and it hid the one number worth watching: how many
+    // objective zones still carry an upstream position no game trigger corroborates.
     ui.add_space(4.0);
+    let total_zones = catalog.zones_game + catalog.zones_dev;
     ui.label(
         RichText::new(format!(
-            "tasks + item names: {}  \u{00B7}  icons: tarkov.dev CDN cache",
+            "identity (name / trader / rewards): {}  \u{00B7}  icons: tarkov.dev CDN cache",
             if catalog.source.is_empty() { "tarkov.dev" } else { catalog.source.as_str() }
         ))
         .size(9.0)
         .italics()
         .color(MUTED),
     );
+    if total_zones > 0 {
+        let pct = 100.0 * catalog.zones_game as f32 / total_zones as f32;
+        ui.label(
+            RichText::new(format!(
+                "objective geometry: {}/{total_zones} ({pct:.0}%) from the game's own quest \
+                 triggers",
+                catalog.zones_game
+            ))
+            .size(9.0)
+            .italics()
+            .color(if catalog.zones_dev == 0 { FIR } else { MUTED }),
+        )
+        .on_hover_text(
+            "Zone positions and footprints are joined to the map's own trigger components by \
+             name. Only built maps can be joined \u{2014} a map you have not built yet keeps \
+             tarkov.dev's geometry until you build it.",
+        );
+    }
 
     // ---- WRITE-BACK (only on a real delta, so poi's is_changed() gates stay meaningful) ----
     if tr != **tracker {
@@ -1315,6 +1700,50 @@ fn obj_location(o: &ObjectiveDef, map_key: &str) -> Option<Vec3> {
     None
 }
 
+/// The zones this objective has on `map_key` — used for the provenance chip and the area count.
+#[cfg(feature = "egui")]
+fn obj_zones_here<'a>(o: &'a ObjectiveDef, map_key: &str) -> Vec<&'a ObjZone> {
+    o.zones.iter().filter(|z| z.map == map_key && z.pos.is_some()).collect()
+}
+
+/// (chip label, colour, hover) describing where an objective's on-map geometry came from.
+/// Provenance is shown rather than assumed: after the first-party rewrite almost everything is
+/// game geometry, and the point of saying so is that the exceptions stand out.
+#[cfg(feature = "egui")]
+fn zone_provenance(zones: &[&ObjZone]) -> Option<(String, bevy_egui::egui::Color32, String)> {
+    use crate::ui_theme as theme;
+    let first = zones.first()?;
+    let areas = zones.len();
+    let suffix = if areas > 1 { format!(" \u{00B7} {areas} areas") } else { String::new() };
+    Some(match first.src.as_str() {
+        "game" => (
+            format!("game{suffix}"),
+            theme::OK,
+            match &first.game {
+                Some(g) => format!(
+                    "position and footprint from the map's own quest trigger \u{2014} {g}\n\
+                     tarkov.dev supplies only the task's identity"
+                ),
+                None => "position and footprint from the game's own scene data".into(),
+            },
+        ),
+        "patch" => (
+            format!("derived{suffix}"),
+            theme::WARN,
+            "neither the game nor tarkov.dev locates this objective; the position was derived \
+             from our own map geometry"
+                .into(),
+        ),
+        _ => (
+            format!("tarkov.dev{suffix}"),
+            theme::MUTED,
+            "no game trigger matched this objective \u{2014} the position is tarkov.dev's and is \
+             not first-party"
+                .into(),
+        ),
+    })
+}
+
 /// A stable id for an objective's checked-off state (task id + index; objective ids aren't always
 /// present/unique across the schema, so the index keys it locally). Ungated: the game link
 /// (game_watch.rs) writes the same keys when a task finishes in-game.
@@ -1331,26 +1760,62 @@ fn trim_num(value: f32) -> String {
     if value.fract().abs() < 0.001 { format!("{value:.0}") } else { format!("{value:.2}") }
 }
 
+/// A restriction chip: short label for the row, plus the FULL list for the hover. Some of these
+/// lists are enormous — "Setting Priorities" forbids 175 named items and "The Punisher - Part 2"
+/// names 90 acceptable mods — and joining them into one chip buried the objective's own text under
+/// ten lines of item names. Three names inline, the rest on hover.
 #[cfg(feature = "egui")]
-fn objective_restrictions(o: &ObjectiveDef) -> Vec<String> {
+fn restriction_chip(label: &str, items: &[String]) -> (String, String) {
+    const INLINE: usize = 3;
+    let head = items.iter().take(INLINE).map(String::as_str).collect::<Vec<_>>().join(" / ");
+    let text = if items.len() > INLINE {
+        format!("{label}: {head} +{}", items.len() - INLINE)
+    } else {
+        format!("{label}: {head}")
+    };
+    (text, format!("{label} ({}):\n{}", items.len(), items.join("\n")))
+}
+
+/// (chip text, hover text) per restriction the objective carries.
+#[cfg(feature = "egui")]
+fn objective_restrictions(o: &ObjectiveDef) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if !o.weapons.is_empty() { out.push(format!("weapon: {}", o.weapons.join(" / "))); }
-    if !o.weapon_mods.is_empty() { out.push(format!("mods: {}", o.weapon_mods.join(" / "))); }
-    if !o.wearing.is_empty() { out.push(format!("wear: {}", o.wearing.join(" / "))); }
-    if !o.not_wearing.is_empty() { out.push(format!("without: {}", o.not_wearing.join(" / "))); }
-    if !o.use_any.is_empty() { out.push(format!("use: {}", o.use_any.join(" / "))); }
-    if let Some(d) = &o.distance {
-        out.push(format!("distance {} {} m", d.compare.as_deref().unwrap_or("at"), trim_num(d.value)));
+    let plain = |s: String| (s.clone(), s);
+    for (label, items) in [
+        ("weapon", &o.weapons),
+        ("mods", &o.weapon_mods),
+        ("wear", &o.wearing),
+        ("without", &o.not_wearing),
+        ("use", &o.use_any),
+    ] {
+        if !items.is_empty() {
+            out.push(restriction_chip(label, items));
+        }
     }
-    if !o.body_parts.is_empty() { out.push(format!("hit: {}", o.body_parts.join(" / "))); }
-    if let Some(shot) = &o.shot_type { out.push(format!("shot: {shot}")); }
-    if let Some([from, until]) = o.time_window { out.push(format!("time {}:00-{}:00", trim_num(from), trim_num(until))); }
+    // ">= 0 m" is every shot ever fired — upstream sets it as the default on kill objectives, so
+    // it is a no-op the same way "durability 0-100%" was.
+    if let Some(d) = &o.distance {
+        let noop = d.value <= 0.0 && matches!(d.compare.as_deref(), Some(">=") | Some("moreThan") | None);
+        if !noop {
+            out.push(plain(format!(
+                "distance {} {} m",
+                d.compare.as_deref().unwrap_or("at"),
+                trim_num(d.value)
+            )));
+        }
+    }
+    if !o.body_parts.is_empty() { out.push(restriction_chip("hit", &o.body_parts)); }
+    if let Some(shot) = &o.shot_type { out.push(plain(format!("shot: {shot}"))); }
+    if let Some([from, until]) = o.time_window {
+        out.push(plain(format!("time {}:00-{}:00", trim_num(from), trim_num(until))));
+    }
+    // Only a REAL durability bound reaches here — build_tasks.py drops the 0-100% no-op.
     if o.min_durability.is_some() || o.max_durability.is_some() {
-        out.push(format!(
+        out.push(plain(format!(
             "durability {}-{}%",
             o.min_durability.map(trim_num).unwrap_or_else(|| "0".into()),
             o.max_durability.map(trim_num).unwrap_or_else(|| "100".into())
-        ));
+        )));
     }
     out
 }
@@ -1364,16 +1829,124 @@ fn reward_summary(r: &TaskRewards) -> String {
     bits.join("  \u{00B7}  ")
 }
 
+/// The item-bearing rewards as an icon grid: the granted items, then any trader-offer unlocks.
+/// Each tile is the cached item art with its stack count painted in the corner; hovering gives the
+/// full name, the count and the ~24 h price. Items with no cached PNG fall back to a text chip so
+/// the reward list is never silently short.
+#[cfg(feature = "egui")]
+fn reward_icons(
+    ui: &mut bevy_egui::egui::Ui,
+    icons: &mut TaskIconCache,
+    root: Option<&Path>,
+    shared: Option<&Path>,
+    r: &TaskRewards,
+) {
+    use bevy_egui::egui::{self, Color32, RichText};
+    use crate::ui_theme as theme;
+    const TILE: f32 = 34.0;
+
+    // (display name, stack count, ~price, unlock-trader) — offers are drawn in the same grid
+    // because "you can now BUY this" is the same shape of fact as "you are GIVEN this", and the
+    // trader name in the hover is what distinguishes them.
+    let mut tiles: Vec<(&str, i64, Option<i64>, Option<&str>)> = r
+        .items
+        .iter()
+        .map(|i| (i.name.as_str(), i.count.unwrap_or(1), i.price, None))
+        .collect();
+    for o in &r.offers {
+        if let Some(item) = o.item.as_deref().filter(|s| !s.is_empty()) {
+            tiles.push((item, 1, None, Some(o.trader.as_str())));
+        }
+    }
+    if tiles.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+        for (name, count, price, unlock) in tiles {
+            let hover = {
+                let mut h = name.to_string();
+                if count > 1 {
+                    h.push_str(&format!("  \u{00D7}{count}"));
+                }
+                if let Some(p) = price.filter(|v| *v > 0) {
+                    h.push_str(&format!("\n~{} RUB", crate::inspect::money(p)));
+                }
+                if let Some(tr) = unlock {
+                    h.push_str(&format!("\nunlocks at {tr}"));
+                }
+                h
+            };
+            let slug = crate::inspect::icon_slug(name);
+            match icons.get(ui.ctx(), root, shared, &slug) {
+                Some(tex) => {
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(TILE, TILE), egui::Sense::hover());
+                    // An unlock is not a granted item; the tinted backing is what says so at a
+                    // glance without spending a whole row on the word "Unlock".
+                    ui.painter().rect_filled(rect, 0.0, theme::INSET);
+                    if unlock.is_some() {
+                        ui.painter().rect_stroke(
+                            rect,
+                            0.0,
+                            egui::Stroke::new(1.0, theme::ACCENT),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                    let sz = tex.size_vec2();
+                    let s = (TILE / sz.x.max(1.0)).min(TILE / sz.y.max(1.0));
+                    ui.painter().image(
+                        tex.id(),
+                        egui::Rect::from_center_size(rect.center(), sz * s),
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    if count > 1 {
+                        // Bottom-right, on a dark plate so it stays legible over pale item art.
+                        let text = format!("\u{00D7}{count}");
+                        let pos = rect.right_bottom() + egui::vec2(-2.0, -2.0);
+                        let galley = ui.painter().layout_no_wrap(
+                            text,
+                            egui::FontId::proportional(9.0),
+                            theme::TEXT_BRIGHT,
+                        );
+                        let at = pos - galley.size();
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(at, galley.size()).expand(1.5),
+                            0.0,
+                            Color32::from_black_alpha(190),
+                        );
+                        ui.painter().galley(at, galley, theme::TEXT_BRIGHT);
+                    }
+                    resp.on_hover_text(hover);
+                }
+                None => {
+                    // No cached art (fetch_icons.py has not run for a map that references it) —
+                    // a chip still names the reward, which is strictly better than dropping it.
+                    let label = format!(
+                        "{}{}",
+                        short_item(name),
+                        if count > 1 { format!(" \u{00D7}{count}") } else { String::new() }
+                    );
+                    theme::chip(ui, &label, if unlock.is_some() { theme::ACCENT } else { theme::MUTED })
+                        .on_hover_text(hover);
+                }
+            }
+        }
+    });
+    let _ = RichText::new("");
+}
+
+/// The rewards no icon can express. Items and offer-unlocks are deliberately absent — they are
+/// drawn by [`reward_icons`], and listing them twice was the obvious thing to get wrong here.
 #[cfg(feature = "egui")]
 fn reward_lines(r: &TaskRewards) -> Vec<String> {
     let mut out = Vec::new();
-    for item in &r.items {
-        let count = item.count.filter(|n| *n > 1).map(|n| format!(" x{n}")).unwrap_or_default();
-        let price = item.price.filter(|v| *v > 0).map(|v| format!(" (~{} R)", crate::inspect::money(v))).unwrap_or_default();
-        out.push(format!("{}{}{}", item.name, count, price));
-    }
     for s in &r.standing { out.push(format!("{} reputation {:+}", s.trader, s.value.unwrap_or(0.0))); }
-    for o in &r.offers { out.push(format!("Unlock: {}{} at {}", o.item.as_deref().unwrap_or("offer"), o.level.map(|v| format!(" LL{v}")).unwrap_or_default(), o.trader)); }
+    // Offers with NO item still need a line — the icon grid can only draw the ones that name one.
+    for o in r.offers.iter().filter(|o| o.item.as_deref().unwrap_or("").is_empty()) {
+        out.push(format!("Unlock: offer{} at {}", o.level.map(|v| format!(" LL{v}")).unwrap_or_default(), o.trader));
+    }
     for s in &r.skills { out.push(format!("Skill: {} +{}", s.name.as_deref().unwrap_or("skill"), trim_num(s.level.unwrap_or(0.0)))); }
     for t in &r.traders { out.push(format!("Unlock trader: {t}")); }
     for a in &r.achievements { out.push(format!("Achievement: {a}")); }
@@ -1401,6 +1974,12 @@ fn obj_tag(kind: &str) -> (&'static str, bevy_egui::egui::Color32) {
         "sellItem" => ("SELL", Color32::from_rgb(96, 156, 226)),
         "useItem" => ("USE", Color32::from_rgb(180, 180, 170)),
         "experience" => ("XP", Color32::from_rgb(150, 150, 145)),
+        // The GAME's own trigger kinds (gamedata.json `quest_triggers[].kind`), which the
+        // unlinked-zone list renders. They are a different vocabulary from tarkov.dev's objective
+        // types, so they get their own arms rather than falling through to "DO".
+        "place_item" => ("PLANT", Color32::from_rgb(226, 150, 92)),
+        "flare" => ("FLARE", Color32::from_rgb(232, 194, 122)),
+        "quest" => ("QUEST", Color32::from_rgb(150, 150, 145)),
         _ => ("DO", Color32::from_rgb(150, 150, 145)),
     }
 }
@@ -1451,5 +2030,122 @@ mod tests {
         let s = std::fs::read_to_string(&path).unwrap();
         let rf: super::RawFile = serde_json::from_str(&s).expect("tasks.json must parse");
         assert!(!rf.tasks.is_empty(), "parsed but zero tasks");
+    }
+
+    /// The whole point of the first-party rewrite: on a map that has been BUILT, every objective
+    /// zone should carry the game's own trigger geometry, joined by name. If this regresses, the
+    /// panel is silently drawing tarkov.dev's boxes again — which is what it did before, and which
+    /// the old positional join disguised by reporting "src: game" for zones it had matched to the
+    /// wrong trigger entirely (a minefield check zone, a New Year event zone).
+    #[test]
+    fn built_map_zones_are_first_party() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let path = repo.join("packs").join("shared").join("tasks.json");
+        if !path.is_file() {
+            return;
+        }
+        // Only assert about maps whose pack is actually present — the join can say nothing about
+        // a map nobody has built, and CI checkouts have no packs at all.
+        let built: Vec<String> = match std::fs::read_dir(repo.join("packs")) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .filter_map(|n| n.strip_suffix(".eftpack").map(str::to_string))
+                .filter(|m| repo.join("packs").join(format!("{m}.eftpack")).join("gamedata.json").is_file())
+                .collect(),
+            Err(_) => return,
+        };
+        if built.is_empty() {
+            return;
+        }
+        let s = std::fs::read_to_string(&path).unwrap();
+        let rf: super::RawFile = serde_json::from_str(&s).unwrap();
+        let mut checked = 0usize;
+        for t in &rf.tasks {
+            for o in &t.objectives {
+                for z in &o.zones {
+                    let Some(m) = z.map.as_deref() else { continue };
+                    if !built.iter().any(|b| b == m) {
+                        continue;
+                    }
+                    checked += 1;
+                    assert_eq!(
+                        z.src.as_deref(),
+                        Some("game"),
+                        "{} / {m}: objective zone is not first-party (src={:?}, game={:?})",
+                        t.name,
+                        z.src,
+                        z.game,
+                    );
+                }
+            }
+        }
+        assert!(checked > 0, "no zones on any built map — the map-id join is broken");
+    }
+
+    /// tasks.json has TWO independent consumers with TWO independent schemas — this panel and
+    /// `poi::QuestFile`, which spawns the on-map markers and tracked-zone walls. They drifted, and
+    /// nothing noticed: a single `"outline": null` failed poi's parse of all 501 tasks, poi
+    /// swallowed the error with `.ok()`, and the only symptom was that tracking a task drew no
+    /// zone on the map. Testing the panel's schema alone could never have caught it, so this
+    /// asserts the OTHER consumer parses the very file we ship.
+    #[test]
+    fn poi_quest_schema_parses_the_shipped_catalog() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("packs")
+            .join("shared")
+            .join("tasks.json");
+        if !path.is_file() {
+            return;
+        }
+        let s = std::fs::read_to_string(&path).unwrap();
+        let qf: crate::poi::QuestFile =
+            serde_json::from_str(&s).expect("poi::QuestFile must parse the shipped tasks.json");
+        assert!(!qf.tasks.is_empty(), "poi parsed tasks.json but found zero tasks");
+        // And it must actually find zones — a schema that parses but resolves nothing is the same
+        // outage with a different cause.
+        let zoned = qf.tasks.iter().flat_map(|t| &t.objectives).filter(|o| !o.zones.is_empty()).count();
+        assert!(zoned > 0, "poi parsed tasks.json but no objective carries a zone");
+    }
+
+    /// One upstream zone id must not produce two markers on one spot. tarkov.dev lists a zone once
+    /// per map alias (factory + night-factory, ground-zero + ground-zero-21) and once per box for
+    /// multi-box triggers, and both used to survive into the catalog: every factory objective had
+    /// its marker and wall drawn twice, and Claustrophobia's 4-box zone came out as 16 rows.
+    #[test]
+    fn no_duplicate_zone_positions_within_an_objective() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("packs")
+            .join("shared")
+            .join("tasks.json");
+        if !path.is_file() {
+            return;
+        }
+        let s = std::fs::read_to_string(&path).unwrap();
+        let rf: super::RawFile = serde_json::from_str(&s).unwrap();
+        for t in &rf.tasks {
+            for o in &t.objectives {
+                let mut seen = std::collections::HashSet::new();
+                for z in &o.zones {
+                    let Some(p) = z.pos else { continue };
+                    let key = (
+                        z.map.clone().unwrap_or_default(),
+                        p[0].to_bits(),
+                        p[1].to_bits(),
+                        p[2].to_bits(),
+                    );
+                    assert!(
+                        seen.insert(key),
+                        "{}: duplicate zone position {p:?} on {:?}",
+                        t.name,
+                        z.map
+                    );
+                }
+            }
+        }
     }
 }

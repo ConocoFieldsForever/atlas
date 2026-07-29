@@ -11,7 +11,7 @@ import os, sys, json, argparse, time
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# portable kit: paths come from the environment (see extraction/README.md)
+# portable kit: paths come from the environment (see README.md)
 #   EFT_GAME_DATA   = the game's EscapeFromTarkov_Data dir (default: standard install path)
 #   EFT_ASSETS_ROOT = where extracted datasets are written (default: <EFT_TARKMAP_ROOT>/../eft_assets, else ./eft_assets)
 EFTDATA = os.environ.get("EFT_GAME_DATA",

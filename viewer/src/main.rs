@@ -348,6 +348,12 @@ fn load_map(
         .unwrap_or(&dir)
         .to_string();
     info!("map switch: loading '{name}' in place (async)\u{2026}");
+    // We are becoming an interactive MAP view now, so claim the GPU from here on: a bake started
+    // after this point must see us and stay off the adapter. Startup deliberately does NOT take the
+    // lease in menu mode (see main()), and PLAY is an in-place switch rather than a relaunch — so
+    // without this the process would render a map while still advertising the GPU as free.
+    // Idempotent, so a second switch is a no-op.
+    crate::gpu_lease::hold("map loaded");
     let task = bevy::tasks::AsyncComputeTaskPool::get()
         .spawn(async move { Pack::load(&dir).map_err(|e| format!("{e:#}")) });
     pending.0 = Some((name, task));
@@ -687,7 +693,7 @@ fn main() {
                  atlas bake-nav <pack-dir> [--res 1.0] [--layers 8]  (headless CPU nav baker)\n\
                  no args: start menu (scans <exe>/packs).  env: EFT_PACK, EFT_RENDER, EFT_SHADOWS,\n\
                  EFT_GRADE/EFT_GRADE_EXPOSURE, EFT_FOG, EFT_UNCAPPED, EFT_HIDDEN, EFT_SHOT,\n\
-                 EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0. Docs: README_DIST.md"
+                 EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0. Docs: README.md"
             );
             return;
         }
@@ -795,18 +801,20 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Take the INTERACTIVE-GPU lease for this process's lifetime. A bake worker started while we
-    // render sees it and picks the CPU backend instead of fighting us for the adapter — a TDR
-    // resets the DEVICE, not just the offending process, so a runaway compute dispatch would take
-    // this viewer down with it (that is the 0xC0000409 abort we hit). Held in a `static` so the
-    // handle lives until the process exits, and released by the OS even on an abort/kill.
-    // See viewer/src/gpu_lease.rs.
-    static GPU_LEASE: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
-    let _ = GPU_LEASE.set(gpu_lease::acquire());
-    eprintln!(
-        "[gpu-lease] viewer holding = {}",
-        GPU_LEASE.get().map(|o| o.is_some()).unwrap_or(false)
-    );
+    // Take the INTERACTIVE-GPU lease, but ONLY when we are actually rendering a map. A bake worker
+    // started while we render sees it and picks the CPU backend instead of fighting us for the
+    // adapter — a TDR resets the DEVICE, not just the offending process, so a runaway compute
+    // dispatch would take this viewer down with it (that is the 0xC0000409 abort we hit).
+    //
+    // NOT IN MENU MODE. The menu and the viewer are one process, and this used to be taken for the
+    // whole lifetime unconditionally — so a build launched from the menu always found the GPU
+    // "busy", held by an idle settings screen, and EVERY bake started from the UI silently took the
+    // CPU backend. Measured: interchange's SH bake spent 6m34s on the CPU with the GPU path sitting
+    // right there. A menu is not the interactive map view this protects. The in-place PLAY switch
+    // calls `gpu_lease::hold` as the map loads, so the moment we really are rendering, we claim it.
+    if !menu_mode {
+        gpu_lease::hold("map on the command line");
+    }
 
     let mut app = App::new();
     app.add_plugins(
