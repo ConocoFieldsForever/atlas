@@ -13,7 +13,10 @@ param(
     [switch]$SkipBuild,
     [switch]$SkipRenderSmoke,
     [switch]$SkipPython,   # -Full only: skip bundling the embeddable Python (fast local reruns)
-    [string]$SmokePack = "packs\factory.eftpack"
+    # A pack this repo actually builds. It used to name packs\factory.eftpack, which no longer
+    # exists (the shipped map is the 1.0 rework, factory_rework), so the render smoke silently
+    # took the "no smoke pack - skipping" branch and the release passed without ever rendering.
+    [string]$SmokePack = "packs\factory_rework.eftpack"
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,9 +64,8 @@ foreach ($sh in "gpu_cull.wgsl","gpu_draw.wgsl","gpu_shadow.wgsl","ssao.wgsl","g
     if (-not (Test-Path "viewer\assets\shaders\$sh")) { throw "release: shader $sh missing from workspace" }
     Copy-Item "viewer\assets\shaders\$sh" "$dist\assets\shaders\"
 }
-# README.md is the friendly non-dev guide (first-run + SmartScreen "Run anyway" steps);
-# README.md is the technical/env-toggle reference. Ship both.
-Copy-Item "README.md" $dist -ErrorAction SilentlyContinue
+# One README now: the non-dev first-run guide (incl. the SmartScreen "Run anyway" steps) and the
+# technical env-toggle reference were merged, so there is a single file to ship and to keep current.
 Copy-Item "README.md" $dist -ErrorAction SilentlyContinue
 Copy-Item "LICENSE-NOTES.md" $dist -ErrorAction SilentlyContinue
 # Field-test protocol for the target-GPU testers (RTX 4060 / RX 6800 round): ships at the zip
