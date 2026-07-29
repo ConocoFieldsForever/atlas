@@ -35,14 +35,19 @@ def is_embeddable(exe):
     return bool(glob.glob(os.path.join(os.path.dirname(os.path.abspath(exe)), "python*._pth")))
 
 
+def ascii_safe(value):
+    """Escape non-ASCII text so logs remain writable on every Windows code page."""
+    return value.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
 def run(cmd):
-    print("  $ " + " ".join(cmd), flush=True)
+    print("  $ " + ascii_safe(" ".join(cmd)), flush=True)
     p = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="ascii", errors="replace",
+        text=True, encoding="ascii", errors="backslashreplace",
     )
     for line in p.stdout:
-        print("  " + line.rstrip(), flush=True)
+        print("  " + ascii_safe(line.rstrip()), flush=True)
     return p.wait()
 
 
