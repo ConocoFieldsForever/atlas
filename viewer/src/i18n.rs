@@ -131,6 +131,9 @@ pub enum K {
     LiveLinkNote,
     BackToTarkov,
     OverlayReopenHint,
+    OverlayExitWindow,
+    OverlayExitHotkey,
+    OverlayExitHint,
     UnbuiltNotProcessed,
     UnbuiltBody,
     UnbuiltProcess,
@@ -398,6 +401,18 @@ Atlas читает только файлы, которые игра уже за�
         OverlayReopenHint => [
             "Take an in-game screenshot to reopen the overlay",
             "Чтобы снова открыть оверлей, сделайте скриншот в игре",
+        ],
+        OverlayExitWindow => [
+            "EXIT OVERLAY / WINDOW MODE",
+            "ВЫЙТИ ИЗ ОВЕРЛЕЯ / ОКОННЫЙ РЕЖИМ",
+        ],
+        OverlayExitHotkey => [
+            "Exit-overlay hotkey",
+            "Клавиша выхода из оверлея",
+        ],
+        OverlayExitHint => [
+            "Restores the normal resizable Atlas window",
+            "Возвращает обычное изменяемое окно Atlas",
         ],
         UnbuiltNotProcessed => ["is not processed yet", "ещё не обработана"],
         UnbuiltBody => [

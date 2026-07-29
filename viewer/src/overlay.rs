@@ -301,12 +301,79 @@ fn request_atlas_focus() -> bool {
     false
 }
 
+/// User-selectable key that restores Atlas's ordinary desktop window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayExitHotkey {
+    NumpadEnter,
+    Enter,
+    Escape,
+    F10,
+    F11,
+    F12,
+}
+
+impl OverlayExitHotkey {
+    pub const ALL: [Self; 6] = [
+        Self::NumpadEnter,
+        Self::Enter,
+        Self::Escape,
+        Self::F10,
+        Self::F11,
+        Self::F12,
+    ];
+
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::NumpadEnter => "numpad_enter",
+            Self::Enter => "enter",
+            Self::Escape => "escape",
+            Self::F10 => "f10",
+            Self::F11 => "f11",
+            Self::F12 => "f12",
+        }
+    }
+
+    pub fn from_config(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "numpad_enter" | "numpadenter" | "right_enter" => Some(Self::NumpadEnter),
+            "enter" => Some(Self::Enter),
+            "escape" | "esc" => Some(Self::Escape),
+            "f10" => Some(Self::F10),
+            "f11" => Some(Self::F11),
+            "f12" => Some(Self::F12),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NumpadEnter => "Right Enter (numpad)",
+            Self::Enter => "Enter",
+            Self::Escape => "Escape",
+            Self::F10 => "F10",
+            Self::F11 => "F11",
+            Self::F12 => "F12",
+        }
+    }
+
+    fn key_code(self) -> KeyCode {
+        match self {
+            Self::NumpadEnter => KeyCode::NumpadEnter,
+            Self::Enter => KeyCode::Enter,
+            Self::Escape => KeyCode::Escape,
+            Self::F10 => KeyCode::F10,
+            Self::F11 => KeyCode::F11,
+            Self::F12 => KeyCode::F12,
+        }
+    }
+}
+
 /// Everything the overlay's behaviour is configured by — ONE struct so the menu UI can bind to it
 /// directly and `atlas.config.json` has one obvious home for these keys. Runtime state (is it up
 /// right now, what geometry did we come from) lives in `OverlayState`, deliberately separate: this
 /// is the part worth persisting and showing in a settings panel.
 ///
-/// Persisted flat, one key per field, matching the established `config_bool` pattern in menu.rs.
+/// Persisted flat, one key per field, matching the established config helper pattern in menu.rs.
 #[derive(Resource, Debug, Clone, PartialEq)]
 pub struct OverlayConfig {
     /// Master switch. OFF by default: overlaying a game is the user's call to make, not ours
@@ -352,6 +419,8 @@ pub struct OverlayConfig {
     /// we didn't parse, and nothing at all while screenshot-locate is off. Lives here because the
     /// menu shows it beside the overlay's other live-link settings.
     pub delete_processed_shots: bool,
+    /// Restore the ordinary decorated, resizable Atlas window without disarming screenshot summon.
+    pub exit_hotkey: OverlayExitHotkey,
 }
 
 impl Default for OverlayConfig {
@@ -371,6 +440,7 @@ impl Default for OverlayConfig {
             show_on_screenshot: true,
             return_focus_to_game: true,
             delete_processed_shots: true,
+            exit_hotkey: OverlayExitHotkey::NumpadEnter,
         }
     }
 }
@@ -428,6 +498,10 @@ impl OverlayConfig {
                 .unwrap_or(d.return_focus_to_game),
             delete_processed_shots: crate::menu::config_bool_pub("deleteProcessedShots")
                 .unwrap_or(d.delete_processed_shots),
+            exit_hotkey: crate::menu::config_str_pub("overlayExitHotkey")
+                .as_deref()
+                .and_then(OverlayExitHotkey::from_config)
+                .unwrap_or(d.exit_hotkey),
         }
     }
 
@@ -447,6 +521,10 @@ impl OverlayConfig {
         ok &= crate::menu::save_config_bool_pub("overlayShowOnScreenshot", self.show_on_screenshot);
         ok &= crate::menu::save_config_bool_pub("overlayReturnFocus", self.return_focus_to_game);
         ok &= crate::menu::save_config_bool_pub("deleteProcessedShots", self.delete_processed_shots);
+        ok &= crate::menu::save_config_str_pub(
+            "overlayExitHotkey",
+            self.exit_hotkey.config_value(),
+        );
         ok
     }
 
@@ -460,11 +538,31 @@ impl OverlayConfig {
     }
 }
 
+/// Winit's reactive update mode is the renderer-side overlay frame limiter. Keep this in one
+/// helper so focused and unfocused windows cannot accidentally drift back to different policies.
+/// Device events (raw mouse motion) do not wake an extra frame; ordinary keyboard/window events
+/// still do, which keeps input responsive while the timer supplies the steady redraw cadence.
+fn overlay_update_mode(fps_cap: u32) -> UpdateMode {
+    if fps_cap > 0 {
+        UpdateMode::Reactive {
+            wait: std::time::Duration::from_secs_f32(1.0 / fps_cap as f32),
+            react_to_device_events: false,
+            react_to_user_events: true,
+            react_to_window_events: true,
+        }
+    } else {
+        UpdateMode::Continuous
+    }
+}
+
 /// Live overlay state (not persisted).
 #[derive(Resource, Default)]
 pub struct OverlayState {
     /// Is the overlay currently summoned?
     pub shown: bool,
+    /// The user explicitly left overlay presentation but kept Atlas open as an ordinary decorated,
+    /// resizable window. Screenshot summon remains armed and clears this flag next time.
+    pub windowed: bool,
     /// Bumped whenever something asks for the overlay to be brought to the FRONT, even if it is
     /// already `shown`. Windows can put us behind (or minimise us) without changing `shown` at
     /// all -- notably when Tarkov takes exclusive fullscreen back after a screenshot -- and
@@ -494,7 +592,11 @@ impl Plugin for OverlayPlugin {
             });
         }
         app.insert_resource(OverlayConfig::load().sanitized())
-            .insert_resource(OverlayState { shown: summon, raise_nonce: 0 })
+            .insert_resource(OverlayState {
+                shown: summon,
+                windowed: false,
+                raise_nonce: 0,
+            })
             .init_resource::<OverlayViewSlice>()
             .add_systems(
                 Update,
@@ -541,8 +643,19 @@ fn toggle_overlay(
     if ui_kb.map(|k| k.0).unwrap_or(false) {
         return;
     }
-    if keys.just_pressed(KeyCode::Backquote) {
-        state.shown = !state.shown;
+    if state.shown && keys.just_pressed(cfg.exit_hotkey.key_code()) {
+        state.shown = false;
+        state.windowed = true;
+    } else if keys.just_pressed(KeyCode::Backquote) {
+        // `~` remains the fast raid handoff. If Atlas is currently in ordinary window mode,
+        // treat it as an explicit re-summon rather than hiding the desktop window.
+        if state.windowed {
+            state.windowed = false;
+            state.shown = true;
+            state.raise_nonce = state.raise_nonce.wrapping_add(1);
+        } else {
+            state.shown = !state.shown;
+        }
     }
 }
 
@@ -557,7 +670,7 @@ fn apply_overlay(
     monitors: Query<&bevy::window::Monitor, With<bevy::window::PrimaryMonitor>>,
     any_monitor: Query<&bevy::window::Monitor>,
     mut winit: ResMut<bevy::winit::WinitSettings>,
-    mut last: Local<Option<bool>>,
+    mut last_active: Local<Option<bool>>,
     mut last_nonce: Local<Option<u32>>,
     mut raise_retries: Local<u8>,
     mut focus_confirmed: Local<bool>,
@@ -568,21 +681,22 @@ fn apply_overlay(
     // Re-run on a shown/hidden transition, on a settings change, OR on an explicit re-raise
     // request (see `OverlayState::raise_nonce`) -- the last one is what makes a second screenshot
     // pull the window back to the front after the game has taken the foreground.
-    let shown_changed = *last != Some(state.shown);
+    let active = cfg.enabled && state.shown && !state.windowed;
+    let active_changed = *last_active != Some(active);
     let nonce_changed = *last_nonce != Some(state.raise_nonce);
     let config_changed = cfg.is_changed();
-    if state.shown && nonce_changed {
+    if active && nonce_changed {
         // A screenshot arrives while Tarkov is still finishing its own capture/fullscreen
         // transition. One immediate raise can be overwritten by the game a frame later, leaving
         // OverlayState::shown true but the OS window minimized/behind. Retry for up to roughly two
         // seconds at 60 fps, stopping immediately once Windows confirms Atlas owns the keyboard.
         *raise_retries = 120;
         *focus_confirmed = false;
-    } else if !state.shown {
+    } else if !active {
         *raise_retries = 0;
         *focus_confirmed = false;
     }
-    if !shown_changed && !config_changed && !nonce_changed && *raise_retries == 0 {
+    if !active_changed && !config_changed && !nonce_changed && *raise_retries == 0 {
         return;
     }
     *last_nonce = Some(state.raise_nonce);
@@ -590,13 +704,13 @@ fn apply_overlay(
     // the window on a real shown->hidden transition: on the first frame (`last` = None) and on
     // every settings tweak (cfg change marks this system dirty) `shown` is simply still false, and
     // treating that as "dismiss" minimised Atlas at startup and whenever a slider moved.
-    let was_shown = last.unwrap_or(false);
-    *last = Some(state.shown);
+    let was_active = last_active.unwrap_or(false);
+    *last_active = Some(active);
     let Ok(mut win) = q.single_mut() else { return };
 
     // Follow-up raises after the full transition. Re-applying size/position/window level every
     // frame would churn the swapchain — exactly the surface path we are trying to keep stable.
-    if state.shown && !shown_changed && !config_changed {
+    if active && !active_changed && !config_changed {
         win.visible = true;
         win.set_minimized(false);
         // `win.focused = true` is not a native-focus guarantee: it mutates Bevy's event-fed cache,
@@ -614,7 +728,7 @@ fn apply_overlay(
         return;
     }
 
-    if state.shown {
+    if active {
         // Reopens after BACK TO TARKOV use the exact previous overlay rectangle. Re-querying the
         // game here made placement depend on a focus race: Tarkov was sometimes visible (anchor to
         // the game) and sometimes briefly iconic (fall back to the monitor).
@@ -624,9 +738,8 @@ fn apply_overlay(
         if saved.is_none() {
             *saved = Some((win.position, win.resolution.physical_size()));
         }
-        if cfg.borderless {
-            win.decorations = false;
-        }
+        win.decorations = !cfg.borderless;
+        win.resizable = false;
         win.window_level = if cfg.always_on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal };
         // Raise + take focus: summoned from a raid the game owns the foreground, so an always-on-top
         // window that never asks for focus would appear without receiving the WASD that follows.
@@ -705,24 +818,17 @@ fn apply_overlay(
                 view.0 = Some(slice);
             }
         }
-        // Leave the GAME headroom: once the user clicks back to EFT we are unfocused, and an
-        // unthrottled Atlas would keep rendering the map at full rate on the same GPU. `fps_cap`
-        // sets that unfocused rate; focused stays continuous so the overlay itself feels normal.
-        winit.focused_mode = UpdateMode::Continuous;
-        winit.unfocused_mode = if cfg.fps_cap > 0 {
-            UpdateMode::Reactive {
-                wait: std::time::Duration::from_secs_f32(1.0 / cfg.fps_cap as f32),
-                react_to_device_events: false,
-                react_to_user_events: true,
-                react_to_window_events: true,
-            }
-        } else {
-            UpdateMode::Continuous
-        };
+        // Leave the GAME headroom for the entire time the overlay is shown. Atlas deliberately
+        // takes focus so WASD/mouse cannot leak into Tarkov; limiting only `unfocused_mode` meant
+        // that normal focused use ignored the user's cap and rendered at monitor refresh/full
+        // speed. Apply the same policy on both sides of the focus transition. Standalone mode is
+        // restored to Continuous in the cfg.enabled=false branch below.
+        winit.focused_mode = overlay_update_mode(cfg.fps_cap);
+        winit.unfocused_mode = overlay_update_mode(cfg.fps_cap);
         // Say WHICH rect we anchored to. "The overlay opened somewhere unexpected" is otherwise
         // undiagnosable from a log, and the two cases look identical on a single-monitor desk.
         info!(
-            "overlay: shown (borderless={}, always_on_top={}, {:.0}%x{:.0}% of {}, unfocused cap {} fps)",
+            "overlay: shown (borderless={}, always_on_top={}, {:.0}%x{:.0}% of {}, cap {} fps)",
             cfg.borderless,
             cfg.always_on_top,
             cfg.size_frac.x * 100.0,
@@ -746,14 +852,28 @@ fn apply_overlay(
         // Overlay OFF entirely: behave like a stock desktop app. Restoring Continuous here (this
         // system only runs on change) undoes any throttle a previous enable left behind, and a
         // user who never opted in never sees their unfocused frame rate touched.
-        if !cfg.enabled {
+        if state.windowed || !cfg.enabled {
+            win.window_level = WindowLevel::Normal;
+            win.decorations = true;
+            win.resizable = true;
+            win.visible = true;
+            win.set_minimized(false);
+            if let Some((pos, res)) = saved.take() {
+                win.position = pos;
+                win.resolution.set_physical_resolution(res.x, res.y);
+            }
+            *overlay_rect = None;
+            view.0 = None;
             winit.focused_mode = UpdateMode::Continuous;
             winit.unfocused_mode = UpdateMode::Continuous;
+            if state.windowed {
+                info!("overlay: exited to the ordinary resizable Atlas window");
+            }
             return;
         }
-        // Window mutations only on a REAL dismiss (see `was_shown` above) — never at startup and
+        // Window mutations only on a REAL dismiss (see `was_active` above) — never at startup and
         // never because a settings checkbox redrew us.
-        if was_shown {
+        if was_active {
             win.window_level = WindowLevel::Normal;
             if cfg.return_focus_to_game {
                 // Minimize in place. Restoring the desktop geometry before minimizing is what made
@@ -763,6 +883,7 @@ fn apply_overlay(
             } else {
                 // No automatic handoff: restore the ordinary desktop window immediately.
                 win.decorations = true;
+                win.resizable = true;
                 if let Some((pos, res)) = saved.take() {
                     win.position = pos;
                     win.resolution.set_physical_resolution(res.x, res.y);
@@ -791,6 +912,34 @@ fn apply_overlay(
     }
 }
 
+#[cfg(test)]
+mod overlay_update_mode_tests {
+    use super::*;
+
+    #[test]
+    fn positive_overlay_cap_uses_the_requested_timer() {
+        match overlay_update_mode(50) {
+            UpdateMode::Reactive {
+                wait,
+                react_to_device_events,
+                react_to_user_events,
+                react_to_window_events,
+            } => {
+                assert_eq!(wait, std::time::Duration::from_millis(20));
+                assert!(!react_to_device_events);
+                assert!(react_to_user_events);
+                assert!(react_to_window_events);
+            }
+            other => panic!("expected capped reactive mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_overlay_cap_is_uncapped() {
+        assert!(matches!(overlay_update_mode(0), UpdateMode::Continuous));
+    }
+}
+
 /// Apply the asymmetric projection only while the overlay is visible. The camera position,
 /// rotation, and Tarkov FOV still come from `game_watch`; this supplies the final missing datum:
 /// which rectangle of the full game image the Atlas window has replaced.
@@ -800,7 +949,7 @@ fn apply_overlay_view_slice(
     view: Res<OverlayViewSlice>,
     mut cameras: Query<&mut Camera, With<crate::render::CullCamera>>,
 ) {
-    let desired = if cfg.enabled && state.shown {
+    let desired = if cfg.enabled && state.shown && !state.windowed {
         view.0
     } else {
         None
@@ -820,13 +969,14 @@ fn overlay_return_button(
     mut contexts: bevy_egui::EguiContexts,
     menu: Option<Res<crate::menu::MenuState>>,
     lang: Res<crate::i18n::Lang>,
+    cfg: Res<OverlayConfig>,
     mut state: ResMut<OverlayState>,
 ) {
     use crate::i18n::{t, K};
     use crate::ui_theme as theme;
     use bevy_egui::egui::{self, RichText};
 
-    if !state.shown || menu.is_some() {
+    if !state.shown || state.windowed || menu.is_some() {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else { return };
@@ -850,6 +1000,29 @@ fn overlay_return_button(
                 }
                 ui.add_space(2.0);
                 ui.label(RichText::new(t(lg, K::OverlayReopenHint)).size(10.0).color(theme::MUTED));
+                ui.add_space(5.0);
+                let exit = egui::Button::new(
+                    RichText::new(t(lg, K::OverlayExitWindow))
+                        .size(12.0)
+                        .strong()
+                        .color(theme::TEXT_BRIGHT),
+                )
+                .fill(theme::CARD)
+                .corner_radius(5.0)
+                .min_size(egui::vec2(280.0, 32.0));
+                if ui.add(exit).clicked() {
+                    state.shown = false;
+                    state.windowed = true;
+                }
+                ui.label(
+                    RichText::new(format!(
+                        "{} \u{00B7} {}",
+                        cfg.exit_hotkey.label(),
+                        t(lg, K::OverlayExitHint)
+                    ))
+                    .size(9.0)
+                    .color(theme::MUTED),
+                );
             });
         });
 }
@@ -857,6 +1030,20 @@ fn overlay_return_button(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn right_enter_is_the_default_exit_hotkey_and_round_trips() {
+        assert_eq!(
+            OverlayConfig::default().exit_hotkey,
+            OverlayExitHotkey::NumpadEnter
+        );
+        for key in OverlayExitHotkey::ALL {
+            assert_eq!(
+                OverlayExitHotkey::from_config(key.config_value()),
+                Some(key)
+            );
+        }
+    }
 
     #[test]
     fn centered_overlay_maps_to_the_same_game_pixels() {

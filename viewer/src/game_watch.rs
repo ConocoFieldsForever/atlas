@@ -39,6 +39,9 @@ enum GameEvent {
     Fov(f32),
     /// The raid ended (UserMatchOver) — the last fix is stale.
     RaidEnd,
+    /// The local profile's side for the upcoming/current raid. This comes only from
+    /// GroupMatchRaidSettings; uppercase `Side` fields elsewhere describe other profiles.
+    RaidSide(RaidSide),
 }
 
 /// Scene-preset bundle name -> our pack id. GAME-DERIVED via the embedded manifest
@@ -87,6 +90,35 @@ pub struct PlayerFixState {
     pub at: f32,
 }
 
+/// Local raid side as named by EFT's `raidSettings.side` log field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaidSide {
+    Pmc,
+    Scav,
+}
+
+impl RaidSide {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pmc => "PMC",
+            Self::Scav => "Scav",
+        }
+    }
+
+    /// Component-type eligibility. `secret` remains visible for both sides because the
+    /// SecretExfiltrationPoint class does not encode a faction.
+    pub fn allows_extract(self, faction: &str) -> bool {
+        let f = faction.to_ascii_lowercase();
+        if f == "shared" || f == "secret" || f.contains('+') {
+            return true;
+        }
+        match self {
+            Self::Pmc => f == "pmc",
+            Self::Scav => f == "scav" || f == "savage",
+        }
+    }
+}
+
 #[derive(Resource)]
 pub struct GameLink {
     rx: Mutex<Receiver<GameEvent>>,
@@ -99,6 +131,9 @@ pub struct GameLink {
     /// here is the worst outcome, because the user is standing in a raid watching a map that is
     /// NOT where they are.
     pub unbuilt_map: Option<String>,
+    /// Authoritative when present. None means this session did not log GroupMatchRaidSettings;
+    /// consumers must keep both factions visible instead of guessing.
+    pub raid_side: Option<RaidSide>,
 }
 
 pub struct GameWatchPlugin;
@@ -125,6 +160,7 @@ impl Plugin for GameWatchPlugin {
             player: None,
             pending_map: None,
             unbuilt_map: None,
+            raid_side: None,
         })
             .add_systems(
                 Update,
@@ -241,6 +277,7 @@ with the overlay up"
                         // between screenshots, and a summon that only fires on the rising edge
                         // leaves the overlay flagged shown but invisible.
                         st.raise_nonce = st.raise_nonce.wrapping_add(1);
+                        st.windowed = false;
                         if !st.shown {
                             st.shown = true;
                             info!("game link: screenshot fix -> summoning the overlay");
@@ -310,6 +347,13 @@ with the overlay up"
             GameEvent::RaidEnd => {
                 link.unbuilt_map = None;
                 link.player = None;
+                link.raid_side = None;
+            }
+            GameEvent::RaidSide(side) => {
+                if link.raid_side != Some(side) {
+                    info!("game link: raid side is {} (GroupMatchRaidSettings)", side.label());
+                    link.raid_side = Some(side);
+                }
             }
         }
     }
@@ -351,6 +395,66 @@ fn draw_player_marker(
     }
     // Vertical beacon: visible from the fly camera far above.
     gizmos.line(p, p + Vec3::Y * 30.0, dim);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_side_and_match_end_are_emitted_in_log_order() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = String::new();
+        let log = concat!(
+            "Got notification | GroupMatchRaidSettings\n",
+            "{\n",
+            "  \"raidSettings\": {\"side\": \"Savage\"}\n",
+            "}\n",
+            "Got notification | UserMatchOver\n",
+            "{\n",
+            "  \"type\": \"userMatchOver\"\n",
+            "}\n",
+            "Got notification | GroupMatchRaidSettings\n",
+            "{\n",
+            "  \"raidSettings\": {\"side\": \"Pmc\"}\n",
+            "}\n",
+        );
+        parse_notifications(&mut pending, log, &tx);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(events.as_slice(), [
+            GameEvent::RaidSide(RaidSide::Scav),
+            GameEvent::RaidEnd,
+            GameEvent::RaidSide(RaidSide::Pmc),
+        ]));
+    }
+
+    #[test]
+    fn unrelated_uppercase_side_never_identifies_the_local_player() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = String::new();
+        parse_notifications(
+            &mut pending,
+            concat!(
+                "Got notification | GroupMatchRaidSettings\n",
+                "{\n",
+                "  \"extendedProfile\": {\"Info\": {\"Side\": \"Savage\"}},\n",
+                "  \"raidSettings\": {\"location\": \"Interchange\"}\n",
+                "}\n",
+            ),
+            &tx,
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn faction_filter_keeps_shared_and_unknown_secret_extracts() {
+        assert!(RaidSide::Pmc.allows_extract("pmc"));
+        assert!(!RaidSide::Pmc.allows_extract("scav"));
+        assert!(RaidSide::Scav.allows_extract("scav"));
+        assert!(!RaidSide::Scav.allows_extract("pmc"));
+        assert!(RaidSide::Pmc.allows_extract("shared"));
+        assert!(RaidSide::Scav.allows_extract("secret"));
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -535,21 +639,26 @@ fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) 
     cap(pending);
 }
 
-/// notifications.log: `Got notification | ChatMessageReceived` followed by a multi-line JSON block
-/// (closing brace at column 0). Task pushes carry message.type 10/11/12 + templateId "<taskid> 0".
+/// notifications.log: `Got notification | <kind>` followed by a multi-line JSON block (closing
+/// brace at column 0). Parse the stream in order so a historical UserMatchOver correctly clears
+/// the preceding raid side, while a later GroupMatchRaidSettings starts the next one.
 fn parse_notifications(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) {
-    if chunk.contains("UserMatchOver") {
-        let _ = tx.send(GameEvent::RaidEnd);
-    }
     pending.push_str(chunk);
-    const MARK: &str = "Got notification | ChatMessageReceived";
+    const MARK: &str = "Got notification | ";
     loop {
         let Some(mi) = pending.find(MARK) else {
             // No marker at all: nothing buffered matters beyond a partial marker at the very end.
             cap(pending);
             return;
         };
-        let Some(js) = pending[mi..].find('{').map(|o| mi + o) else {
+        let kind_start = mi + MARK.len();
+        let Some(kind_end) = pending[kind_start..].find('\n').map(|o| kind_start + o) else {
+            pending.drain(..mi);
+            cap(pending);
+            return;
+        };
+        let kind = pending[kind_start..kind_end].trim().to_string();
+        let Some(js) = pending[kind_end..].find('{').map(|o| kind_end + o) else {
             pending.drain(..mi);
             cap(pending);
             return;
@@ -562,15 +671,33 @@ fn parse_notifications(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>
             return; // incomplete JSON - wait for the next chunk
         };
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pending[js..je]) {
-            let msg = &v["message"];
-            let ty = msg["type"].as_i64().unwrap_or(0);
-            if (10..=12).contains(&ty) {
-                if let Some(tpl) = msg["templateId"].as_str() {
-                    let id = tpl.split(' ').next().unwrap_or(tpl).to_string();
-                    if !id.is_empty() {
-                        let _ = tx.send(GameEvent::Task { id, status: ty });
+            match kind.as_str() {
+                "ChatMessageReceived" => {
+                    let msg = &v["message"];
+                    let ty = msg["type"].as_i64().unwrap_or(0);
+                    if (10..=12).contains(&ty) {
+                        if let Some(tpl) = msg["templateId"].as_str() {
+                            let id = tpl.split(' ').next().unwrap_or(tpl).to_string();
+                            if !id.is_empty() {
+                                let _ = tx.send(GameEvent::Task { id, status: ty });
+                            }
+                        }
                     }
                 }
+                "GroupMatchRaidSettings" => {
+                    let side = match v["raidSettings"]["side"].as_str() {
+                        Some("Pmc") => Some(RaidSide::Pmc),
+                        Some("Savage") => Some(RaidSide::Scav),
+                        _ => None,
+                    };
+                    if let Some(side) = side {
+                        let _ = tx.send(GameEvent::RaidSide(side));
+                    }
+                }
+                "UserMatchOver" => {
+                    let _ = tx.send(GameEvent::RaidEnd);
+                }
+                _ => {}
             }
         }
         pending.drain(..je);

@@ -190,10 +190,12 @@ fn dispatch_plan(
             &crate::inspect::MarkerInfo,
             Option<&crate::poi::SceneInactive>,
             Option<&crate::poi::PlayerStart>,
+            Option<&crate::poi::ExtractFaction>,
         ),
         Without<crate::poi::ZoneWall>,
     >,
     zones: Res<crate::poi::GameDataZones>,
+    game_link: Option<Res<crate::game_watch::GameLink>>,
     mut task: ResMut<PlanTask>,
     mut plan: ResMut<PlanResult>,
     mut route_result: ResMut<RouteResult>,
@@ -256,11 +258,18 @@ fn dispatch_plan(
 
     // ---- extract candidates (active only) — the run must END somewhere safe.
     let want: std::collections::HashSet<&str> = req.extracts.iter().map(String::as_str).collect();
+    let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
     let extracts: Vec<(String, Vec3)> = all_marks
         .iter()
-        .filter(|(l, _, _, inactive, _)| **l == crate::poi::PoiLayer::Extract && inactive.is_none())
-        .filter(|(_, _, info, _, _)| want.is_empty() || want.contains(info.title.as_str()))
-        .map(|(_, gt, info, _, _)| (info.title.clone(), gt.translation()))
+        .filter(|(l, _, _, inactive, _, faction)| {
+            **l == crate::poi::PoiLayer::Extract
+                && inactive.is_none()
+                && !raid_side.is_some_and(|side| {
+                    faction.is_some_and(|faction| !side.allows_extract(&faction.0))
+                })
+        })
+        .filter(|(_, _, info, _, _, _)| want.is_empty() || want.contains(info.title.as_str()))
+        .map(|(_, gt, info, _, _, _)| (info.title.clone(), gt.translation()))
         .collect();
     if extracts.is_empty() {
         // Distinguish "this map has none" from "you deselected them all" - otherwise the user
@@ -276,7 +285,7 @@ fn dispatch_plan(
     // ---- avoid field (same options as normal routing) ----
     let mut avoid_pts: Vec<(Vec3, f32)> = Vec::new();
     if opts.avoid_boss || opts.avoid_pmc || opts.avoid_scav {
-        for (l, gt, _, _, player_start) in &all_marks {
+        for (l, gt, _, _, player_start, _) in &all_marks {
             let r = match l {
                 crate::poi::PoiLayer::Boss if opts.avoid_boss => 45.0,
                 // Player raid starts excluded (players scatter within minutes) — only AI-PMC
@@ -298,8 +307,10 @@ fn dispatch_plan(
             zones.patrols.clone(),
             all_marks
                 .iter()
-                .filter(|(l, _, _, _, ps)| **l == crate::poi::PoiLayer::PmcSpawn && ps.is_none())
-                .map(|(_, gt, _, _, _)| gt.translation())
+                .filter(|(l, _, _, _, ps, _)| {
+                    **l == crate::poi::PoiLayer::PmcSpawn && ps.is_none()
+                })
+                .map(|(_, gt, _, _, _, _)| gt.translation())
                 .collect(),
         )
     } else {

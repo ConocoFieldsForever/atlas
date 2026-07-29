@@ -384,8 +384,15 @@ Anyone picking this up should start by finding the block header at byte 18652 (r
   of ~37 GB found no `NAVMESHSET`. Surfaces are built at runtime. (`NavMeshProjectSettings`,
   `NavMeshModifierVolume` ×176 and `NavMeshModifier`/`IgnoreFromBuild` ×5,798 **do** exist and are
   worth consuming.)
-- **No localization / item templates in the client.** Item, key and exfil **display names must come
-  from tarkov.dev** — nothing under `StreamingAssets` maps a template id to a name.
+- **No complete production quest catalog in the client has been found.** This is narrower than the
+  old "no localization / item templates" claim, which was false because it only searched
+  `StreamingAssets`. `resources.assets` contains first-party backend snapshots such as
+  `TestBackendLocaleEn` (task/item/trader labels), `TestItemTemplates`, `TestTradersSettings`, and
+  profile fixtures with task/condition ids. A current-version IL2CPP dump also provides the
+  `QuestTemplate` schema and `/client/quest/list` request path. These are valuable corroborating
+  sources, but the shipped quest/test documents are small fixtures rather than the hundreds of
+  production records with conditions and rewards needed to replace the complete static catalog.
+  Run `extraction/intel/audit_game_quests.py` after a game update to re-check this boundary.
 - **No spawn chance, escorts, or boss→zone assignment.** Server-side. Positions are ours; the
   probabilities are not.
 - **No exfil timers or item requirements.** `ExfiltrationPoint`'s payload holds only the name string.

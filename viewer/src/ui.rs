@@ -407,17 +407,19 @@ fn map_load_error_panel(
     mut contexts: bevy_egui::EguiContexts,
     menu: Option<Res<crate::menu::MenuState>>,
     mut err: ResMut<crate::MapLoadError>,
+    gpu_load: Option<Res<crate::render::GpuLoadSignal>>,
     mut back: ResMut<crate::ReturnToMenu>,
 ) {
     use bevy_egui::egui::{self, RichText};
     use crate::ui_theme as theme;
-    if menu.is_some() || err.0.is_none() {
+    let gpu_error = gpu_load.as_ref().and_then(|s| s.error());
+    if menu.is_some() || (err.0.is_none() && gpu_error.is_none()) {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    let msg = err.0.clone().unwrap_or_default();
+    let msg = err.0.clone().or(gpu_error).unwrap_or_default();
     let mut dismiss = false;
     let mut go_back = false;
     egui::Area::new(egui::Id::new("map_load_error"))
@@ -440,7 +442,10 @@ fn map_load_error_panel(
                     ui.label(RichText::new(&msg).size(12.0).color(theme::TEXT_BRIGHT));
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("The pack may be corrupt or incomplete \u{2014} rebuild it from the start menu.")
+                        RichText::new(
+                            "Try the Low preset or a smaller map. If this is a pack-data error, \
+                             rebuild it from the start menu.",
+                        )
                             .size(11.0)
                             .color(theme::MUTED),
                     );
@@ -458,8 +463,14 @@ fn map_load_error_panel(
     if go_back {
         back.0 = true;
         err.0 = None;
+        if let Some(signal) = &gpu_load {
+            signal.clear_error();
+        }
     } else if dismiss {
         err.0 = None;
+        if let Some(signal) = &gpu_load {
+            signal.clear_error();
+        }
     }
 }
 
@@ -728,11 +739,15 @@ fn layers_panel(
     // Zone-wall ribbons share their zone's `PoiLayer` for visibility but are scenery — keep
     // them out of the per-layer marker counts and the extract-routing destinations (a wall's
     // transform is identity; it would route the tour through the world origin).
-    poi_q: Query<&crate::poi::PoiLayer, Without<crate::poi::ZoneWall>>,
+    poi_q: Query<
+        (&crate::poi::PoiLayer, Option<&crate::poi::ExtractFaction>),
+        Without<crate::poi::ZoneWall>,
+    >,
     loot_q: Query<&crate::loot::LootClass>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
     server: Res<crate::pathfind::PathfindServer>,
+    game_link: Option<Res<crate::game_watch::GameLink>>,
 ) {
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
     use crate::pathfind::{RouteRequest, ServerStatus};
@@ -767,7 +782,15 @@ fn layers_panel(
     // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
     // dim number after each row so the planner can gauge density without enabling the layer.
     let mut poi_counts = [0usize; 20];
-    for l in &poi_q {
+    let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
+    for (l, faction) in &poi_q {
+        if matches!(l, PoiLayer::Extract)
+            && raid_side.is_some_and(|side| {
+                faction.is_some_and(|faction| !side.allows_extract(&faction.0))
+            })
+        {
+            continue;
+        }
         poi_counts[*l as usize] += 1;
     }
     let mut loot_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1237,6 +1260,22 @@ fn layers_panel(
                             poi_row(ui, &mut toggles.bot_zones, "Bot zones", PoiLayer::BotZone, &poi_counts);
                             poi_row(ui, &mut toggles.patrols, "Patrol areas", PoiLayer::Patrol, &poi_counts);
                             poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract, &poi_counts);
+                            ui.horizontal(|ui| {
+                                ui.add_space(30.0);
+                                let note = match raid_side {
+                                    Some(side) => format!(
+                                        "{} raid \u{00B7} showing eligible + shared extracts",
+                                        side.label()
+                                    ),
+                                    None => "side not in logs \u{00B7} showing all extracts".into(),
+                                };
+                                ui.label(RichText::new(note).size(9.0).italics().color(MUTED))
+                                    .on_hover_text(
+                                        "Atlas uses raidSettings.side from Tarkov's own \
+                                         GroupMatchRaidSettings log event. If EFT omits that \
+                                         event, Atlas does not guess.",
+                                    );
+                            });
                             poi_row(ui, &mut toggles.doors, "Doors", PoiLayer::Door, &poi_counts);
                             // Name-classified props from the game files (jackets/weapon
                             // boxes/safes); mixes real lootables with decorative twins, so it
@@ -1469,7 +1508,9 @@ fn layers_panel(
                         ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.grass, "foliage / grass"))
                             .on_hover_text(
                                 "MEASURED: off is ~13% faster at 1600x1000 and ~17% at 2560x1440 \
-                                 - the single biggest frame-time lever. No VRAM change.",
+                                 - the single biggest frame-time lever. When grass is off as the \
+                                 map loads, its instance buffer is not uploaded (a major Woods VRAM \
+                                 saving). Reload after turning grass back on to restore it.",
                             );
                         ui.add_enabled(
                             is_gpu,

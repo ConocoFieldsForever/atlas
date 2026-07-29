@@ -10,10 +10,13 @@ tacmap. Tasks span all maps, so this is ONE global catalog the viewer filters by
   python extraction/intel/build_tasks.py                 -> <EFT_TARKMAP_ROOT>/out/tasks.json  (all tasks, all maps)
 Re-run per wipe (task data changes per wipe, not per session).
 
-ZONE GEOMETRY IS FIRST-PARTY where the game has it: tarkov.dev supplies task IDENTITY (name,
-trader, prereqs, rewards - none of which the client ships), but every objective zone also exists
-in the scene as a typed trigger with a real polygon footprint, and that wins. See
-apply_first_party_zones. Falls back cleanly to tarkov.dev-only when no map has been built."""
+ZONE GEOMETRY IS FIRST-PARTY where the game has it. The installed client also ships useful
+identity fragments (notably a first-party locale snapshot with most task names, profile fixtures,
+and quest-linked scene components), but no structurally complete production quest catalog has
+been found there. tarkov.dev remains the build input for the complete task graph (conditions,
+prerequisites, rewards, and missing/current labels); scene trigger geometry wins where available.
+See apply_first_party_zones and audit_game_quests.py. Falls back cleanly to tarkov.dev-only when
+no map has been built."""
 import os, json, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,10 +72,13 @@ def conv_zone(z):
 # ---------------------------------------------------------------------------------------------
 # FIRST-PARTY ZONE GEOMETRY
 # ---------------------------------------------------------------------------------------------
-# tarkov.dev is the only source for task IDENTITY (name, trader, prereqs, rewards) - the client
-# ships none of that. It is NOT the source for task GEOMETRY: every objective zone exists in the
-# scene as a typed trigger component (PlaceItemTrigger / ExperienceTrigger / FlareShootDetectorZone
-# / QuestTrigger) with a true polygon footprint, and that wins outright.
+# tarkov.dev is the complete source currently used for task IDENTITY and graph data. The client
+# does ship partial first-party identity evidence: resources.assets includes a locale snapshot with
+# most task names, test/profile payloads with task and condition ids, and current IL2CPP schema.
+# Those fragments cannot enumerate the production conditions/prerequisites/rewards, so they audit
+# and corroborate this catalog rather than replace it. It is NOT the source for task GEOMETRY:
+# typed scene triggers (PlaceItemTrigger / ExperienceTrigger / FlareShootDetectorZone /
+# QuestTrigger) carry true polygon footprints, and that geometry wins outright.
 #
 # THE JOIN IS BY NAME, NOT BY POSITION. Upstream's zone `id` IS the game's serialized trigger name
 # ("place_SALE_03_KOSTIN", "Sandbox_1_MedicalArea_exploration") - the exact string

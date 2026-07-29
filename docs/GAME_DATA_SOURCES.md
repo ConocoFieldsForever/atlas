@@ -23,7 +23,7 @@ Line format for all channels: `YYYY-MM-DD HH:MM:SS.mmm|<version>|<level>|<channe
 | Source | Signal |
 |---|---|
 | `application_*.log` | `scene preset path:maps/<bundle>.bundle` → which map is loading |
-| `push-notifications_*.log` | `Got notification \| ChatMessageReceived` type 10/11/12 (+templateId) → task started/failed/finished; `UserMatchOver` → raid end |
+| `push-notifications_*.log` | `ChatMessageReceived` type 10/11/12 (+templateId) → task started/failed/finished; `GroupMatchRaidSettings.raidSettings.side` → local PMC/Scav when present; `UserMatchOver` → raid end |
 | `Documents\Escape From Tarkov\Screenshots` | filename → position + view quaternion |
 | Build-time UnityPy extraction + tarkov.dev API | geometry, doors, interactables, lights, tasks/loot/icons |
 
@@ -82,7 +82,7 @@ Full inventory of `Got notification | <Type>` seen locally in July 2026 with cou
 | N3 | `Got notification \| UserMatchOver` **[local, TM]** *(already used)* | `location`, `status:"Free"`, `shortId` (may be null) — **no survived/died flag** | raid end | (already: raid end) |
 | N4 | `Got notification \| GroupMatchRaidReady` **[local, TM]** | `extendedProfile`: `Info.Nickname`, `Side`, `Level`, `MemberCategory`, `SavageNickname`, per-body-part `Health`, `Equipment`/`Customization` (full loadout item tree) **[TM parses Info only]** | lobby, per member | **Group roster panel**: member names, sides, levels, ready states, even loadout summary |
 | N5 | `Got notification \| GroupMatchRaidNotReady` **[local]** (TM ignores) | member un-readied | lobby | roster ready-state toggle off |
-| N6 | `Got notification \| GroupMatchRaidSettings` **[local, TM]** | `raidSettings.location`, `timeVariant` (CURR/PAST), full `timeAndWeatherSettings` (cloudiness, rain, fog, wind, hourOfDay), `botSettings`, `side` ("Pmc"/"Savage"), `onlinePveRaidStates` per map | when leader locks settings | Pre-raid map+weather+side pre-load for group raids; PMC/scav known *before* spawn |
+| N6 | `Got notification \| GroupMatchRaidSettings` **[local, TM]** | `raidSettings.location`, `timeVariant` (CURR/PAST), full `timeAndWeatherSettings` (cloudiness, rain, fog, wind, hourOfDay), `botSettings`, `side` ("Pmc"/"Savage"), `onlinePveRaidStates` per map | when settings are logged; absent in many solo sessions | Authoritative local PMC/scav side before spawn when present. Never substitute `GroupMatchRaidReady.extendedProfile.Info.Side`: that record describes a group member/other profile. Unknown must remain unknown. |
 | N7 | `Got notification \| GroupMatchStartGame` **[local]** (TM ignores) | `groupId`, `estimate` (queue estimate, seconds) | group queue start | Queue ETA toast |
 | N8 | `GroupMatchInviteAccept`/`InviteSend`/`InviteDecline`/`InviteCancel`/`InviteExpired`/`UserLeave` (`Nickname`)/`WasRemoved`/`LeaderChanged`/`Abort` **[local; TM handles Accept/UserLeave/WasRemoved]** | group membership churn | instant | Group member count / join-leave toasts |
 | N9 | `ChatMessageReceived` `message.type == 4` + `templateId "5bdabfb886f7743e152e867e 0"` **[local, TM]** | flea sold: `systemData.buyerNickname`, `soldItem` (tpl id), `itemCount`; profit fields in attached items | instant | Flea sale toast (TM plays sound + stats). `templateId "5bdabfe486f7743e1665df6e 0"` = offer expired |
@@ -113,8 +113,16 @@ Full inventory of `Got notification | <Type>` seen locally in July 2026 with cou
 | `EscapeFromTarkov_Data\app.info`, `boot.config` **[local]** | product name, `build-guid` | secondary update fingerprint |
 | `EscapeFromTarkov_Data\StreamingAssets\` (`Acoustics`, `AudioBakeData`, `Culling_Data`, `Grass`, ...) **[local]** | baked culling/acoustics/grass data per map | potential build-time extraction inputs (e.g. Culling_Data for occlusion tuning) — not live signals |
 | `EscapeFromTarkov_Data\ScriptingAssemblies.json`, `il2cpp_data`, `GameAssembly.dll` **[local]** | code metadata | already mined via `tools/il2cpp_explore.py` at build time |
+| `EscapeFromTarkov_Data\resources.assets` → `TestBackendLocaleEn/Ru` **[local]** | exact client locale strings keyed by serialized exfil ids (`NW Exfil` → `Railway Exfil`, `E1` → `Stylobate Building Elevator`) | `extract_gamedata.py` stores `display_name_en/ru`; the viewer keeps the raw key for joins and never proximity-renames from community data |
 | Registry `HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\EscapeFromTarkov` → `InstallLocation` (TM also checks `...\Steam App 3932890`) **[TM]** | install path | auto-discover `<EFT_INSTALL>` instead of configuring it |
 | `Documents\Escape From Tarkov\` **[local]** | contains only `Screenshots` on this machine — no local profile cache exists | — |
+
+Extract authority is the map logic scene itself: `ExfiltrationPoint` = PMC,
+`ScavExfiltrationPoint` = Scav, `SharedExfiltrationPoint` = both, and
+`SecretExfiltrationPoint` = secret/unknown-side. The component's `Settings.Name` is the locale
+key and its `BoxCollider` is the selectable footprint. IL2CPP metadata proves `CarExtraction`
+derives from `ExfiltrationSubscriber`; it animates a car subscribed to a real extraction point
+and is not itself a selectable extract.
 
 ---
 

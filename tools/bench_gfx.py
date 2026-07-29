@@ -35,8 +35,10 @@ BENCH_RE = re.compile(
     r"\s+p50=([\d.]+)\s+p95=([\d.]+)\s+p99=([\d.]+)\s+max=([\d.]+)"
 )
 
-# name -> (label, env delta, textureQuality override or None)
-# `tex_quality` is a persisted config value, not an env var, so it is applied to the config file.
+# name -> (label, env delta, textureQuality)
+# Texture quality is persisted rather than environment-driven. Every benchmark run also selects
+# the Custom preset: named presets own textureQuality at startup and would otherwise silently
+# replace the value requested here (for example, persisted High always forces Half).
 CONFIGS = [
     ("baseline",        "Baseline (defaults, textures Half)",      {},                              1),
     # --- textures: the single biggest VRAM lever (docs/VRAM_AUDIT.md) ---
@@ -85,19 +87,51 @@ def vram_baseline(n=5):
     return statistics.median(vals) if vals else None
 
 
-def set_tex_quality(q):
+def read_config():
     try:
-        cfg = json.load(open(CONFIG, encoding="utf-8-sig")) if os.path.exists(CONFIG) else {}
+        with open(CONFIG, encoding="utf-8-sig") as fh:
+            return json.load(fh)
     except Exception:
-        cfg = {}
+        return {}
+
+
+def write_bench_config(q):
+    cfg = read_config()
+    # 4 = QualityPreset::Custom. A named preset owns textureQuality in main.rs, so changing the
+    # texture field alone does not change the renderer and produces mislabeled benchmark rows.
+    cfg["qualityPreset"] = 4.0
     cfg["textureQuality"] = float(q)
     os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
-    with open(CONFIG, "w", encoding="utf-8") as fh:
+    tmp = CONFIG + f".bench-{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=1)
+    os.replace(tmp, CONFIG)
+
+
+class ConfigSandbox:
+    """Restore atlas.config.json byte-for-byte, including the originally-missing case."""
+
+    def __enter__(self):
+        self.existed = os.path.exists(CONFIG)
+        self.original = None
+        if self.existed:
+            with open(CONFIG, "rb") as fh:
+                self.original = fh.read()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.existed:
+            os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+            tmp = CONFIG + f".restore-{os.getpid()}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(self.original)
+            os.replace(tmp, CONFIG)
+        elif os.path.exists(CONFIG):
+            os.unlink(CONFIG)
 
 
 def run_one(name, label, delta, texq, pack, secs):
-    set_tex_quality(texq)
+    write_bench_config(texq)
     env = dict(os.environ)
     env.update({
         "EFT_BENCH": str(secs),
@@ -137,7 +171,13 @@ def run_one(name, label, delta, texq, pack, secs):
         m = BENCH_RE.search(ln)
         if m:
             break
+    resolved_cfg = read_config()
     rec = {"name": name, "label": label, "texQuality": texq, "env": delta,
+           "requestedSettings": {"qualityPreset": 4, "textureQuality": texq},
+           "resolvedSettings": {
+               "qualityPreset": int(resolved_cfg.get("qualityPreset", -1)),
+               "textureQuality": int(resolved_cfg.get("textureQuality", -1)),
+           },
            "wall_s": round(time.time() - t0, 1),
            "vram_base": base, "vram_peak": peak,
            "vram_mib": (peak - base) if (base is not None) else None}
@@ -170,17 +210,22 @@ def main():
 
     print(f"benchmarking {len(todo)} configs x {args.secs}s on {args.pack} @ {WINDOW}", flush=True)
     results = []
-    for i, (name, label, delta, texq) in enumerate(todo, 1):
-        print(f"[{i}/{len(todo)}] {name:16} {label}", flush=True)
-        rec = run_one(name, label, delta, texq, args.pack, args.secs)
-        if "fps" in rec:
-            print(f"        fps={rec['fps']:.1f} avg={rec['avg_ms']:.2f}ms p95={rec['p95']:.2f}ms "
-                  f"vram={rec['vram_mib']} MiB ({rec['wall_s']}s)", flush=True)
-        else:
-            print(f"        FAILED: {rec.get('error')}", flush=True)
-        results.append(rec)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        json.dump(results, open(out_path, "w", encoding="utf-8"), indent=1)
+    # The benchmark temporarily edits the same config used by the menu. Always restore the user's
+    # exact bytes, even on Ctrl-C, timeout, a failed viewer launch, or a malformed results path.
+    with ConfigSandbox():
+        for i, (name, label, delta, texq) in enumerate(todo, 1):
+            print(f"[{i}/{len(todo)}] {name:16} {label}", flush=True)
+            rec = run_one(name, label, delta, texq, args.pack, args.secs)
+            if "fps" in rec:
+                print(f"        fps={rec['fps']:.1f} avg={rec['avg_ms']:.2f}ms p95={rec['p95']:.2f}ms "
+                      f"vram={rec['vram_mib']} MiB ({rec['wall_s']}s)", flush=True)
+            else:
+                print(f"        FAILED: {rec.get('error')}", flush=True)
+            results.append(rec)
+            out_dir = os.path.dirname(os.path.abspath(out_path))
+            os.makedirs(out_dir, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(results, fh, indent=1)
 
     # Summary table, deltas relative to baseline.
     base = next((r for r in results if r["name"] == "baseline" and "fps" in r), None)
@@ -199,7 +244,7 @@ def main():
               f"{str(r['vram_mib']):>9} {dfps:>8} {dv:>8}  {r['label']}")
     print("=" * 108)
     print(f"\nwrote {out_path}")
-    set_tex_quality(1)  # leave the user's config on the shipped default
+    print("restored atlas.config.json")
     return 0
 
 
