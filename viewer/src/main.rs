@@ -97,6 +97,37 @@ pub struct CameraCommand {
     pub eye: Option<(Vec3, Vec3)>,
 }
 
+/// Exact camera pose handed across the menu -> map relaunch by the screenshot trigger.
+///
+/// `OverlayPlugin` deliberately removes `EFT_POSE` in PostStartup so it cannot leak into a later
+/// PLAY relaunch. An async cold load, however, finishes several frames after that cleanup. Keep one
+/// parsed copy here until `reset_map_view` observes the first real pack, then consume it exactly once.
+#[derive(Clone, Copy, Debug)]
+struct ExactCameraPose {
+    position: Vec3,
+    yaw: f32,
+    pitch: f32,
+}
+
+#[derive(Resource, Default)]
+struct PendingStartupPose(Option<ExactCameraPose>);
+
+fn parse_eft_pose(value: &str) -> Option<ExactCameraPose> {
+    let parts = value
+        .split(',')
+        .map(|v| v.trim().parse::<f32>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if parts.len() != 5 || parts.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    Some(ExactCameraPose {
+        position: Vec3::new(parts[0], parts[1], parts[2]),
+        yaw: parts[3].to_radians(),
+        pitch: parts[4].to_radians(),
+    })
+}
+
 /// Which locomotion model owns the camera. `Fly` = free-fly (WASD+QE), `Walk` = FPV on foot
 /// (ground-follow + jump + collision), `Drone` = FPV quadcopter (drone.rs physics; also the body
 /// the agent link flies).
@@ -116,8 +147,8 @@ pub struct CameraSettings {
     pub fov_deg: f32,
     /// Base fly-move speed (m/s); the scroll wheel scales this live.
     pub fly_speed: f32,
-    /// Base WALK speed (m/s); the scroll wheel scales this in walk mode, and jump height rides
-    /// off it (scroll faster -> move faster + jump higher).
+    /// Selected WALK speed (m/s); the scroll wheel changes EFT's normalized walking-speed dial.
+    /// Sprint and jump remain independent of that dial.
     pub walk_speed: f32,
     /// Camera locomotion mode (Fly / Walk / Drone).
     pub mode: CamMode,
@@ -150,7 +181,14 @@ impl Default for CameraSettings {
             Err(_) => CamMode::Fly,
         };
         Self {
-            fov_deg: 60.0,   // Bevy's default PerspectiveProjection fov (0.25π ≈ 45°? no — ~60)
+            // A screenshot-triggered menu -> map relaunch carries the FOV that the menu process
+            // already parsed from Tarkov's settings log. This makes the very first loaded frame use
+            // the game's projection instead of waiting for the child watcher to re-tail the log.
+            fov_deg: std::env::var("EFT_GAME_FOV")
+                .ok()
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| (20.0..=120.0).contains(v))
+                .unwrap_or(60.0),
             fly_speed: 40.0, // matches the old FlyCam::default speed
             walk_speed: 5.0, // human-ish
             mode,
@@ -179,9 +217,12 @@ fn flycam_scroll(
     let factor = 1.15f32.powf(scroll.delta.y);
     match settings.mode {
         CamMode::Walk => {
-            // In walk mode the wheel juices walk speed (and jump height rides off it) into a
-            // human-ish band, so a fast scroll makes the walk cam quicker AND jump higher.
-            settings.walk_speed = (settings.walk_speed * factor).clamp(1.5, 12.0);
+            // EFT's wheel controls the normalized walking-speed dial. It does not alter sprint
+            // top speed or ballistic jump height.
+            settings.walk_speed = (settings.walk_speed * factor).clamp(
+                walk_ground::MIN_WALK_SPEED,
+                walk_ground::MAX_WALK_SPEED,
+            );
         }
         CamMode::Drone => {
             // In drone mode the wheel adjusts the FPV camera uptilt (like re-mounting the cam).
@@ -455,6 +496,7 @@ fn reset_map_view(
     pack: Option<Res<LoadedPack>>,
     epoch: Res<render::MapEpoch>,
     mut images: ResMut<Assets<Image>>,
+    mut startup_pose: ResMut<PendingStartupPose>,
     mut cam: Query<
         (
             Entity,
@@ -482,12 +524,25 @@ fn reset_map_view(
     };
     // Skip only if `setup` already framed this pack AND built its skybox (sync path). On the async
     // cold-load path the camera has NO skybox yet, so fall through to frame + insert it.
+    // Take the relaunch pose on the first real pack observation even on the synchronous path, where
+    // `setup` already applied it and the skybox early-return below is correct. That keeps it one-shot
+    // and prevents a later in-place map switch from inheriting the old screenshot location.
+    let startup_pose = startup_pose.0.take();
     if was_first && skybox.is_some() {
         return;
     }
-    // Debug overrides (EFT_POSE / EFT_LOOK) pin the camera in `setup`; don't clobber them with the
-    // content-anchor reframe here (the skybox insert below still runs so the sky is correct).
-    if std::env::var("EFT_POSE").is_err() && std::env::var("EFT_LOOK").is_err() {
+    // The screenshot handoff must win AFTER an async cold load becomes active. PostStartup has
+    // already removed EFT_POSE by now, so consulting only the environment here used to reframe the
+    // camera to the map overview and lose the user's position.
+    if let Some(pose) = startup_pose {
+        tf.translation = pose.position;
+        tf.rotation =
+            Quat::from_axis_angle(Vec3::Y, pose.yaw) * Quat::from_axis_angle(Vec3::X, pose.pitch);
+        fly.yaw = pose.yaw;
+        fly.pitch = pose.pitch;
+    // EFT_LOOK remains a persistent debug override. A direct EFT_POSE launch also keeps its env var
+    // (only an overlay summon removes it), preserving the existing "pin across map resets" behavior.
+    } else if std::env::var("EFT_POSE").is_err() && std::env::var("EFT_LOOK").is_err() {
         let (cam_pos, _target, far, yaw, pitch) = frame_for_pack(Some(&pack.0));
         tf.translation = cam_pos;
         tf.rotation = Quat::from_axis_angle(Vec3::Y, yaw) * Quat::from_axis_angle(Vec3::X, pitch);
@@ -647,11 +702,17 @@ fn main() {
     // this only changes the default for someone who has never touched the setting.
     // A non-Custom preset OWNS texture quality, so the two can never drift apart (a stale
     // `textureQuality` from before a preset was picked would otherwise load the wrong mips).
-    render::gpu_driven::set_tex_mip_skip(
-        render::QualityPreset::from_index(menu::config_f32_pub("qualityPreset").unwrap_or(2.0) as u8)
-            .tex_quality()
-            .unwrap_or_else(|| menu::config_f32_pub("textureQuality").unwrap_or(1.0) as u8),
-    );
+    let startup_preset =
+        render::QualityPreset::from_index(menu::config_f32_pub("qualityPreset").unwrap_or(2.0) as u8);
+    let configured_tex = menu::config_f32_pub("textureQuality").unwrap_or(1.0) as u8;
+    let startup_tex = startup_preset.tex_quality().unwrap_or(configured_tex).min(2);
+    render::gpu_driven::set_tex_mip_skip(startup_tex);
+    // Heal config pairs written by older builds or competing old viewer processes. Without this,
+    // rendering correctly obeys the named preset but the menu/in-map label reads the stale texture
+    // value and claims the scene is Custom.
+    if startup_preset.tex_quality().is_some() && configured_tex != startup_tex {
+        let _ = menu::save_quality_preset_pub(startup_preset);
+    }
     // Headless nav baker BEFORE any Bevy/GPU init: `atlas bake-nav <pack_dir> [--res R] [--layers K]`
     // bakes the routing grid on the CPU (portable — AMD/NVIDIA/no-GPU) and exits, so the map-build
     // pipeline can produce routing on any machine without CUDA. No window, no adapter.
@@ -777,6 +838,23 @@ fn main() {
     // menu — it renders the loading screen while the pack streams in via the async path.
     let menu_mode = pack.is_none() && !async_cold_load;
 
+    // Headless mode is only valid for a finite automated capture/benchmark. A leaked EFT_HIDDEN
+    // used to create a perfectly healthy Atlas process at (-20000,-20000), absent from the taskbar,
+    // which is indistinguishable from "the app did not open". EFT_HIDDEN_ALLOW=1 is an explicit
+    // escape hatch for a custom finite harness.
+    let hidden_requested =
+        std::env::var("EFT_HIDDEN").map(|v| v.trim() == "1").unwrap_or(false);
+    let finite_hidden_job = std::env::var_os("EFT_SHOT").is_some()
+        || std::env::var_os("EFT_BENCH").is_some()
+        || std::env::var("EFT_HIDDEN_ALLOW").map(|v| v.trim() == "1").unwrap_or(false);
+    let hidden = hidden_requested && finite_hidden_job;
+    if hidden_requested && !finite_hidden_job {
+        eprintln!(
+            "Atlas: ignoring EFT_HIDDEN=1 because no finite EFT_SHOT/EFT_BENCH job was supplied. \
+             Set EFT_HIDDEN_ALLOW=1 only for a harness that guarantees process cleanup."
+        );
+    }
+
     // Play-alongside-a-game friendliness: by DEFAULT cap to vsync (don't render faster than the
     // monitor) and idle when the window loses focus (see WinitSettings below) — so with the game in
     // the foreground the viewer stops churning the GPU. EFT_UNCAPPED=1 restores the old uncapped /
@@ -813,10 +891,27 @@ fn main() {
     // right there. A menu is not the interactive map view this protects. The in-place PLAY switch
     // calls `gpu_lease::hold` as the map loads, so the moment we really are rendering, we claim it.
     if !menu_mode {
-        gpu_lease::hold("map on the command line");
+        let lease_held = gpu_lease::hold("map on the command line");
+        // Hidden captures are easy to strand and historically accumulated until several viewers
+        // fought over one Vulkan device. Interactive launches remain permissive, but an automated
+        // hidden job must be the only map renderer.
+        if hidden && !lease_held {
+            eprintln!(
+                "Atlas: refusing hidden capture because another map viewer owns the GPU lease. \
+                 Close it or capture from that visible viewer."
+            );
+            std::process::exit(73);
+        }
     }
 
     let mut app = App::new();
+    // Capture the screenshot handoff before OverlayPlugin's PostStartup cleanup removes EFT_POSE.
+    // The resource survives the async file/GPU load and is consumed by the first map reset.
+    app.insert_resource(PendingStartupPose(
+        std::env::var("EFT_POSE")
+            .ok()
+            .and_then(|value| parse_eft_pose(&value)),
+    ));
     app.add_plugins(
         DefaultPlugins
             // Persistent file log (packs/logs/atlas_viewer.log): double-click launches have no
@@ -871,20 +966,13 @@ fn main() {
                     // window; pair with EFT_UNCAPPED so the focus-idle gate doesn't stall).
                     // Bevy re-shows the window after the first present, so belt-and-braces:
                     // also park it far off-screen and skip the taskbar.
-                    visible: !std::env::var("EFT_HIDDEN")
-                        .map(|v| v.trim() == "1")
-                        .unwrap_or(false),
-                    position: if std::env::var("EFT_HIDDEN")
-                        .map(|v| v.trim() == "1")
-                        .unwrap_or(false)
-                    {
+                    visible: !hidden,
+                    position: if hidden {
                         WindowPosition::At(IVec2::new(-20000, -20000))
                     } else {
                         WindowPosition::Automatic
                     },
-                    skip_taskbar: std::env::var("EFT_HIDDEN")
-                        .map(|v| v.trim() == "1")
-                        .unwrap_or(false),
+                    skip_taskbar: hidden,
                     ..default()
                 }),
                 ..default()
@@ -1180,6 +1268,13 @@ fn install_gpu_error_handler(device: Res<bevy::render::renderer::RenderDevice>) 
             GPU_FATAL.store(true, Ordering::Relaxed);
         }
     }));
+    // wgpu deliberately does NOT send DeviceLost through the uncaptured-error callback. Without
+    // this separate callback, the next mapped staging-buffer access can panic first and make a
+    // device reset look like an unrelated UniformBuffer unwrap (the July 28/29 field logs).
+    device.wgpu_device().set_device_lost_callback(|reason, message| {
+        error!("wgpu DEVICE LOST ({reason:?}): {message}");
+        GPU_FATAL.store(true, Ordering::Release);
+    });
 }
 
 /// A lost device can't be rebuilt inside a running Bevy 0.17 app — every later submit fails
@@ -1357,11 +1452,10 @@ fn frame_for_pack(pack: Option<&crate::eftpack::Pack>) -> (Vec3, Vec3, f32, f32,
     }
     // EFT_POSE="x,y,z,yaw_deg,pitch_deg" reproduces an EXACT camera pose (the POS HUD's copy button).
     if let Ok(s) = std::env::var("EFT_POSE") {
-        let p: Vec<f32> = s.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-        if p.len() == 5 {
-            cam_pos = Vec3::new(p[0], p[1], p[2]);
-            yaw = p[3].to_radians();
-            pitch = p[4].to_radians();
+        if let Some(pose) = parse_eft_pose(&s) {
+            cam_pos = pose.position;
+            yaw = pose.yaw;
+            pitch = pose.pitch;
         }
     }
     (cam_pos, target, far, yaw, pitch)
@@ -1829,8 +1923,10 @@ fn build_walk_ground(
     commands.insert_resource(walk_ground::GroundGrid::build(&pack.0, flying));
 }
 
-/// Walk locomotion: yaw-only WASD on the ground plane at `walk_speed`, ground-follow (stairs glide),
-/// gravity + Space jump (jump height rides off walk_speed). Gated on `walk_mode`; fly is inert then.
+/// Walk locomotion: yaw-only WASD drives a persistent horizontal velocity using the extracted EFT
+/// acceleration/deceleration and sprint-transition settings. Ground-follow, capsule collision, and
+/// fixed ballistic jumping remain viewer-side because the original animation/root-motion rig is
+/// not part of an eftpack. Gated on walk mode; fly is inert then.
 fn walk_move(
     keys: Res<ButtonInput<KeyCode>>,
     time: Res<Time>,
@@ -1862,25 +1958,39 @@ fn walk_move(
             if keys.pressed(KeyCode::KeyD) { h += right; }
             if keys.pressed(KeyCode::KeyA) { h -= right; }
         }
-        let mut moved = 0.0f32; // horizontal distance walked this frame (drives the head-bob)
-        if h != Vec3::ZERO {
-            let mut spd = settings.walk_speed;
-            if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
-                spd *= 1.8; // sprint
-            }
-            moved = spd * dt;
-            tf.translation += h.normalize() * spd * dt;
-            // Player-sized collision: push the body capsule back out of any wall it entered so you
-            // can't run through walls/fences. Purely horizontal (feet height is unchanged here).
-            let feet_y = tf.translation.y - EYE_HEIGHT;
-            let fixed = grid.resolve_walls(tf.translation, feet_y);
-            tf.translation.x = fixed.x;
-            tf.translation.z = fixed.y;
-        }
+        let wish = Vec2::new(h.x, h.z);
+        let sprint = !typing
+            && (keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight));
+        let start_xz = Vec2::new(tf.translation.x, tf.translation.z);
+        let grounded = ws.grounded;
+        let delta = walk_ground::advance_horizontal(
+            &mut ws,
+            wish,
+            settings.walk_speed,
+            sprint,
+            grounded,
+            dt,
+        );
+        tf.translation.x += delta.x;
+        tf.translation.z += delta.y;
+
+        // Player-sized collision: push the body capsule back out of any wall it entered. Feed the
+        // correction back into velocity by cancelling only the inward component, which preserves
+        // momentum parallel to the wall and produces a natural slide.
+        let feet_y = tf.translation.y - EYE_HEIGHT;
+        let proposed_xz = Vec2::new(tf.translation.x, tf.translation.z);
+        let fixed = grid.resolve_walls(tf.translation, feet_y);
+        let fixed_xz = Vec2::new(fixed.x, fixed.y);
+        walk_ground::cancel_velocity_into_wall(&mut ws, fixed_xz - proposed_xz);
+        tf.translation.x = fixed.x;
+        tf.translation.z = fixed.y;
+        // Actual resolved displacement drives footsteps/head bob; pushing into a wall no longer
+        // makes the camera bob in place.
+        let moved = (fixed_xz - start_xz).length();
 
         // Jump (behind the typing guard so Space in a text field doesn't launch).
         if !typing && keys.just_pressed(KeyCode::Space) && ws.grounded {
-            ws.vy = walk_ground::jump_velocity(settings.walk_speed);
+            ws.vy = walk_ground::jump_velocity();
             ws.grounded = false;
         }
 
@@ -1941,6 +2051,8 @@ fn walk_move(
 /// frame). By default it is LOAD-AWARE: it waits until the pack has loaded AND the GPU build has
 /// finished (the texcache/geometry stream across many frames after the file load), then settles a
 /// beat — so a bench screenshot is never a blank/loading frame, regardless of a slow first load.
+/// Hidden captures exit after the file is written so they cannot become invisible orphan viewers.
+/// A visible capture remains interactive unless `EFT_SHOT_EXIT=1` is explicitly set.
 /// `EFT_SHOT_FRAME=<n>` forces the legacy ABSOLUTE-frame capture instead (for `EFT_SWITCH` soak
 /// tests that need a precise frame); `EFT_SHOT_SETTLE=<n>` tunes the post-load settle (default 30).
 fn auto_screenshot(
@@ -1985,9 +2097,36 @@ fn auto_screenshot(
     }
 
     use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-    commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path.clone()));
-    info!("auto-screenshot -> {path} (frame {})", *frames);
+    let exit_after = std::env::var("EFT_HIDDEN").map(|v| v.trim() == "1").unwrap_or(false)
+        || std::env::var("EFT_SHOT_EXIT").map(|v| v.trim() == "1").unwrap_or(false);
+    if exit_after {
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_screenshot_then_exit(path.clone()));
+    } else {
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path.clone()));
+    }
+    info!(
+        "auto-screenshot -> {path} (frame {}, exit_after={exit_after})",
+        *frames
+    );
     *done = true;
+}
+
+fn save_screenshot_then_exit(
+    path: String,
+) -> impl FnMut(
+    On<bevy::render::view::screenshot::ScreenshotCaptured>,
+    MessageWriter<bevy::app::AppExit>,
+) {
+    use bevy::render::view::screenshot::save_to_disk;
+    let mut save = save_to_disk(path);
+    move |captured, mut exit| {
+        save(captured);
+        exit.write(bevy::app::AppExit::Success);
+    }
 }
 
 /// EFT_BENCH=<seconds>: benchmark mode. After the pack load settles (same gate as
@@ -2093,5 +2232,25 @@ fn debug_switch(mut sw: ResMut<MapSwitch>, mut frames: Local<u32>) {
                 sw.0 = Some(dir.trim().to_string());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_pose_tests {
+    use super::*;
+
+    #[test]
+    fn parses_exact_screenshot_pose() {
+        let pose = parse_eft_pose(" 12.5, -4, 91.25, 135, -17.5 ").expect("valid pose");
+        assert_eq!(pose.position, Vec3::new(12.5, -4.0, 91.25));
+        assert!((pose.yaw - 135.0_f32.to_radians()).abs() < 1e-6);
+        assert!((pose.pitch - (-17.5_f32).to_radians()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rejects_malformed_or_non_finite_pose() {
+        assert!(parse_eft_pose("1,2,3,4").is_none());
+        assert!(parse_eft_pose("1,bad,3,4,5").is_none());
+        assert!(parse_eft_pose("1,2,3,NaN,5").is_none());
     }
 }

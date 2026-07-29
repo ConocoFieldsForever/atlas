@@ -1410,9 +1410,13 @@ fn layers_panel(
                                     && p != crate::render::QualityPreset::Custom
                                 {
                                     p.apply(&mut g);
+                                    // Keep the menu, the next map relaunch, and this live scene on
+                                    // the same preset. Previously this row changed the scene but
+                                    // only persisted its texture tier, so returning to the menu
+                                    // resurrected the old preset and silently undid the choice.
+                                    let _ = crate::menu::save_quality_preset_pub(p);
                                     if let Some(q) = p.tex_quality() {
                                         crate::render::gpu_driven::set_tex_mip_skip(q);
-                                        crate::menu::save_config_f32_pub("textureQuality", q as f32);
                                     }
                                 }
                             }
@@ -2110,7 +2114,7 @@ fn camera_panel(
             let hint = match mode {
                 CamMode::Fly => "WASD + QE fly, RMB look, Shift boost; scroll scales speed",
                 CamMode::Walk => {
-                    "WASD walk, Space jump, Shift sprint; scroll scales walk speed + jump height"
+                    "WASD walk with momentum, Space jump, Shift sprint; scroll sets walk speed"
                 }
                 CamMode::Drone => {
                     "Gamepad / USB RC transmitter: Mode 2 (left = throttle+yaw, right = \

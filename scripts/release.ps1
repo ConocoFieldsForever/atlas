@@ -107,12 +107,25 @@ if (-not $SkipRenderSmoke) {
     } else {
         $shot = Join-Path (Resolve-Path "dist") "smoke.png"
         if (Test-Path $shot) { Remove-Item $shot }
-        $env:EFT_HIDDEN = "1"; $env:EFT_UNCAPPED = "1"; $env:EFT_SHOT = $shot
-        $p = Start-Process -FilePath "$dist\atlas.exe" -ArgumentList (Resolve-Path $SmokePack) -PassThru -WindowStyle Hidden
-        $deadline = (Get-Date).AddSeconds(120)
-        while ((Get-Date) -lt $deadline -and -not (Test-Path $shot)) { Start-Sleep -Seconds 2 }
-        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {}
-        Remove-Item Env:\EFT_HIDDEN, Env:\EFT_UNCAPPED, Env:\EFT_SHOT -ErrorAction SilentlyContinue
+        $oldHidden = $env:EFT_HIDDEN
+        $oldUncapped = $env:EFT_UNCAPPED
+        $oldShot = $env:EFT_SHOT
+        $p = $null
+        try {
+            $env:EFT_HIDDEN = "1"; $env:EFT_UNCAPPED = "1"; $env:EFT_SHOT = $shot
+            $p = Start-Process -FilePath "$dist\atlas.exe" -ArgumentList (Resolve-Path $SmokePack) -PassThru -WindowStyle Hidden
+            $deadline = (Get-Date).AddSeconds(120)
+            while ((Get-Date) -lt $deadline -and -not (Test-Path $shot) -and -not $p.HasExited) {
+                Start-Sleep -Seconds 2
+            }
+        } finally {
+            if ($null -ne $p -and -not $p.HasExited) {
+                try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {}
+            }
+            if ($null -eq $oldHidden) { Remove-Item Env:\EFT_HIDDEN -ErrorAction SilentlyContinue } else { $env:EFT_HIDDEN = $oldHidden }
+            if ($null -eq $oldUncapped) { Remove-Item Env:\EFT_UNCAPPED -ErrorAction SilentlyContinue } else { $env:EFT_UNCAPPED = $oldUncapped }
+            if ($null -eq $oldShot) { Remove-Item Env:\EFT_SHOT -ErrorAction SilentlyContinue } else { $env:EFT_SHOT = $oldShot }
+        }
         if (-not (Test-Path $shot)) { throw "render smoke: no screenshot produced" }
         if ((Get-Item $shot).Length -lt 10kb) { throw "render smoke: screenshot suspiciously small" }
         Write-Host "[release] render smoke OK ($([math]::Round((Get-Item $shot).Length/1kb)) KB)"

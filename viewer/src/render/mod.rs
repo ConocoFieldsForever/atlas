@@ -346,6 +346,56 @@ impl QualityPreset {
     }
 }
 
+#[cfg(test)]
+mod quality_preset_tests {
+    use super::{GfxSettings, QualityPreset};
+
+    #[test]
+    fn every_named_preset_round_trips_through_detection() {
+        for preset in [
+            QualityPreset::Low,
+            QualityPreset::Medium,
+            QualityPreset::High,
+            QualityPreset::Ultra,
+        ] {
+            let mut settings = GfxSettings::default();
+            preset.apply(&mut settings);
+            assert_eq!(
+                QualityPreset::detect(&settings, preset.tex_quality().unwrap()),
+                preset,
+                "{preset:?} must be the state the menu says it selected"
+            );
+        }
+    }
+
+    #[test]
+    fn presets_apply_the_advertised_cost_drivers_and_texture_tiers() {
+        let mut low = GfxSettings::default();
+        QualityPreset::Low.apply(&mut low);
+        assert_eq!(QualityPreset::Low.tex_quality(), Some(2));
+        assert!(!low.grass && !low.shadows && !low.bloom && !low.ssao && !low.lights);
+        assert_eq!((low.cull_px, low.cull_px_grass), (4.0, 1000.0));
+
+        let mut medium = GfxSettings::default();
+        QualityPreset::Medium.apply(&mut medium);
+        assert_eq!(QualityPreset::Medium.tex_quality(), Some(1));
+        assert!(medium.grass && medium.bloom && medium.lights);
+        assert!(!medium.shadows && !medium.ssao);
+        assert_eq!((medium.cull_px, medium.cull_px_grass), (2.0, 600.0));
+
+        let mut high = GfxSettings::default();
+        QualityPreset::High.apply(&mut high);
+        assert_eq!(QualityPreset::High.tex_quality(), Some(1));
+        assert!(high.grass && high.shadows && high.bloom && high.lights);
+        assert!(!high.ssao);
+
+        let mut ultra = GfxSettings::default();
+        QualityPreset::Ultra.apply(&mut ultra);
+        assert_eq!(QualityPreset::Ultra.tex_quality(), Some(0));
+        assert!(ultra.grass && ultra.shadows && ultra.bloom && ultra.ssao && ultra.lights);
+    }
+}
+
 /// Bumped by the in-place map loader (`main::load_map`) on every `.eftpack` swap. Extracted to the
 /// render world so the epoch-aware GPU reset (`gpu_driven::reset_gpu_map_if_epoch_changed`) can tear
 /// down the old map's buffers/bind-groups/pipelines and rebuild for the new pack. Also gates the

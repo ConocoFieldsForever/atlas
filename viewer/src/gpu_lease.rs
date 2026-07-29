@@ -28,10 +28,25 @@
 use std::fs::File;
 use std::path::PathBuf;
 
-/// The lease file. Next to the packs (a dir that always exists and is writable by both the
-/// viewer and the worker, which share `paths`).
+/// The lease file. This must NOT live under `packs_root()`: that root deliberately depends on
+/// executable layout and the launcher's current working directory, so two copies of the same
+/// viewer could resolve different lease files and both believe they owned the one physical GPU.
+/// Keep it in one per-user runtime directory instead. Every Atlas viewer/baker on the account now
+/// contends on the same lock regardless of whether it was launched from Explorer, PowerShell, a
+/// release bundle, or the repo.
 fn lease_path() -> PathBuf {
-    crate::paths::packs_root().join(".gpu-interactive.lease")
+    let root = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("atlas");
+    if let Err(e) = std::fs::create_dir_all(&root) {
+        eprintln!(
+            "[gpu-lease] could not create runtime directory {}: {e}",
+            root.display()
+        );
+    }
+    root.join("gpu-interactive.lease")
 }
 
 /// Take the interactive-GPU lease. Hold the returned handle for as long as the process renders —
@@ -84,15 +99,14 @@ static HELD: std::sync::OnceLock<Option<File>> = std::sync::OnceLock::new();
 /// such bake silently took the CPU backend. Interchange cost 6m34s of CPU that way. The lease is
 /// meant to protect an interactive MAP view from a TDR, and a menu is not that; it is now taken
 /// when a map actually loads (`hold`), including the in-place PLAY switch out of the menu.
-pub fn hold(reason: &str) {
+pub fn hold(reason: &str) -> bool {
     let first = HELD.get().is_none();
     let _ = HELD.set(acquire());
+    let held = HELD.get().map(|o| o.is_some()).unwrap_or(false);
     if first {
-        eprintln!(
-            "[gpu-lease] holding = {} ({reason})",
-            HELD.get().map(|o| o.is_some()).unwrap_or(false)
-        );
+        eprintln!("[gpu-lease] holding = {held} ({reason})");
     }
+    held
 }
 
 /// Is an interactive viewer currently holding the GPU? Called by the bake worker to decide

@@ -214,6 +214,10 @@ fn apply_game_events(
                                         format!("{},{},{},{yaw},{pitch}", pos.x, pos.y, pos.z),
                                     );
                                 }
+                                // The child watcher will rediscover this from the application log,
+                                // but carry the already-known value across the relaunch so its first
+                                // rendered map frame has Tarkov's exact projection.
+                                std::env::set_var("EFT_GAME_FOV", cam_settings.fov_deg.to_string());
                                 std::env::set_var("EFT_OVERLAY_SUMMON", "1");
                                 info!(
                                     "game link: screenshot at the menu -> relaunching into '{id}' \
