@@ -56,11 +56,11 @@ pub enum PoiLayer {
 #[derive(Component)]
 pub struct QuestMarkerTask(pub String);
 
-/// The extract's faction ("pmc"/"scav"/"shared") carried by every `extracts_dev` marker, so the
-/// UI can reason about who can use it (nearest-extract routing; the string itself is kept for
-/// future per-faction filtering).
+/// The extract's faction ("pmc"/"scav"/"shared"/"secret") carried by every extract marker and
+/// collider wall. When the game log exposes the local raid side, the visibility pass uses it to
+/// hide only the definitely-wrong faction.
 #[derive(Component)]
-pub struct ExtractFaction(#[allow(dead_code)] pub String);
+pub struct ExtractFaction(pub String);
 
 /// A marker's estimated ruble value — the container's `ev` on loot.rs container markers, the item
 /// price `pr` on loose-loot markers (0 when unpriced). Read by the panel's "min value" filter
@@ -950,8 +950,14 @@ fn snap_boss_pos(
 #[derive(Deserialize)]
 struct GdExfil {
     pos: [f32; 3],
+    /// Serialized ExfiltrationPoint.Settings.Name locale key (the stable join identity).
     #[serde(default)]
     name: String,
+    /// Exact client text from the game's resources.assets locale dictionaries.
+    #[serde(default)]
+    display_name_en: Option<String>,
+    #[serde(default)]
+    display_name_ru: Option<String>,
     #[serde(default)]
     faction: String,
     /// BoxCollider footprint corners (viewer space, ground height); empty when none.
@@ -1083,12 +1089,14 @@ fn outline_extent(outline: &[[f32; 3]]) -> Option<String> {
     (w > 1.0 && h > 1.0).then(|| format!("~{:.0} x {:.0} m", w, h))
 }
 
-/// Card for a typed extract (gamedata.json `exfils`). Same look as the tarkov.dev card it
-/// replaces, plus the game-file provenance and an inactive tag. `friendly` is the community name
-/// resolved from the tarkov.dev extract list ("Railway Exfil" for scene id "NW Exfil") — it
-/// becomes the display name, with the raw scene id kept as a detail line.
-fn gd_exfil_info(e: &GdExfil, friendly: Option<&str>) -> MarkerInfo {
-    let display = friendly.unwrap_or(e.name.as_str());
+/// Card for a typed extract (gamedata.json `exfils`). Its display label comes from the game's
+/// own resources.assets locale table, while the serialized key stays available for joins.
+fn gd_exfil_info(e: &GdExfil, lang: crate::i18n::Lang) -> MarkerInfo {
+    let display = match lang {
+        crate::i18n::Lang::En => e.display_name_en.as_deref(),
+        crate::i18n::Lang::Ru => e.display_name_ru.as_deref().or(e.display_name_en.as_deref()),
+    }
+    .unwrap_or(e.name.as_str());
     let base = ExtractDev {
         id: None,
         pos: e.pos,
@@ -1101,8 +1109,8 @@ fn gd_exfil_info(e: &GdExfil, friendly: Option<&str>) -> MarkerInfo {
         transfer: None,
     };
     let mut info = extract_dev_info(&base, &e.faction);
-    if friendly.is_some_and(|f| f != e.name) && !e.name.is_empty() {
-        info.detail.push(format!("Scene id: {}", e.name));
+    if display != e.name && !e.name.is_empty() {
+        info.detail.push(format!("Game id: {}", e.name));
     }
     if !e.active {
         info.detail.push("Inactive in scene".into());
@@ -1763,6 +1771,7 @@ fn spawn_pois(
     mut materials: ResMut<Assets<StandardMaterial>>,
     pack: Option<Res<LoadedPack>>,
     mut respawned: ResMut<PoiMarkersRespawned>,
+    lang: Res<crate::i18n::Lang>,
 ) {
     let Some(lp) = pack else { return };
     // Markers below spawn Hidden; latch so the visibility pass runs even on a cold load with a
@@ -2003,10 +2012,6 @@ fn spawn_pois(
     // Every loot.json lock position + its key's display name, for the typed-door proximity
     // cross-check (a tarkov.dev lock within 2 m names the door's `key_id`).
     let mut lock_keys: Vec<(Vec3, String)> = Vec::new();
-    // tarkov.dev extract names + positions: the COMMUNITY names players actually know ("Railway
-    // Exfil", "Emercom Checkpoint"). The typed gamedata exfils carry raw scene ids ("NW Exfil",
-    // "SE Exfil"), so each is renamed to the nearest dev extract within 60 m (XZ) below.
-    let mut dev_extract_names: Vec<(String, Vec3)> = Vec::new();
     let mut intel_meta = MapIntelMeta::default();
     let mut operation_links: Vec<(Vec3, Vec3)> = Vec::new();
     let key = map_key(&lp.0.manifest);
@@ -2175,14 +2180,6 @@ fn spawn_pois(
             let points: Vec<Vec3> = zone.outline.iter().copied().map(Vec3::from).collect();
             wall(&mut commands, &mut meshes, PoiLayer::Hazard, &points, poi_look(PoiLayer::Hazard).0, true);
         }
-        // Community extract names for the typed-exfil rename (kept whether or not the dev
-        // markers themselves spawn — the names matter either way).
-        dev_extract_names = mn
-            .extracts_dev
-            .iter()
-            .filter(|ex| !ex.name.is_empty())
-            .map(|ex| (ex.name.clone(), Vec3::from(ex.pos)))
-            .collect();
         // Prefer the clean faction-tagged extract list when it's present — unless the TYPED
         // exfils from gamedata.json already own the Extract layer (they include secret
         // extracts and exact collider footprints; tarkov.dev stays the fallback).
@@ -2226,7 +2223,16 @@ fn spawn_pois(
                 );
                 commands.entity(e).insert(ExtractFaction(fac.clone()));
                 let points: Vec<Vec3> = ex.outline.iter().copied().map(Vec3::from).collect();
-                wall(&mut commands, &mut meshes, PoiLayer::Extract, &points, extract_faction_color(fac), true);
+                if let Some(w) = wall(
+                    &mut commands,
+                    &mut meshes,
+                    PoiLayer::Extract,
+                    &points,
+                    extract_faction_color(fac),
+                    true,
+                ) {
+                    commands.entity(w).insert(ExtractFaction(fac.clone()));
+                }
                 for switch_name in &ex.switches {
                     if let Some(sw) = mn.switches.iter().find(|sw| sw.name.eq_ignore_ascii_case(switch_name)) {
                         operation_links.push((Vec3::from(sw.pos), Vec3::from(ex.pos)));
@@ -2295,24 +2301,11 @@ fn spawn_pois(
                 "secret" => Some(ex_secret.clone()),
                 _ => None, // pmc keeps the layer's extract green
             };
-            // Rename to the community name: nearest tarkov.dev extract within 60 m (XZ — the Y
-            // conventions differ: collider bottom vs surface point). NON-exclusive on purpose: a
-            // physical extract listed per-faction in the scene ("NW Exfil" pmc + scav) maps both
-            // entries to the one dev extract ("Railway Exfil").
-            let friendly = dev_extract_names
-                .iter()
-                .map(|(n, p)| {
-                    let d = ((p.x - e.pos[0]).powi(2) + (p.z - e.pos[2]).powi(2)).sqrt();
-                    (n, d)
-                })
-                .filter(|(_, d)| *d <= 60.0)
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .map(|(n, _)| n.clone());
             let ent = spawn(
                 &mut commands,
                 PoiLayer::Extract,
                 e.pos,
-                gd_exfil_info(e, friendly.as_deref()),
+                gd_exfil_info(e, *lang),
                 mat,
             );
             commands.entity(ent).insert(ExtractFaction(e.faction.clone()));
@@ -2321,8 +2314,16 @@ fn spawn_pois(
             }
             if e.outline.len() >= 3 {
                 let pts: Vec<Vec3> = e.outline.iter().map(|a| Vec3::from(*a)).collect();
-                wall(&mut commands, &mut meshes, PoiLayer::Extract, &pts,
-                     extract_faction_color(&e.faction), e.active);
+                if let Some(w) = wall(
+                    &mut commands,
+                    &mut meshes,
+                    PoiLayer::Extract,
+                    &pts,
+                    extract_faction_color(&e.faction),
+                    e.active,
+                ) {
+                    commands.entity(w).insert(ExtractFaction(e.faction.clone()));
+                }
                 gd_zones.exfils.push((e.faction.clone(), pts, e.active));
             }
         }
@@ -2904,6 +2905,7 @@ fn teardown_pois(mut commands: Commands, q: Query<Entity, With<PoiLayer>>) {
 fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
+    game_link: Option<Res<crate::game_watch::GameLink>>,
     mut respawned: ResMut<PoiMarkersRespawned>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     mut last_cam: Local<Vec3>,
@@ -2912,6 +2914,7 @@ fn apply_poi_visibility(
             &PoiLayer,
             Option<&MarkerValue>,
             Option<&SceneInactive>,
+            Option<&ExtractFaction>,
             &GlobalTransform,
             Option<&DenseMarker>,
             &mut Visibility,
@@ -2929,6 +2932,7 @@ fn apply_poi_visibility(
     if !respawned.0
         && !toggles.is_changed()
         && !epoch.is_changed()
+        && !game_link.as_ref().is_some_and(|link| link.is_changed())
         && !(toggles.cluster_dense && moved)
     {
         return;
@@ -2936,7 +2940,8 @@ fn apply_poi_visibility(
     respawned.0 = false;
     *last_cam = camera;
     let mut occupied = std::collections::HashSet::new();
-    for (l, val, inactive, gt, dense, mut vis) in &mut q {
+    let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
+    for (l, val, inactive, faction, gt, dense, mut vis) in &mut q {
         let show = match l {
             PoiLayer::PmcSpawn => toggles.pmc_spawns,
             PoiLayer::ScavSpawn => toggles.scav_spawns,
@@ -2964,6 +2969,11 @@ fn apply_poi_visibility(
         let mut show = show
             && value_passes(toggles.min_value, val)
             && !(toggles.hide_inactive && inactive.is_some());
+        if show && matches!(l, PoiLayer::Extract) {
+            if let (Some(side), Some(faction)) = (raid_side, faction) {
+                show = side.allows_extract(&faction.0);
+            }
+        }
         if show && toggles.cluster_dense && dense.is_some() {
             let p = gt.translation();
             let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
@@ -3295,6 +3305,7 @@ fn draw_gamedata_outlines(
     mut gizmos: Gizmos,
     zones: Res<GameDataZones>,
     toggles: Res<LayerToggles>,
+    game_link: Option<Res<crate::game_watch::GameLink>>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     nav: Option<Res<crate::pathfind::Nav>>,
     epoch: Res<crate::render::MapEpoch>,
@@ -3320,8 +3331,12 @@ fn draw_gamedata_outlines(
         );
     };
     if toggles.extracts {
+        let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
         for (fac, outline, active) in &zones.exfils {
             if hide_inactive && !active {
+                continue;
+            }
+            if raid_side.is_some_and(|side| !side.allows_extract(fac)) {
                 continue;
             }
             ring(outline, extract_faction_color(fac));

@@ -29,7 +29,7 @@
 use core::num::NonZeroU32;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bevy::core_pipeline::core_3d::{
     graph::{Core3d, Node3d},
@@ -1164,6 +1164,11 @@ pub struct CpuData {
     /// array past a storage BINDING limit on its own, so the render world reports it by name when
     /// the buffer is oversized rather than making the reader guess.
     grass_instances: usize,
+    /// First grass record in `instances`. Grass is built as one contiguous run; synthetic sea
+    /// instances may follow it. The render upload can therefore omit the run without rebuilding
+    /// the pack, then shift only later mesh bases. This is the seam that makes Low quality avoid
+    /// Woods' ~883 MiB grass SSBO instead of merely culling it after upload.
+    grass_instance_base: usize,
     mesh_meta: Vec<MeshMeta>,
     /// Per-material GPU table, indexed by global materialId (== materials.json order).
     materials: Vec<GpuMaterial>,
@@ -1236,36 +1241,57 @@ impl ExtractResource for ExtractedCpuData {
     }
 }
 
-/// Cross-world "GPU map build in progress" flag. Set TRUE the moment a new map's GPU build begins
+/// Cross-world GPU map-build state. The progress flag is set the moment a new build begins
 /// (main world: `build_cpu_data` / `poll_map_load`), cleared FALSE when `prepare_gpu_buffers`
 /// finishes uploading every texture and inserts `EftGpuBuffers` (render world). The SAME `Arc` is
 /// inserted into BOTH the main app and the render sub-app, so the render world can signal the main
 /// world's `map_loading_indicator` to keep showing the "Loading…" toast until the map is actually
 /// on-screen — not just until the .eftpack FILE finished loading (which is all `PendingMapLoad`
-/// tracks). Without this the toast vanishes the instant the file loads, then the window would sit
-/// blank/frozen through the multi-second GPU build.
+/// tracks). Allocation preflight errors use the same state to reach the main-world error panel.
+struct GpuLoadState {
+    in_progress: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
 #[derive(Resource, Clone)]
-pub struct GpuLoadSignal(pub Arc<AtomicBool>);
+pub struct GpuLoadSignal(Arc<GpuLoadState>);
 
 impl Default for GpuLoadSignal {
     fn default() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self(Arc::new(GpuLoadState {
+            in_progress: AtomicBool::new(false),
+            error: Mutex::new(None),
+        }))
     }
 }
 
 impl GpuLoadSignal {
     /// True while a map's GPU build is still running (textures uploading / buffers not yet built).
     pub fn in_progress(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.in_progress.load(Ordering::Relaxed)
     }
     /// Latch the flag TRUE — a new map's GPU build is starting. Called by `poll_map_load` the moment
     /// it applies a finished file load (closing the 1-frame gap before `build_cpu_data` runs) and by
     /// `build_cpu_data` itself.
     pub fn begin(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.clear_error();
+        self.0.in_progress.store(true, Ordering::Relaxed);
     }
     fn set(&self, v: bool) {
-        self.0.store(v, Ordering::Relaxed);
+        self.0.in_progress.store(v, Ordering::Relaxed);
+    }
+    /// Surface a render-device allocation failure to the main-world error panel. Continuing after
+    /// an invalid wgpu buffer/binding request only poisons the encoder and produces unrelated
+    /// validation cascades, so allocation preflight terminates this map build here.
+    fn fail(&self, message: String) {
+        *self.0.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(message);
+        self.set(false);
+    }
+    pub fn error(&self) -> Option<String> {
+        self.0.error.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+    pub fn clear_error(&self) {
+        *self.0.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -2553,6 +2579,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         });
     }
     let t_geo = build_t0.elapsed(); // phase: the mesh geometry loop (parse + repack + append)
+    let grass_instance_base = instances.len();
     let mut grass_instances = 0usize;
 
     // ---- #4 GRASS: append the density-placed grass clumps as a cross-quad mesh + N instances,
@@ -3003,6 +3030,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         index_count,
         instances,
         grass_instances,
+        grass_instance_base,
         mesh_meta,
         mesh_names,
         inst_lod_group,
@@ -3462,6 +3490,101 @@ fn reset_gpu_map_if_epoch_changed(
     commands.insert_resource(SpecializedRenderPipelines::<EftDrawPipeline>::default());
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GpuUploadPlan {
+    omit_grass: bool,
+    instance_count: usize,
+    instance_bytes: u64,
+}
+
+/// Decide whether this map can be represented by the adapter before creating any large buffers.
+/// If grass alone pushes the instance SSBO over the binding limit, omitting that contiguous run is
+/// a compatible fallback: the rest of the map remains exact and the grass mesh indirect counts are
+/// zeroed. Vertex/index geometry cannot be split without changing the draw architecture, so those
+/// produce one clear, user-visible failure instead of an invalid device/encoder cascade.
+fn gpu_upload_plan(
+    vertex_bytes: u64,
+    index_bytes: u64,
+    instance_count: usize,
+    grass_instances: usize,
+    max_buffer_size: u64,
+    max_storage_binding_size: u64,
+    grass_requested: bool,
+) -> Result<GpuUploadPlan, String> {
+    for (label, bytes) in [("vertex", vertex_bytes), ("index", index_bytes)] {
+        if bytes > max_buffer_size {
+            return Err(format!(
+                "{label} buffer needs {:.0} MiB, but this GPU supports at most {:.0} MiB per \
+                 buffer. Try a smaller map or rebuild it with lean geometry.",
+                bytes as f64 / 1048576.0,
+                max_buffer_size as f64 / 1048576.0,
+            ));
+        }
+    }
+    if grass_instances > instance_count {
+        return Err("pack has more grass records than total instances".to_string());
+    }
+    let instance_stride = std::mem::size_of::<InstanceGpuRecord>() as u64;
+    let full_bytes = (instance_count as u64)
+        .checked_mul(instance_stride)
+        .ok_or_else(|| "instance buffer byte size overflowed u64".to_string())?;
+    let binding_limit = max_buffer_size.min(max_storage_binding_size);
+    let omit_grass = grass_instances > 0 && (!grass_requested || full_bytes > binding_limit);
+    let selected_count =
+        if omit_grass { instance_count - grass_instances } else { instance_count };
+    let selected_bytes = (selected_count as u64)
+        .checked_mul(instance_stride)
+        .ok_or_else(|| "instance buffer byte size overflowed u64".to_string())?;
+    if selected_bytes > binding_limit {
+        return Err(format!(
+            "instance buffer needs {:.0} MiB even without optional grass, but this GPU supports \
+             at most {:.0} MiB for one storage binding. Try a smaller map or a leaner pack.",
+            selected_bytes as f64 / 1048576.0,
+            binding_limit as f64 / 1048576.0,
+        ));
+    }
+    if selected_count > u32::MAX as usize {
+        return Err(format!(
+            "map has {selected_count} drawable instances, exceeding the renderer's {}-instance limit",
+            u32::MAX
+        ));
+    }
+    Ok(GpuUploadPlan {
+        omit_grass,
+        instance_count: selected_count,
+        instance_bytes: selected_bytes,
+    })
+}
+
+/// Remove the contiguous grass instance range while preserving mesh IDs. Grass mesh metadata is
+/// retained with zero instances so every material/mesh index remains stable; synthetic meshes
+/// appended after grass (currently the sea horizon) have only their instance base shifted.
+fn compact_without_grass(
+    instances: &[InstanceGpuRecord],
+    mesh_meta: &[MeshMeta],
+    grass_start: usize,
+    grass_count: usize,
+) -> (Vec<InstanceGpuRecord>, Vec<MeshMeta>) {
+    let grass_end = grass_start
+        .checked_add(grass_count)
+        .expect("grass instance range overflow");
+    assert!(grass_end <= instances.len(), "grass instance range outside instance data");
+    let mut compact_instances = Vec::with_capacity(instances.len() - grass_count);
+    compact_instances.extend_from_slice(&instances[..grass_start]);
+    compact_instances.extend_from_slice(&instances[grass_end..]);
+    let mut compact_mesh_meta = mesh_meta.to_vec();
+    let removed = grass_count as u32;
+    for meta in &mut compact_mesh_meta {
+        let base = meta.instance_base as usize;
+        if base >= grass_start && base < grass_end {
+            meta.instance_count = 0;
+        } else if base >= grass_end {
+            meta.instance_base = meta.instance_base.saturating_sub(removed);
+        }
+    }
+    (compact_instances, compact_mesh_meta)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_gpu_buffers(
     mut commands: Commands,
@@ -3473,6 +3596,7 @@ fn prepare_gpu_buffers(
     compute: Option<Res<EftComputePipelines>>,
     draw: Option<Res<EftDrawPipeline>>,
     map_epoch: Option<Res<super::MapEpoch>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
     // Async streaming build state (present only DURING a build) + the cross-world loading flag.
     mut build: Option<ResMut<GpuBuildState>>,
     load_signal: Option<Res<GpuLoadSignal>>,
@@ -3517,6 +3641,29 @@ fn prepare_gpu_buffers(
     }
     let epoch = cpu.1;
     let cpu = &cpu.0;
+    let limits = render_device.limits();
+    let grass_requested = settings.as_ref().map(|s| s.grass).unwrap_or(true);
+    let upload_plan = match gpu_upload_plan(
+        std::mem::size_of_val(cpu.vertex_data.as_slice()) as u64,
+        cpu.index_bytes.len() as u64,
+        cpu.instances.len(),
+        cpu.grass_instances,
+        limits.max_buffer_size,
+        limits.max_storage_buffer_binding_size as u64,
+        grass_requested,
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            let message = format!("This map is too large for the selected GPU: {reason}");
+            error!("gpu-driven allocation preflight: {message}");
+            if let Some(s) = &load_signal {
+                s.fail(message);
+            }
+            commands.remove_resource::<GpuBuildState>();
+            commands.remove_resource::<ExtractedCpuData>();
+            return;
+        }
+    };
 
     // ===== ASYNC STREAMING TEXTURE BUILD (fixes the "Not Responding" load freeze) ==============
     // Instead of decoding+BC-encoding+uploading all ~700 albedo + ~540 normal textures in ONE
@@ -3543,6 +3690,21 @@ fn prepare_gpu_buffers(
         // -- KICKOFF: spawn off-thread prep for every texture (once per map epoch) --
         let need_kickoff = build.as_ref().map(|b| b.epoch != epoch).unwrap_or(true);
         if need_kickoff {
+            if upload_plan.omit_grass {
+                let why = if grass_requested {
+                    "the full instance SSBO exceeds this adapter's binding limit"
+                } else {
+                    "foliage is disabled by the active quality settings"
+                };
+                warn!(
+                    "gpu-driven grass: omitting {} clumps from GPU upload/dispatch because {why} \
+                     ({:.0} MiB avoided)",
+                    cpu.grass_instances,
+                    cpu.grass_instances as f64
+                        * std::mem::size_of::<InstanceGpuRecord>() as f64
+                        / 1048576.0,
+                );
+            }
             let pool = bevy::tasks::AsyncComputeTaskPool::get();
             let bc = bc_enabled(&render_device);
             // Texture-quality mip skip, captured ONCE per map build so every texture of one map
@@ -3745,50 +3907,49 @@ fn prepare_gpu_buffers(
             (v, i)
         }
     };
-    // The instance array is ONE storage binding, so it is bounded by
-    // `max_storage_buffer_binding_size` — a limit nothing else in this path comes close to, and
-    // which grass can blow past on its own: woods ships 11.5 M clumps, and at
-    // size_of::<InstanceGpuRecord>() = 80 B that is 883 MiB in a single binding. Exceeding it does
-    // not fail loudly; wgpu invalidates the encoder and every later pass reports "Encoder is
-    // invalid" instead, which is what a 2 fps woods with 56 validation errors actually was.
-    // Record the numbers so the next occurrence is one grep, not an evening.
-    let inst_bytes = cpu.instances.len() as u64 * std::mem::size_of::<InstanceGpuRecord>() as u64;
-    let lim = render_device.limits();
-    let max_binding = lim.max_storage_buffer_binding_size as u64;
+    // The instance array is ONE storage binding. `gpu_upload_plan` has already checked the adapter
+    // limit and selected the no-grass fallback when needed; build that compact upload view now.
+    // Woods' 11.5 M clumps are 883 MiB at 80 B each, so this is a material residency reduction,
+    // not merely a shader-side visibility toggle.
+    let compact = if upload_plan.omit_grass {
+        Some(compact_without_grass(
+            &cpu.instances,
+            &cpu.mesh_meta,
+            cpu.grass_instance_base,
+            cpu.grass_instances,
+        ))
+    } else {
+        None
+    };
+    let (instance_records, mesh_records): (&[InstanceGpuRecord], &[MeshMeta]) = compact
+        .as_ref()
+        .map(|(instances, meta)| (instances.as_slice(), meta.as_slice()))
+        .unwrap_or((cpu.instances.as_slice(), cpu.mesh_meta.as_slice()));
+    debug_assert_eq!(instance_records.len(), upload_plan.instance_count);
+    let instance_total = upload_plan.instance_count as u32;
     info!(
         "gpu-driven limits: max_buffer_size {:.0} MiB, max_storage_buffer_binding_size {:.0} MiB, \
          max_compute_workgroups_per_dimension {} (= {} instances at 64/group) \
          | vtx {:.0} MiB, idx {:.0} MiB, inst {:.0} MiB",
-        lim.max_buffer_size as f64 / 1048576.0,
-        max_binding as f64 / 1048576.0,
-        lim.max_compute_workgroups_per_dimension,
-        lim.max_compute_workgroups_per_dimension as u64 * 64,
+        limits.max_buffer_size as f64 / 1048576.0,
+        limits.max_storage_buffer_binding_size as f64 / 1048576.0,
+        limits.max_compute_workgroups_per_dimension,
+        limits.max_compute_workgroups_per_dimension as u64 * 64,
         cpu.vertex_data.len() as f64 * 4.0 / 1048576.0,
         cpu.index_bytes.len() as f64 / 1048576.0,
-        inst_bytes as f64 / 1048576.0,
+        upload_plan.instance_bytes as f64 / 1048576.0,
     );
-    if inst_bytes > max_binding || inst_bytes > lim.max_buffer_size {
-        error!(
-            "gpu-driven: instance buffer {:.0} MiB ({} instances x {} B) EXCEEDS this adapter's \
-             max_storage_buffer_binding_size of {:.0} MiB — the binding is invalid and rendering \
-             will fail. Grass is the usual cause ({} of the instances).",
-            inst_bytes as f64 / 1048576.0,
-            cpu.instances.len(),
-            std::mem::size_of::<InstanceGpuRecord>(),
-            max_binding as f64 / 1048576.0,
-            cpu.grass_instances,
-        );
-    } else {
+    if upload_plan.omit_grass {
         info!(
-            "gpu-driven: instance buffer {:.0} MiB ({} instances) of {:.0} MiB binding limit",
-            inst_bytes as f64 / 1048576.0,
-            cpu.instances.len(),
-            max_binding as f64 / 1048576.0,
+            "gpu-driven: {} grass instances omitted; uploading {:.0} MiB / {} instances",
+            cpu.grass_instances,
+            upload_plan.instance_bytes as f64 / 1048576.0,
+            upload_plan.instance_count,
         );
     }
     let instances = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_gpu_instances"),
-        contents: bytemuck::cast_slice(&cpu.instances),
+        contents: bytemuck::cast_slice(instance_records),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
     // DOORS: match each swing door to its GPU instance (the panel sits at the door pivot) so
@@ -3924,12 +4085,12 @@ fn prepare_gpu_buffers(
     }
     let mesh_meta = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_gpu_mesh_meta"),
-        contents: bytemuck::cast_slice(&cpu.mesh_meta),
+        contents: bytemuck::cast_slice(mesh_records),
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
     let visible = render_device.create_buffer(&BufferDescriptor {
         label: Some("eft_gpu_visible"),
-        size: cpu.instance_total as u64 * 4,
+        size: instance_total as u64 * 4,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -3950,7 +4111,7 @@ fn prepare_gpu_buffers(
     // than randomly culling.
     let seed = CullUniform {
         frustum: [[0.0; 4]; 6],
-        counts: [cpu.instance_total, cpu.mesh_count, 0, 0],
+        counts: [instance_total, cpu.mesh_count, 0, 0],
         cam_k: [0.0; 4],
         lod_params: [1.0, 1.0, 0.0, 0.0], // proj11=1, bias=1, mode=0 (max detail) until upload_frustum
     };
@@ -4623,7 +4784,7 @@ fn prepare_gpu_buffers(
         cull_uniform,
         blend_meshes: cpu.blend_meshes.clone(),
         mesh_count: cpu.mesh_count,
-        instance_total: cpu.instance_total,
+        instance_total,
         blend_sort_groups,
         index_format: if cpu.index_u16 { IndexFormat::Uint16 } else { IndexFormat::Uint32 },
     });
@@ -6536,6 +6697,69 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
 #[cfg(test)]
 mod material_stride_tests {
     use super::*;
+
+    #[test]
+    fn upload_plan_omits_disabled_grass_before_sizing_the_ssbo() {
+        let plan = gpu_upload_plan(
+            64,
+            64,
+            1_100,
+            1_000,
+            1_000_000,
+            1_000_000,
+            false,
+        )
+        .unwrap();
+        assert!(plan.omit_grass);
+        assert_eq!(plan.instance_count, 100);
+        assert_eq!(plan.instance_bytes, 100 * 80);
+    }
+
+    #[test]
+    fn upload_plan_uses_grass_as_a_binding_limit_fallback() {
+        // Full = 88,000 B and does not fit. Base geometry = 8,000 B and does.
+        let plan =
+            gpu_upload_plan(64, 64, 1_100, 1_000, 1_000_000, 16_000, true).unwrap();
+        assert!(plan.omit_grass);
+        assert_eq!(plan.instance_count, 100);
+    }
+
+    #[test]
+    fn upload_plan_rejects_unsplittable_or_still_oversized_buffers() {
+        assert!(gpu_upload_plan(65, 1, 1, 0, 64, 64, true)
+            .unwrap_err()
+            .contains("vertex buffer"));
+        assert!(gpu_upload_plan(1, 1, 1_000, 100, 1_000_000, 16_000, true)
+            .unwrap_err()
+            .contains("even without optional grass"));
+    }
+
+    #[test]
+    fn grass_compaction_zeroes_its_draw_and_shifts_a_later_sea_instance() {
+        let instances = vec![InstanceGpuRecord::default(); 6];
+        let meta = vec![
+            MeshMeta {
+                instance_base: 0,
+                instance_count: 2,
+                ..default()
+            },
+            MeshMeta {
+                instance_base: 2,
+                instance_count: 3,
+                ..default()
+            },
+            MeshMeta {
+                instance_base: 5,
+                instance_count: 1,
+                ..default()
+            },
+        ];
+        let (instances, meta) = compact_without_grass(&instances, &meta, 2, 3);
+        assert_eq!(instances.len(), 3);
+        assert_eq!((meta[0].instance_base, meta[0].instance_count), (0, 2));
+        assert_eq!((meta[1].instance_base, meta[1].instance_count), (2, 0));
+        assert_eq!((meta[2].instance_base, meta[2].instance_count), (2, 1));
+    }
 
     /// No dispatch may exceed `max_compute_workgroups_per_dimension` (65,535 on every real
     /// adapter). Exceeding it is a validation error whose only symptom is a cascade of

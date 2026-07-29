@@ -82,6 +82,12 @@ struct Row {
     inactive: bool,
 }
 
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct NavLive<'w> {
+    epoch: Res<'w, crate::render::MapEpoch>,
+    game_link: Option<Res<'w, crate::game_watch::GameLink>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn navigate_tab(
     mut contexts: bevy_egui::EguiContexts,
@@ -103,20 +109,21 @@ pub fn navigate_tab(
             &GlobalTransform,
             &crate::inspect::MarkerInfo,
             Option<&SceneInactive>,
+            Option<&crate::poi::ExtractFaction>,
         ),
         Without<ZoneWall>,
     >,
     cams: Query<&Transform, With<CullCamera>>,
-    epoch: Res<crate::render::MapEpoch>,
+    live: NavLive,
     mut ui_state: Local<NavUiState>,
 ) {
     if menu.is_some() {
         return; // start-menu mode owns the screen
     }
     // In-place map swap: forget the pending extract row (its Entity is from the OLD map).
-    if epoch.0 != ui_state.last_epoch {
+    if live.epoch.0 != ui_state.last_epoch {
         ui_state.pending = None;
-        ui_state.last_epoch = epoch.0;
+        ui_state.last_epoch = live.epoch.0;
     }
     // Leaving the tab keeps an armed place-mode live on purpose: you arm it, swing the camera,
     // click. The banner (with its cancel button) stays visible either way.
@@ -136,11 +143,17 @@ pub fn navigate_tab(
     // fallback we sort by name so rows don't reshuffle while flying.
     let cam_pos = cams.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let ref_pos = start_pt.0.unwrap_or(cam_pos);
+    let raid_side = live.game_link.as_ref().and_then(|link| link.raid_side);
 
     let mut rows: Vec<Row> = extracts
         .iter()
-        .filter(|(_, l, _, _, _)| **l == PoiLayer::Extract)
-        .map(|(e, _, gt, info, inactive)| {
+        .filter(|(_, l, _, _, _, faction)| {
+            **l == PoiLayer::Extract
+                && !raid_side.is_some_and(|side| {
+                    faction.is_some_and(|faction| !side.allows_extract(&faction.0))
+                })
+        })
+        .map(|(e, _, gt, info, inactive, _)| {
             let pos = gt.translation();
             let (raw_name, tag) = split_tag(&info.title);
             let name = pretty_name(&raw_name);

@@ -96,9 +96,67 @@ EXFIL_CLASSES = {
     "ScavExfiltrationPoint": "scav",
     "SharedExfiltrationPoint": "shared",
     "SecretExfiltrationPoint": "secret",
-    # Vehicle extracts are separate typed components in newer scenes.
-    "CarExtraction": "shared",
 }
+
+
+@functools.lru_cache(maxsize=1)
+def game_locale_tables():
+    """First-party EN/RU locale dictionaries embedded in resources.assets.
+
+    ExfiltrationPoint.Settings.Name is a locale KEY ("NW Exfil", "E1", ...), not necessarily
+    the text EFT puts on screen. The old viewer renamed it by choosing the nearest tarkov.dev
+    extract within 60 m, which could silently attach the wrong name. resources.assets ships the
+    exact client locale snapshot, so carry that string beside the raw key instead.
+
+    Keys are case-folded because one scene serializes "factory gate" while the locale table uses
+    "Factory gate". Values are left byte-for-byte as authored by the game.
+    """
+    path = os.path.join(DATA, "resources.assets")
+    wanted = {"TestBackendLocaleEn": "en", "TestBackendLocaleRu": "ru"}
+    tables = {}
+    try:
+        env = UnityPy.load(path)
+        for o in env.objects:
+            if o.type.name != "TextAsset":
+                continue
+            d = o.read()
+            tag = wanted.get(getattr(d, "m_Name", ""))
+            if not tag:
+                continue
+            root = json.loads(getattr(d, "m_Script", "") or "{}")
+            data = root.get("data") if isinstance(root, dict) else None
+            if isinstance(data, dict):
+                tables[tag] = {
+                    str(k).casefold(): v for k, v in data.items()
+                    if isinstance(v, str) and v.strip()
+                }
+            if len(tables) == len(wanted):
+                break
+    except Exception as ex:
+        print(f"[exfils] game locale unavailable ({type(ex).__name__}: {ex}) - raw ids only")
+    return tables
+
+
+def localize_exfils(exfils):
+    """Attach exact in-game display names without changing the serialized identity key.
+
+    `CarExtraction` is deliberately not accepted here: IL2CPP metadata proves it derives from
+    ExfiltrationSubscriber and only animates a car subscribed to the real ExfiltrationPoint. It is
+    not a selectable extract and used to create duplicate/stray markers.
+    """
+    tables = game_locale_tables()
+    if not tables:
+        return
+    for e in exfils:
+        raw = (e.get("name") or "").casefold()
+        for tag, table in tables.items():
+            if value := table.get(raw):
+                e[f"display_name_{tag}"] = value
+    named_en = sum(bool(e.get("display_name_en")) for e in exfils)
+    named_ru = sum(bool(e.get("display_name_ru")) for e in exfils)
+    print(f"[exfils] exact game locale: EN {named_en}/{len(exfils)}, "
+          f"RU {named_ru}/{len(exfils)}")
+
 DOOR_CLASSES = {"Door": "door", "Trunk": "trunk", "KeycardDoor": "door", "SlidingDoor": "door",
                 "ExfiltrationDoor": "exfil_door", "DoorSwitch": "door"}
 # Swing doors we can open by rotating about the owner's local Z (Codex audit): Trunk / sliding /
@@ -1787,6 +1845,7 @@ def main():
         scanned += extra
 
     sink["exfils"] = dedupe(sink["exfils"], lambda r: (r["faction"], r["name"]))
+    localize_exfils(sink["exfils"])
     sink["doors"] = dedupe(sink["doors"], lambda r: r["id"] or (r["name"], tuple(r["pos"])))
     for k in ("minefields", "sniper_zones", "transit_points", "stationary", "mines_directional",
               "quest_triggers", "trader_zones", "buffer_switches", "buffer_zones", "loot_groups",

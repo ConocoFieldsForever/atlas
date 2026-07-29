@@ -1018,6 +1018,15 @@ fn save_config_str(key: &str, val: &str) -> bool {
     }
 }
 
+/// String variants used by modules that own settings in the shared atlas.config.json.
+pub fn config_str_pub(key: &str) -> Option<String> {
+    config_str(key)
+}
+#[must_use]
+pub fn save_config_str_pub(key: &str, val: &str) -> bool {
+    save_config_str(key, val)
+}
+
 /// Generic single-key BOOL read from atlas.config.json (mirrors `config_str`). None when the key is
 /// absent / not a bool — callers supply the default.
 /// Public wrappers so other modules (overlay.rs) can persist their own settings through the SAME
@@ -2388,6 +2397,26 @@ pub fn menu_ui(
                                 cfg.fps_cap = cap.round() as u32;
                                 dirty = true;
                             }
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(t(lg, K::OverlayExitHotkey))
+                                        .size(10.0)
+                                        .color(DIM),
+                                );
+                                egui::ComboBox::from_id_salt("overlay_exit_hotkey")
+                                    .selected_text(cfg.exit_hotkey.label())
+                                    .show_ui(ui, |ui| {
+                                        for key in crate::overlay::OverlayExitHotkey::ALL {
+                                            dirty |= ui
+                                                .selectable_value(
+                                                    &mut cfg.exit_hotkey,
+                                                    key,
+                                                    key.label(),
+                                                )
+                                                .changed();
+                                        }
+                                    });
+                            });
                             dirty |= ui
                                 .checkbox(&mut cfg.pause_when_hidden, RichText::new(t(lg, K::OverlayIdleHidden)).size(11.0))
                                 .on_hover_text(t(lg, K::OverlayIdleHiddenTip))

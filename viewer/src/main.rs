@@ -402,9 +402,16 @@ fn load_map(
 
 /// Clear a stale `MapLoadError` the moment a NEW async load is kicked off, so the error toast from a
 /// previous failed attempt doesn't linger over a fresh (possibly succeeding) load.
-fn clear_map_error_on_new_load(pending: Res<PendingMapLoad>, mut err: ResMut<MapLoadError>) {
-    if pending.is_changed() && pending.loading().is_some() && err.0.is_some() {
+fn clear_map_error_on_new_load(
+    pending: Res<PendingMapLoad>,
+    mut err: ResMut<MapLoadError>,
+    gpu_load: Option<Res<render::GpuLoadSignal>>,
+) {
+    if pending.is_changed() && pending.loading().is_some() {
         err.0 = None;
+        if let Some(signal) = gpu_load {
+            signal.clear_error();
+        }
     }
 }
 
