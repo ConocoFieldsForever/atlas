@@ -1106,7 +1106,7 @@ fn main() {
     if let Some(g) = grade_lut {
         app.insert_resource(g);
     }
-    app.add_plugins((GradePlugin, render::SsaoPlugin, render::TaaPlugin, render::FpvCamPlugin));
+    app.add_plugins((GradePlugin, render::SsaoPlugin, render::SsrPlugin, render::TaaPlugin, render::FpvCamPlugin));
     // Phase 0 (docs/GRAPHICS_PLAN.md): per-pass GPU timestamps. Frame averages cannot resolve the
     // plan's sub-millisecond costs from the 0.3 ms noise floor; the phases' acceptance criteria are
     // written against these spans ("eft cull/shadow/prepass..."). Env-gated because timestamp
