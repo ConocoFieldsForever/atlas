@@ -378,6 +378,30 @@ struct MapNodes {
     artillery: Vec<ApiZone>,
     #[serde(default)]
     meta: MapMeta,
+    /// Per-exfil timing/gating from the client's baked location config. Joined to the drawn
+    /// extracts BY NAME — upstream gives position + faction, the client gives how long standing in
+    /// it takes and what it demands of you.
+    #[serde(default)]
+    exits_game: Vec<ExitCfg>,
+}
+
+/// One exit's config from the client (`exits_game`).
+#[derive(Deserialize, Clone)]
+struct ExitCfg {
+    #[serde(default)] name: String,
+    /// Percent chance this exfil is available at all in a given raid.
+    #[serde(default)] chance: Option<f32>,
+    /// Seconds you must stand in it.
+    #[serde(default)] time: Option<i64>,
+    /// Raid-time window in which it can appear (0/0 = always).
+    #[serde(default)] min_time: Option<i64>,
+    #[serde(default)] max_time: Option<i64>,
+    /// "Individual" / "SharedTimer" / ...
+    #[serde(default)] r#type: Option<String>,
+    /// What it demands: a key, a vehicle payment, a co-op partner, ...
+    #[serde(default)] requirement: Option<String>,
+    /// An item slot that must be filled/empty (e.g. FirstPrimaryWeapon).
+    #[serde(default)] required_slot: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -387,6 +411,16 @@ struct MapMeta {
     #[serde(default)] enemies: Vec<String>,
     #[serde(default)] raid_minutes: Option<i64>,
     #[serde(default)] players: Option<String>,
+    /// "game files" once the client's EscapeTimeLimit has replaced upstream's value. The client is
+    /// the CURRENT one here: customs 40 vs 35, woods 40 vs 35, streets 50 vs 40, labs 35 vs 30.
+    #[serde(default)] raid_src: Option<String>,
+    /// Upstream's raid length, kept only when it DISAGREED, so the difference stays visible.
+    #[serde(default)] raid_minutes_dev: Option<i64>,
+    #[serde(default)] min_players: Option<i64>,
+    #[serde(default)] max_players: Option<i64>,
+    /// The map's own GlobalLootChanceModifier — first-party, and previously modelled nowhere.
+    /// Lighthouse ships 0.17 against woods' 0.9, a ~5x swing in expected loot.
+    #[serde(default)] loot_modifier: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -409,9 +443,16 @@ struct Node {
     /// Boss slug, e.g. "cultist-priest" (boss_nodes only).
     #[serde(default)]
     boss: Option<String>,
-    /// Boss spawn chance 0..1 (boss_nodes only).
+    /// Boss spawn chance 0..1 (boss_nodes only), from tarkov.dev.
     #[serde(default)]
     chance: Option<f32>,
+    /// The CLIENT's own spawn chance 0..1, joined from the baked location config
+    /// (BossLocationSpawn.BossChance). Preferred over `chance` — see the Boss card.
+    #[serde(default)]
+    chance_game: Option<f32>,
+    /// The client's own spawn-zone names for this boss (BossZone), first-party.
+    #[serde(default)]
+    zones_game: Vec<String>,
     /// Boss DISPLAY name from tarkov.dev, e.g. "Cultist Priest" (boss_nodes only).
     #[serde(default)]
     name: Option<String>,
@@ -1091,7 +1132,7 @@ fn outline_extent(outline: &[[f32; 3]]) -> Option<String> {
 
 /// Card for a typed extract (gamedata.json `exfils`). Its display label comes from the game's
 /// own resources.assets locale table, while the serialized key stays available for joins.
-fn gd_exfil_info(e: &GdExfil, lang: crate::i18n::Lang) -> MarkerInfo {
+fn gd_exfil_info(e: &GdExfil, lang: crate::i18n::Lang, exit_cfgs: &[ExitCfg]) -> MarkerInfo {
     let display = match lang {
         crate::i18n::Lang::En => e.display_name_en.as_deref(),
         crate::i18n::Lang::Ru => e.display_name_ru.as_deref().or(e.display_name_en.as_deref()),
@@ -1108,7 +1149,7 @@ fn gd_exfil_info(e: &GdExfil, lang: crate::i18n::Lang) -> MarkerInfo {
         switches: if e.requires_power { vec!["Power".into()] } else { Vec::new() },
         transfer: None,
     };
-    let mut info = extract_dev_info(&base, &e.faction);
+    let mut info = extract_dev_info(&base, &e.faction, exit_cfgs);
     if display != e.name && !e.name.is_empty() {
         info.detail.push(format!("Game id: {}", e.name));
     }
@@ -1364,8 +1405,27 @@ fn node_info(l: PoiLayer, nd: &Node) -> MarkerInfo {
                 .or_else(|| nd.boss.as_deref().map(titlecase).filter(|s| !s.is_empty()))
                 .unwrap_or_else(|| "Boss".into());
             let mut detail = Vec::new();
-            if let Some(ch) = nd.chance {
-                detail.push(format!("Chance {:.0}%", ch * 100.0));
+            // SPAWN CHANCE — two DIFFERENT facts, so show both rather than pick a winner.
+            //
+            // tarkov.dev's number is the CURRENT one and leads: it tracks live server state,
+            // including events. The client's BossLocationSpawn.BossChance (baked into
+            // resources.assets, joined here in build_loot.py via the mobs display-name table) is the
+            // BASE rate and cannot know about an event — verified: all six location variants per map
+            // ship an identical boss-chance set, no exit carries EventAvailable, and the only
+            // Triggers present are quest-gated. So when an event puts every boss at 100%, upstream
+            // reads 100% and the client still reads 30%; neither is wrong, and labelling the base
+            // rate as the truth would actively mislead during an event.
+            match (nd.chance, nd.chance_game) {
+                (Some(d), Some(g)) if (g - d).abs() > 0.005 => {
+                    detail.push(format!("Chance {:.0}%  (current)", d * 100.0));
+                    detail.push(format!("Base rate {:.0}%  (game files)", g * 100.0));
+                }
+                (Some(d), _) => detail.push(format!("Chance {:.0}%", d * 100.0)),
+                (None, Some(g)) => detail.push(format!("Base rate {:.0}%  (game files)", g * 100.0)),
+                (None, None) => {}
+            }
+            if !nd.zones_game.is_empty() {
+                detail.push(format!("Game spawn zones: {}", nd.zones_game.join(", ")));
             }
             // Delayed spawns (e.g. Partisan at 900 s) are raid-planning gold; -1/small
             // values mean "at raid start" and stay silent.
@@ -1470,7 +1530,39 @@ fn extract_faction_color(fac: &str) -> Color {
 
 /// Card for a clean faction-tagged extract (loot.json `extracts_dev`). `fac` may be a merged
 /// "pmc+scav" (one physical extract listed once per faction by tarkov.dev).
-fn extract_dev_info(ex: &ExtractDev, fac: &str) -> MarkerInfo {
+/// Append the CLIENT's own config for this exfil, joined by name. Upstream gives us where an
+/// extract is and who may use it; the client gives how long you must stand in it, whether it is
+/// even open this raid, and what it demands — none of which upstream carries per-exit.
+fn push_exit_cfg(detail: &mut Vec<String>, name: &str, cfgs: &[ExitCfg]) {
+    let key = name.trim().to_ascii_lowercase();
+    let Some(c) = cfgs.iter().find(|c| c.name.trim().to_ascii_lowercase() == key) else {
+        return;
+    };
+    if let Some(t) = c.time.filter(|&t| t > 0) {
+        detail.push(format!("Extract time  {t} s  (game files)"));
+    }
+    // A chance under 100 is the thing worth knowing: this exfil may simply not exist this raid.
+    if let Some(ch) = c.chance.filter(|&v| v > 0.0 && v < 100.0) {
+        detail.push(format!("Available {ch:.0}% of raids"));
+    }
+    match (c.min_time.unwrap_or(0), c.max_time.unwrap_or(0)) {
+        (a, b) if a > 0 || b > 0 => {
+            detail.push(format!("Open between {} and {} s of raid time", a, b))
+        }
+        _ => {}
+    }
+    if let Some(r) = c.requirement.as_deref().filter(|r| !r.is_empty() && *r != "None") {
+        detail.push(format!("Requires: {r}"));
+    }
+    if let Some(sl) = c.required_slot.as_deref().filter(|s| !s.is_empty()) {
+        detail.push(format!("Slot: {sl}"));
+    }
+    if let Some(ty) = c.r#type.as_deref().filter(|t| !t.is_empty() && *t != "Individual") {
+        detail.push(format!("Type: {ty}"));
+    }
+}
+
+fn extract_dev_info(ex: &ExtractDev, fac: &str, exit_cfgs: &[ExitCfg]) -> MarkerInfo {
     let accent = extract_faction_color(fac);
     let name = ex.name.as_str();
     let name = if name.is_empty() { "Extract" } else { name };
@@ -1487,6 +1579,7 @@ fn extract_dev_info(ex: &ExtractDev, fac: &str) -> MarkerInfo {
         faction_label(fac)
     };
     let mut detail = vec![format!("Faction: {fac_line}")];
+    push_exit_cfg(&mut detail, name, exit_cfgs);
     if !ex.switches.is_empty() {
         detail.push(format!("Requires switch: {}", ex.switches.join(", ")));
     }
@@ -2018,11 +2111,14 @@ fn spawn_pois(
     // ONE loot.json resolver for the whole app (loot.rs: env > pack > pack-parent shared >
     // shared_dir > cwd) - poi.rs used to re-implement a subset (audit A6).
     let loot_path = crate::loot::resolve_loot_json(Some(lp.0.root.as_path()));
+    // Hoisted: the typed-exfil cards are built further down, after the loot block closes.
+    let mut exit_cfgs: Vec<ExitCfg> = Vec::new();
     if let Some(mn) = loot_path
         .and_then(|pb| std::fs::read_to_string(pb).ok())
         .and_then(|s| serde_json::from_str::<LootFile>(&s).ok())
         .and_then(|mut f| f.maps.remove(&key))
     {
+        exit_cfgs = mn.exits_game.clone();
         intel_meta = MapIntelMeta {
             name: mn.meta.name.clone(),
             description: mn.meta.description.clone(),
@@ -2218,7 +2314,7 @@ fn spawn_pois(
                     &mut commands,
                     PoiLayer::Extract,
                     ex.pos,
-                    extract_dev_info(ex, fac),
+                    extract_dev_info(ex, fac, &exit_cfgs),
                     mat,
                 );
                 commands.entity(e).insert(ExtractFaction(fac.clone()));
@@ -2305,7 +2401,7 @@ fn spawn_pois(
                 &mut commands,
                 PoiLayer::Extract,
                 e.pos,
-                gd_exfil_info(e, *lang),
+                gd_exfil_info(e, *lang, &exit_cfgs),
                 mat,
             );
             commands.entity(ent).insert(ExtractFaction(e.faction.clone()));

@@ -582,3 +582,18 @@ def load_static_tasks():
         })
     print(f"  [json] resolved {len(out)} tasks", flush=True)
     return {"tasks": out}
+
+
+def load_static_mob_names():
+    """{game bot-role id: EN display name} — e.g. bossKojaniy -> "Shturman", bossBully -> "Reshala".
+
+    The `mobs` catalog in the maps dump is keyed by the SAME role ids the client uses in a location's
+    BossLocationSpawn, and maps_en translates them. That makes it the join between the client's boss
+    entries (which carry the real spawn CHANCE) and tarkov.dev's boss nodes (which carry the world
+    POSITION). A prefix-strip cannot do this job: bossKojaniy is "Shturman", bossBully is "Reshala",
+    bossBoar is "Kaban", sectantPriest is "Cultist Priest".
+    """
+    men = _get("maps_en").get("data", {}) or {}
+    mobs = _get("maps")["data"].get("mobs") or {}
+    ids = list(mobs) if isinstance(mobs, dict) else [m.get("id") for m in _list(mobs)]
+    return {i: men.get(i) for i in ids if i and men.get(i)}
