@@ -1,0 +1,125 @@
+[
+ {
+  "name": "u_base",
+  "label": "ULTRA: full tex + SSAO on (the Ultra preset)",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 30.6,
+  "vram_base": 1895,
+  "vram_peak": 8567,
+  "vram_mib": 6672,
+  "frames": 1688,
+  "avg_ms": 11.852,
+  "fps": 84.4,
+  "p50": 11.512,
+  "p95": 16.647,
+  "p99": 18.274,
+  "max_ms": 19.135
+ },
+ {
+  "name": "u_no_shadows",
+  "label": "ULTRA minus sun shadows",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_SHADOWS": "0"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 36.1,
+  "vram_base": 1919,
+  "vram_peak": 8554,
+  "vram_mib": 6635,
+  "frames": 2036,
+  "avg_ms": 9.826,
+  "fps": 101.8,
+  "p50": 9.602,
+  "p95": 13.684,
+  "p99": 14.946,
+  "max_ms": 16.018
+ },
+ {
+  "name": "u_no_grass",
+  "label": "ULTRA minus foliage/grass",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_CULL_PX": "1.5,1000"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.7,
+  "vram_base": 1934,
+  "vram_peak": 8607,
+  "vram_mib": 6673,
+  "frames": 2781,
+  "avg_ms": 7.192,
+  "fps": 139.0,
+  "p50": 6.996,
+  "p95": 10.25,
+  "p99": 11.138,
+  "max_ms": 19.766
+ },
+ {
+  "name": "u_lod_off",
+  "label": "ULTRA, distance-LOD OFF (finest shell only)",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_LOD": "0"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.4,
+  "vram_base": 1921,
+  "vram_peak": 8590,
+  "vram_mib": 6669,
+  "frames": 1276,
+  "avg_ms": 15.677,
+  "fps": 63.8,
+  "p50": 15.092,
+  "p95": 24.47,
+  "p99": 26.687,
+  "max_ms": 51.132
+ }
+]

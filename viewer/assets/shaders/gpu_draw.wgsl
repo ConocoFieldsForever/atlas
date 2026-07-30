@@ -224,19 +224,24 @@ struct ShVolume {
 @group(3) @binding(4) var sh_samp: sampler;
 
 // --- #5 Dynamic sun shadows (added to the EXISTING SH/lighting group 3; NOT a 5th bind group) ----
-// A 2-cascade near-field contact CSM. The SH volume above already bakes the BROAD sun shadow; these
-// two near cascades only add the missing high-frequency contact edge, and the combination below is
-// gated + capped so it can only SUBTRACT a small, bounded amount of light (anti double-darkening).
-// Byte-identical to the Rust `SunShadowUniform` (208 bytes).
+// A 4-cascade CSM reaching 700 m. The SH volume above bakes the BROAD sun shadow; these cascades add
+// the missing high-frequency edge, and the combination below is gated + capped so it can only
+// SUBTRACT a small, bounded amount of light (anti double-darkening). The two FAR cascades exist
+// because at 2 cascades the effect stopped at 80 m, leaving every distant tree and ridge unshadowed
+// on a 1.2 km map.
+// Byte-identical to the Rust `SunShadowUniform` (352 bytes: 4×mat4 = 256 + 6×vec4 = 96). If the
+// cascade count changes, the array length, this comment, the Rust struct AND its size assert all
+// move together — a silent layout mismatch between this file and Rust caused a device loss before.
 struct SunShadowUniform {
-    view_proj: array<mat4x4<f32>, 2>, // per-cascade world->light-clip (0..1 depth ortho)
-    split_depths: vec4<f32>,          // x=far0(15) y=far1(80) z=overlap(0.10) w=enabled(1/0)
+    view_proj: array<mat4x4<f32>, 4>, // per-cascade world->light-clip (0..1 depth ortho)
+    split_far: vec4<f32>,             // per-cascade FAR plane in m: 15 / 80 / 250 / 700
     sun_dir_texel: vec4<f32>,         // xyz=Lsun (toward sun), w=1/shadow_map_size (PCF texel)
-    texel_world: vec4<f32>,           // x=cascade0 world texel, y=cascade1 world texel (bias units)
-    combine: vec4<f32>,               // x=diffuse cap(0.12) y=fade start(65) z=fade end(80) w=debug
+    texel_world: vec4<f32>,           // per-cascade world texel size (bias units), one lane each
+    combine: vec4<f32>,               // x=diffuse cap(0.12) y=fade start z=fade end w=debug
     // Runtime graphics scales from the UI (all 1.0 = shipped look):
     // x = fog density scale (0 = fog off), y = sky-reflection gain scale, z = emissive scale.
     gfx: vec4<f32>,
+    casc_params: vec4<f32>,           // x=overlap(0.10) y=enabled(1/0) z=cascade count w=reserved
 };
 @group(3) @binding(5) var<uniform> sun: SunShadowUniform;
 @group(3) @binding(6) var shadow_map: texture_depth_2d_array;
@@ -620,7 +625,143 @@ fn apply_fog(rgb: vec3<f32>, world_pos: vec3<f32>, directionality: f32) -> vec3<
     let dens = FOG_DENSITY * sun.gfx.x; // runtime density scale (0 = fog off, 1 = shipped)
     let f = 1.0 - exp(-(d * dens) * (d * dens));
     let gate = mix(FOG_INDOOR_FLOOR, 1.0, smoothstep(0.03, 0.20, directionality));
-    return mix(rgb, FOG_COLOR, f * gate);
+    let hazed = mix(rgb, FOG_COLOR, f * gate);
+    // Volumetric shafts ADD on top of the haze (in-scattering is emission along the ray, not a blend
+    // toward a colour). Pass only the INDOOR gate, NOT `f`: `f` is the exp-SQUARED extinction
+    // fraction, and weighting in-scatter by it made the shafts 33x too dim at 100 m — see
+    // volumetric_inscatter, which derives its own optical depth.
+    return hazed + volumetric_inscatter(world_pos, gate);
+}
+
+// --- Volumetric sun scattering (light shafts) ---------------------------------------------------
+// Ray-marches the SUN SHADOW CASCADES through the fog medium, so shafts appear wherever geometry
+// occludes the sun — canopy gaps on woods, window slots indoors. This is only worth doing now that
+// the cascades reach 700 m: at the old 80 m reach the march would have found "lit" everywhere past
+// 80 m and produced a uniform glow with no shafts in it, which is worse than no effect at all.
+//
+// Implemented inside the existing fog function rather than as a froxel volume + 3D texture + extra
+// pass, because everything it needs is already bound here (the cascade array, the sun direction, the
+// fog amount) and that keeps the cost proportional to fog, with no new render node or memory.
+//
+// COST CAVEAT, stated because it is easy to miss: this runs per FRAGMENT in a forward pass with no
+// depth prepass, so overdraw multiplies it. That is why the step count is low and the march is
+// distance-capped, and why it is measured rather than assumed.
+const VOL_STEPS: i32 = 12;
+const VOL_MAX_DIST: f32 = 300.0;   // beyond this the shafts are far below the haze noise floor
+/// Skip the march for fragments closer than this. Justified by MAGNITUDE: at 25 m the optical depth
+/// is 0.0075, so a sun-facing shaft reaches 0.05 pre-exposure and 0.009 after the grade's 0.18 —
+/// below anything a viewer can see, so nothing is lost by not computing it.
+///
+/// It is NOT much of a speed win: measured 5.97 ms -> 5.40 ms of added frame time at 2560x1440 on the
+/// woods flythrough, about 0.5 ms. I expected ~2 ms (near fragments are where grass overdraw
+/// concentrates) and wrote that down before measuring; it was wrong. The march is dominated by the
+/// far fragments that still run all 12 steps. The previous version got this skip by ACCIDENT, via an
+/// early-out on the squared fog fraction — which is also why the effect was invisible.
+const VOL_MIN_DIST: f32 = 25.0;
+/// Henyey-Greenstein g. Was 0.72, which is physically fine but made the effect invisible in practice:
+/// woods' sun sits high (Lsun.y = 0.80), so a level view is ~78 deg off-axis where g=0.72 gives phase
+/// 0.028 against 1.75 on-axis — a 62x drop, i.e. you only saw shafts if you looked straight up at the
+/// sun. 0.40 keeps the forward bias that makes shafts read as light (4.6x on-axis vs level) while
+/// leaving them visible at the angles a viewer actually flies at.
+const VOL_ANISO: f32 = 0.40;
+const VOL_SUN_COLOR: vec3<f32> = vec3<f32>(1.0, 0.96, 0.88);
+/// Scattering medium density for the SHAFTS, in 1/m. Deliberately INDEPENDENT of the fog slider.
+///
+/// The shafts used to derive their optical depth from `FOG_DENSITY * gfx.x`, which tied them to the
+/// distance-haze look control. That control defaults to 0.4 (1.0 "flattened mid/far contrast" — see
+/// apply_fog), so seeing shafts meant cranking fog until the whole scene went milky. Wrong coupling:
+/// the haze slider is an aesthetic control over aerial perspective, while the shaft medium is what
+/// the sunlight scatters off. Splitting them means shafts at a plausible strength in CLEAR air.
+/// 0.00145/m gives optical depth 0.29 over 200 m -> ~25% scatter, a light-haze atmosphere.
+const VOL_DENSITY: f32 = 0.00145;
+/// Scattering gain: stands in for the SUN's radiance in this renderer's scene-linear units, which is
+/// not 1.0 (the sun is baked into the SH volume, and a sunlit surface reads ~1-3 pre-exposure).
+/// Calibrated against a LEVEL view, not an on-axis one, because a high sun means most views are far
+/// off-axis: 8.0 puts a level-view shaft near 0.12 pre-exposure and an on-axis one near 0.56 —
+/// i.e. subtle across the frame, bright looking INTO the sun, which is how the game reads.
+/// EFT_VOLUMETRIC_STRENGTH scales it if that still isn't your taste.
+const VOL_SCATTER: f32 = 8.0;
+
+// ONE comparison tap, no PCF, no receiver offset. The 3x3 tent in `sample_cascade` is 9 samples;
+// at 12 march steps that would be 108 shadow samples per fragment. A volumetric march does not need
+// a filtered edge — the march itself averages along the ray.
+fn shadow_1tap(p: vec3<f32>, c: u32) -> f32 {
+    let q = sun.view_proj[c] * vec4<f32>(p, 1.0);
+    let ndc = q.xyz / q.w;
+    if (any(ndc.xy < vec2<f32>(-1.0)) || any(ndc.xy > vec2<f32>(1.0))
+        || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0; // outside this cascade -> treat as lit; the caller picked it by distance
+    }
+    let uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+    return textureSampleCompareLevel(shadow_map, shadow_cmp, uv, i32(c), ndc.z);
+}
+
+// Cheap hash for the march start offset. Without a jitter, 12 uniform steps band visibly; the
+// jitter trades that for fine noise the haze hides. Hashed on WORLD position so the pattern is
+// stable as the camera moves (a screen-space dither would crawl, and there is no TAA to resolve it).
+fn vol_jitter(p: vec3<f32>) -> f32 {
+    return fract(sin(dot(p, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+fn volumetric_inscatter(world_pos: vec3<f32>, gate: f32) -> vec3<f32> {  // gate: early-out only
+    // casc_params.w, NOT gfx.w — gfx.w carries app time for the grass wind phase, so writing a
+    // strength there would have frozen or scrambled the wind. (The Rust doc comment called gfx.w
+    // "reserved"; it is not, and that comment has been corrected.)
+    let strength = sun.casc_params.w;
+    // Off, or shadows disabled (no cascades to march -> there is nothing to occlude the sun, so a
+    // march would return a flat glow that reads as a washed-out lens effect).
+    if (strength <= 0.0 || sun.casc_params.y <= 0.5 || gate <= 0.001) {
+        return vec3<f32>(0.0);
+    }
+    // Shafts use their OWN medium density, not the fog slider's — see VOL_DENSITY. Turning the haze
+    // down (or off, for an A/B capture) no longer takes the shafts with it.
+    let dens = VOL_DENSITY;
+    let cam = view.world_position.xyz;
+    let seg = world_pos - cam;
+    let d = length(seg);
+    if (d < VOL_MIN_DIST) {
+        return vec3<f32>(0.0);
+    }
+    let dir = seg / d;
+    let march = min(d, VOL_MAX_DIST);
+    let dt = march / f32(VOL_STEPS);
+
+    // Henyey-Greenstein phase: shafts are brightest looking INTO the sun and nearly absent looking
+    // away, which is what makes them read as light rather than as fog brightness.
+    let cos_t = dot(dir, sun.sun_dir_texel.xyz);
+    let g = VOL_ANISO;
+    let denom = 1.0 + g * g - 2.0 * g * cos_t;
+    let phase = (1.0 - g * g) / (12.5663706 * pow(max(denom, 1e-4), 1.5));
+
+    let j = vol_jitter(world_pos);
+    var lit = 0.0;
+    let n = i32(sun.casc_params.z);
+    for (var i = 0; i < VOL_STEPS; i++) {
+        let t = (f32(i) + j) * dt;
+        let p = cam + dir * t;
+        // Pick the cascade whose far plane contains this sample; the coarsest covers the tail.
+        var c = n - 1;
+        for (var k = 0; k < n; k++) {
+            if (t < sun.split_far[k]) { c = k; break; }
+        }
+        lit += shadow_1tap(p, u32(max(c, 0)));
+    }
+    lit /= f32(VOL_STEPS);
+    // Single-scatter weight from the LINEAR optical depth over the marched segment. The haze itself
+    // uses exp(-tau^2) for its look, but tau^2 is the wrong quantity for in-scatter: at 100 m tau is
+    // 0.030 and tau^2 is 0.0009, which made the shafts 33x too dim to see.
+    // Optical depth over the FULL view distance, while the march itself stops at VOL_MAX_DIST: the
+    // medium keeps scattering past the march cap, and beyond it we assume visibility equals the
+    // marched average (the tail is mostly unoccluded anyway). Capped so a 2 km sightline on
+    // lighthouse cannot saturate.
+    let tau = min(d, 1000.0) * dens;
+    let scatter = 1.0 - exp(-tau);
+    // NOT multiplied by the indoor `gate`: that gate is derived from SH directionality to suppress
+    // HAZE indoors, and outdoor overcast directionality is itself low (see apply_fog), so it
+    // evaluated to ~0.23 outdoors and cut the shafts 4x in exactly the place they should show.
+    // Shafts need no such gate — indoors the cascades report occluded, `lit` goes to ~0, and the
+    // effect switches itself off. Window light is then a feature rather than an artifact.
+    return VOL_SUN_COLOR * (VOL_SCATTER * scatter * lit * phase * strength);
 }
 
 // --- #5 sun-shadow PCF sampling ----------------------------------------------
@@ -671,15 +812,31 @@ fn sample_cascade(p: vec3<f32>, Ng: vec3<f32>, c: u32) -> f32 {
 // Cascade select by VIEW-SPACE depth with a short blend across the overlap, then fade the whole
 // effect to fully lit over the far contact range. Returns visibility in [0,1].
 fn sun_shadow_visibility(p: vec3<f32>, Ng: vec3<f32>, view_depth: f32) -> f32 {
-    // Blend cascade 0 -> 1 across 13.5..15 m (just inside the split, per the 10% overlap fit).
-    if (view_depth < 13.5) {
-        return sample_cascade(p, Ng, 0u);
-    } else if (view_depth < 15.0) {
-        let v0 = sample_cascade(p, Ng, 0u);
-        let v1 = sample_cascade(p, Ng, 1u);
-        return mix(v0, v1, (view_depth - 13.5) / (15.0 - 13.5));
+    // Generalized over the cascade COUNT (casc_params.z) rather than an unrolled if-chain per split:
+    // the 2-cascade version hardcoded 13.5/15.0, so every added cascade needed another hand-written
+    // branch with its own literals — exactly where an off-by-one silently drops a band.
+    //
+    // Pick the first cascade whose far plane contains the receiver, then blend into the next one
+    // across the overlap band just inside that far plane, so the resolution change is not a visible
+    // seam. Beyond the last cascade the caller's far fade owns the transition to fully lit.
+    let n = i32(sun.casc_params.z);
+    let overlap = sun.casc_params.x;
+    for (var c = 0; c < n; c++) {
+        let far = sun.split_far[c];
+        if (view_depth >= far) {
+            continue;
+        }
+        // Blend band: the last `overlap` fraction of this cascade's far distance.
+        let blend_start = far * (1.0 - overlap);
+        let v0 = sample_cascade(p, Ng, u32(c));
+        if (view_depth < blend_start || c + 1 >= n) {
+            return v0;
+        }
+        let v1 = sample_cascade(p, Ng, u32(c + 1));
+        return mix(v0, v1, (view_depth - blend_start) / max(far - blend_start, 1e-4));
     }
-    return sample_cascade(p, Ng, 1u);
+    // Past every cascade: sample the coarsest so the far fade has something to fade FROM.
+    return sample_cascade(p, Ng, u32(max(n - 1, 0)));
 }
 
 struct Vertex {
@@ -1190,7 +1347,7 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // the feature is disabled (sun_dir missing or not EFT_SHADOWS=1), so the render is identical to today.
     var shadow_event = 0.0;
     var sun_diffuse = vec3<f32>(0.0); // B4-M: additive direct-sun diffuse (indirect-only bakes)
-    if (sun.split_depths.w > 0.5) {
+    if (sun.casc_params.y > 0.5) {
         let Lsun = sun.sun_dir_texel.xyz;
         let align = dot(dom.dir, Lsun);
         let NdotSun = dot(N, Lsun);

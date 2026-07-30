@@ -10,6 +10,7 @@
 //! designed in `render::gpu_driven` (M1).
 
 mod agent_link;
+mod character;
 mod drone;
 mod eftpack;
 mod game_watch;
@@ -1058,6 +1059,15 @@ fn main() {
             std::env::var("EFT_SSAO").is_ok(),
             std::env::var("EFT_LIGHTS").is_ok(),
         );
+        // Same rule for the three newest options. Ultra now turns volumetric shafts ON, so without
+        // this an `EFT_VOLUMETRIC=0` A/B run on a machine with Ultra persisted would silently measure
+        // shafts ON — the precise failure the comment above describes, and one that would have
+        // corrupted the +5.40 ms figure had the harness not forced the Custom preset.
+        let (env_vol, env_aa, env_grass_dist) = (
+            std::env::var("EFT_VOLUMETRIC").is_ok(),
+            std::env::var("EFT_AA").is_ok(),
+            std::env::var("EFT_GRASS_DIST").is_ok(),
+        );
         let before = gfx.clone();
         preset.apply(&mut gfx);
         if env_shadows {
@@ -1071,6 +1081,15 @@ fn main() {
         }
         if env_lights {
             gfx.lights = before.lights;
+        }
+        if env_vol {
+            gfx.volumetric = before.volumetric;
+        }
+        if env_aa {
+            gfx.aa = before.aa;
+        }
+        if env_grass_dist {
+            gfx.grass_dist_m = before.grass_dist_m;
         }
     }
     gfx.grade_available = grade_lut.is_some();
@@ -1136,6 +1155,7 @@ fn main() {
         .add_plugins(game_watch::GameWatchPlugin) // passive game link: auto map swap, live player fix, task sync
         .add_plugins(planner::PlannerPlugin) // loot-run orienteering planner (Navigation tab)
         .add_plugins(jobs::JobsPlugin) // background job worker: build/sync maps while a map is open
+        .add_plugins(character::CharacterPlugin) // EFT_CHARACTER=<id|dir> -> skinned body on the walk camera
         .init_resource::<CameraCommand>() // UI-driven "fly the camera to X" (search / quest jump / route)
         .init_resource::<CameraSettings>() // camera-tab: FOV / fly speed / walk mode
         .init_resource::<MapSwitch>() // UI map dropdown -> switch to the selected pack (in place)
@@ -1171,6 +1191,7 @@ fn main() {
                 .chain()
                 .run_if(not(resource_exists::<menu::MenuState>)),
         )
+        .init_resource::<BenchSampleStart>()
         .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change, bench_stats))
         // Bench cameras override the fly-cam AFTER Update, before transforms propagate.
         .add_systems(
@@ -2136,17 +2157,43 @@ fn save_screenshot_then_exit(
     }
 }
 
-/// EFT_BENCH=<seconds>: benchmark mode. After the pack load settles (same gate as
-/// `auto_screenshot`), record EVERY frame's CPU delta for the given window, print a one-line
-/// stats dump (avg/p50/p95/p99/max ms + fps) and exit 0 so scripted runs end cleanly. Pair
-/// with EFT_UNCAPPED=1 (vsync off) and EFT_POSE / EFT_ORBIT / EFT_FLY for repeatable scenarios.
+/// The instant benchmark sampling began (seconds since app start), or `None` while still settling.
+///
+/// SHARED with `debug_bench_camera` so a scripted camera path starts at the same moment sampling
+/// does. Driving the path from `time.elapsed_secs()` instead makes the phase depend on how long the
+/// map took to load, and load time varies per run (a cold pipeline cache cost woods 32.3 s against
+/// 17.6 s warm). Two configs then sample different stretches of the path over terrain of different
+/// density, which is not a comparison at all: it once put "SSAO off" 1.6 ms SLOWER than SSAO on.
+#[derive(Resource, Default)]
+struct BenchSampleStart(Option<f32>);
+
+/// Steady state is not a frame COUNT. 90 frames is ~1 s at 90 fps but ~4 s at 22 fps, so the slower
+/// the config the longer it waited — the gate itself was biased. And `GpuLoadSignal` clearing only
+/// means the texcache+geometry build finished; render pipelines still compile on each pass's first
+/// draw and the frame time is visibly unsettled after it. Require a wall-clock floor AND a rolling
+/// window whose spread has collapsed, capped so a genuinely unstable scene still reports.
+const BENCH_SETTLE_MIN_S: f32 = 3.0;
+const BENCH_SETTLE_MAX_S: f32 = 30.0;
+const BENCH_STABLE_FRAMES: usize = 60;
+/// p95/p50 - 1 within the window. Compilation hitches and streaming spikes blow the tail out well
+/// past this; a settled scene on a moving camera sits comfortably under it.
+const BENCH_STABLE_SPREAD: f32 = 0.25;
+
+/// EFT_BENCH=<seconds>: benchmark mode. Once the pack load has finished AND the frame time has
+/// actually settled, record EVERY frame's CPU delta for the given window, print a one-line stats
+/// dump (avg/p50/p95/p99/max ms + fps) and exit 0 so scripted runs end cleanly. Pair with
+/// EFT_UNCAPPED=1 (vsync off) and EFT_POSE / EFT_ORBIT / EFT_FLY for repeatable scenarios.
+///
+/// With a moving camera, make the sample window a whole multiple of the path period, or the window
+/// covers an arbitrary slice of the route and configs stop being comparable.
 fn bench_stats(
     time: Res<Time>,
     pending: Res<PendingMapLoad>,
     gpu_load: Option<Res<render::GpuLoadSignal>>,
     pack: Option<Res<LoadedPack>>,
     mut samples: Local<Vec<f32>>,
-    mut settle: Local<i32>,
+    mut warm: Local<Vec<f32>>,
+    mut start: ResMut<BenchSampleStart>,
 ) {
     let Some(secs) = std::env::var("EFT_BENCH").ok().and_then(|s| s.trim().parse::<f32>().ok())
     else {
@@ -2156,15 +2203,42 @@ fn bench_stats(
         && pending.loading().is_none()
         && gpu_load.as_ref().map(|s| !s.in_progress()).unwrap_or(true);
     if !loaded {
-        *settle = 0;
+        warm.clear();
+        start.0 = None;
         return;
     }
-    // Let steady state establish after the load (texcache warm-up, first-frame compiles).
-    *settle += 1;
-    if *settle <= 90 {
+    let dt_ms = time.delta_secs() * 1000.0;
+    if start.0.is_none() {
+        warm.push(dt_ms);
+        let elapsed: f32 = warm.iter().sum::<f32>() / 1000.0;
+        if elapsed < BENCH_SETTLE_MIN_S {
+            return;
+        }
+        // Spread over the most recent window only — early compilation hitches must not keep the
+        // gate shut forever once the scene has actually calmed down.
+        let stable = if warm.len() >= BENCH_STABLE_FRAMES {
+            let mut w: Vec<f32> = warm[warm.len() - BENCH_STABLE_FRAMES..].to_vec();
+            w.sort_by(|a, b| a.total_cmp(b));
+            let p50 = w[w.len() / 2];
+            let p95 = w[((w.len() - 1) as f32 * 0.95) as usize];
+            p50 > 0.0 && (p95 / p50 - 1.0) < BENCH_STABLE_SPREAD
+        } else {
+            false
+        };
+        if !stable && elapsed < BENCH_SETTLE_MAX_S {
+            return;
+        }
+        start.0 = Some(time.elapsed_secs());
+        eprintln!(
+            "[bench] settled after {elapsed:.1}s of warm-up ({} frames, stable={stable}) — \
+             sampling {secs}s from here",
+            warm.len()
+        );
+        // Sample from the NEXT frame: this one still contains the warm-up's last delta, and the
+        // camera path is only now being anchored to t=0.
         return;
     }
-    samples.push(time.delta_secs() * 1000.0);
+    samples.push(dt_ms);
     let total: f32 = samples.iter().sum::<f32>() / 1000.0;
     if total >= secs {
         let mut s = samples.clone();
@@ -2193,13 +2267,28 @@ fn bench_stats(
 /// fly-cam's Update-stage writes.
 fn debug_bench_camera(
     time: Res<Time>,
+    start: Res<BenchSampleStart>,
     mut q: Query<&mut Transform, With<render::CullCamera>>,
 ) {
     let Ok(mut tf) = q.single_mut() else { return };
+    // Under EFT_BENCH the path clock is anchored to the start of SAMPLING, so every config flies the
+    // identical route over the identical ground. Before that instant the camera is parked at the
+    // path's t=0 pose, so the warm-up settles where sampling begins and there is no teleport (and
+    // therefore no culling-churn spike) on the first measured frame. Without EFT_BENCH — an
+    // interactive EFT_FLY/EFT_ORBIT — the clock is just app time, as before.
+    let benching = std::env::var_os("EFT_BENCH").is_some();
+    let clock = if benching {
+        match start.0 {
+            Some(t0) => time.elapsed_secs() - t0,
+            None => 0.0,
+        }
+    } else {
+        time.elapsed_secs()
+    };
     if let Ok(spec) = std::env::var("EFT_ORBIT") {
         let v: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         if v.len() == 6 {
-            let ang = (time.elapsed_secs() * v[5]).to_radians();
+            let ang = (clock * v[5]).to_radians();
             let target = Vec3::new(v[0], v[1], v[2]);
             let pos = target + Vec3::new(v[3] * ang.cos(), v[4], v[3] * ang.sin());
             *tf = Transform::from_translation(pos).looking_at(target, Vec3::Y);
@@ -2214,7 +2303,7 @@ fn debug_bench_camera(
                 let dur: f32 = secs.trim().parse().unwrap_or(10.0);
                 if pa.len() == 3 && pb.len() == 3 && dur > 0.0 {
                     let (a, b) = (Vec3::from_slice(&pa), Vec3::from_slice(&pb));
-                    let t = time.elapsed_secs() / dur;
+                    let t = clock / dur;
                     let (from, to) = if (t as i32) % 2 == 0 { (a, b) } else { (b, a) };
                     let p = from.lerp(to, t.fract());
                     *tf = Transform::from_translation(p).looking_at(to, Vec3::Y);

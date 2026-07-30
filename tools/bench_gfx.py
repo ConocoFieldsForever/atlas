@@ -27,6 +27,11 @@ CONFIG = os.path.join(os.environ.get("APPDATA", ""), "atlas", "atlas.config.json
 
 # A view with heavy mixed load: mall shell + power station + foliage + many lights.
 POSE = "239.2,32.7,-335.3,50.0,-10.1"
+# Camera env for the runs. A STATIC pose cannot see any cost that only appears under motion -- the
+# sun cascades refit while the camera turns, and that was measured at 11x the resting shadow cost.
+# So a moving scenario (--fly / --orbit) is not a nicety, it is the only way to price shadows
+# honestly. Overridden by --pose/--fly/--orbit; whatever is set here is passed through verbatim.
+CAMERA = {"EFT_POSE": POSE}
 WINDOW = "1600x1000"   # fixed across configs so fragment cost is comparable
 LOGDIR = os.path.join(HERE, "docs", "_bench_logs")
 
@@ -68,6 +73,31 @@ CONFIGS = [
       "EFT_CULL_PX": "4,1000", "EFT_PARALLAX": "0", "EFT_VIGNETTE": "0", "EFT_FOG": "0"}, 2),
     ("stack_medium",    "STACK: half tex + no shadows + grass culled",
      {"EFT_SHADOWS": "0", "EFT_CULL_PX": "2,600"},                                                  1),
+    # --- the ULTRA matrix -------------------------------------------------------------------------
+    # The rows above are deltas from the SHIPPED look (High: half textures, SSAO off). They cannot
+    # answer "what is expensive in MY session" for someone on Ultra, because Ultra turns SSAO on and
+    # textures to Full, and a knob's cost is not independent of the others. These rows re-baseline on
+    # Ultra so each delta is what THAT user would actually get back by turning the knob off.
+    # Every run selects Custom, so GfxSettings::default() + the env delta is the real config:
+    # default is shadows ON, grass ON, bloom ON, lights ON, SSAO OFF -- hence SSAO is opt-IN here.
+    ("u_base",          "ULTRA: full tex + SSAO on (the Ultra preset)",
+     {"EFT_SSAO": "1"},                                                                             0),
+    ("u_no_ssao",       "ULTRA minus SSAO",                        {},                              0),
+    ("u_no_shadows",    "ULTRA minus sun shadows",
+     {"EFT_SSAO": "1", "EFT_SHADOWS": "0"},                                                         0),
+    ("u_no_both",       "ULTRA minus SSAO AND sun shadows",        {"EFT_SHADOWS": "0"},            0),
+    ("u_no_grass",      "ULTRA minus foliage/grass",
+     {"EFT_SSAO": "1", "EFT_CULL_PX": "1.5,1000"},                                                  0),
+    ("u_grass_shadows", "ULTRA + grass casts shadows",
+     {"EFT_SSAO": "1", "EFT_GRASS_SHADOWS": "1"},                                                   0),
+    ("u_no_lights",     "ULTRA minus realtime lights",
+     {"EFT_SSAO": "1", "EFT_LIGHTS": "0"},                                                          0),
+    # Distance-LOD A/B. Only meaningful on an --alllod pack (one built WITHOUT it has a single shell
+    # per group, so both rows are identical). EFT_LOD=0 selects cull mode 0 = draw only the default
+    # (finest-present) shell, which is exactly what a non-alllod pack renders — so this pair isolates
+    # distance-LOD on ONE pack, with identical geometry, textures and camera.
+    ("u_lod_off",       "ULTRA, distance-LOD OFF (finest shell only)",
+     {"EFT_SSAO": "1", "EFT_LOD": "0"},                                                             0),
 ]
 
 
@@ -140,8 +170,8 @@ def run_one(name, label, delta, texq, pack, secs):
         # (`gpu_load.in_progress() == false`) never opens and the run hangs until timeout. A real
         # window at a FIXED size is also the honest thing to measure -- fill cost is part of it.
         "EFT_WIN": WINDOW,
-        "EFT_POSE": POSE,
     })
+    env.update(CAMERA)
     env.update(delta)
     base = vram_baseline()
     t0 = time.time()
@@ -172,7 +202,9 @@ def run_one(name, label, delta, texq, pack, secs):
         if m:
             break
     resolved_cfg = read_config()
-    rec = {"name": name, "label": label, "texQuality": texq, "env": delta,
+    # Record the camera: a static row and a flythrough row are not comparable, and without this the
+    # two are indistinguishable once they are sitting in the same JSON file.
+    rec = {"name": name, "label": label, "texQuality": texq, "env": delta, "camera": dict(CAMERA),
            "requestedSettings": {"qualityPreset": 4, "textureQuality": texq},
            "resolvedSettings": {
                "qualityPreset": int(resolved_cfg.get("qualityPreset", -1)),
@@ -201,14 +233,33 @@ def main():
     ap.add_argument("--win", default=WINDOW,
                     help="window WxH. A 5090 is CPU-bound at 1600x1000 on this scene, which hides "
                          "every fragment-bound knob; sweep a higher resolution too.")
+    # Camera scenario. Mutually exclusive; --fly/--orbit are the ones that can price sun shadows,
+    # because a static camera never makes the cascades refit.
+    cam = ap.add_mutually_exclusive_group()
+    cam.add_argument("--pose", default=None, metavar="x,y,z,yaw,pitch",
+                     help=f"static camera (default {POSE})")
+    cam.add_argument("--fly", default=None, metavar="x1,y1,z1>x2,y2,z2@secs",
+                     help="ping-pong a straight path, looking forward")
+    cam.add_argument("--orbit", default=None, metavar="cx,cy,cz,radius,height,degps",
+                     help="circle a target point, looking at it")
+    ap.add_argument("--baseline", default="baseline", metavar="NAME",
+                    help="config name the summary deltas are relative to (use u_base for the "
+                         "Ultra matrix)")
     args = ap.parse_args()
 
     WINDOW = args.win
+    if args.fly:
+        CAMERA.clear(); CAMERA["EFT_FLY"] = args.fly
+    elif args.orbit:
+        CAMERA.clear(); CAMERA["EFT_ORBIT"] = args.orbit
+    elif args.pose:
+        CAMERA["EFT_POSE"] = args.pose
     want = {s.strip() for s in args.only.split(",") if s.strip()}
     todo = [c for c in CONFIGS if not want or c[0] in want]
     out_path = args.out or os.path.join(HERE, "docs", f"GFX_BENCH_{WINDOW}.json")
 
-    print(f"benchmarking {len(todo)} configs x {args.secs}s on {args.pack} @ {WINDOW}", flush=True)
+    print(f"benchmarking {len(todo)} configs x {args.secs}s on {args.pack} @ {WINDOW} "
+          f"camera={CAMERA}", flush=True)
     results = []
     # The benchmark temporarily edits the same config used by the menu. Always restore the user's
     # exact bytes, even on Ctrl-C, timeout, a failed viewer launch, or a malformed results path.
@@ -228,7 +279,7 @@ def main():
                 json.dump(results, fh, indent=1)
 
     # Summary table, deltas relative to baseline.
-    base = next((r for r in results if r["name"] == "baseline" and "fps" in r), None)
+    base = next((r for r in results if r["name"] == args.baseline and "fps" in r), None)
     print("\n" + "=" * 108)
     print(f"{'config':18} {'fps':>7} {'avg ms':>8} {'p95 ms':>8} {'VRAM MiB':>9} "
           f"{'d fps':>8} {'d VRAM':>8}  label")

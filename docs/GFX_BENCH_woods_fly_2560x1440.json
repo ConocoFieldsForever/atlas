@@ -1,0 +1,214 @@
+[
+ {
+  "name": "u_base",
+  "label": "ULTRA: full tex + SSAO on (the Ultra preset)",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.7,
+  "vram_base": 1748,
+  "vram_peak": 8166,
+  "vram_mib": 6418,
+  "frames": 1359,
+  "avg_ms": 14.718,
+  "fps": 67.9,
+  "p50": 14.35,
+  "p95": 22.834,
+  "p99": 24.404,
+  "max_ms": 25.836
+ },
+ {
+  "name": "u_no_ssao",
+  "label": "ULTRA minus SSAO",
+  "texQuality": 0,
+  "env": {},
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.0,
+  "vram_base": 1758,
+  "vram_peak": 8183,
+  "vram_mib": 6425,
+  "frames": 1378,
+  "avg_ms": 14.515,
+  "fps": 68.9,
+  "p50": 14.178,
+  "p95": 22.725,
+  "p99": 24.28,
+  "max_ms": 25.726
+ },
+ {
+  "name": "u_no_shadows",
+  "label": "ULTRA minus sun shadows",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_SHADOWS": "0"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 72.8,
+  "vram_base": 1757,
+  "vram_peak": 8154,
+  "vram_mib": 6397,
+  "frames": 1568,
+  "avg_ms": 12.757,
+  "fps": 78.4,
+  "p50": 11.207,
+  "p95": 17.15,
+  "p99": 18.681,
+  "max_ms": 250.0
+ },
+ {
+  "name": "u_no_both",
+  "label": "ULTRA minus SSAO AND sun shadows",
+  "texQuality": 0,
+  "env": {
+   "EFT_SHADOWS": "0"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.2,
+  "vram_base": 1738,
+  "vram_peak": 8147,
+  "vram_mib": 6409,
+  "frames": 1732,
+  "avg_ms": 11.549,
+  "fps": 86.6,
+  "p50": 11.64,
+  "p95": 17.013,
+  "p99": 18.06,
+  "max_ms": 19.275
+ },
+ {
+  "name": "u_no_grass",
+  "label": "ULTRA minus foliage/grass",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_CULL_PX": "1.5,1000"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 30.7,
+  "vram_base": 1737,
+  "vram_peak": 8172,
+  "vram_mib": 6435,
+  "frames": 2051,
+  "avg_ms": 9.752,
+  "fps": 102.5,
+  "p50": 8.954,
+  "p95": 16.247,
+  "p99": 17.925,
+  "max_ms": 18.563
+ },
+ {
+  "name": "u_grass_shadows",
+  "label": "ULTRA + grass casts shadows",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_GRASS_SHADOWS": "1"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.1,
+  "vram_base": 1740,
+  "vram_peak": 8150,
+  "vram_mib": 6410,
+  "frames": 1037,
+  "avg_ms": 19.295,
+  "fps": 51.8,
+  "p50": 20.306,
+  "p95": 29.524,
+  "p99": 31.393,
+  "max_ms": 32.75
+ },
+ {
+  "name": "u_no_lights",
+  "label": "ULTRA minus realtime lights",
+  "texQuality": 0,
+  "env": {
+   "EFT_SSAO": "1",
+   "EFT_LIGHTS": "0"
+  },
+  "camera": {
+   "EFT_FLY": "-245,22,-606>611,22,223@10"
+  },
+  "requestedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "resolvedSettings": {
+   "qualityPreset": 4,
+   "textureQuality": 0
+  },
+  "wall_s": 29.0,
+  "vram_base": 1740,
+  "vram_peak": 8153,
+  "vram_mib": 6413,
+  "frames": 1388,
+  "avg_ms": 14.41,
+  "fps": 69.4,
+  "p50": 13.889,
+  "p95": 22.52,
+  "p99": 24.207,
+  "max_ms": 25.692
+ }
+]

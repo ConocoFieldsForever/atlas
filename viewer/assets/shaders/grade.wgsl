@@ -21,7 +21,9 @@ struct GradeParams {
     exposure: f32,
     // EFT-style unsharp-mask strength on the pre-LUT linear scene (0 = off; game ships ~0.5).
     sharpen: f32,
-    _pad1: f32, _pad2: f32,
+    // FXAA blend strength (0 = off) — rides the first old pad lane; size unchanged.
+    aa: f32,
+    _pad2: f32,
     // vignette tuning (PRISM): aspect divisors + smoothstep edges + strength.
     // xy = (1.15, 0.95) axis divisors; z,w = smoothstep(0.55, 1.25).
     vig: vec4<f32>,
@@ -69,9 +71,75 @@ fn lut_sample(c: vec3<f32>) -> vec3<f32> {
 //   let uv0 = (vec2(u.b_mod8, floor(b0/8)) * 64.0 + xy) / 512.0;   // etc.
 //   return mix(tex(uv0).rgb, tex(uv1).rgb, f);
 
+// --- FXAA (console variant) ------------------------------------------------------------------
+// Every render pipeline here is sample_count:1 with alpha-to-coverage off, so nothing else in the
+// chain anti-aliases. The worst case is exactly this renderer's signature content: alpha-CUTOUT
+// foliage against bright sky, whose hard 1-pixel edge crawls as the camera moves.
+//
+// Edge detection runs on a PERCEPTUAL luma, not the raw value. The scene RT is linear HDR, where a
+// sky at 8.0 and a leaf at 0.05 differ by ~160x — a linear luma threshold would either fire on
+// everything or nothing depending on exposure. sqrt() is a cheap gamma-ish compress that makes the
+// threshold behave the same in bright and dark parts of the frame.
+fn fxaa_luma(rgb: vec3<f32>) -> f32 {
+    return sqrt(max(dot(rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0));
+}
+
+fn fxaa(uv: vec2<f32>, ts: vec2<f32>, strength: f32) -> vec3<f32> {
+    let rgb_m = textureSampleLevel(scene_tex, scene_samp, uv, 0.0).rgb;
+    // Four DIAGONAL taps: the diagonals carry the edge orientation that the axis-aligned taps used
+    // by the sharpen pass cannot distinguish.
+    let rgb_nw = textureSampleLevel(scene_tex, scene_samp, uv + vec2<f32>(-ts.x, -ts.y), 0.0).rgb;
+    let rgb_ne = textureSampleLevel(scene_tex, scene_samp, uv + vec2<f32>( ts.x, -ts.y), 0.0).rgb;
+    let rgb_sw = textureSampleLevel(scene_tex, scene_samp, uv + vec2<f32>(-ts.x,  ts.y), 0.0).rgb;
+    let rgb_se = textureSampleLevel(scene_tex, scene_samp, uv + vec2<f32>( ts.x,  ts.y), 0.0).rgb;
+
+    let l_m = fxaa_luma(rgb_m);
+    let l_nw = fxaa_luma(rgb_nw);
+    let l_ne = fxaa_luma(rgb_ne);
+    let l_sw = fxaa_luma(rgb_sw);
+    let l_se = fxaa_luma(rgb_se);
+
+    let l_min = min(l_m, min(min(l_nw, l_ne), min(l_sw, l_se)));
+    let l_max = max(l_m, max(max(l_nw, l_ne), max(l_sw, l_se)));
+    // Flat area -> leave it EXACTLY alone. Returning the untouched centre sample (not a blend at
+    // zero weight) keeps interiors bit-identical to the no-AA image, so this cannot soften texture
+    // detail — only edges.
+    if (l_max - l_min < max(0.05, l_max * 0.15)) {
+        return rgb_m;
+    }
+
+    var dir = vec2<f32>(
+        -((l_nw + l_ne) - (l_sw + l_se)),
+         ((l_nw + l_sw) - (l_ne + l_se)),
+    );
+    let dir_reduce = max((l_nw + l_ne + l_sw + l_se) * 0.25 * 0.05, 1.0 / 128.0);
+    let rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + dir_reduce);
+    // Clamp the search to +-2 texels: an unbounded direction smears foliage into long streaks.
+    dir = clamp(dir * rcp, vec2<f32>(-2.0), vec2<f32>(2.0)) * ts;
+
+    let rgb_a = 0.5 * (
+        textureSampleLevel(scene_tex, scene_samp, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb
+      + textureSampleLevel(scene_tex, scene_samp, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+    let rgb_b = rgb_a * 0.5 + 0.25 * (
+        textureSampleLevel(scene_tex, scene_samp, uv + dir * -0.5, 0.0).rgb
+      + textureSampleLevel(scene_tex, scene_samp, uv + dir *  0.5, 0.0).rgb);
+
+    // The wider 4-tap result is only used while it stays inside the neighbourhood's luma range;
+    // outside it, the narrow pair is the safe choice (this is what stops halos on high-contrast
+    // silhouettes, i.e. exactly a treeline against sky).
+    let l_b = fxaa_luma(rgb_b);
+    let picked = select(rgb_a, rgb_b, l_b >= l_min && l_b <= l_max);
+    return mix(rgb_m, picked, clamp(strength, 0.0, 1.0));
+}
+
 @fragment
 fn fs_grade(in: FsIn) -> @location(0) vec4<f32> {
     var scene = textureSampleLevel(scene_tex, scene_samp, in.uv, 0.0).rgb;
+    // AA BEFORE the sharpen: sharpening first would harden the very aliased edge this then has to
+    // undo, and the two would fight over the same pixels.
+    if (grade.aa > 0.0) {
+        scene = fxaa(in.uv, 1.0 / vec2<f32>(textureDimensions(scene_tex)), grade.aa);
+    }
     // EFT-style sharpen: 4-tap unsharp mask on the pre-LUT linear scene (the game applies a
     // strong sharpen in its own post chain). max() guards ringing below zero.
     if (grade.sharpen > 0.0) {
