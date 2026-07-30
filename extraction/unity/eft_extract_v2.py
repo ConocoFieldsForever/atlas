@@ -1442,6 +1442,22 @@ def main():
                     inst = {"mesh": fn, "m": [round(float(v), 5) for v in W.flatten()], "subs": subs,
                             "lv": lv, "kind": "mesh", "root": root_of(mr.m_GameObject.path_id),
                             "cast": cast, "renON": ren_on, "aih": aih, "drop": hidden}
+                    # PARENT transform id (stable within a level): destructible STATE siblings
+                    # (glass / glass_broken) share an immediate parent, and position alone cannot
+                    # pair them (the broken mesh is authored at the FRAME pivot, panes at their
+                    # own). culls.py's sibling-state rule keys on (lv, par); instances without the
+                    # field simply skip that rule, so pre-existing scenes are unaffected.
+                    _ptp = go2tf.get(mr.m_GameObject.path_id)
+                    if _ptp is not None:
+                        _par = _tf.get(_ptp, (0, None, None))[0]
+                        if _par:
+                            inst["par"] = _par
+                            # ...and the GRANDparent: Unity wraps every renderer in its own
+                            # LODGroup-holder node, so state siblings (glass vs glass_broken)
+                            # first share an ancestor at the PREFAB level, one up from `par`.
+                            _gp = _tf.get(_par, (0, None, None))[0]
+                            if _gp:
+                                inst["par2"] = _gp
                     _lt = rid2lod.get(o.path_id)                  # Stage A: tag LODGroup membership (g=global group idx, i=lod index)
                     if _lt: inst["lod"] = {"g": _lt[0], "i": _lt[1]}
                     # AUDIT #3 fix: under --alllod a renderer Unity lists at several LOD levels needs a
