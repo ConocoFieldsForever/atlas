@@ -109,6 +109,14 @@ class Culls:
                     if d is not None and d > self.inactive_keep_max_m:
                         self._n_oversize += 1
                         return False
+        # WATER LAYER OVERRIDE. `wlayer` is set by eft_extract_v2 for geometry on Unity's built-in
+        # Water layer (4) — the layer EFT's own ballistics reads. It must outrank the root denylist
+        # below, because BSG parks woods' `WATER_LEVEL` surface under a `BLOCKERS` scene root, and
+        # BLOCKER is on that denylist: without this the lake extracts correctly and is then silently
+        # discarded here, which is indistinguishable from never extracting it. The engine LAYER is the
+        # authoritative statement that this is water; which root it happens to hang under is not.
+        if it.get("wlayer"):
+            return True
         root = it.get("root") or ""
         # ALLOWLIST = PROTECTION, NOT EXCLUSION (2026-07-13). The allowlist's one legitimate job is to shield
         # declared-content roots from the generic name denylist (DEFAULT_DROP_ROOT_RE's '.*light' would nuke
@@ -133,7 +141,16 @@ class Culls:
         if any(f in sh for f in FOG_SUBSTR):
             return False                                              # fog-sheet billboard -> see-through haze "wall" if kept
         if self.drop_proxies and not sb.get("tex") and sh in PROXY_SHADERS:
-            return False                                              # untextured + default-shader = invisible Unity proxy box
+            # ...EXCEPT water. An untextured empty-shader sub with role='water' is a real surface,
+            # not a proxy box: shoreline's ocean tiles have always matched this filter and died here
+            # (the visible ocean is the seaLevel quad the viewer synthesizes instead), which was fine
+            # for the SEA. But enclosed water gets no synthesized quad (derive_sea_level correctly
+            # rejects lakes), so woods' layer-4 WATER_LEVEL plane must ship as geometry or the lake
+            # simply does not exist. The viewer shades role='water' + no albedo as opaque deep water
+            # (same branch as the sea quad), so no material/texture is needed. Discovered the hard
+            # way: the lake extracted perfectly and this line silently merged it out of the pack.
+            if sb.get("role") != "water":
+                return False                                          # untextured + default-shader = invisible Unity proxy box
         return True
 
     def _offmap_backdrop_filter(self, kept, dropped_roots):

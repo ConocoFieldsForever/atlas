@@ -1566,7 +1566,11 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         // Amp falls off hard past ~250 m: the derivative footprint underreads on this one
         // 6.8 km quad at grazing, so the Nyquist gates alone leave faint residue; beyond a
         // few hundred meters fog owns the look and the game's sea reads flat anyway.
-        let ripple_amp = (0.06 / (1.0 + d * 0.004)) * (1.0 - smoothstep(150.0, 350.0, d));
+        // Fade band was (150, 350): amplitude ZERO past 350 m, which froze the whole lake from any
+        // flyover view — the hard cutoff predates the footprint Nyquist gates below, which now own
+        // the anti-aliasing. Keep a far calm-down for the km-scale sea (the gates underread at
+        // extreme grazing on that one giant quad) but let normal viewing distances keep their chop.
+        let ripple_amp = (0.06 / (1.0 + d * 0.004)) * (1.0 - smoothstep(500.0, 1400.0, d));
         let wp = o.world_pos.xz * 0.35;
         // Nyquist band-limit per octave (shader-side "mip" for the procedural sines): fade an
         // octave to zero as its cycles-per-pixel pass 1/4 -> 1/2. The old amplitude-only distance
@@ -1580,10 +1584,46 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         // ~2px wave alias faintly. Near-shore footprints are centimeters — unaffected.
         let w1 = 1.0 - smoothstep(0.10, 0.22, cyc);        // base octave (~18 m wavelength)
         let w2 = 1.0 - smoothstep(0.10, 0.22, cyc * 3.4);  // detail octave (~5 m wavelength)
+        // ANIMATED (Water4 port): the octaves used to be STATIC — frozen chop, the single biggest
+        // tell against the game, whose Water4 shader scrolls two layers in different directions.
+        // Drift phases ported from tarkmap/out/_water.js (the calibrated web port of FX/SimpleWater4):
+        // base layer (sp, 0.63*sp), detail layer (-0.8*sp, 1.15*sp) with sp = 0.05 m/s at 0.15
+        // cycles/m. sun.gfx.w is app time (seconds, hour-wrapped) — the same clock the grass wind
+        // rides, so water and foliage move on one timebase.
+        // Speeds give ~0.36 m/s of spatial drift on the 18 m base octave — parity with the port's
+        // 0.05 uv/s over a 6.7 m tile. The first cut converted to 0.0075 cycles/s (0.13 m/s), 2.7x
+        // slower, and on an 18 m wavelength that reads as STATIC — which the user reported verbatim.
+        let wt = sun.gfx.w;
+        let drift1 = wt * vec2<f32>(0.0200, 0.0126);
+        let drift2 = wt * vec2<f32>(-0.0160, 0.0230);
         let wc = wp / 6.2831853; // phase in CYCLES for the f32-safe rsin (see rsin above)
-        let dxy = (w1 * vec2<f32>(rsin(wc.x + wc.y * 0.6), rsin(wc.x * 0.7 - wc.y))
-                 + 0.5 * w2 * vec2<f32>(rsin(wc.x * 3.1 + wc.y * 2.3), rsin(wc.y * 3.7 - wc.x * 2.9)))
+        let wc1 = wc + drift1;
+        let wc2 = wc + drift2;
+        var dxy = (w1 * vec2<f32>(rsin(wc1.x + wc1.y * 0.6), rsin(wc1.x * 0.7 - wc1.y))
+                 + 0.5 * w2 * vec2<f32>(rsin(wc2.x * 3.1 + wc2.y * 2.3), rsin(wc2.y * 3.7 - wc2.x * 2.9)))
                  * ripple_amp;
+        // AUTHORED WAVES (faithful path): maps whose water ships a real FX/SimpleWater4 material
+        // (lighthouse, labs, ground_zero, reserve, streets) carry the game's own WaterBasicNormals
+        // bump map in m.normal_index. Sample it exactly the way _water.js does — two layers over
+        // WORLD XZ (wavelength in metres, independent of mesh UVs), scrolling in different
+        // directions — and let it REPLACE the procedural chop. textureSampleGrad because this is
+        // non-uniform control flow (same rule as every other late sample in this shader); the
+        // gradients come from the world-space footprint scaled by the 0.15 cycles/m tiling, which
+        // keeps mip selection honest at distance and grazing angles. BC5 two-channel decode with
+        // reconstructed Z, matching the base normal path above.
+        if (has_normal) {
+            let wfreq = 0.15;
+            let uvw1 = o.world_pos.xz * wfreq + wt * vec2<f32>(0.050, 0.0315);
+            let uvw2 = o.world_pos.xz * wfreq * 1.73 + wt * vec2<f32>(-0.040, 0.0575);
+            let gx = vec2<f32>(wxz_footprint.x * wfreq, 0.0);
+            let gy = vec2<f32>(0.0, wxz_footprint.y * wfreq);
+            let a1 = textureSampleGrad(normal_tex[nidx], albedo_samp, uvw1, gx, gy).xy * 2.0 - vec2<f32>(1.0);
+            let a2 = textureSampleGrad(normal_tex[nidx], albedo_samp, uvw2, gx * 1.73, gy * 1.73).xy * 2.0
+                     - vec2<f32>(1.0);
+            // 50/50 layer mix (the _water.js blend), amplitude on the SAME distance/Nyquist fade as
+            // the procedural path so authored waves also calm to flat at range instead of sparkling.
+            dxy = (a1 + a2) * 0.5 * 0.85 * (ripple_amp / 0.06) * w1;
+        }
         // Base the water normal on WORLD UP, not the interpolated mesh/map normal: the sea mesh's
         // per-vertex normals crosshatch at the quad-grid period (fine screen stripes + the wide
         // dark fresnel bands the user reported as "shadow streaks" — verified by red-paint diag +
@@ -1608,7 +1648,14 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         let env_w = max(sh_irradiance_hw(p_air, Rw), ambient_floor) * sh.vol_min.w;
         let lvl_w = dot(env_w, vec3<f32>(0.2126, 0.7152, 0.0722));
         let refl = max(env_w, sky_reflect(Rw, lvl_w));
-        let deep = vec3<f32>(0.015, 0.045, 0.060);
+        // DERIVED FROM THE GAME, not authored here (and not the web port's eye-calibrated olive,
+        // which this replaces): _DepthColor from EFT's own FX/SimpleWater4 material set — the
+        // shader's literal deep-water extinction colour — extracted from Sandbox_Water4Advanced
+        // (sharedassets489). Woods ships NO water material of its own (its lake is drawn by the
+        // runtime water system), so the Water4 family's authored value is the closest derivable
+        // truth. The LUT-clip cap below still bounds the final radiance, so the brighter green
+        // channel cannot push the water into the grade's highlight plateau.
+        let deep = vec3<f32>(0.0275, 0.1418, 0.1323);
         // Reinhard-compress the sky mirror: the baked open-sky SH is HDR-bright (sky_scale ≈ 2), and
         // reflecting it raw washed the whole sea to a pale slab (term-bisected: refl*wf ≈ 4x the
         // body+glint terms). The game's overcast sea is a MUTED sheen over a dark teal body — compress

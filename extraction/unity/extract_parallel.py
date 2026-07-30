@@ -252,6 +252,15 @@ def _merge(name, n_chunks, out, levels_order):
 
 
 def main():
+    # Windows consoles default to cp1252, and EFT ships meshes with Cyrillic (and worse) in their
+    # names. Relaying a child's progress line through print() then CRASHED THE WHOLE PARALLEL RUN
+    # with UnicodeEncodeError — after every chunk's real work had succeeded. Never let loggingable
+    # cosmetics kill a 10-minute extraction: emit UTF-8 and replace what the console cannot show.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--levels", required=True)
     ap.add_argument("--name", required=True)
