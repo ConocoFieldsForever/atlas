@@ -906,7 +906,8 @@ pub(crate) struct EftPrepassResources {
     pub(crate) normal_view: Option<TextureView>,
     #[allow(dead_code)]
     depth_texture: Option<Texture>,
-    depth_view: Option<TextureView>,
+    /// pub(crate): TAA reprojects from this depth; the pyramid reduces it.
+    pub(crate) depth_view: Option<TextureView>,
     size: UVec2,
     /// Set by `prepare_prepass` when this frame actually has a valid camera + targets AND the ssao
     /// consumer is on. The node and ssao both read it, so "prepass off" degrades cleanly to the

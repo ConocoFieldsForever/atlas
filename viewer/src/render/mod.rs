@@ -22,6 +22,7 @@ pub mod grade;
 pub mod instancing;
 pub mod ssao;
 pub mod standard;
+pub mod taa;
 
 /// Pre-LUT exposure calibrated for the native renderer's SH radiance scale.  Keep this in one
 /// place: both the startup LUT resource and the live graphics settings must begin at the same value.
@@ -34,6 +35,7 @@ pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin, GpuLoadSignal};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 pub use ssao::SsaoPlugin;
+pub use taa::TaaPlugin;
 pub use standard::EftStandardPlugin;
 
 /// Runtime graphics settings, driven by the UI's "Graphics (experimental)" section and extracted

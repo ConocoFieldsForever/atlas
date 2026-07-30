@@ -140,7 +140,7 @@ fn init_ssao_pipeline(
 }
 
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
-struct SsaoLabel;
+pub(crate) struct SsaoLabel;
 
 /// Bind-group cache keyed on (source view id, depth view id) — same pattern as render::grade
 /// (the depth view is also swapped when the window resizes).
