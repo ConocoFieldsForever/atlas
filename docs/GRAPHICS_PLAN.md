@@ -271,3 +271,18 @@ Acceptance:
 9. A clear derive-don’t-author policy for physical sky, PCSS softness, Gerstner waves and ML upscaling. Each currently invites new hand-tuned or invented values.
 
 10. A distinction between “implemented” and “default enabled.” All eleven can be implemented, but SSR, PCSS and learned upscaling should remain opt-in unless the full shipped stack stays at or below 12.0 ms average on the Woods Ultra reference, with p95 no worse than baseline by more than 0.3 ms.
+
+---
+
+## Phase 4 status note (post-implementation, 2026-07-30)
+
+The extracted cubemaps are environment CAPTURES, not sky domes. Two consequences, both resolved by
+measurement rather than assumption:
+1. As a visible sky they render photo treelines above the map's real geometry — REMOVED at user
+   direction (not even optional). The procedural dome stays.
+2. The sidecar's derived HORIZON colors are contaminated by those treelines (rain_1k_sharp measures
+   0.022/0.019/0.015 — near-black — which would render black fog). The ZENITH values are plausible
+   (0.434 neutral overcast) but a zenith alone cannot drive sky_reflect/fog. Per Phase 0's rule,
+   the invalid values are NOT wired; sky_reflect and FOG_COLOR remain authored WITH this note as
+   the reason. A future derivation needs horizon/sky segmentation of the captures, or a genuinely
+   sky-only source.
