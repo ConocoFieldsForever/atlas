@@ -667,6 +667,7 @@ def main():
     mat_cache = {}       # (fid,pid) material -> (alb,nrm,sh,tile)
     instances = []
     lodgroups = []       # Stage A (LOD_PLAN.md): SSoT Unity LODGroup table; global index across levels. values verbatim from Unity
+    waterbodies = []     # water SURFACES from Unity layer 4 (see the water pass); world AABB + surface height
     terrain_manifest = {"tiles": {}, "layers": []}; _layer_saved = {}   # accumulate splat layers/maps across tiles
     splat_root = os.path.join(out, "terrain_layers")
     if _TEXCACHE_ENABLED:
@@ -687,6 +688,9 @@ def main():
             print(f"level{lv} missing"); continue
         env = UnityPy.load(path)
         tfm = {o.path_id: o for o in env.objects if o.type.name == "Transform"}
+        # path_id -> object, for resolving PPtrs (the water pass follows MeshFilter -> GameObject and
+        # MeshFilter -> Mesh). Built in the same walk that builds `tfm`, so it costs no extra pass.
+        _byid = {o.path_id: o for o in env.objects}
         wcache = {}
 
         # ONE shared per-Transform memo (built once below) replaces the FOUR separate re-reads of every Transform
@@ -1226,6 +1230,84 @@ def main():
                   f"levels (distinct renderers per level — the simple case)", flush=True)
         print(f"  [lv{lv}] LODGroups: +{sum(1 for grp in lodgroups)} cumulative={len(lodgroups)}, renderers tagged this level={len(rid2lod)}", flush=True)
 
+        # ---- WATER SURFACES (Unity layer 4) --------------------------------------------------------
+        # EFT's water planes ship with an EMPTY m_Materials, so the renderer loop below drops them (a
+        # material-less MeshRenderer draws nothing, and emitting a fake white submesh produced the
+        # flat sheets repair_nomat.py exists to remove). The game still renders water there, so the
+        # surface has to come from somewhere else -- and it does: those GameObjects sit on LAYER 4,
+        # Unity's built-in "Water" layer, which is what the ballistics system reads.
+        #
+        # That is a STRUCTURAL signal, not a name rule: layer 4 is an engine convention. On woods
+        # level43 it selects exactly 8 objects (one `WATER_LEVEL` plane plus 7 `*_BALLISTIC_water`
+        # colliders) out of 44,824 GameObjects on layer 0 -- and the plane's height, 7.4 m, matches
+        # independently what build_map's old water-plane heuristic derived (7.454 m) from the very
+        # placeholder meshes that get dropped. Two sources, same answer.
+        #
+        # Only objects with a MeshFilter are emitted: those carry the renderable surface. The collider
+        # -only ones describe the same volume and would just duplicate it. m_LocalAABB is used instead
+        # of reading vertices -- it is exact and costs one typetree read.
+        # Emit the water MESH, not its bounding box. A first attempt recorded each surface's world AABB
+        # and let the viewer draw a rectangle from it; measured on woods that gives 8-21 ha boxes that
+        # overlap heavily (two identical, one spanning 21 ha at y=-16.6 under the terrain), because a
+        # shoreline collider is an irregular outline whose AABB is far larger than the water. Drawing
+        # those rectangles would flood the map -- the exact failure build_map's sea heuristic warns
+        # about. The mesh itself is the correct footprint, and exporting it costs nothing new.
+        #
+        # The mesh PPtr must be resolved through UnityPy, NOT by path_id lookup in this file: these
+        # meshes are EXTERNAL (m_FileID 30/5/2 = shared asset files), so a path_id-only lookup silently
+        # returns an unrelated local object of the same id.
+        #
+        # MeshFilter only (not MeshCollider): the filter carries the renderable surface, while the
+        # ballistics colliders describe the same volume and would double-draw it.
+        nwater = 0
+        for _mf in env.objects:
+            if _mf.type.name != "MeshFilter":
+                continue
+            try:
+                _c = _mf.read()
+                _gopid = _c.m_GameObject.path_id
+                _go = _c.m_GameObject.read()
+                if int(g(_go, "m_Layer", default=0)) != 4:
+                    continue
+                _pp = g(_c, "m_Mesh")
+                if _pp is None or getattr(_pp, "path_id", 0) == 0:
+                    continue
+                W = world_of_go(_gopid)
+                if W is None:
+                    continue
+                _fn = export_mesh(_pp)
+                if not _fn:
+                    continue
+                _tri, _aabb, _nm = mesh_info(_pp)
+            except Exception:
+                continue
+            # A synthesized water submesh per triangle run. These renderers ship an EMPTY m_Materials
+            # (the material is not in the level), so there is nothing to resolve — but the VIEWER
+            # shades water from `role`, not from a material, so role alone is sufficient and correct.
+            # This is the narrow, layer-gated version of what the old extractor did for EVERY
+            # material-less renderer (see repair_nomat.py), which is why that had to be reverted.
+            _subs = [{"role": "water", "sh": None, "tex": None}
+                     for _ in (_tri if _tri else [0])]
+            instances.append({
+                "mesh": _fn,
+                "m": [round(float(v), 5) for v in np.asarray(W, np.float64).flatten()],
+                "subs": _subs,
+                "lv": lv,
+                "kind": "mesh",
+                "root": root_of(_gopid),
+                "cast": 0,        # water casts no shadow
+                "renON": True,
+                "aih": True,
+                "drop": False,
+            })
+            cnt_water_y = round(float(np.asarray(W, np.float64)[1, 3]), 3)
+            waterbodies.append({"lv": lv, "y": cnt_water_y, "mesh": _fn})
+            nwater += 1
+        if nwater:
+            _wy = sorted({w["y"] for w in waterbodies[-nwater:]})
+            print(f"  [lv{lv}] water: {nwater} layer-4 surface(s) emitted as water-role meshes "
+                  f"(heights {_wy})", flush=True)
+
         # ---- mesh renderers + skinned mesh renderers ----
         cnt = 0
         nomat_skipped = {}   # GameObject name -> count of renderers dropped for having NO material
@@ -1422,10 +1504,14 @@ def main():
                       f"scene.json ({len(kept)} kept, {len(merged)} total)", flush=True)
                 instances = merged
                 lodgroups = old.get("lodGroups") or lodgroups
+                # Same reason as lodGroups: a terrain-only re-run must not erase the full run's water
+                # surfaces just because this pass happened to find none.
+                waterbodies = waterbodies or (old.get("waterBodies") or [])
                 levels = sorted(set(old.get("levels") or []) | set(levels))
         except Exception as e:
             print(f"  terrain-only: scene merge failed ({e}) - writing this run's scene as-is", flush=True)
     json.dump({"instances": instances, "up": "unity", "levels": levels, "lodGroups": lodgroups, "lod_schema": 1,
+               "waterBodies": waterbodies,
                "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"},
               open(os.path.join(out, "scene.json"), "w"))
     print(f"  LOD: {len(lodgroups)} LODGroups, {sum(1 for it in instances if it.get('lod'))} tagged instances", flush=True)
