@@ -39,18 +39,27 @@ def _parse_obj_fast(data):
         if h2 == b'v ': vrem.append(ln[2:])
         elif h2 == b'f ': frem.append(ln[2:])
         elif ln[:3] == b'vt ': vtrem.append(ln[3:])
+    # NO np.fromstring. It was replaced 2026-07-30 after a 0xC0000005 hunt: assemble crashed at an
+    # UNRELATED line (a 4x4 matmul in the collider loop) only on runs that fast-parsed ~12k cold OBJs
+    # with .msh stores interleaved -- the signature of a heap overrun planted here and detonating at a
+    # later allocation. Every single-variable A/B (fast-only, msh-only, neither) ran clean; only the
+    # combination crashed, and only after a crashed extraction had rewritten 12,005 meshes so the
+    # parser actually ran hot. fromstring's sep-mode C parser is deprecated since numpy 1.14 and is
+    # exactly the kind of code that fails this way. np.array(token_list, dtype) uses numpy's ordinary
+    # per-element string->number conversion (same strtod, same values -- verified by hashing the
+    # assembled pack against a slow-parser build) with none of the hand-rolled buffer math.
     # --- vertices: require exactly 3 tokens/line (matches the slow path's [:3] on all-3-coord EFT meshes) ---
     if vrem:
         vtoks = b' '.join(vrem).split()
         if len(vtoks) != 3 * len(vrem): return None
-        Va = np.fromstring(b' '.join(vtoks), sep=' ', dtype=np.float32).reshape(-1, 3)
+        Va = np.array(vtoks, dtype=np.float32).reshape(-1, 3)
     else:
         Va = np.zeros((0, 3), np.float32)
     # --- texcoords: exactly 2 tokens/line; empty -> (1,2) zeros exactly like the slow path ---
     if vtrem:
         ttoks = b' '.join(vtrem).split()
         if len(ttoks) != 2 * len(vtrem): return None
-        VTa = np.fromstring(b' '.join(ttoks), sep=' ', dtype=np.float32).reshape(-1, 2)
+        VTa = np.array(ttoks, dtype=np.float32).reshape(-1, 2)
     else:
         VTa = np.zeros((1, 2), np.float32)
     # --- faces: all-triangle `v/t/n`. Bail on `//` (missing uv) or any non-3-token line -> slow path ---
@@ -60,8 +69,9 @@ def _parse_obj_fast(data):
         if b'//' in fjoin: return None
         ftoks = fjoin.split()
         if len(ftoks) != 3 * nf: return None                        # quad/ngon/degenerate -> slow (fan triangulation)
-        fi = np.fromstring(b' '.join(ftoks).replace(b'/', b' '), dtype=np.int64, sep=' ')
-        if fi.size != 9 * nf: return None                           # not exactly v/t/n per corner -> slow
+        ctoks = b' '.join(ftoks).replace(b'/', b' ').split()
+        if len(ctoks) != 9 * nf: return None                        # not exactly v/t/n per corner -> slow
+        fi = np.array(ctoks, dtype=np.int64)
         Fa = (fi.reshape(nf, 3, 3)[:, :, :2] - 1).astype(np.int32)  # keep (vert,uv), drop normal; -1 like slow path
     else:
         Fa = np.zeros((0, 3, 2), np.int32)

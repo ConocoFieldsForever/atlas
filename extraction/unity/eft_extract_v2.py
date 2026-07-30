@@ -688,9 +688,6 @@ def main():
             print(f"level{lv} missing"); continue
         env = UnityPy.load(path)
         tfm = {o.path_id: o for o in env.objects if o.type.name == "Transform"}
-        # path_id -> object, for resolving PPtrs (the water pass follows MeshFilter -> GameObject and
-        # MeshFilter -> Mesh). Built in the same walk that builds `tfm`, so it costs no extra pass.
-        _byid = {o.path_id: o for o in env.objects}
         wcache = {}
 
         # ONE shared per-Transform memo (built once below) replaces the FOUR separate re-reads of every Transform
@@ -1299,10 +1296,87 @@ def main():
                 "renON": True,
                 "aih": True,
                 "drop": False,
+                # Marks this as coming from Unity's WATER layer, which culls.py honours as a keep.
+                # Needed because BSG parks woods' WATER_LEVEL under a `BLOCKERS` scene root, and
+                # BLOCKER is on the structural drop list -- so without this the surface extracts
+                # cleanly and is then discarded at assembly, which is exactly what a silent failure
+                # looks like. The LAYER is the authoritative signal; the parent root is incidental.
+                "wlayer": 1,
             })
             cnt_water_y = round(float(np.asarray(W, np.float64)[1, 3]), 3)
             waterbodies.append({"lv": lv, "y": cnt_water_y, "mesh": _fn})
             nwater += 1
+        # SIBLING SURFACES. Only the big lake ships its surface on layer 4 directly (WATER_LEVEL,
+        # MeshFilter). Ponds, river segments and swamp pools ship as LAYER-0 MeshRenderers with an
+        # EMPTY m_Materials, and their only tie to water is STRUCTURAL: the same parent GameObject
+        # also owns a layer-4 ballistics collider. Verified on woods level43 —
+        #   Shoreline_Lake_Water_02 ── _LOD0 (renderer, 0 materials, layer 0)
+        #                           └─ _BALLISTIC_water (MeshCollider, layer 4)
+        # for the pond, all four river segments, and both swamp stumps. Name-free: the rule is
+        # "material-less renderer whose PARENT also parents a Water-layer collider". WATER_LEVEL has
+        # no renderer sibling, so the two passes cannot double-emit.
+        water_parent_tfs = set()
+        for _mc in env.objects:
+            if _mc.type.name not in ("MeshCollider", "MeshFilter"):
+                continue
+            try:
+                _cc = _mc.read()
+                _cgo = _cc.m_GameObject.read()
+                if int(g(_cgo, "m_Layer", default=0)) != 4:
+                    continue
+                _ctp = go2tf.get(_cc.m_GameObject.path_id)
+                if _ctp is not None:
+                    _fpid = _tf.get(_ctp, (0, None, None))[0]
+                    if _fpid:
+                        water_parent_tfs.add(_fpid)
+            except Exception:
+                continue
+        if water_parent_tfs:
+            _seen_wr = set()
+            for _mr in env.objects:
+                if _mr.type.name != "MeshRenderer" or _mr.path_id in _seen_wr:
+                    continue
+                try:
+                    _r = _mr.read()
+                    if len(getattr(_r, "m_Materials", []) or []) != 0:
+                        continue                      # has materials -> the normal renderer loop owns it
+                    _rgo_pid = _r.m_GameObject.path_id
+                    _rtp = go2tf.get(_rgo_pid)
+                    if _rtp is None or _tf.get(_rtp, (0, None, None))[0] not in water_parent_tfs:
+                        continue
+                    _rgo = _r.m_GameObject.read()
+                    _mp2 = None
+                    for _comp in _rgo.m_Component:
+                        _cp = _comp[1] if isinstance(_comp, (list, tuple)) else _comp.component
+                        _co = _cp.read()
+                        if _co.__class__.__name__ == "MeshFilter":
+                            _mp2 = _co.m_Mesh
+                            break
+                    if _mp2 is None or getattr(_mp2, "path_id", 0) == 0:
+                        continue
+                    W = world_of_go(_rgo_pid)
+                    if W is None:
+                        continue
+                    _fn2 = export_mesh(_mp2)
+                    if not _fn2:
+                        continue
+                    _tri2, _a2, _n2 = mesh_info(_mp2)
+                except Exception:
+                    continue
+                _seen_wr.add(_mr.path_id)
+                instances.append({
+                    "mesh": _fn2,
+                    "m": [round(float(v), 5) for v in np.asarray(W, np.float64).flatten()],
+                    "subs": [{"role": "water", "sh": None, "tex": None}
+                             for _ in (_tri2 if _tri2 else [0])],
+                    "lv": lv, "kind": "mesh", "root": root_of(_rgo_pid),
+                    "cast": 0, "renON": True, "aih": True, "drop": False,
+                    "wlayer": 1,
+                })
+                waterbodies.append({"lv": lv,
+                                    "y": round(float(np.asarray(W, np.float64)[1, 3]), 3),
+                                    "mesh": _fn2})
+                nwater += 1
         if nwater:
             _wy = sorted({w["y"] for w in waterbodies[-nwater:]})
             print(f"  [lv{lv}] water: {nwater} layer-4 surface(s) emitted as water-role meshes "

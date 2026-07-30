@@ -61,6 +61,28 @@ pub struct GfxSettings {
     pub grade_available: bool,
     /// Pre-LUT exposure (native renderer default [`DEFAULT_GRADE_EXPOSURE`]).
     pub grade_exposure: f32,
+    /// Eye adaptation. `grade_exposure` is otherwise a CONSTANT — its own comment claimed
+    /// "eye-adaptation may override" and nothing ever did, so one value had to serve a sunlit
+    /// exterior and an unlit interior on the same map. A GPU reduction measures the frame's
+    /// log-average luminance and applies an EV offset to `exposure`.
+    ///
+    /// DEFAULT OFF, and it should stay off until the reference is fixed. The adaptation is relative to
+    /// a reference log-luminance latched on the first frame the reduction runs -- which during a map
+    /// load is an arbitrary partially-streamed frame, so the reference is not meaningful and the
+    /// result measured 1.92x on a woods exterior instead of the 1.00x a correct reference must give.
+    /// The fix is to latch the reference only once the load has settled (the GpuLoadSignal gate the
+    /// bench harness already uses), not on first dispatch. Until then this is opt-in only:
+    /// EFT_AUTO_EXPOSURE=1.
+    pub auto_exposure: bool,
+    /// ARMED gate for `auto_exposure`, set by `arm_auto_exposure` — NOT a user setting, and
+    /// deliberately not touched by any preset.
+    ///
+    /// Adaptation must not latch its reference from a load-time frame. The reference has to come from
+    /// a frame that represents the scene, so this only goes true once the pack is resident and the GPU
+    /// build has finished (the same gate the bench harness settles on) plus a short hold. Latching on
+    /// first dispatch instead measured 1.92x on a woods exterior where a correct reference gives 1.00x,
+    /// and showed up as the image brightening the moment the camera first moved.
+    pub exposure_armed: bool,
     /// PRISM vignette on/off.
     pub vignette: bool,
     /// Grass rendering (off = all clumps screen-size-culled).
@@ -194,6 +216,10 @@ impl Default for GfxSettings {
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0.0),
             aa: !std::env::var("EFT_AA").map(|v| v.trim() == "0").unwrap_or(false),
+            auto_exposure: std::env::var("EFT_AUTO_EXPOSURE")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false),
+            exposure_armed: false,
             aa_strength: std::env::var("EFT_AA_STRENGTH")
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
@@ -368,6 +394,8 @@ impl QualityPreset {
                 g.cull_px = d.cull_px;
                 g.cull_px_grass = d.cull_px_grass;
                 g.aa = true;
+                // Off in every preset while the reference latch is wrong (see GfxSettings::auto_exposure).
+                g.auto_exposure = false;
                 g.volumetric = true;
                 g.volumetric_strength = d.volumetric_strength;
                 g.grass_dist_m = 0.0;
@@ -381,6 +409,8 @@ impl QualityPreset {
                 g.cull_px = d.cull_px;
                 g.cull_px_grass = d.cull_px_grass;
                 g.aa = true;
+                // Off in every preset while the reference latch is wrong (see GfxSettings::auto_exposure).
+                g.auto_exposure = false;
                 g.volumetric = false;
                 g.volumetric_strength = d.volumetric_strength;
                 g.grass_dist_m = 0.0;
@@ -395,6 +425,7 @@ impl QualityPreset {
                 g.cull_px = 2.0;
                 g.cull_px_grass = 600.0;
                 g.aa = true;
+                g.auto_exposure = false;
                 // Shafts need the cascades; shadows are off here, so this would be forced off at the
                 // uniform anyway. Set it explicitly so the preset says what it means.
                 g.volumetric = false;
@@ -411,6 +442,8 @@ impl QualityPreset {
                 g.cull_px = 4.0;
                 g.cull_px_grass = 1000.0;
                 g.aa = true;
+                // Off in every preset while the reference latch is wrong (see GfxSettings::auto_exposure).
+                g.auto_exposure = false;
                 g.volumetric = false;
                 g.volumetric_strength = d.volumetric_strength;
                 // Grass is off entirely here, so this is belt-and-braces rather than a saving.

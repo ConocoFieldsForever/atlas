@@ -1063,10 +1063,11 @@ fn main() {
         // this an `EFT_VOLUMETRIC=0` A/B run on a machine with Ultra persisted would silently measure
         // shafts ON — the precise failure the comment above describes, and one that would have
         // corrupted the +5.40 ms figure had the harness not forced the Custom preset.
-        let (env_vol, env_aa, env_grass_dist) = (
+        let (env_vol, env_aa, env_grass_dist, env_ae) = (
             std::env::var("EFT_VOLUMETRIC").is_ok(),
             std::env::var("EFT_AA").is_ok(),
             std::env::var("EFT_GRASS_DIST").is_ok(),
+            std::env::var("EFT_AUTO_EXPOSURE").is_ok(),
         );
         let before = gfx.clone();
         preset.apply(&mut gfx);
@@ -1090,6 +1091,9 @@ fn main() {
         }
         if env_grass_dist {
             gfx.grass_dist_m = before.grass_dist_m;
+        }
+        if env_ae {
+            gfx.auto_exposure = before.auto_exposure;
         }
     }
     gfx.grade_available = grade_lut.is_some();
@@ -1192,7 +1196,7 @@ fn main() {
                 .run_if(not(resource_exists::<menu::MenuState>)),
         )
         .init_resource::<BenchSampleStart>()
-        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change, bench_stats))
+        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change, bench_stats, arm_auto_exposure))
         // Bench cameras override the fly-cam AFTER Update, before transforms propagate.
         .add_systems(
             PostUpdate,
@@ -2257,6 +2261,46 @@ fn bench_stats(
         info!("{line}");
         eprintln!("{line}"); // bypass the subscriber too — the run exits immediately after
         std::process::exit(0);
+    }
+}
+
+/// Arm auto-exposure once the scene on screen actually REPRESENTS the map.
+///
+/// Adaptation is relative to a reference log-luminance, and the reference is worthless if it is
+/// latched from a load-time frame: during streaming the framebuffer holds a partial scene, so the
+/// reference encodes that instead of the map. Symptom, reported from a real session: the image looked
+/// correct on arrival and then brightened the instant the camera first moved, because that was the
+/// first frame whose luminance differed from the bogus reference.
+///
+/// The gate is the SAME one `bench_stats` settles on (pack resident, no pending load, GPU build
+/// finished), plus a short frame hold so the first post-load frames -- which still upload textures --
+/// cannot be the reference either. Disarms on any new load so a map switch re-latches.
+fn arm_auto_exposure(
+    pending: Res<PendingMapLoad>,
+    gpu_load: Option<Res<render::GpuLoadSignal>>,
+    pack: Option<Res<LoadedPack>>,
+    settings: Option<ResMut<render::GfxSettings>>,
+    mut held: Local<u32>,
+) {
+    let Some(mut s) = settings else { return };
+    let loaded = pack.is_some()
+        && pending.loading().is_none()
+        && gpu_load.as_ref().map(|sig| !sig.in_progress()).unwrap_or(true);
+    if !loaded {
+        *held = 0;
+        if s.exposure_armed {
+            s.exposure_armed = false; // a new load invalidates the reference
+        }
+        return;
+    }
+    // ~0.5 s at 60 fps. Long enough for the texcache to stop landing, short enough that the user
+    // never waits on it.
+    if *held < 30 {
+        *held += 1;
+        return;
+    }
+    if !s.exposure_armed {
+        s.exposure_armed = true;
     }
 }
 

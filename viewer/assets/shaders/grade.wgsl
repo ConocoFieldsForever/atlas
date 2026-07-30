@@ -23,7 +23,8 @@ struct GradeParams {
     sharpen: f32,
     // FXAA blend strength (0 = off) — rides the first old pad lane; size unchanged.
     aa: f32,
-    _pad2: f32,
+    // Frame delta in seconds (was a pad lane); read by autoexposure.wgsl, unused here.
+    dt: f32,
     // vignette tuning (PRISM): aspect divisors + smoothstep edges + strength.
     // xy = (1.15, 0.95) axis divisors; z,w = smoothstep(0.55, 1.25).
     vig: vec4<f32>,
@@ -35,6 +36,11 @@ struct GradeParams {
 @group(0) @binding(2) var lut3d: texture_3d<f32>;       // 64^3, Linear filter, ClampToEdge, NoColorSpace
 @group(0) @binding(3) var lut_samp: sampler;
 @group(0) @binding(4) var<uniform> grade: GradeParams;
+
+// Auto-exposure state written by autoexposure.wgsl earlier on the same encoder. `exposure` is 0 when
+// adaptation has never run (the pass is off), which is the signal to keep the authored value.
+struct ExposureState { log_lum: f32, exposure: f32, ref_log: f32, _pad1: f32 };
+@group(0) @binding(5) var<storage, read> ae: ExposureState;
 
 struct FsIn {
     @builtin(position) clip: vec4<f32>,
@@ -155,7 +161,11 @@ fn fs_grade(in: FsIn) -> @location(0) vec4<f32> {
               + textureSampleLevel(scene_tex, scene_samp, in.uv - vec2<f32>(0.0, ts.y), 0.0).rgb;
         scene = max(scene + (scene - n * 0.25) * grade.sharpen, vec3<f32>(0.0));
     }
-    let lin = scene * grade.exposure;
+    // Adapted exposure when auto-exposure has produced one, else the authored constant. The state
+    // buffer's `exposure` is 0 until the reduction has run at least once, so a disabled or
+    // still-compiling adaptation pass falls back cleanly instead of blacking the frame.
+    let exposure = select(grade.exposure, ae.exposure, ae.exposure > 0.0);
+    let lin = scene * exposure;
     let g = lut_sample(lin);
 
     // PRISM vignette: e = (uv-0.5)*2 / (1.15, 0.95); vig = 1 - smoothstep(0.55,1.25,|e|)*0.488.

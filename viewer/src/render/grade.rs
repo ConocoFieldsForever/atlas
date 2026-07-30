@@ -139,9 +139,14 @@ struct GradeParamsGpu {
     /// `GfxSettings::aa`, which records the mistaken claim this used to make). This targets shading
     /// aliasing and A2C's quantized cutout coverage, which MSAA does not resolve.
     aa: f32,
-    _pad: f32,
+    /// Frame delta in seconds, read by autoexposure.wgsl so adaptation runs at a per-second rate
+    /// instead of a per-frame one. Was a pad lane, so the 48-byte layout is unchanged.
+    dt: f32,
     vig: [f32; 4],          // xy = aspect divisors, zw = smoothstep edges
-    vig_strength: [f32; 4], // x = strength
+    /// x = vignette strength. y = auto-exposure ARMED (1/0): the reduction may only latch its
+    /// reference once the scene represents the map (see `arm_auto_exposure`). Rides free lanes, so the
+    /// 48-byte layout is unchanged.
+    vig_strength: [f32; 4],
 }
 
 /// Render-world GPU state, built once at RenderStartup.
@@ -155,6 +160,12 @@ struct GradePipeline {
     #[allow(dead_code)]
     lut_tex: Texture,
     params: Buffer,
+    /// Auto-exposure: the reduction's own layout/pipeline, plus the 16-byte state buffer that carries
+    /// the smoothed log-luminance ACROSS frames. It lives on the GPU and is never read back — a
+    /// readback would either stall the frame or make adaptation land a frame late.
+    ae_layout: BindGroupLayout,
+    ae_pipeline_id: bevy::render::render_resource::CachedComputePipelineId,
+    ae_state: Buffer,
 }
 
 fn init_grade_pipeline(
@@ -216,7 +227,7 @@ fn init_grade_pipeline(
             exposure: lut.exposure,
             sharpen: 0.0, // live value comes from update_grade_params each frame
             aa: 0.0,      // ditto
-            _pad: 0.0,
+            dt: 0.0,      // 0 => autoexposure snaps on the first frame instead of fading in
             vig: [1.15, 0.95, 0.55, 1.25], // PRISM defaults (see grade.wgsl header)
             vig_strength: [lut.vignette, 0.0, 0.0, 0.0],
         }),
@@ -233,9 +244,47 @@ fn init_grade_pipeline(
                 texture_3d(TextureSampleType::Float { filterable: true }), // lut
                 sampler(SamplerBindingType::Filtering),
                 uniform_buffer_sized(false, Some(std::num::NonZeroU64::new(48).unwrap())),
+                // Auto-exposure state, read-only here: the fragment multiplies by the ADAPTED
+                // exposure instead of GradeParams.exposure when adaptation is enabled.
+                bevy::render::render_resource::binding_types::storage_buffer_read_only_sized(
+                    false,
+                    Some(std::num::NonZeroU64::new(16).unwrap()),
+                ),
             ),
         ),
     );
+    // --- auto-exposure: one storage buffer + one compute pipeline -----------------------------------
+    // log_lum seeded with the shader's 1e9 sentinel so the FIRST frame snaps to the measured average
+    // rather than easing up from an arbitrary value (which would look like a fade-in on every load).
+    let ae_state = device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_autoexposure_state"),
+        contents: bytemuck::cast_slice(&[1.0e9f32, 0.0, 1.0e9f32, 0.0]),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let ae_layout = device.create_bind_group_layout(
+        "eft_autoexposure_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }), // scene (textureLoad)
+                bevy::render::render_resource::binding_types::storage_buffer_sized(
+                    false,
+                    Some(std::num::NonZeroU64::new(16).unwrap()),
+                ),
+                uniform_buffer_sized(false, Some(std::num::NonZeroU64::new(48).unwrap())),
+            ),
+        ),
+    );
+    let ae_pipeline_id = cache.queue_compute_pipeline(
+        bevy::render::render_resource::ComputePipelineDescriptor {
+            label: Some("eft_autoexposure_pipeline".into()),
+            layout: vec![ae_layout.clone()],
+            shader: asset_server.load("shaders/autoexposure.wgsl"),
+            entry_point: Some("cs_autoexposure".into()),
+            ..default()
+        },
+    );
+
     let shader = asset_server.load("shaders/grade.wgsl");
     let pipeline_id = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("eft_grade_pipeline".into()),
@@ -275,7 +324,20 @@ fn init_grade_pipeline(
         lut_view,
         lut_tex,
         params,
+        ae_layout,
+        ae_pipeline_id,
+        ae_state,
     });
+}
+
+/// Borrow the compiled auto-exposure compute pipeline, or `None` while it is still compiling.
+/// Separate fn because the render pipeline was already fetched from a `PipelineCache` borrow that the
+/// node shadows as `cache`; a second lookup inline would be confusing to read.
+fn cache_ref_compute<'w>(
+    world: &'w World,
+    id: bevy::render::render_resource::CachedComputePipelineId,
+) -> Option<&'w bevy::render::render_resource::ComputePipeline> {
+    world.resource::<PipelineCache>().get_compute_pipeline(id)
 }
 
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
@@ -334,6 +396,7 @@ impl ViewNode for GradeNode {
                         &gp.lut_view,
                         &gp.lut_sampler,
                         gp.params.as_entire_binding(),
+                        gp.ae_state.as_entire_binding(),
                     )),
                 );
                 *cache = Some((post.source.id(), bg.clone()));
@@ -341,6 +404,38 @@ impl ViewNode for GradeNode {
             }
         };
         drop(cache);
+
+        // AUTO-EXPOSURE reduction, on THIS node's encoder immediately before the grade pass. Doing it
+        // here rather than as its own graph node means it sees exactly the texture the grade is about
+        // to read (post.source) with no extra node, no second view query, and no ordering edge to get
+        // wrong. One workgroup, so the dispatch itself is trivial.
+        if world
+            .get_resource::<crate::render::GfxSettings>()
+            .map(|s| s.auto_exposure)
+            .unwrap_or(false)
+        {
+            if let Some(ae) = cache_ref_compute(world, gp.ae_pipeline_id) {
+                let ae_bg = render_context.render_device().create_bind_group(
+                    "eft_autoexposure_bg",
+                    &gp.ae_layout,
+                    &BindGroupEntries::sequential((
+                        post.source,
+                        gp.ae_state.as_entire_binding(),
+                        gp.params.as_entire_binding(),
+                    )),
+                );
+                let mut cp = render_context.command_encoder().begin_compute_pass(
+                    &bevy::render::render_resource::ComputePassDescriptor {
+                        label: Some("eft_autoexposure_pass"),
+                        timestamp_writes: None,
+                    },
+                );
+                cp.set_pipeline(ae);
+                cp.set_bind_group(0, &ae_bg, &[]);
+                cp.dispatch_workgroups(1, 1, 1);
+            }
+        }
+
         let mut pass = render_context.command_encoder().begin_render_pass(&RenderPassDescriptor {
             label: Some("eft_grade_pass"),
             color_attachments: &[Some(RenderPassColorAttachment {
@@ -374,8 +469,12 @@ fn update_grade_params(
     queue: Res<bevy::render::renderer::RenderQueue>,
     gp: Option<Res<GradePipeline>>,
     settings: Option<Res<crate::render::GfxSettings>>,
+    time: Res<Time>,
 ) {
     let (Some(gp), Some(s)) = (gp, settings) else { return };
+    // Auto-exposure integrates at a per-second rate, so it needs the real delta. Clamped: a 2 s hitch
+    // (a map load, an alt-tab) would otherwise snap adaptation in one frame and read as a flash.
+    let dt_secs = time.delta_secs().clamp(0.0, 0.1);
     queue.write_buffer(
         &gp.params,
         0,
@@ -383,9 +482,14 @@ fn update_grade_params(
             exposure: s.grade_exposure,
             sharpen: s.sharpen,
             aa: if s.aa { s.aa_strength } else { 0.0 },
-            _pad: 0.0,
+            dt: dt_secs,
             vig: [1.15, 0.95, 0.55, 1.25],
-            vig_strength: [if s.vignette { 0.488 } else { 0.0 }, 0.0, 0.0, 0.0],
+            vig_strength: [
+                if s.vignette { 0.488 } else { 0.0 },
+                if s.exposure_armed { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
         }),
     );
 }
