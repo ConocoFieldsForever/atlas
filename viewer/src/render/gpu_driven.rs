@@ -662,8 +662,18 @@ fn build_light_grid(lights: &[crate::eftpack::Light], bounds: &[f32; 6], rt_enab
 // strict no-op when the feature is disabled (sun_dir missing or not EFT_SHADOWS=1): `enabled=0` in the
 // uniform, and the depth array — always allocated so the group(3) layout stays stable — is ignored.
 
-/// Shadow-map resolution per cascade (square). 2048² * 2 layers * 4 bytes = 32 MiB.
-const SHADOW_MAP_SIZE_DEFAULT: u32 = 2048;
+/// Shadow-map resolution per cascade (square). 3072² * 2 layers * 4 bytes = 72 MiB.
+///
+/// Raised from 2048 alongside the rotation-invariant cascade fit. That fit centres each cascade on
+/// the CAMERA instead of the frustum slice, which is what lets the #5b cache survive a pan (the
+/// shadow pass went from 6.16 ms to ~0 while rotating), but an eye-centred square must reach the
+/// slice's far corners: cascade 0's radius goes ~15 -> 20 m and cascade 1's ~78 -> 107 m, so texels
+/// would be ~1.35x coarser at the same resolution. 3072 more than absorbs that (1.5x the samples
+/// for 1.35x the area = ~1.1x FINER than the old default), so shadows come out slightly sharper
+/// rather than softer. Resolution is nearly free on this path — 512² -> 4096² measured +0.32 ms,
+/// because the cost is geometry resubmission, not fill. VRAM goes 32 -> 72 MiB; `EFT_SHADOW_SIZE`
+/// still overrides either way (2048 restores the old 32 MiB, 4096 costs 128 MiB).
+const SHADOW_MAP_SIZE_DEFAULT: u32 = 3072;
 /// Live-tunable shadow-map resolution (`EFT_SHADOW_SIZE`, default 2048). Exposed so the shadow
 /// pass cost can be bisected: if frame time scales with this, the cascades are FILL-bound; if it
 /// barely moves, the cost is geometry resubmission (the cascades replay the main camera's
@@ -679,6 +689,22 @@ fn shadow_map_size() -> u32 {
             .unwrap_or(SHADOW_MAP_SIZE_DEFAULT)
     })
 }
+/// Does grass cast sun shadows? Off by default: the alpha-tested cross-quads dominated the shadow
+/// pass for micro-shadows that read as noise at map scale. `EFT_GRASS_SHADOWS=1` restores them.
+/// Shared by the cascade-uniform fit and the shadow multidraw so the two cannot disagree about
+/// whether the grass range is drawn.
+fn shadow_debug() -> bool {
+    use std::sync::OnceLock;
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("EFT_SHADOW_DEBUG").is_ok_and(|v| v.trim() == "1"))
+}
+
+fn grass_shadows() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var("EFT_GRASS_SHADOWS").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// Cascade count (2 near cascades). The depth array has this many layers.
 const SHADOW_CASCADES: usize = 2;
 /// Practical/log split distances (metres): cascade i covers [SHADOW_SPLITS[i], SHADOW_SPLITS[i+1]].
@@ -687,6 +713,15 @@ const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.5, 15.0, 80.0];
 const SHADOW_CASCADE_OVERLAP: f32 = 0.10;
 /// How far a caster may sit toward the sun and still project into the slice (light-space Z fit).
 const SHADOW_CASTER_EXTRUDE: f32 = 80.0;
+/// Cascade centre snap quantum, in shadow-map texels. 1 would snap to the finest grid (no crawl,
+/// but the fit changes every 1.3 cm of walking, so the #5b cache never survives movement). Larger
+/// values make translation lazy at the price of the shadow grid stepping in blocks when it does
+/// move. 16 is the measured compromise; the fit radius is padded by one quantum to compensate.
+const SHADOW_SNAP_TEXELS: f32 = 16.0;
+/// Cascade radius quantum (metres). The raw max-corner distance jitters in f32's low bits as the
+/// view matrix changes, and `view_proj` is cache-compared for exact equality, so the radius is
+/// rounded UP to this step to make the fit bit-reproducible. 1 m costs <5% extra cascade extent.
+const SHADOW_RADIUS_STEP: f32 = 1.0;
 /// Receiver-side margin pulled away from the sun in the light-space Z fit.
 const SHADOW_RECEIVER_MARGIN: f32 = 10.0;
 /// Max fraction of REMOVABLE (above-floor) baked diffuse the contact term may subtract. Hard-capped.
@@ -1160,6 +1195,10 @@ pub struct CpuData {
     index_u16: bool,
     index_count: usize,
     instances: Vec<InstanceGpuRecord>,
+    /// The contiguous mesh-SLOT range the grass kinds occupy, `[start, end)`. Recorded because the
+    /// shadow pass must skip it, and it cannot be derived as `mesh_count - n_kinds`: the SEA quad is
+    /// appended AFTER grass on coastal maps, so a tail-relative guess would skip the sea instead.
+    grass_mesh_range: Option<(u32, u32)>,
     /// How many of `instances` are GRASS. Grass is the only source that can push the instance
     /// array past a storage BINDING limit on its own, so the render world reports it by name when
     /// the buffer is oversized rather than making the reader guess.
@@ -2581,6 +2620,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     let t_geo = build_t0.elapsed(); // phase: the mesh geometry loop (parse + repack + append)
     let grass_instance_base = instances.len();
     let mut grass_instances = 0usize;
+    let mut grass_mesh_range: Option<(u32, u32)> = None;
 
     // ---- #4 GRASS: append the density-placed grass clumps as a cross-quad mesh + N instances,
     //      rendered by the SAME cull + multidraw + alpha-cutout path. grass.bin = N×[x,y,z,rotY,
@@ -2733,6 +2773,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             }
             vtx_cursor += nverts;
             idx_cursor += nidx;
+            if grass_mesh_range.is_none() {
+                grass_mesh_range = Some((mesh_meta.len() as u32, mesh_meta.len() as u32));
+            }
             kind_mesh.push(Some(mesh_meta.len()));
             mesh_names.push(String::new()); // grass (synthetic)
             mesh_meta.push(MeshMeta {
@@ -2766,6 +2809,11 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         }
         if dropped > 0 {
             warn!("gpu-driven grass: {dropped} instances referenced a missing grass kind — dropped");
+        }
+        // Every grass kind's mesh slot has been pushed by now, and they are contiguous, so close the
+        // range here — before the SEA quad can append past it.
+        if let Some((start, _)) = grass_mesh_range {
+            grass_mesh_range = Some((start, mesh_meta.len() as u32));
         }
         let mut count = 0u32;
         for (kind, recs) in kind_bins.iter().enumerate() {
@@ -3029,6 +3077,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         index_u16,
         index_count,
         instances,
+        grass_mesh_range,
         grass_instances,
         grass_instance_base,
         mesh_meta,
@@ -3206,6 +3255,12 @@ struct EftDrawPipeline {
 
 #[derive(Resource)]
 struct EftGpuBuffers {
+    /// Grass mesh-slot range `[start, end)` — excluded from the SHADOW multidraw. Grass was already
+    /// "skipped" by emitting a degenerate triangle inside the shadow vertex shader, which saves
+    /// fragments but still runs a vertex invocation per clump: measured identical cost whether the
+    /// quads were really rasterized or not (18.606 vs 18.609 ms), i.e. fill was never the cost.
+    /// Dropping the draw range removes the invocations too (~1.75 ms of a 6.3 ms shadow pass).
+    grass_mesh_range: Option<(u32, u32)>,
     vertex: Buffer,
     index: Buffer,
     /// Width the index buffer was uploaded in (u16 when every mesh fits under 64Ki vertices).
@@ -4777,6 +4832,7 @@ fn prepare_gpu_buffers(
     );
 
     commands.insert_resource(EftGpuBuffers {
+        grass_mesh_range: cpu.grass_mesh_range,
         vertex,
         index,
         indirect,
@@ -5930,9 +5986,7 @@ fn prepare_shadow_uniforms(
 
     // B2: grass shadow casters off by default (the 109k alpha-tested cross-quads dominated the
     // shadow pass for micro-shadows invisible at map scale). EFT_GRASS_SHADOWS=1 restores.
-    static GRASS_CASTERS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let grass_casters = *GRASS_CASTERS
-        .get_or_init(|| std::env::var("EFT_GRASS_SHADOWS").is_ok_and(|v| v.trim() == "1"));
+    let grass_casters = grass_shadows();
 
     let mut main = SunShadowUniform {
         split_depths: [
@@ -5971,52 +6025,86 @@ fn prepare_shadow_uniforms(
             }
         }
 
-        // Centroid + rotation-invariant bounding-sphere radius (constant cascade size under camera
-        // rotation -> no size shimmer). SQUARE fit uses this radius on both axes.
-        let mut center = Vec3::ZERO;
-        for cc in &corners {
-            center += *cc;
-        }
-        center /= 8.0;
+        // ROTATION-INVARIANT FIT, centred on the CAMERA rather than the slice.
+        //
+        // This used to centre on the slice centroid. The radius was rotation-invariant, but the
+        // CENTRE was not: the frustum slice swings around the eye as you look around, so its
+        // centroid orbits, every yaw/pitch produced a different `view_proj`, and the #5b cache
+        // below missed on every frame of a pan — both cascades fully re-rendered. Measured on
+        // interchange's mall at 2560x1440: the shadow pass costs 0.57 ms with the camera at rest
+        // and 6.16 ms while panning, 11x more, ~36% of the frame. Static benchmarks could never
+        // see it, which is why "sun shadows off" had only ever measured ~5%.
+        //
+        // The eye is fixed under rotation and |corner - eye| is preserved by rotation, so centring
+        // here makes the whole fit depend on camera POSITION alone. Panning is then bit-identical
+        // and free. The price is a larger square: the eye-centred bound must reach the slice's far
+        // corners, so the radius grows ~1.3x per cascade (coarser texels). That is worth paying
+        // because shadow-map resolution is nearly free on this path — 512^2 -> 4096^2 measured
+        // +0.32 ms — so SHADOW_MAP_SIZE_DEFAULT absorbs it and comes out ahead of the old texel
+        // density at a fraction of the old cost.
+        let center = world_from_view.w_axis.truncate();
         let mut radius = 0.0f32;
         for cc in &corners {
             radius = radius.max((*cc - center).length());
         }
         radius = radius.max(0.05);
 
-        // Light view: eye on the sun side looking at the slice centre.
-        let eye = center + lsun * (radius + SHADOW_CASTER_EXTRUDE);
-        let light_view = Mat4::look_at_rh(eye, center, up);
-
-        // Texel-snap the light-space XY centre so the cascade doesn't crawl as the camera moves.
+        // QUANTISE THE WHOLE FIT, not just the ortho offsets.
+        //
+        // Snapping the ortho centre alone did nothing (measured: 15.007 ms vs 14.976 unsnapped),
+        // because `light_view` was built from the UNSNAPPED centre and the Z range was fitted to the
+        // moving corners — so `view_proj` changed every frame no matter what the ortho offsets did.
+        // Everything that feeds view_proj has to be quantised or constant:
+        //   * the light BASIS depends only on lsun + up, so it is already constant;
+        //   * the centre is snapped in that basis to a block of SHADOW_SNAP_TEXELS texels, and the
+        //     radius is padded by one quantum so the slice can never escape the square between
+        //     snaps;
+        //   * the Z range is derived from `radius` and the extrude/margin constants instead of the
+        //     corner set, which makes it invariant too (slightly more conservative depth, same
+        //     precision in a 0..1 depth buffer).
+        // Rotation is then free and translation only re-renders once per quantum crossed. The cost
+        // of a coarse quantum is that the texel grid steps in blocks when it does move, so
+        // shadow-edge aliasing changes in one frame rather than crawling — which is why the constant
+        // stays modest.
+        // QUANTISE THE RADIUS FIRST. `radius` is the max corner distance, which is invariant under
+        // rotation in exact arithmetic but wobbles in the low bits of f32 as the view matrix changes.
+        // `view_proj` is compared for EXACT equality, so that wobble alone re-rendered ~89% of frames
+        // even after the centre was snapped. Rounding up to a fixed step makes the whole fit — texel
+        // size, snap quantum and ortho extent — bit-reproducible while the camera stays inside a step.
+        let radius = (radius / SHADOW_RADIUS_STEP).ceil() * SHADOW_RADIUS_STEP;
+        let base_texel = (2.0 * radius) / shadow_map_size() as f32;
+        let snap = base_texel * SHADOW_SNAP_TEXELS;
+        let radius = radius + snap;
         let world_texel = (2.0 * radius) / shadow_map_size() as f32;
-        let center_ls = light_view.transform_point3(center);
-        let snapped_x = (center_ls.x / world_texel).round() * world_texel;
-        let snapped_y = (center_ls.y / world_texel).round() * world_texel;
 
-        // Light-space Z fit over the receiver corners + caster extrusion (toward the sun) + receiver
-        // margin (away from the sun). In RH light space, in-front points have negative z.
-        let mut zmin = f32::MAX;
-        let mut zmax = f32::MIN;
-        for cc in &corners {
-            for p in &[
-                *cc,
-                *cc + lsun * SHADOW_CASTER_EXTRUDE,
-                *cc - lsun * SHADOW_RECEIVER_MARGIN,
-            ] {
-                let z = light_view.transform_point3(*p).z;
-                zmin = zmin.min(z);
-                zmax = zmax.max(z);
-            }
-        }
-        let ortho_near = (-zmax).max(0.0);
-        let ortho_far = (-zmin).max(ortho_near + 0.1);
+        // Constant light basis (rotation only, about the world origin).
+        let basis = Mat4::look_at_rh(lsun, Vec3::ZERO, up);
+        let c_ls = basis.transform_point3(center);
+        // ALL THREE axes, not just the texel plane. Leaving z unquantised kept the target sliding
+        // along the light's view direction every frame, so `light_view` — and therefore `view_proj` —
+        // still changed on every frame of movement even though the ortho box was stable. Measured
+        // exactly that: `vp changed 600/600` with `forced 1`. Sliding along z is harmless to cover
+        // because ortho_near/far already span 2*radius + extrude + margin around the target.
+        let snapped_ls = Vec3::new(
+            (c_ls.x / snap).round() * snap,
+            (c_ls.y / snap).round() * snap,
+            (c_ls.z / snap).round() * snap,
+        );
+        let target = basis.inverse().transform_point3(snapped_ls);
+        let eye = target + lsun * (radius + SHADOW_CASTER_EXTRUDE);
+        let light_view = Mat4::look_at_rh(eye, target, up);
+
+        // Z range from the geometry of the fit rather than the corners: every slice point lies
+        // within `radius` of `target`, and the eye sits (radius + EXTRUDE) toward the sun, so the
+        // near plane can be EXTRUDE and the far plane 2*radius + EXTRUDE + MARGIN.
+        let ortho_near = SHADOW_CASTER_EXTRUDE.max(0.0);
+        let ortho_far = ortho_near + 2.0 * radius + SHADOW_RECEIVER_MARGIN;
 
         let proj = Mat4::orthographic_rh(
-            snapped_x - radius,
-            snapped_x + radius,
-            snapped_y - radius,
-            snapped_y + radius,
+            -radius,
+            radius,
+            -radius,
+            radius,
             ortho_near,
             ortho_far,
         );
@@ -6028,10 +6116,46 @@ fn prepare_shadow_uniforms(
         // shadows are OFF the atlas content goes stale/undefined, so the cache is voided and
         // re-enabling re-renders both layers.
         if shadows_on {
-            let dirty = force || cache.vp[c] != Some(vp_cols);
+            let vp_changed = cache.vp[c] != Some(vp_cols);
+            let dirty = force || vp_changed;
             cache.render[c] = dirty;
             if dirty {
                 cache.vp[c] = Some(vp_cols);
+            }
+            // EFT_SHADOW_DEBUG=1: report how often each cascade actually re-renders. Frame time
+            // alone cannot separate "the cascade re-rendered" from "the main pass sampled more
+            // shadow texels", and inferring one from the other is how a bad conclusion gets shipped.
+            if shadow_debug() {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static FRAMES: [AtomicU64; SHADOW_CASCADES] =
+                    [AtomicU64::new(0), AtomicU64::new(0)];
+                static RENDERS: [AtomicU64; SHADOW_CASCADES] =
+                    [AtomicU64::new(0), AtomicU64::new(0)];
+                static FORCED: [AtomicU64; SHADOW_CASCADES] =
+                    [AtomicU64::new(0), AtomicU64::new(0)];
+                static VPDIFF: [AtomicU64; SHADOW_CASCADES] =
+                    [AtomicU64::new(0), AtomicU64::new(0)];
+                let f = FRAMES[c].fetch_add(1, Ordering::Relaxed) + 1;
+                if dirty {
+                    RENDERS[c].fetch_add(1, Ordering::Relaxed);
+                }
+                if force {
+                    FORCED[c].fetch_add(1, Ordering::Relaxed);
+                }
+                if vp_changed {
+                    VPDIFF[c].fetch_add(1, Ordering::Relaxed);
+                }
+                if f % 300 == 0 {
+                    let r = RENDERS[c].load(Ordering::Relaxed);
+                    eprintln!(
+                        "  [shadow] cascade {c}: rendered {r}/{f} ({:.0}%) | forced {} | vp changed {}                          | radius {:.1} m snap {:.3} m",
+                        100.0 * r as f32 / f as f32,
+                        FORCED[c].load(Ordering::Relaxed),
+                        VPDIFF[c].load(Ordering::Relaxed),
+                        radius,
+                        snap
+                    );
+                }
             }
         } else {
             cache.render[c] = false;
@@ -6624,7 +6748,28 @@ impl Node for EftShadowNode {
             pass.set_bind_group(2, &material_bg.0, &[]); // material table + albedo (alpha test)
             pass.set_vertex_buffer(0, buffers.vertex.slice(..));
             pass.set_index_buffer(buffers.index.slice(..), 0, buffers.index_format);
-            pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count);
+            // Skip the GRASS mesh range unless grass is meant to cast. The shadow vertex shader
+            // already collapsed grass to a degenerate triangle, but that still costs one vertex
+            // invocation per clump — 3.26 M of them on interchange — and measured the same whether
+            // the quads were really rasterized or not. Not drawing the range at all is what removes
+            // the work. Two ranges around the hole, because the SEA quad is appended AFTER grass and
+            // must still cast.
+            const IND_STRIDE: u64 = std::mem::size_of::<DrawIndexedIndirectArgs>() as u64;
+            match buffers.grass_mesh_range.filter(|_| !grass_shadows()) {
+                Some((gs, ge)) if ge > gs && ge <= buffers.mesh_count => {
+                    if gs > 0 {
+                        pass.multi_draw_indexed_indirect(&buffers.indirect, 0, gs);
+                    }
+                    if buffers.mesh_count > ge {
+                        pass.multi_draw_indexed_indirect(
+                            &buffers.indirect,
+                            ge as u64 * IND_STRIDE,
+                            buffers.mesh_count - ge,
+                        );
+                    }
+                }
+                _ => pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count),
+            }
         }
         Ok(())
     }

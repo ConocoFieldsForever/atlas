@@ -117,6 +117,158 @@ def cluster(pts, radius):
     return [([round(c['s'][0] / c['n'], 2), round(c['s'][1] / c['n'], 2), round(c['s'][2] / c['n'], 2)], c['n']) for c in out]
 
 
+# Populated in main() from tarkov.dev's mobs catalog: {bot role id: EN display name}. Used to join
+# the client's boss entries (which carry the real spawn chance) to tarkov.dev's positioned nodes.
+MOB_NAMES = {}
+
+
+def load_client_intel():
+    """packs/shared/client_intel.json (extract_client_intel.py), or None when it hasn't been run.
+
+    Absent -> every consumer below falls back to today's behaviour, so this never becomes a hard
+    dependency on having the game installed.
+    """
+    p = os.path.join(REPO, 'packs', 'shared', 'client_intel.json')
+    if not os.path.isfile(p):
+        print('[loot] no client_intel.json - loot rates / boss odds / exit timings stay tarkov.dev '
+              '(run extraction/intel/extract_client_intel.py to add them)')
+        return None
+    try:
+        return json.load(open(p, encoding='utf-8'))
+    except Exception as e:
+        print(f'[loot] client_intel.json unreadable ({e}) - continuing tarkov.dev-only')
+        return None
+
+
+# Search time from CAPACITY, not from a hand-picked constant. The container's own template gives its
+# grid size, and cells are what you actually click through: a 25-cell supply crate is not a 4-cell
+# jacket. Fitted to keep the old hand-tuned table's range (jacket ~4 s .. big crate ~9 s) so the
+# planner's budgets stay comparable, but now MONOTONIC in real capacity instead of per-type opinion.
+T_BASE = 2.5        # seconds to reach + open anything
+T_PER_CELL = 0.26   # ~1 s per 4 cells of grid to scan
+
+
+def search_time_from_cells(cells):
+    return round(T_BASE + T_PER_CELL * cells, 1)
+
+
+def apply_client_intel(mid, rec, intel, containers):
+    """Fold first-party location facts into one map's record. Returns a short report string."""
+    if not intel:
+        return ''
+    loc = (intel.get('locations') or {}).get(mid)
+    if not loc:
+        return ''
+    notes = []
+
+    # 1. RAID TIMER + PLAYERS. The client is CURRENT here and upstream is behind (customs 40 vs 35,
+    #    woods 40 vs 35, streets 50 vs 40, labs 35 vs 30). Take the game's, keep upstream's as
+    #    `raid_minutes_dev` so the disagreement stays visible rather than being silently overwritten.
+    meta = rec['meta']
+    if loc.get('escapeTimeLimit'):
+        if meta.get('raid_minutes') and meta['raid_minutes'] != loc['escapeTimeLimit']:
+            meta['raid_minutes_dev'] = meta['raid_minutes']
+            notes.append(f"raid {meta['raid_minutes']}->{loc['escapeTimeLimit']}min")
+        meta['raid_minutes'] = loc['escapeTimeLimit']
+        meta['raid_src'] = 'game files'
+    for src, dst in (('minPlayers', 'min_players'), ('maxPlayers', 'max_players')):
+        if loc.get(src) is not None:
+            meta[dst] = loc[src]
+
+    # 2. PER-MAP LOOT RATE — first-party and previously modelled NOWHERE. Lighthouse ships 0.17
+    #    against woods' 0.9, so an unscaled `ev` overstates a lighthouse run by ~5x relative to
+    #    woods. Scale the expected value; leave `spawn` alone (that is per-container, and the game's
+    #    own per-area odds already ride on gamedata's grp_p).
+    lm = loc.get('globalLootChanceModifier')
+    cm = loc.get('globalContainerChanceModifier')
+    if lm:
+        for c in containers:
+            c['ev'] = int(round(c['ev'] * lm))
+        meta['loot_modifier'] = lm
+        notes.append(f'ev x{lm}')
+    if cm and cm != 1:
+        meta['container_modifier'] = cm
+
+    # 3. BOSS BASE RATE + ZONES, first-party — attached to, never replacing, tarkov.dev's chance.
+    #    The client's BossChance is the BASE rate and is event-blind: all six location variants per
+    #    map ship an identical boss-chance set, no exit is flagged EventAvailable, and the only
+    #    Triggers present are quest-gated. Event state is server-driven, so during a "all bosses
+    #    100%" event upstream reads 100% while the client still reads 30% — both correct, about
+    #    different things. The client also gives the zone NAMES but no world position; the position
+    #    is what puts a marker on the map, so the nodes stay. Joined on display name through the mobs
+    #    catalog (bossKojaniy is "Shturman", bossBoar is "Kaban" — a prefix-strip cannot do this).
+    #    BossChance is a percentage in the client payload; boss_nodes.chance is a 0..1 fraction.
+    if loc.get('bosses'):
+        game_bosses = []
+        for b in loc['bosses']:
+            disp = MOB_NAMES.get(b['name'])
+            game_bosses.append({'role': b['name'], 'name': disp or b['name'],
+                                'chance': round(float(b.get('chance') or 0) / 100.0, 3),
+                                'zones': b.get('zones') or [],
+                                'escort': MOB_NAMES.get(b.get('escort')) or b.get('escort'),
+                                'escort_amount': b.get('escortAmount'),
+                                'difficulty': b.get('difficulty')})
+        rec['bosses_game'] = game_bosses
+        # Attach to the positioned nodes. Several client entries can share a boss (lighthouse ships
+        # ten Rogue rows at different chances/zones); take the HIGHEST, which is the chance that it
+        # appears at all somewhere on the map.
+        best = {}
+        for g in game_bosses:
+            k = (g['name'] or '').strip().lower()
+            if k and g['chance'] > best.get(k, {'chance': -1})['chance']:
+                best[k] = g
+        n_join = 0
+        for nd in rec['boss_nodes']:
+            g = best.get((nd.get('name') or '').strip().lower())
+            if not g:
+                continue
+            n_join += 1
+            nd['chance_game'] = g['chance']
+            if g['zones']:
+                nd['zones_game'] = g['zones']
+        notes.append(f"{len(game_bosses)} boss entr(ies), {n_join}/{len(rec['boss_nodes'])} joined")
+
+    # 4. EXFIL TIMINGS + GATING. Upstream gives us extract positions and factions; the client gives
+    #    how long standing in one takes, its spawn chance, and what it demands of you.
+    if loc.get('exits'):
+        rec['exits_game'] = loc['exits']
+        notes.append(f"{len(loc['exits'])} exit config(s)")
+
+    rec['meta']['intel_src'] = loc.get('src') or 'game files'
+    return '; '.join(notes)
+
+
+def container_capacity_by_type(intel):
+    """{container type name: grid cells} from the game's item templates.
+
+    The loot.json container `type` is tarkov.dev's display name for the container ("Jacket",
+    "Weapon box (5x5)"). The game's own template for that container carries `Grids`, and the item
+    record we extracted keeps its `_name` plus the cell count — so match on the TEMPLATE NAME the
+    packs already record against each placed container (`tpl_name`), which is the same display
+    string. Names that do not resolve simply keep the hand-tuned time.
+    """
+    if not intel:
+        return {}
+    import glob
+    # tpl_name -> template id, learned from any pack's gamedata (the packs already did this join).
+    tpl_of = {}
+    for gp in glob.glob(os.path.join(REPO, 'packs', '*.eftpack', 'gamedata.json')):
+        try:
+            gd = json.load(open(gp, encoding='utf-8'))
+        except Exception:
+            continue
+        for c in (gd.get('containers') or []):
+            if c.get('tpl_name') and c.get('template'):
+                tpl_of.setdefault(c['tpl_name'], c['template'])
+    items = intel.get('items') or {}
+    out = {}
+    for nm, tid in tpl_of.items():
+        cells = (items.get(tid) or {}).get('cells')
+        if cells:
+            out[nm] = cells
+    return out
+
+
 def main():
     print("[tarkov.dev/json] building loot + spawns + intel ...")
     # The bundled embeddable Python pins sys.path via python311._pth and does not add this directory.
@@ -126,7 +278,21 @@ def main():
     import tarkov_static
     data = tarkov_static.load_static_maps()
     source = 'tarkov.dev/json'
+    # FIRST-PARTY intel from the client (extract_client_intel.py). Absent -> everything below keeps
+    # today's tarkov.dev-only behaviour, so this is never a hard dependency on a game install.
+    intel = load_client_intel()
+    global MOB_NAMES
+    try:
+        MOB_NAMES = tarkov_static.load_static_mob_names()
+    except Exception as e:
+        print(f'[loot] mob-name table unavailable ({e}) - boss odds will not be joined')
+        MOB_NAMES = {}
+    cap_by_type = container_capacity_by_type(intel)
+    if cap_by_type:
+        print(f'[loot] container capacity known for {len(cap_by_type)} type(s) from game templates '
+              f'- search time derived from real grid cells')
     out = {}
+    intel_used = 0
     for m in data['maps']:
         mid = DEV_TO_ID.get(m['normalizedName'])
         if not mid:
@@ -134,6 +300,7 @@ def main():
         # ---- static loot containers ----
         containers = []
         unknown = {}
+        n_cap_t = 0
         for lc in (m['lootContainers'] or []):
             p = bridge(lc.get('position'))
             if not p:
@@ -143,7 +310,16 @@ def main():
             if cv is None:
                 unknown[name] = unknown.get(name, 0) + 1
                 cv = DEFAULT_C
-            containers.append({'pos': p, 'type': name, 'cls': cv['cls'], 'ev': cv['ev'], 'spawn': cv['spawn'], 't': cv['t']})
+            # `t` (search time) prefers the container's REAL capacity from its own game template
+            # over the hand-picked constant; falls back to the table when the name has no cells.
+            cells = cap_by_type.get(name)
+            t = search_time_from_cells(cells) if cells else cv['t']
+            rec_c = {'pos': p, 'type': name, 'cls': cv['cls'], 'ev': cv['ev'],
+                     'spawn': cv['spawn'], 't': t}
+            if cells:
+                rec_c['cells'] = cells
+                n_cap_t += 1
+            containers.append(rec_c)
         # ---- normalize each spawn's category/side sets (lowercase) for DEFENSIBLE filtering ----
         # (Codex review: `sides:all` is NOT player-PMC, and `categories:bot` alone sweeps in raiders/
         #  rogues/cultists/boss-guards. Split them explicitly.)
@@ -318,6 +494,10 @@ def main():
                              'max_level': m.get('maxPlayerLevel')},
                     'access_keys': [{'n': k.get('name'), 's': k.get('shortName'), 'pr': k.get('avg24hPrice')}
                                     for k in (m.get('accessKeys') or [])]}
+        note = apply_client_intel(mid, out[mid], intel, containers)
+        if note:
+            intel_used += 1
+            print(f'[loot]   {mid}: first-party {note}')
         eff = sum(c['ev'] * c['spawn'] for c in containers)
         from collections import Counter as _C
         by_cls = _C(c['cls'] for c in containers)
