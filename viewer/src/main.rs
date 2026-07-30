@@ -1403,57 +1403,15 @@ pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
 /// pack-less install renders exactly as before — the fallback is legacy, and is never claimed
 /// derived.
 fn build_sky_cubemap(images: &mut Assets<Image>, sun: Vec3) -> Handle<Image> {
-    if let Some(img) = load_extracted_sky() {
-        info!("sky: EXTRACTED game cubemap (rain_1k_sharp, packs/shared/sky)");
-        return images.add(img);
-    }
-    info!("sky: no extracted cubemap - procedural overcast gradient (legacy fallback)");
+    // Procedural overcast dome, and ONLY that. The Phase-4 attempt to use the game's extracted
+    // cubemaps as the visible sky is REMOVED (not an option): those assets are environment
+    // CAPTURES — photo-spheres with treelines baked into the horizon — and as a sky dome they put
+    // photographic trees behind the map's real geometry. The extraction survives as
+    // packs/shared/sky's DERIVED zenith/horizon colors, which are the right feed for reflections
+    // and fog (colors, not photographs); the dome itself stays synthesized.
     build_procedural_sky(sun)
         .map(|img| images.add(img))
         .expect("procedural sky is infallible")
-}
-
-fn load_extracted_sky() -> Option<Image> {
-    let dir = crate::paths::shared_dir().join("sky");
-    let mut data: Vec<u8> = Vec::new();
-    let mut size = 0u32;
-    for i in 0..6 {
-        let p = dir.join(format!("rain_1k_sharp_DXT1_face{i}.png"));
-        let img = image::open(&p).ok()?.to_rgb8();
-        if i == 0 {
-            size = img.width();
-            data.reserve(size as usize * size as usize * 6 * 8);
-        }
-        if img.width() != size || img.height() != size {
-            return None;
-        }
-        for px in img.pixels() {
-            for c in 0..3 {
-                let lin = (px.0[c] as f32 / 255.0).powf(2.2);
-                data.extend_from_slice(&f32_to_f16_bits(lin).to_le_bytes());
-            }
-            data.extend_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
-        }
-    }
-    let mut image = Image::new(
-        Extent3d {
-            width: size,
-            height: size,
-            depth_or_array_layers: 6,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba16Float,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
-    // NO reinterpret_stacked_2d_as_array here: the Extent3d above already declares 6 layers and
-    // the face-major data IS the layer layout — reinterpreting a 6-layer image asserts (6 != 1).
-    image.texture_view_descriptor = Some(bevy::render::render_resource::TextureViewDescriptor {
-        dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
-        ..default()
-    });
-    Some(image)
 }
 
 fn build_procedural_sky(sun: Vec3) -> Option<Image> {
