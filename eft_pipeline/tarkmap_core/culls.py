@@ -193,6 +193,34 @@ class Culls:
                 if self.drop_hidden and it.get("drop"): hidden += 1
                 r = it.get("root") or "?"
                 dropped_roots[r] = dropped_roots.get(r, 0) + 1
+        # ALTERNATE-STATE cull (user-reported: broken windows rendered as SOLID). EFT prefabs ship
+        # destructible objects as coincident state PAIRS -- e.g. Window_..._glass (intact) and
+        # Window_..._glass_broken at the SAME transform -- with Unity's m_IsActive selecting the
+        # raid-start state (ground_zero: 184 intact panes INACTIVE over 7 active broken ones). The
+        # aih=False keep-exemption exists for raid-activated LOOT, which has no active twin; a kept
+        # INACTIVE instance whose position coincides with any ACTIVE one is therefore an unselected
+        # alternate state, and drawing it paints the wrong state over the right one. Structural,
+        # position-based, no name rules: loot crates sit alone, states sit stacked.
+        active_pos = set()
+        for it in kept:
+            if it.get("aih") is not False and it.get("kind") == "mesh" and it.get("m"):
+                m = it["m"]
+                active_pos.add((round(m[3], 1), round(m[7], 1), round(m[11], 1)))
+        n_state = 0
+        kept2 = []
+        for it in kept:
+            if it.get("aih") is False and it.get("kind") == "mesh" and it.get("m"):
+                m = it["m"]
+                if (round(m[3], 1), round(m[7], 1), round(m[11], 1)) in active_pos:
+                    n_state += 1
+                    r = it.get("root") or "?"
+                    dropped_roots[r] = dropped_roots.get(r, 0) + 1
+                    continue
+            kept2.append(it)
+        kept = kept2
+        if n_state:
+            print(f"[cull] alternate-state: dropped {n_state} INACTIVE instance(s) coincident with "
+                  f"an active twin (unselected destructible states, e.g. intact glass over broken)")
         kept, offmap, offmap_examples = self._offmap_backdrop_filter(kept, dropped_roots)
         top = sorted(dropped_roots.items(), key=lambda kv: -kv[1])[:12]
         return kept, {"raw": len(instances), "kept": len(kept), "hidden_unity": hidden,
