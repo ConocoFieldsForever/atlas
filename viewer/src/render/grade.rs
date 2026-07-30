@@ -133,7 +133,14 @@ struct GradeParamsGpu {
     exposure: f32,
     /// EFT-style unsharp-mask strength (rides the old pad lane; 0 = off).
     sharpen: f32,
-    _pad: [f32; 2],
+    /// FXAA blend strength (0 = off). Rides a pad lane so the uniform size is unchanged.
+    ///
+    /// Every render pipeline in this renderer is `sample_count: 1` with alpha-to-coverage off, so
+    /// there was NO anti-aliasing at all. On a forest map that is the most visible artifact in
+    /// motion: alpha-cutout foliage against bright sky has a hard 1-pixel edge that crawls as the
+    /// camera moves. It also makes distance-LOD shell swaps pop harder than they need to.
+    aa: f32,
+    _pad: f32,
     vig: [f32; 4],          // xy = aspect divisors, zw = smoothstep edges
     vig_strength: [f32; 4], // x = strength
 }
@@ -209,7 +216,8 @@ fn init_grade_pipeline(
         contents: bytemuck::bytes_of(&GradeParamsGpu {
             exposure: lut.exposure,
             sharpen: 0.0, // live value comes from update_grade_params each frame
-            _pad: [0.0; 2],
+            aa: 0.0,      // ditto
+            _pad: 0.0,
             vig: [1.15, 0.95, 0.55, 1.25], // PRISM defaults (see grade.wgsl header)
             vig_strength: [lut.vignette, 0.0, 0.0, 0.0],
         }),
@@ -375,7 +383,8 @@ fn update_grade_params(
         bytemuck::bytes_of(&GradeParamsGpu {
             exposure: s.grade_exposure,
             sharpen: s.sharpen,
-            _pad: [0.0; 2],
+            aa: if s.aa { s.aa_strength } else { 0.0 },
+            _pad: 0.0,
             vig: [1.15, 0.95, 0.55, 1.25],
             vig_strength: [if s.vignette { 0.488 } else { 0.0 }, 0.0, 0.0, 0.0],
         }),

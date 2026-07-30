@@ -157,10 +157,22 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>,
     // Screen-size cull: drop instances whose bounding sphere subtends fewer than min_px pixels
     // (grass uses a larger threshold — 100k+ ~1.3 m clumps are invisible way before the far
     // plane and dominated the draw cost). k==0 (frame-0 seed / EFT_CULL_PX=0) disables.
-    let k = select(G.cam_k.w, bitcast<f32>(G.counts.z), inst.ids.z == 1u);
+    let is_grass = inst.ids.z == 1u;
+    let k = select(G.cam_k.w, bitcast<f32>(G.counts.z), is_grass);
     if (k > 0.0) {
         let d = max(distance(G.cam_k.xyz, sphere.xyz), 1e-3);
         if (sphere.w < k * d) { return; }
+        // GRASS DISTANCE CLAMP (counts.w, 0 = off). The screen-size test above is already a distance
+        // test — it rejects past `sphere.w / k` — but `k` is derived as px/(0.5·viewport_h·proj11),
+        // so the grass horizon SCALES WITH RESOLUTION AND FOV: 1080p -> 1440p is 1.33x viewport
+        // height, which pushes grass 33% further out for the same setting and costs proportionally
+        // more. It also varies per grass KIND, because the cull distance depends on each clump's
+        // bounding radius and woods ships 15 kinds. A metre limit is resolution-independent,
+        // FOV-independent, uniform across kinds, and is a number a user can reason about.
+        if (is_grass) {
+            let lim = bitcast<f32>(G.counts.w);
+            if (lim > 0.0 && d > lim) { return; }
+        }
     }
 
     // Distance-LOD shell selection. ids.w == 0 is the sentinel (always draw): lean packs, ungrouped
@@ -179,7 +191,31 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>,
             let gid = min(inst.ids.z >> 13u, arrayLength(&lod_centers) - 1u);
             let d = max(distance(G.cam_k.xyz, lod_centers[gid].xyz), 1e-3);
             let m = G.lod_params.x * G.lod_params.y;
-            if (!(d > ab.x * m && d <= ab.y * m)) { return; }
+            var lo = ab.x * m;
+            var hi = ab.y * m;
+            // STAGGERED transition, using the game's own fade width (lod_centers[gid].w, derived from
+            // Unity's ftw/srh — see the CPU side). Without this, every instance in a group swaps shell
+            // at the SAME distance, so a stand of trees pops in unison and reads as a glitch.
+            //
+            // Each instance jitters its own boundaries by up to +-half the band, hashed from its index
+            // so the offset is FIXED for that instance: it must not change frame to frame, or the
+            // instance would flicker between shells while the camera holds still. The boundaries of
+            // adjacent shells move together (both derive from the same hash and band), so the windows
+            // still tile and no distance is left undrawn or double-drawn.
+            //
+            // This is a stagger, NOT Unity's alpha cross-fade: a true dithered fade needs a per-visible
+            // -instance fade weight passed from this shader to the fragment stage, which means a new
+            // storage buffer in the draw's bind group. Deliberately not done here.
+            let band = lod_centers[gid].w;
+            if (band > 0.0) {
+                // Hash the instance index to a stable [-0.5, 0.5).
+                var h = i * 747796405u + 2891336453u;
+                h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+                let j = f32((h >> 22u) ^ h) * (1.0 / 4294967296.0) - 0.5;
+                lo = lo * (1.0 + band * j);
+                hi = hi * (1.0 + band * j);
+            }
+            if (!(d > lo && d <= hi)) { return; }
         } else {
             // Force a single shell index (debug).
             if (((inst.ids.z >> 9u) & 15u) != u32(G.lod_params.w)) { return; }

@@ -68,6 +68,12 @@ pub struct GfxSettings {
     /// Screen-size cull thresholds in pixels (general, grass). 0 disables that cull.
     pub cull_px: f32,
     pub cull_px_grass: f32,
+    /// Hard grass draw distance in METRES (0 = no clamp; `cull_px_grass` alone decides).
+    /// A screen-size threshold's world horizon scales with viewport height and 1/tan(fov/2), so the
+    /// same `cull_px_grass` draws grass 33% further at 1440p than at 1080p and further again when
+    /// zoomed — and it lands at a different distance for each of woods' 15 grass kinds, because the
+    /// distance is radius/k. This is the resolution- and kind-independent control. EFT_GRASS_DIST.
+    pub grass_dist_m: f32,
     /// Depth-only SSAO post pass (experimental; off = shipped look).
     pub ssao: bool,
     pub ssao_intensity: f32,
@@ -75,6 +81,13 @@ pub struct GfxSettings {
     pub ssao_radius: f32,
     /// EFT-style unsharp-mask strength in the grade pass (0 = off; the game ships ~0.5).
     pub sharpen: f32,
+    /// FXAA in the grade pass. Default ON: every pipeline is single-sampled with alpha-to-coverage
+    /// off, so without this there is no anti-aliasing anywhere, and alpha-cutout foliage against sky
+    /// crawls badly in motion. EFT_AA=0 opts out (A/B against the game's own edges).
+    pub aa: bool,
+    /// FXAA blend strength, 0..1. 0.75 keeps foliage edges soft without smearing the grade's
+    /// unsharp pass, which runs on the same tap set.
+    pub aa_strength: f32,
     /// Realtime practical lights (lamps/spots from the light grid) master toggle. Only affects maps
     /// whose grid is populated (indirect-only bakes / EFT_LIGHTS-forced); a no-op on full bakes.
     pub lights: bool,
@@ -86,6 +99,14 @@ pub struct GfxSettings {
     /// Baked-GI (SH ambient) intensity MULTIPLIER (render-audit "gi_intensity": lifts/dims the
     /// whole indirect term without touching practicals or the sun).
     pub gi_intensity: f32,
+    /// Volumetric sun shafts (god rays) — marches the shadow cascades through the fog medium.
+    /// Default OFF: it is the most expensive photoreal extra here (a per-fragment march in a forward
+    /// pass with no depth prepass, so overdraw multiplies it) and it changes the look, so it is opt-in
+    /// rather than a silent change to every map. Requires shadows; forced off without them.
+    pub volumetric: bool,
+    /// Shaft brightness. 1.0 is a visible-but-plausible overcast shaft; the phase function already
+    /// concentrates it toward the sun, so this does not need to be large.
+    pub volumetric_strength: f32,
     /// Depth of field (bokeh) — photoreal extra, default off.
     pub dof: bool,
     pub dof_focal_m: f32,
@@ -96,9 +117,12 @@ pub struct GfxSettings {
     /// every group off (mall dark at raid spawn). Flipped by the Level-controls UI + clicking a
     /// switch mesh; `update_light_power` re-uploads the light buffer when it changes.
     pub light_groups: u32,
-    /// Distance-based LOD on/off (default off = max detail = shipped look). Only meaningful on an
-    /// all-LOD pack; a lean pack has one shell per group so it's a no-op. A live cull-uniform
-    /// switch — no rebuild. See LOD_DISTANCE_PLAN.md.
+    /// Distance-based LOD on/off. Default ON (`EFT_LOD=0` opts out) — this comment used to claim
+    /// "default off = shipped look", which was wrong and actively misleading once packs started
+    /// shipping multiple shells: on an --alllod pack it is worth 3.83 ms of a 15.68 ms frame on
+    /// woods (measured, 2560x1440), so a reader who believed it was off would mis-attribute that.
+    /// Only meaningful on an all-LOD pack; a lean pack has one shell per group so it's a no-op.
+    /// A live cull-uniform switch — no rebuild.
     pub lod_distance: bool,
     /// LOD bias (>1 holds finer shells to a greater distance; <1 switches to coarse sooner).
     pub lod_bias: f32,
@@ -147,6 +171,12 @@ impl Default for GfxSettings {
             grass: true,
             cull_px,
             cull_px_grass,
+            // Default 0 = OFF, so the shipped look is unchanged and this is purely opt-in. A default
+            // horizon here would silently shorten grass on every existing map.
+            grass_dist_m: std::env::var("EFT_GRASS_DIST")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0.0),
             ssao: std::env::var("EFT_SSAO").map(|v| v.trim() == "1").unwrap_or(false),
             ssao_intensity: 1.0,
             ssao_radius: 0.7,
@@ -154,10 +184,22 @@ impl Default for GfxSettings {
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(0.0),
+            aa: !std::env::var("EFT_AA").map(|v| v.trim() == "0").unwrap_or(false),
+            aa_strength: std::env::var("EFT_AA_STRENGTH")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0.75),
             lights: true,
             light_intensity: 1.0,
             sun_diffuse: 1.0,
             gi_intensity: 1.0,
+            volumetric: std::env::var("EFT_VOLUMETRIC")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false),
+            volumetric_strength: std::env::var("EFT_VOLUMETRIC_STRENGTH")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(1.0),
             dof: false,
             dof_focal_m: 15.0,
             dof_fstop: 2.8,
@@ -260,10 +302,18 @@ impl QualityPreset {
     /// Headline the user can act on: measured speed vs High, and measured VRAM.
     pub fn summary(self) -> &'static str {
         match self {
-            QualityPreset::Low => "~30% faster \u{2022} ~1.6 GB VRAM \u{2014} no foliage, shadows or bloom",
-            QualityPreset::Medium => "~20% faster \u{2022} ~2.2 GB VRAM \u{2014} thinned foliage, no shadows",
-            QualityPreset::High => "baseline \u{2022} ~2.2 GB VRAM \u{2014} the shipped look",
-            QualityPreset::Ultra => "~2% slower \u{2022} ~4.4 GB VRAM \u{2014} full-res textures + SSAO",
+            QualityPreset::Low => {
+                "~30% faster \u{2022} ~1.6 GB VRAM \u{2014} no foliage, shadows or bloom"
+            }
+            QualityPreset::Medium => {
+                "~25% faster \u{2022} ~2.2 GB VRAM \u{2014} thinned foliage to 150 m, no shadows"
+            }
+            QualityPreset::High => "baseline \u{2022} ~2.3 GB VRAM \u{2014} the shipped look",
+            // Ultra used to read "~2% slower". Volumetric shafts cost a measured +5.4 ms of a ~12 ms
+            // frame, so that number would now be a lie by a factor of ~15.
+            QualityPreset::Ultra => {
+                "~30% slower \u{2022} ~4.5 GB VRAM \u{2014} full-res textures, SSAO + volumetric sun shafts"
+            }
             QualityPreset::Custom => "your own mix \u{2014} see the per-option costs below",
         }
     }
@@ -282,6 +332,20 @@ impl QualityPreset {
     /// Apply the preset's render-side choices in place. Texture quality is handled separately by
     /// the caller because it is a persisted config value that only takes effect on the next map
     /// load (mip levels are dropped at upload time).
+    /// Every named preset must set EVERY field it means to control. `detect` applies a preset to a
+    /// probe and compares, so a field left unset silently inherits the user's value and the preset
+    /// stops being a description of what is running.
+    ///
+    /// Placement of the three newest options, from measurements on the woods flythrough at
+    /// 2560x1440 (docs/GFX_BENCH_woods_*.json):
+    ///   * FXAA (`aa`): +0.04 ms — inside the run-to-run noise floor, so it is ON everywhere,
+    ///     including Low. Nothing else in this renderer anti-aliases (every pipeline is
+    ///     sample_count 1), and turning it off buys a weak GPU almost nothing.
+    ///   * Volumetric shafts: +5.40 ms, ~45% of the frame — ULTRA ONLY. It is the most expensive
+    ///     option here by a wide margin, more than the whole distance-LOD win.
+    ///   * Grass distance clamp: -3.24 ms at 150 m, -4.65 ms at 80 m. Left OFF for High/Ultra
+    ///     (those are the "shipped look" presets and a horizon would visibly shorten grass), and
+    ///     used by Medium/Low, which already thin foliage via `cull_px_grass`.
     pub fn apply(self, g: &mut GfxSettings) {
         let d = GfxSettings::default();
         match self {
@@ -294,6 +358,10 @@ impl QualityPreset {
                 g.lights = true;
                 g.cull_px = d.cull_px;
                 g.cull_px_grass = d.cull_px_grass;
+                g.aa = true;
+                g.volumetric = true;
+                g.volumetric_strength = d.volumetric_strength;
+                g.grass_dist_m = 0.0;
             }
             QualityPreset::High => {
                 g.grass = true;
@@ -303,6 +371,10 @@ impl QualityPreset {
                 g.lights = true;
                 g.cull_px = d.cull_px;
                 g.cull_px_grass = d.cull_px_grass;
+                g.aa = true;
+                g.volumetric = false;
+                g.volumetric_strength = d.volumetric_strength;
+                g.grass_dist_m = 0.0;
             }
             QualityPreset::Medium => {
                 // Measured stack: shadows off + thinned foliage = +17% / +22%.
@@ -313,6 +385,12 @@ impl QualityPreset {
                 g.lights = true;
                 g.cull_px = 2.0;
                 g.cull_px_grass = 600.0;
+                g.aa = true;
+                // Shafts need the cascades; shadows are off here, so this would be forced off at the
+                // uniform anyway. Set it explicitly so the preset says what it means.
+                g.volumetric = false;
+                g.volumetric_strength = d.volumetric_strength;
+                g.grass_dist_m = 150.0;
             }
             QualityPreset::Low => {
                 // Measured stack: +29% / +32%, and the texture drop takes VRAM to ~1.6 GB.
@@ -323,6 +401,11 @@ impl QualityPreset {
                 g.lights = false;
                 g.cull_px = 4.0;
                 g.cull_px_grass = 1000.0;
+                g.aa = true;
+                g.volumetric = false;
+                g.volumetric_strength = d.volumetric_strength;
+                // Grass is off entirely here, so this is belt-and-braces rather than a saving.
+                g.grass_dist_m = 80.0;
             }
         }
     }

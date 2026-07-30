@@ -140,7 +140,11 @@ pub struct DrawIndexedIndirectArgs {
 pub struct CullUniform {
     pub frustum: [[f32; 4]; 6],
     /// x = instance_count, y = mesh_count, z = bitcast f32 k_grass (grass screen-size cull
-    /// threshold — larger than the general one so 100k sub-pixel clumps drop early), w = pad.
+    /// threshold — larger than the general one so 100k sub-pixel clumps drop early),
+    /// w = bitcast f32 grass MAX DISTANCE in metres (0 = off). The z threshold is already a distance
+    /// test, but in px/(0.5·viewport_h·proj11) units, so its world horizon moves with resolution and
+    /// FOV and differs per grass kind; w is an absolute clamp that does none of that. Was a pad lane,
+    /// so adding it does not change the struct size.
     pub counts: [u32; 4],
     /// Screen-size cull: xyz = camera world pos, w = k_general where
     /// k = min_px / (0.5 * viewport_h * proj11). An instance is culled when its bounding-sphere
@@ -705,10 +709,20 @@ fn grass_shadows() -> bool {
     *G.get_or_init(|| std::env::var("EFT_GRASS_SHADOWS").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// Cascade count (2 near cascades). The depth array has this many layers.
-const SHADOW_CASCADES: usize = 2;
+/// Cascade count. The depth array has this many layers, and `SunShadowUniform` carries this many
+/// matrices — bumping it changes that struct's size, so the WGSL twin and its assert move too.
+///
+/// Was 2, reaching only 80 m. On a map spanning ~1.2 km that left EVERYTHING past 80 m unshadowed:
+/// no tree shadows on distant terrain, no self-shadowing on a treeline, and a hard fade band at
+/// 65-80 m where the effect simply stopped. Two far cascades extend the reach to 700 m. They are
+/// affordable specifically because the #5b cache now survives camera motion: a far cascade's snap
+/// quantum is metres wide (`SHADOW_SNAP_TEXELS` × its texel), so it re-renders rarely even while
+/// moving, where an unquantised fit would have re-rendered all four every frame.
+const SHADOW_CASCADES: usize = 4;
 /// Practical/log split distances (metres): cascade i covers [SHADOW_SPLITS[i], SHADOW_SPLITS[i+1]].
-const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.5, 15.0, 80.0];
+/// Roughly logarithmic so near-field texel density is preserved: the 0.5-15 m and 15-80 m bands are
+/// unchanged from the 2-cascade fit, so close-up shadow quality is bit-identical to before.
+const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.5, 15.0, 80.0, 250.0, 700.0];
 /// Cascade overlap fraction (reported in the uniform; the shader blends 13.5..15 m).
 const SHADOW_CASCADE_OVERLAP: f32 = 0.10;
 /// How far a caster may sit toward the sun and still project into the slice (light-space Z fit).
@@ -727,8 +741,10 @@ const SHADOW_RECEIVER_MARGIN: f32 = 10.0;
 /// Max fraction of REMOVABLE (above-floor) baked diffuse the contact term may subtract. Hard-capped.
 const SHADOW_DIFFUSE_CAP: f32 = 0.12;
 /// Far contact fade band (metres): the whole shadow effect fades to fully lit across this range.
-const SHADOW_FADE_START: f32 = 65.0;
-const SHADOW_FADE_END: f32 = 80.0;
+/// MUST track the last cascade's far plane — these were 65/80 against the old 80 m reach, and left
+/// unchanged they would have thrown away both new cascades by fading the effect out at 80 m.
+const SHADOW_FADE_START: f32 = SHADOW_SPLITS[SHADOW_CASCADES - 1] + 350.0; // 600
+const SHADOW_FADE_END: f32 = SHADOW_SPLITS[SHADOW_CASCADES]; // 700
 
 /// group(1) per-cascade uniform for the shadow depth pass. Byte-identical to the WGSL
 /// `ShadowCascadeUniform` (80 bytes, 16-aligned).
@@ -751,27 +767,38 @@ struct ShadowCascadeUniform {
 const _: () = assert!(std::mem::size_of::<ShadowCascadeUniform>() == 96);
 
 /// group(3) binding(5) main sun-shadow uniform read by gpu_draw.wgsl. Byte-identical to the WGSL
-/// `SunShadowUniform` (208 bytes: 2×64 + 5×16).
+/// `SunShadowUniform` (352 bytes: 4×64 + 6×16).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 struct SunShadowUniform {
     /// Per-cascade world->light-clip matrices (column-major).
     view_proj: [[[f32; 4]; 4]; SHADOW_CASCADES],
-    /// x = far0 (15), y = far1 (80), z = overlap (0.10), w = enabled (1/0).
-    split_depths: [f32; 4],
+    /// Per-cascade FAR plane in metres: x = far0 (15), y = far1 (80), z = far2 (250), w = far3 (700).
+    /// One lane per cascade, so this is exactly full at SHADOW_CASCADES == 4. Overlap and the enable
+    /// flag moved to `casc_params` when the two far cascades took the z/w lanes.
+    split_far: [f32; 4],
     /// xyz = Lsun (toward the sun), w = 1/shadow_map_size() (PCF texel).
     sun_dir_texel: [f32; 4],
-    /// x = cascade0 world texel, y = cascade1 world texel (world-space bias units), z,w reserved.
+    /// Per-cascade world texel size (world-space bias units), one lane per cascade.
     texel_world: [f32; 4],
-    /// x = diffuse cap (0.12), y = fade start (65), z = fade end (80), w = debug mode (1 = spec-only).
+    /// x = diffuse cap (0.12), y = fade start, z = fade end, w = debug mode (1 = spec-only).
     combine: [f32; 4],
     /// Runtime graphics scales from the UI (GfxSettings): x = fog density scale (0 = off),
-    /// y = sky-reflection gain scale, z = emissive scale, w = reserved. All 1.0 = shipped look.
+    /// y = sky-reflection gain scale, z = emissive scale.
+    /// w = APP TIME for the grass wind phase — NOT a reserved lane. It said "reserved" here for a
+    /// while, which is exactly the sort of wrong comment that gets a live lane overwritten.
     gfx: [f32; 4],
+    /// x = cascade overlap fraction (0.10), y = enabled (1/0), z = cascade count,
+    /// w = volumetric shaft strength (0 = off).
+    /// The shader reads the COUNT rather than hardcoding 4, so a future count change needs no WGSL
+    /// edit beyond the array length and this struct's assert.
+    casc_params: [f32; 4],
 }
-// #6: LOCK the byte layout — matches `SunShadowUniform` in gpu_draw.wgsl (2×mat4 = 128 + 5×vec4 = 80
-// => 208). SHADOW_CASCADES is fixed at 2; bumping it changes this size (update the WGSL twin too).
-const _: () = assert!(std::mem::size_of::<SunShadowUniform>() == 208);
+// #6: LOCK the byte layout — matches `SunShadowUniform` in gpu_draw.wgsl (4×mat4 = 256 + 6×vec4 = 96
+// => 352). Changing SHADOW_CASCADES changes this size: update the WGSL twin's array length AND its
+// own size assert in the same commit. A silent mismatch here is how the RX6800 device loss happened.
+const _: () = assert!(std::mem::size_of::<SunShadowUniform>() == 352);
+const _: () = assert!(SHADOW_CASCADES <= 4, "split_far/texel_world carry one lane per cascade");
 
 /// Runtime shadow feature switch + the pack's sun direction (already X-flipped into pack space).
 /// Default ON; `enabled=false` (missing sun_dir, EFT_SHADOWS=0, or the UI toggle off) makes the
@@ -1926,7 +1953,16 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         // _Cutoff (1.3) because their albedo alpha is SMOOTHNESS, not hole-coverage; left set, the
         // cutout discard (alpha < 0.5*1.3) would nuke every fragment. Clear it for any non-decal
         // vp material (genuine SoftCutout decals kept their softcutout path above).
-        if (flags & MAT_FLAG_VP) != 0 && mat.role != "decal" {
+        // Gate on the vp BLOCK, not on MAT_FLAG_VP. That flag is only set when all of the splat
+        // layers' albedos resolved; a vp material with one null layer falls back to single-layer
+        // tiling and never gets the flag, so this guard silently skipped the exact materials it
+        // exists to protect. "tex.a is smoothness, not coverage" is a property of the MATERIAL,
+        // not of whether we managed to build its layer table. woods material 725 (concrete
+        // platform, 3 layers with the third missing) was the one material in all five packs that
+        // fell through: alpha mean 0.043 against cutoff 0.5 discarded 98.3% of its fragments, so
+        // it rendered as nothing while still being pickable. The other 270 cutout+vp materials
+        // already cleared the flag and are unaffected.
+        if mat.vp.is_some() && mat.role != "decal" {
             flags &= !MAT_FLAG_CUTOUT;
         }
         if mat.role == "water" {
@@ -3106,7 +3142,31 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             pack.manifest
                 .lod_groups
                 .iter()
-                .map(|g| [g.center[0], g.center[1], g.center[2], 0.0])
+                .map(|g| {
+                    // `w` was a spare lane; it now carries the group's LOD-TRANSITION BAND as a
+                    // FRACTION of each shell's far distance, derived from Unity's own authoring.
+                    //
+                    // The game ships `ftw` (fadeTransitionWidth) and `srh` (screenRelativeHeight)
+                    // per level, and until now the viewer parsed BOTH and used NEITHER — every shell
+                    // swap was a hard pop at one exact distance, which is the visible cost of the
+                    // distance-LOD we just enabled. woods ships fadeMode=1 (cross-fade) on 35,252 of
+                    // 42,928 groups and a non-zero width on 7,318, so this is the game telling us how
+                    // wide each transition should be.
+                    //
+                    // ftw is in screen-relative-height units and far = size/(2*srh), so d(far)/far =
+                    // -d(srh)/srh: a width of `ftw` in srh is a band of `ftw/srh` in DISTANCE. Taken
+                    // as the max over the group's levels (one band per group is all `w` can hold) and
+                    // clamped to 40%: an unclamped ratio on a tiny srh would swallow the whole shell.
+                    let band = g
+                        .srh
+                        .iter()
+                        .zip(g.ftw.iter())
+                        .filter(|(s, _)| **s > 1.0e-6)
+                        .map(|(s, w)| (w / s).abs())
+                        .fold(0.0f32, f32::max)
+                        .clamp(0.0, 0.40);
+                    [g.center[0], g.center[1], g.center[2], band]
+                })
                 .collect()
         },
     })
@@ -4512,12 +4572,14 @@ fn prepare_gpu_buffers(
     };
     info!(
         "gpu-driven #5 shadows: enabled={shadows_enabled} debug={shadow_debug} Lsun={lsun:?} \
-         (2 cascades, {sz}²×{n} Depth32Float; default ON, EFT_SHADOWS=0 to disable, diag EFT_SHADOW_DEBUG=1)",
+         ({n} cascades to {reach:.0} m, {sz}²×{n} Depth32Float; default ON, EFT_SHADOWS=0 to disable, \
+          diag EFT_SHADOW_DEBUG=1)",
         sz = shadow_map_size(),
         n = SHADOW_CASCADES,
+        reach = SHADOW_SPLITS[SHADOW_CASCADES],
     );
 
-    // The 2-layer depth atlas. RENDER_ATTACHMENT (the shadow pass writes it) | TEXTURE_BINDING (the
+    // The depth atlas, one layer per cascade. RENDER_ATTACHMENT (the shadow pass writes it) | TEXTURE_BINDING (the
     // main pass samples it). One D2Array sampling view + one D2 render view per layer.
     let shadow_depth = render_device.create_texture(&TextureDescriptor {
         label: Some("eft_shadow_depth"),
@@ -4548,7 +4610,7 @@ fn prepare_gpu_buffers(
         })
     };
     let shadow_layer_views: [TextureView; SHADOW_CASCADES] =
-        [shadow_layer_view(0), shadow_layer_view(1)];
+        std::array::from_fn(|c| shadow_layer_view(c as u32));
 
     // Comparison sampler: LessEqual (fragment lit when its light-space depth <= stored occluder).
     let shadow_cmp_sampler = render_device.create_sampler(&SamplerDescriptor {
@@ -4586,20 +4648,23 @@ fn prepare_gpu_buffers(
             mapped_at_creation: false,
         })
     };
+    // Built with from_fn rather than a hand-written array literal: the literal had to grow by hand
+    // for every cascade added, and a count/literal mismatch is a compile error at best and a
+    // silently unbound cascade at worst. Labels stay per-index for capture tooling.
     let cascade_uniforms: [Buffer; SHADOW_CASCADES] =
-        [make_cascade_uniform(), make_cascade_uniform()];
-    let cascade_bind_groups: [BindGroup; SHADOW_CASCADES] = [
+        std::array::from_fn(|_| make_cascade_uniform());
+    let cascade_bind_groups: [BindGroup; SHADOW_CASCADES] = std::array::from_fn(|c| {
         render_device.create_bind_group(
-            "eft_shadow_cascade_bg0",
+            match c {
+                0 => "eft_shadow_cascade_bg0",
+                1 => "eft_shadow_cascade_bg1",
+                2 => "eft_shadow_cascade_bg2",
+                _ => "eft_shadow_cascade_bg3",
+            },
             &cascade_layout,
-            &BindGroupEntries::single(cascade_uniforms[0].as_entire_binding()),
-        ),
-        render_device.create_bind_group(
-            "eft_shadow_cascade_bg1",
-            &cascade_layout,
-            &BindGroupEntries::single(cascade_uniforms[1].as_entire_binding()),
-        ),
-    ];
+            &BindGroupEntries::single(cascade_uniforms[c].as_entire_binding()),
+        )
+    });
 
     // The main SunShadowUniform (group(3) binding(5)). Initialize enabled=0 so the very first frame
     // — before prepare_shadow_uniforms runs — is a strict no-op; per-frame fill flips it on.
@@ -5698,7 +5763,15 @@ fn upload_frustum(
             buffers.instance_total,
             buffers.mesh_count,
             (px_grass / denom).to_bits(),
-            0,
+            // Grass distance clamp in metres. Gated on `grass` so the master toggle still wins:
+            // grass OFF already sets an enormous k above, and a finite limit here must not read as
+            // "grass is on out to N metres".
+            settings
+                .as_ref()
+                .filter(|s| s.grass)
+                .map(|s| s.grass_dist_m.max(0.0))
+                .unwrap_or(0.0)
+                .to_bits(),
         ],
         cam_k: [cam_pos.x, cam_pos.y, cam_pos.z, px_gen / denom],
         // distance-LOD: proj11 for the screen-height metric; mode/bias from the graphics panel
@@ -5989,11 +6062,23 @@ fn prepare_shadow_uniforms(
     let grass_casters = grass_shadows();
 
     let mut main = SunShadowUniform {
-        split_depths: [
-            SHADOW_SPLITS[1],
-            SHADOW_SPLITS[2],
+        // One far plane per cascade (SHADOW_SPLITS[1..=N]); overlap/enabled live in casc_params now.
+        split_far: std::array::from_fn(|c| {
+            SHADOW_SPLITS
+                .get(c + 1)
+                .copied()
+                .unwrap_or(SHADOW_SPLITS[SHADOW_CASCADES])
+        }),
+        casc_params: [
             SHADOW_CASCADE_OVERLAP,
             if shadows_on { 1.0 } else { 0.0 },
+            SHADOW_CASCADES as f32,
+            // Volumetric shafts need the cascades to march, so they are forced off whenever shadows
+            // are off — otherwise the march finds "lit" everywhere and paints a flat glow.
+            match settings.as_ref() {
+                Some(s) if shadows_on && s.volumetric => s.volumetric_strength.max(0.0),
+                _ => 0.0,
+            },
         ],
         sun_dir_texel: [lsun.x, lsun.y, lsun.z, 1.0 / shadow_map_size() as f32],
         combine: [
@@ -6127,14 +6212,17 @@ fn prepare_shadow_uniforms(
             // shadow texels", and inferring one from the other is how a bad conclusion gets shipped.
             if shadow_debug() {
                 use std::sync::atomic::{AtomicU64, Ordering};
+                // `[const { .. }; N]` rather than a literal per cascade: AtomicU64 is not Copy, so a
+                // static array cannot use the `[expr; N]` repeat form, and the hand-written literal
+                // had to be edited for every cascade added.
                 static FRAMES: [AtomicU64; SHADOW_CASCADES] =
-                    [AtomicU64::new(0), AtomicU64::new(0)];
+                    [const { AtomicU64::new(0) }; SHADOW_CASCADES];
                 static RENDERS: [AtomicU64; SHADOW_CASCADES] =
-                    [AtomicU64::new(0), AtomicU64::new(0)];
+                    [const { AtomicU64::new(0) }; SHADOW_CASCADES];
                 static FORCED: [AtomicU64; SHADOW_CASCADES] =
-                    [AtomicU64::new(0), AtomicU64::new(0)];
+                    [const { AtomicU64::new(0) }; SHADOW_CASCADES];
                 static VPDIFF: [AtomicU64; SHADOW_CASCADES] =
-                    [AtomicU64::new(0), AtomicU64::new(0)];
+                    [const { AtomicU64::new(0) }; SHADOW_CASCADES];
                 let f = FRAMES[c].fetch_add(1, Ordering::Relaxed) + 1;
                 if dirty {
                     RENDERS[c].fetch_add(1, Ordering::Relaxed);

@@ -1131,6 +1131,7 @@ def main():
         # it writes lod.json (same as instance placement). No hardcoded thresholds; keyed on path_ids present in every scene.
         lod0_rids = set(); all_lod_rids = set(); billboard_only_rids = set()
         rid2lod = {}                                              # renderer path_id -> (GLOBAL groupIdx, lodIndex)  [min index if shared]
+        rid2levels = {}                                           # renderer path_id -> {(groupIdx, lodIndex)}: the FULL span (AUDIT #3)
         group_min_lod = {}                                        # gidx -> FINEST non-billboard lodIndex that actually has renderers
         for o in env.objects:
             if o.type.name != "LODGroup": continue
@@ -1176,14 +1177,14 @@ def main():
                             billboard_only_rids.discard(rid)
                             if rid not in rid2lod or li < rid2lod[rid][1]:   # shared renderer -> highest-detail (min) lodIndex
                                 rid2lod[rid] = (gidx, li)
-                            # AUDIT #3 (deferred, --alllod only): a renderer LISTED in several LOD
-                            # levels is collapsed to its MIN level here, so on an alllod pack it is
-                            # emitted once (at that finest level) and DISAPPEARS in the coarser bands
-                            # where Unity keeps it visible. Harmless when the shared span starts at the
-                            # group's finest present index (near'=0 -> always drawn). Fix when alllod is
-                            # exercised: record the full level SPAN per renderer and emit one shell per
-                            # level so their per-level windows tile with no gap. Standard EFT authoring
-                            # uses distinct renderers per level, so this may be rare-to-absent.
+                            # AUDIT #3 (FIXED — was deferred until --alllod was exercised): a renderer
+                            # LISTED in several LOD levels used to be collapsed to its MIN level, so an
+                            # alllod pack emitted it ONCE at the finest level and it DISAPPEARED in the
+                            # coarser bands where Unity keeps it visible. Record the full level SPAN so
+                            # the emitter can write one shell per level and their per-level distance
+                            # windows tile with no gap. `rid2lod` keeps the min-level behaviour that the
+                            # default (LOD0-resolved) path relies on — this only ADDS information.
+                            rid2levels.setdefault(rid, set()).add((gidx, li))
                             # FINEST real (non-billboard) LOD present in THIS group. Usually 0, but some
                             # LODGroups ship an EMPTY LOD0 slot (the object's only geometry lives at LOD1+
                             # -- e.g. certain vehicles). Recording the finest-present index lets keep_renderer
@@ -1209,6 +1210,20 @@ def main():
             if gi is None:
                 return rpid in lod0_rids
             return li == group_min_lod.get(gi, 0)
+        # AUDIT #3 exposure, reported on EVERY build (not just --alllod): how many renderers does
+        # Unity list in more than one LOD level? The old code asserted this was "rare-to-absent" in
+        # EFT authoring but never measured it, and that guess was the only thing standing between an
+        # --alllod pack and trusting it. Printed unconditionally so a default build still tells you
+        # what an --alllod build would face.
+        _shared = {r: sorted(s) for r, s in rid2levels.items() if len(s) > 1}
+        if _shared:
+            _ex = list(_shared.items())[:3]
+            print(f"  [lv{lv}] AUDIT#3: {len(_shared)} of {len(rid2levels)} grouped renderers span "
+                  f"MULTIPLE LOD levels (e.g. {_ex}) — one shell per level is emitted under --alllod",
+                  flush=True)
+        else:
+            print(f"  [lv{lv}] AUDIT#3: 0 of {len(rid2levels)} grouped renderers span multiple LOD "
+                  f"levels (distinct renderers per level — the simple case)", flush=True)
         print(f"  [lv{lv}] LODGroups: +{sum(1 for grp in lodgroups)} cumulative={len(lodgroups)}, renderers tagged this level={len(rid2lod)}", flush=True)
 
         # ---- mesh renderers + skinned mesh renderers ----
@@ -1273,8 +1288,22 @@ def main():
                             "cast": cast, "renON": ren_on, "aih": aih, "drop": hidden}
                     _lt = rid2lod.get(o.path_id)                  # Stage A: tag LODGroup membership (g=global group idx, i=lod index)
                     if _lt: inst["lod"] = {"g": _lt[0], "i": _lt[1]}
-                    instances.append(inst)
-                    cnt += 1
+                    # AUDIT #3 fix: under --alllod a renderer Unity lists at several LOD levels needs a
+                    # shell in EACH of those bands, or it vanishes between its finest level and the
+                    # coarsest one that references it (the viewer derives each shell's distance window
+                    # from the group's present-shell set, so a missing level leaves an undrawn band).
+                    # The copies share `subs`/`m` by reference on purpose: identical geometry at the
+                    # same transform, and nothing downstream mutates them per instance.
+                    _span = sorted(rid2levels.get(o.path_id) or ()) if args.alllod else ()
+                    if len(_span) > 1:
+                        for _gi, _li in _span:
+                            _c = dict(inst)
+                            _c["lod"] = {"g": _gi, "i": _li}
+                            instances.append(_c)
+                            cnt += 1
+                    else:
+                        instances.append(inst)
+                        cnt += 1
                 except Exception:
                     continue
 
