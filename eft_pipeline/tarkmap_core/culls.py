@@ -218,9 +218,42 @@ class Culls:
                     continue
             kept2.append(it)
         kept = kept2
-        if n_state:
-            print(f"[cull] alternate-state: dropped {n_state} INACTIVE instance(s) coincident with "
-                  f"an active twin (unselected destructible states, e.g. intact glass over broken)")
+        # SIBLING form of the same rule (needs the extractor's `par` field; scenes without it are
+        # untouched): the coincidence test misses state pairs whose meshes are authored at
+        # different pivots — ground_zero's window banks put ONE active broken mesh at the frame
+        # pivot and each INACTIVE intact pane at its own, ~3 m apart. Under one immediate parent,
+        # an inactive renderer that coexists with an ACTIVE renderer within 6 m is an unselected
+        # state. The 6 m tie plus same-parent keeps this off raid-activated loot: a crate's parent
+        # is an organizational node, but the crate has no active sibling REPLACING it — dropping
+        # only when actives exist nearby under the same prefab keeps lone inactive loot alive.
+        par_active = {}
+        for it in kept:
+            if it.get("aih") is not False and it.get("kind") == "mesh" and it.get("m"):
+                for key in (it.get("par"), it.get("par2")):
+                    if key:
+                        par_active.setdefault((it.get("lv"), key), []).append(
+                            (it["m"][3], it["m"][7], it["m"][11]))
+        n_sib = 0
+        kept3 = []
+        for it in kept:
+            if (it.get("aih") is False and it.get("kind") == "mesh"
+                    and (it.get("par") or it.get("par2")) and it.get("m")):
+                acts = []
+                for key in (it.get("par"), it.get("par2")):
+                    if key:
+                        acts += par_active.get((it.get("lv"), key), [])
+                if acts:
+                    x, y, z = it["m"][3], it["m"][7], it["m"][11]
+                    if any((x - a) ** 2 + (y - b) ** 2 + (z - c) ** 2 < 36.0 for a, b, c in acts):
+                        n_sib += 1
+                        r = it.get("root") or "?"
+                        dropped_roots[r] = dropped_roots.get(r, 0) + 1
+                        continue
+            kept3.append(it)
+        kept = kept3
+        if n_state or n_sib:
+            print(f"[cull] alternate-state: dropped {n_state} coincident + {n_sib} same-parent "
+                  f"INACTIVE instance(s) (unselected destructible states, e.g. intact glass over broken)")
         kept, offmap, offmap_examples = self._offmap_backdrop_filter(kept, dropped_roots)
         top = sorted(dropped_roots.items(), key=lambda kv: -kv[1])[:12]
         return kept, {"raw": len(instances), "kept": len(kept), "hidden_unity": hidden,
