@@ -1546,6 +1546,53 @@ fn layers_panel(
                             egui::Slider::new(&mut g.sharpen, 0.0..=1.0).text("sharpen"),
                         )
                         .on_hover_text("EFT-style unsharp mask (the game ships ~0.5); needs the grade LUT");
+                        // ---- graphics-plan features (docs/GRAPHICS_PLAN.md; all measured) ----
+                        // Every toggle here rides GfxSettings live — no reload. The prepass that
+                        // TAA/SSR need turns itself on with them (consumer mask) and off again
+                        // when nothing wants it, so an all-off panel pays zero.
+                        ui.separator();
+                        ui.add_enabled(
+                            is_gpu && g.shadows && g.shadows_available,
+                            egui::Checkbox::new(&mut g.volumetric, "volumetric sun shafts"),
+                        )
+                        .on_hover_text(
+                            "god rays: the sun's shadow cascades ray-marched through the air. \
+                             Needs sun shadows. MEASURED COST: +5.4 ms at 1440p — the most \
+                             expensive option in the build.",
+                        );
+                        ui.add_enabled(
+                            is_gpu && g.volumetric && g.shadows,
+                            egui::Slider::new(&mut g.volumetric_strength, 0.0..=3.0)
+                                .text("shaft strength"),
+                        );
+                        ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.taa, "TAA (temporal AA)"))
+                            .on_hover_text(
+                                "temporal accumulation on top of MSAA: converges specular glint, \
+                                 splat blend and residual shimmer. Water and foliage stay \
+                                 reactive (no smear). MEASURED COST: +0.4 ms at 1440p.",
+                            );
+                        ui.add_enabled(
+                            is_gpu,
+                            egui::Checkbox::new(&mut g.ssr, "SSR (screen-space reflections)"),
+                        )
+                        .on_hover_text(
+                            "real reflections on smooth surfaces and water, traced against the \
+                             scene itself; falls back to the analytic sky where the trace misses. \
+                             MEASURED COST: +0.3 ms at 1440p.",
+                        );
+                        ui.checkbox(&mut g.aa, "FXAA (shading AA)").on_hover_text(
+                            "supplements MSAA on shading aliasing (glint/splat shimmer). \
+                             MEASURED COST: +0.04 ms — free.",
+                        );
+                        ui.add_enabled(
+                            is_gpu && g.grass,
+                            egui::Slider::new(&mut g.grass_dist_m, 0.0..=400.0)
+                                .text("grass distance m (0 = unlimited)"),
+                        )
+                        .on_hover_text(
+                            "hard grass horizon in metres, independent of resolution and zoom. \
+                             MEASURED: 150 m saves ~3.2 ms, 80 m saves ~4.7 ms on woods at 1440p.",
+                        );
                         // ---- lighting (live: rides the LightGrid uniform, no rebuild) ----
                         ui.separator();
                         ui.add_enabled(is_gpu, egui::Checkbox::new(&mut g.lights, "practical lights"))
