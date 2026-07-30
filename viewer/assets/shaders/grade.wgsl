@@ -72,9 +72,14 @@ fn lut_sample(c: vec3<f32>) -> vec3<f32> {
 //   return mix(tex(uv0).rgb, tex(uv1).rgb, f);
 
 // --- FXAA (console variant) ------------------------------------------------------------------
-// Every render pipeline here is sample_count:1 with alpha-to-coverage off, so nothing else in the
-// chain anti-aliases. The worst case is exactly this renderer's signature content: alpha-CUTOUT
-// foliage against bright sky, whose hard 1-pixel edge crawls as the camera moves.
+// CORRECTION: added on the belief that nothing else here anti-aliases. That was wrong, and came from
+// grepping `sample_count: 1` and generalizing -- those hits are the SHADOW depth atlas. The main pass
+// is MSAA (count = the view's Msaa, Bevy default 4x) with alpha-to-coverage on the opaque/cutout
+// passes, so geometric and cutout edges already resolve.
+// This still earns its keep on what MSAA cannot see: SHADING aliasing -- specular glint on rough
+// detail, the terrain splat blend, normal-map sparkle -- and A2C quantizes cutout coverage to
+// `samples` levels (4 steps at 4x), which still stairsteps on a treeline. Supplement, not sole
+// defence: if the image ever reads too soft, this is the first thing to turn off.
 //
 // Edge detection runs on a PERCEPTUAL luma, not the raw value. The scene RT is linear HDR, where a
 // sky at 8.0 and a leaf at 0.05 differ by ~160x — a linear luma threshold would either fire on

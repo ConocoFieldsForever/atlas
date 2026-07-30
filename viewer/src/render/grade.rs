@@ -135,10 +135,9 @@ struct GradeParamsGpu {
     sharpen: f32,
     /// FXAA blend strength (0 = off). Rides a pad lane so the uniform size is unchanged.
     ///
-    /// Every render pipeline in this renderer is `sample_count: 1` with alpha-to-coverage off, so
-    /// there was NO anti-aliasing at all. On a forest map that is the most visible artifact in
-    /// motion: alpha-cutout foliage against bright sky has a hard 1-pixel edge that crawls as the
-    /// camera moves. It also makes distance-LOD shell swaps pop harder than they need to.
+    /// NOT the only anti-aliasing: the main pass is MSAA with alpha-to-coverage (see
+    /// `GfxSettings::aa`, which records the mistaken claim this used to make). This targets shading
+    /// aliasing and A2C's quantized cutout coverage, which MSAA does not resolve.
     aa: f32,
     _pad: f32,
     vig: [f32; 4],          // xy = aspect divisors, zw = smoothstep edges

@@ -81,9 +81,18 @@ pub struct GfxSettings {
     pub ssao_radius: f32,
     /// EFT-style unsharp-mask strength in the grade pass (0 = off; the game ships ~0.5).
     pub sharpen: f32,
-    /// FXAA in the grade pass. Default ON: every pipeline is single-sampled with alpha-to-coverage
-    /// off, so without this there is no anti-aliasing anywhere, and alpha-cutout foliage against sky
-    /// crawls badly in motion. EFT_AA=0 opts out (A/B against the game's own edges).
+    /// FXAA in the grade pass. EFT_AA=0 opts out.
+    ///
+    /// CORRECTION: this was added believing the renderer had NO anti-aliasing, from grepping
+    /// `sample_count: 1`. That was wrong -- those hits are the SHADOW depth atlas. The main pass is
+    /// MSAA (`count: key.samples` from the view's Msaa, Bevy default 4x) with alpha-to-coverage on
+    /// the opaque/cutout passes, so geometric and cutout edges were already resolved.
+    ///
+    /// It is kept ON because MSAA does not touch SHADING aliasing -- specular glint on high-roughness
+    /// detail, the terrain splat blend, normal-map sparkle -- and A2C quantizes cutout coverage to
+    /// `samples` levels (4 steps at 4x), which still stairsteps on a treeline. It costs +0.043 ms,
+    /// inside the noise floor. But it is a supplement, not the only line of defence, and if it ever
+    /// reads too soft that is the reason to drop it.
     pub aa: bool,
     /// FXAA blend strength, 0..1. 0.75 keeps foliage edges soft without smearing the grade's
     /// unsharp pass, which runs on the same tap set.
