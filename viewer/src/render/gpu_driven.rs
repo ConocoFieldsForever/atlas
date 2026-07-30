@@ -44,6 +44,7 @@ use bevy::pbr::{
 };
 use bevy::prelude::*;
 use bevy::render::{
+    diagnostic::RecordDiagnostics,
     extract_component::{ExtractComponent, ExtractComponentPlugin},
     extract_resource::{ExtractResource, ExtractResourcePlugin},
     render_graph::{Node, NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel},
@@ -62,7 +63,8 @@ use bevy::render::{
         CachedRenderPipelineId, ColorTargetState, ColorWrites, CompareFunction,
         ComputePassDescriptor, ComputePipelineDescriptor, DepthBiasState, DepthStencilState,
         Extent3d, FilterMode, FragmentState, IndexFormat, LoadOp, MultisampleState, Operations,
-        PipelineCache, PrimitiveState, PrimitiveTopology, RenderPassDepthStencilAttachment,
+        PipelineCache, PrimitiveState, PrimitiveTopology, RenderPassColorAttachment,
+        RenderPassDepthStencilAttachment,
         RenderPassDescriptor, RenderPipelineDescriptor, Sampler, SamplerBindingType,
         SamplerDescriptor, ShaderStages, SpecializedRenderPipeline, SpecializedRenderPipelines,
         StencilState, StoreOp, Texture, TextureDataOrder, TextureDescriptor, TextureDimension,
@@ -872,6 +874,73 @@ struct EftShadowPipeline {
     cascade_layout: BindGroupLayout,
 }
 
+/// group(1) uniform for the NORMAL PREPASS (gpu_prepass.wgsl). Byte-identical to the WGSL
+/// `PrepassUniform` (80 bytes: mat4 + vec4) — pinned like every other cross-shader struct here.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+struct PrepassUniform {
+    /// world -> camera clip (Bevy reverse-z). Column-major Mat4 upload.
+    view_proj: [[f32; 4]; 4],
+    /// x = bindless albedo array length (descriptor-index clamp in the cutout alpha test — same
+    /// upload the shadow pass makes, and for the same AMD-fault reason). yzw pad.
+    params: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<PrepassUniform>() == 80);
+
+/// The normal prepass: camera-view geometric normals + roughness (Rgba16Float) over its own 1x
+/// Depth32Float, drawn from the SAME culled indirect buffers as the main pass. The enabler for
+/// normal-aware SSAO now and SSR later — the forward main pass writes only color, so before this
+/// every screen-space effect had to reconstruct normals from depth derivatives.
+///
+/// Textures are (re)created by `prepare_prepass` whenever the view size changes; consumers (ssao)
+/// key their bind-group caches on the view ids, so recreation Just Works on resize.
+#[derive(Resource)]
+pub(crate) struct EftPrepassResources {
+    pipeline_id: CachedRenderPipelineId,
+    uniform: Buffer,
+    /// group(1) — just the uniform; the targets are attachments, not bindings.
+    bind_group: BindGroup,
+    #[allow(dead_code)] // keeps the views below valid
+    normal_texture: Option<Texture>,
+    /// pub(crate): ssao binds this as its normal source.
+    pub(crate) normal_view: Option<TextureView>,
+    #[allow(dead_code)]
+    depth_texture: Option<Texture>,
+    depth_view: Option<TextureView>,
+    size: UVec2,
+    /// Set by `prepare_prepass` when this frame actually has a valid camera + targets AND the ssao
+    /// consumer is on. The node and ssao both read it, so "prepass off" degrades cleanly to the
+    /// old derivative-normal path instead of binding stale textures.
+    pub(crate) active: bool,
+    /// Phase 1 history: this frame's and the previous frame's clip_from_world (UNJITTERED — TAA
+    /// reprojection must not chase the jitter). `prev` is None whenever history is invalid: first
+    /// frame, resize, map swap, or the prepass toggling off — consumers reject history on None.
+    pub(crate) clip_from_world: [[f32; 4]; 4],
+    pub(crate) prev_clip_from_world: Option<[[f32; 4]; 4]>,
+}
+
+/// Phase 1 substrate: ONE reverse-z max-reduction depth pyramid over the prepass depth, shared by
+/// every hierarchical-depth consumer (SSR Phase 6, Hi-Z Phase 3) — the plan is explicit that they
+/// must not each build their own. Gated on those consumers, so it is exactly absent otherwise.
+#[derive(Resource)]
+pub(crate) struct EftPyramidResources {
+    layout: BindGroupLayout,
+    copy_pipeline: CachedComputePipelineId,
+    reduce_pipeline: CachedComputePipelineId,
+    #[allow(dead_code)] // keeps the views valid
+    tex: Option<Texture>,
+    /// One view per mip (base_mip_level=i, count=1). mip_views[0] is also the SSR/Hi-Z sample view
+    /// for the finest level; a whole-chain sampling view is created alongside.
+    mip_views: Vec<TextureView>,
+    /// Full-chain sampling view (all mips) for consumers.
+    pub(crate) sample_view: Option<TextureView>,
+    /// Per-mip bind groups: [0] = copy (prepass depth -> mip0), [i>=1] = reduce (mip i-1 -> mip i).
+    bind_groups: Vec<BindGroup>,
+    size: UVec2,
+    mips: u32,
+    pub(crate) active: bool,
+}
+
 /// Owns the shadow GPU resources so the depth views + uniforms outlive their bind groups.
 #[derive(Resource)]
 struct EftShadowResources {
@@ -1524,6 +1593,14 @@ impl Plugin for EftGpuDrivenPlugin {
                     prepare_shadow_uniforms
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
+                    // Normal prepass: camera matrix + (re)size the normal/depth targets. After the
+                    // buffers exist for the same reason the shadow prepare is.
+                    prepare_prepass
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
+                    prepare_pyramid
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_prepass),
                     // Live lighting sliders: base x GfxSettings multipliers into the LightGrid
                     // uniform (48 B/frame; byte-identical at the default multipliers).
                     update_light_uniform
@@ -1550,9 +1627,17 @@ impl Plugin for EftGpuDrivenPlugin {
             // or resets the shared stream.
             .add_render_graph_node::<EftCullNode>(Core3d, EftCullLabel)
             .add_render_graph_node::<EftShadowNode>(Core3d, EftShadowLabel)
+            .add_render_graph_node::<EftPrepassNode>(Core3d, EftPrepassLabel)
+            .add_render_graph_node::<EftPyramidNode>(Core3d, EftPyramidLabel)
             .add_render_graph_edges(
                 Core3d,
-                (EftCullLabel, EftShadowLabel, Node3d::StartMainPass),
+                (
+                    EftCullLabel,
+                    EftShadowLabel,
+                    EftPrepassLabel,
+                    EftPyramidLabel,
+                    Node3d::StartMainPass,
+                ),
             );
     }
 }
@@ -3300,6 +3385,8 @@ struct EftDrawPipeline {
     /// the shadow render pipeline (which also needs the material_layout) is queued in
     /// `prepare_gpu_buffers` once that layout exists.
     shadow_shader: Handle<Shader>,
+    prepass_shader: Handle<Shader>,
+    pyramid_shader: Handle<Shader>,
     mesh_pipeline: MeshPipeline,
     ssbo_layout: BindGroupLayout,
     /// group(2) bindless material layout: material-table SSBO + albedo `binding_array` +
@@ -3490,6 +3577,8 @@ fn init_gpu_pipelines(
     let cull_shader_sort = cull_shader.clone();
     let draw_shader = asset_server.load("shaders/gpu_draw.wgsl");
     let shadow_shader = asset_server.load("shaders/gpu_shadow.wgsl"); // #5 depth-only caster
+    let prepass_shader = asset_server.load("shaders/gpu_prepass.wgsl"); // normal+roughness prepass
+    let pyramid_shader = asset_server.load("shaders/depth_pyramid.wgsl"); // Phase-1 shared depth pyramid
 
     let reset_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("eft_cull_reset".into()),
@@ -3531,6 +3620,8 @@ fn init_gpu_pipelines(
     commands.insert_resource(EftDrawPipeline {
         shader: draw_shader,
         shadow_shader,
+        prepass_shader,
+        pyramid_shader,
         mesh_pipeline: mesh_pipeline.clone(),
         ssbo_layout,
         material_layout: None, // filled in prepare_gpu_buffers once the albedo count is known
@@ -3592,6 +3683,8 @@ fn reset_gpu_map_if_epoch_changed(
         commands.insert_resource(EftDrawPipeline {
             shader: d.shader.clone(),
             shadow_shader: d.shadow_shader.clone(),
+            prepass_shader: d.prepass_shader.clone(),
+            pyramid_shader: d.pyramid_shader.clone(),
             mesh_pipeline: d.mesh_pipeline.clone(),
             ssbo_layout: d.ssbo_layout.clone(),
             material_layout: None,
@@ -4755,6 +4848,163 @@ fn prepare_gpu_buffers(
         zero_initialize_workgroup_memory: false,
     });
 
+    // ---- NORMAL PREPASS (gpu_prepass.wgsl) ------------------------------------------------------
+    // Same "shared culled buffers, different pipeline" shape as the shadow pass, but through the
+    // CAMERA into an Rgba16Float normal+roughness target with its own 1x depth. Targets are created
+    // by `prepare_prepass` once the view size is known (and recreated on resize); only the uniform,
+    // its bind group and the queued pipeline are made here.
+    let prepass_layout = render_device.create_bind_group_layout(
+        "eft_prepass_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::VERTEX_FRAGMENT,
+            (uniform_buffer_sized(
+                false,
+                Some(std::num::NonZeroU64::new(80).unwrap()),
+            ),),
+        ),
+    );
+    let prepass_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_prepass_uniform"),
+        contents: bytemuck::bytes_of(&PrepassUniform::default()),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+    let prepass_bg = render_device.create_bind_group(
+        "eft_prepass_bg",
+        &prepass_layout,
+        &BindGroupEntries::single(prepass_uniform.as_entire_binding()),
+    );
+    let prepass_pipeline_id = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("eft_normal_prepass".into()),
+        layout: vec![
+            draw.ssbo_layout.clone(),
+            prepass_layout,
+            material_layout.clone(),
+        ],
+        push_constant_ranges: vec![],
+        vertex: VertexState {
+            shader: draw.prepass_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vertex".into()),
+            buffers: vec![VertexBufferLayout {
+                array_stride: DRAW_VERTEX_STRIDE,
+                step_mode: VertexStepMode::Vertex,
+                // pos @0 (loc0), oct normal @12 (loc1), uv @16 (loc2), material @24 (loc3).
+                // color (@28) is skipped — the prepass has no vert-paint use.
+                attributes: vec![
+                    VertexAttribute {
+                        format: VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    },
+                    VertexAttribute {
+                        format: VertexFormat::Snorm16x2,
+                        offset: 12,
+                        shader_location: 1,
+                    },
+                    VertexAttribute {
+                        format: VertexFormat::Float32x2,
+                        offset: 16,
+                        shader_location: 2,
+                    },
+                    VertexAttribute {
+                        format: VertexFormat::Uint32,
+                        offset: 24,
+                        shader_location: 3,
+                    },
+                ],
+            }],
+        },
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            cull_mode: None, // double-sided, like the main pass; front_facing flip in the fragment
+            ..default()
+        },
+        depth_stencil: Some(DepthStencilState {
+            // CAMERA depth: Bevy reverse-z (clear 0.0, GreaterEqual) — NOT the shadow pass's
+            // conventional LessEqual. Getting this backwards renders exactly nothing.
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: CompareFunction::GreaterEqual,
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState {
+            count: 1, // consumers (ssao/ssr) want single-sample data; no A2C at 1x
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        fragment: Some(FragmentState {
+            shader: draw.prepass_shader.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fragment".into()),
+            targets: vec![Some(ColorTargetState {
+                format: TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: ColorWrites::ALL,
+            })],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
+    // Depth pyramid: layout (depth src, mip src, storage dst) + the two compute pipelines.
+    let pyramid_layout = render_device.create_bind_group_layout(
+        "eft_pyramid_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (
+                bevy::render::render_resource::binding_types::texture_depth_2d(),
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                bevy::render::render_resource::binding_types::texture_storage_2d(
+                    TextureFormat::R32Float,
+                    bevy::render::render_resource::StorageTextureAccess::WriteOnly,
+                ),
+            ),
+        ),
+    );
+    let pyramid_shader = draw.pyramid_shader.clone();
+    let pyramid_copy = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("eft_pyramid_copy".into()),
+        layout: vec![pyramid_layout.clone()],
+        push_constant_ranges: vec![],
+        shader: pyramid_shader.clone(),
+        shader_defs: vec![],
+        entry_point: Some("cs_copy".into()),
+        zero_initialize_workgroup_memory: false,
+    });
+    let pyramid_reduce = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("eft_pyramid_reduce".into()),
+        layout: vec![pyramid_layout.clone()],
+        push_constant_ranges: vec![],
+        shader: pyramid_shader,
+        shader_defs: vec![],
+        entry_point: Some("cs_reduce".into()),
+        zero_initialize_workgroup_memory: false,
+    });
+    commands.insert_resource(EftPyramidResources {
+        layout: pyramid_layout,
+        copy_pipeline: pyramid_copy,
+        reduce_pipeline: pyramid_reduce,
+        tex: None,
+        mip_views: Vec::new(),
+        sample_view: None,
+        bind_groups: Vec::new(),
+        size: UVec2::ZERO,
+        mips: 0,
+        active: false,
+    });
+    commands.insert_resource(EftPrepassResources {
+        pipeline_id: prepass_pipeline_id,
+        uniform: prepass_uniform,
+        bind_group: prepass_bg,
+        normal_texture: None,
+        normal_view: None,
+        depth_texture: None,
+        depth_view: None,
+        size: UVec2::ZERO,
+        active: false,
+        clip_from_world: [[0.0; 4]; 4],
+        prev_clip_from_world: None,
+    });
+
     // ---- REALTIME lights (group(3) bindings 8/9/10) --------------------------------------------
     // Tiny CPU-built buffers (a few KB of light records + a few 100 KB grid) — no streaming needed;
     // build them here on the render thread in the same finalize as the SH/shadow group(3) resources.
@@ -4835,6 +5085,8 @@ fn prepare_gpu_buffers(
     commands.insert_resource(EftDrawPipeline {
         shader: draw.shader.clone(),
         shadow_shader: draw.shadow_shader.clone(),
+        prepass_shader: draw.prepass_shader.clone(),
+        pyramid_shader: draw.pyramid_shader.clone(),
         mesh_pipeline: draw.mesh_pipeline.clone(),
         ssbo_layout: draw.ssbo_layout.clone(),
         material_layout: Some(material_layout),
@@ -6698,7 +6950,9 @@ impl Node for EftCullNode {
         let reset_groups = dispatch_2d(buffers.mesh_count.div_ceil(64));
         let cull_groups = dispatch_2d(buffers.instance_total.div_ceil(64));
         let blend_groups = dispatch_2d(buffers.blend_sort_groups.max(1));
+        let diag = render_context.diagnostic_recorder();
         let encoder = render_context.command_encoder();
+        let span = diag.time_span(encoder, "eft cull");
 
         // Separate passes â†’ wgpu inserts a barrier so cs_reset is fully visible to cs_cull.
         {
@@ -6731,6 +6985,7 @@ impl Node for EftCullNode {
             pass.set_bind_group(0, &**bg, &[]);
             pass.dispatch_workgroups(blend_groups.0, blend_groups.1, 1);
         }
+        span.end(render_context.command_encoder());
         Ok(())
     }
 }
@@ -6765,6 +7020,335 @@ fn dispatch_2d(groups: u32) -> (u32, u32) {
 // ===========================================================================
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
 struct EftShadowLabel;
+
+// ===========================================================================
+// Normal prepass: camera matrix + target management (PrepareResources) and the
+// draw node (cull -> shadow -> PREPASS -> main). Shape cloned from the shadow
+// pass — same shared buffers, different camera and targets.
+// ===========================================================================
+#[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
+struct EftPrepassLabel;
+
+/// Per-frame: write the camera clip_from_world into the prepass uniform and (re)create the
+/// normal/depth targets when the view size changes. Sets `active` false whenever there is no
+/// consumer (ssao off), no camera, or no size — the node and ssao both key off it, so the whole
+/// feature degrades to the old derivative-normal path instead of half-running.
+fn prepare_prepass(
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+    mats: Option<Res<EftMaterialResources>>,
+    views: Query<&ExtractedView, With<CullCamera>>,
+    res: Option<ResMut<EftPrepassResources>>,
+) {
+    let Some(mut res) = res else { return };
+    // Phase 1 (docs/GRAPHICS_PLAN.md): consumer MASK, not an SSAO boolean. The prepass runs when
+    // ANY screen-space consumer wants it and is exactly absent otherwise (the acceptance criterion:
+    // "no consumer -> prepass and pyramid GPU timestamps are exactly absent"). Consumer-driven, not
+    // always-on: a Low-preset user with everything off pays zero.
+    let want = settings
+        .as_ref()
+        .map(|s| s.ssao || s.ssr || s.taa || s.hiz || s.depth_prime || s.pcss)
+        .unwrap_or(false);
+    if !want {
+        res.active = false;
+        res.prev_clip_from_world = None; // toggling off invalidates history
+        return;
+    }
+    let Ok(view) = views.single() else {
+        res.active = false;
+        res.prev_clip_from_world = None;
+        return;
+    };
+    let vp = view.viewport; // (x, y, w, h)
+    let size = UVec2::new(vp.z, vp.w);
+    if size.x == 0 || size.y == 0 {
+        res.active = false;
+        return;
+    }
+    if res.size != size || res.normal_view.is_none() {
+        res.prev_clip_from_world = None; // resize invalidates history
+        let normal = render_device.create_texture(&TextureDescriptor {
+            label: Some("eft_prepass_normal"),
+            size: Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1, // consumers read single-sample; MSAA here would only cost
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba16Float,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let depth = render_device.create_texture(&TextureDescriptor {
+            label: Some("eft_prepass_depth"),
+            size: Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        res.normal_view = Some(normal.create_view(&TextureViewDescriptor::default()));
+        res.depth_view = Some(depth.create_view(&TextureViewDescriptor::default()));
+        res.normal_texture = Some(normal);
+        res.depth_texture = Some(depth);
+        res.size = size;
+        info!(
+            "prepass: normal+depth targets {}x{} (Rgba16Float + Depth32Float, ~{} MiB)",
+            size.x,
+            size.y,
+            (size.x as u64 * size.y as u64 * 12) >> 20
+        );
+    }
+    // clip_from_world, exactly the transform the vertex needs (Bevy reverse-z projection included).
+    let world_from_view = view.world_from_view.to_matrix();
+    let clip_from_world = view.clip_from_view * world_from_view.inverse();
+    // History shift: last frame's matrix becomes prev. Done AFTER the invalidation paths above so
+    // a rebuilt frame never offers a stale matrix as history.
+    if res.active {
+        res.prev_clip_from_world = Some(res.clip_from_world);
+    }
+    res.clip_from_world = clip_from_world.to_cols_array_2d();
+    let n_tex = mats.map(|m| m.views.len()).unwrap_or(0) as f32;
+    render_queue.write_buffer(
+        &res.uniform,
+        0,
+        bytemuck::bytes_of(&PrepassUniform {
+            view_proj: clip_from_world.to_cols_array_2d(),
+            params: [n_tex, 0.0, 0.0, 0.0],
+        }),
+    );
+    res.active = true;
+}
+
+/// (Re)build the pyramid chain when its consumers are on and the prepass target resized. Bind
+/// groups are rebuilt with the textures — group[0] copies prepass depth into mip 0 (its unused
+/// src_mip slot binds mip 1 to avoid a same-subresource storage/sampled conflict), group[i>0]
+/// reduces mip i-1 into mip i.
+fn prepare_pyramid(
+    render_device: Res<RenderDevice>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+    prepass: Option<Res<EftPrepassResources>>,
+    res: Option<ResMut<EftPyramidResources>>,
+) {
+    let (Some(mut res), Some(pre)) = (res, prepass) else { return };
+    let want = settings
+        .as_ref()
+        .map(|s| s.ssr || s.hiz || s.depth_prime)
+        .unwrap_or(false);
+    if !want || !pre.active || pre.depth_view.is_none() {
+        res.active = false;
+        return;
+    }
+    let size = pre.size;
+    if res.size != size || res.sample_view.is_none() {
+        let mips = 32 - size.x.max(size.y).leading_zeros();
+        let tex = render_device.create_texture(&TextureDescriptor {
+            label: Some("eft_depth_pyramid"),
+            size: Extent3d {
+                width: size.x,
+                height: size.y,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R32Float,
+            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let mip_views: Vec<TextureView> = (0..mips)
+            .map(|i| {
+                tex.create_view(&TextureViewDescriptor {
+                    label: Some("eft_depth_pyramid_mip"),
+                    base_mip_level: i,
+                    mip_level_count: Some(1),
+                    ..default()
+                })
+            })
+            .collect();
+        let sample_view = tex.create_view(&TextureViewDescriptor::default());
+        let depth_view = pre.depth_view.as_ref().unwrap();
+        let mut bind_groups = Vec::with_capacity(mips as usize);
+        for i in 0..mips as usize {
+            let (src_mip, dst) = if i == 0 {
+                // copy: src_mip unused; bind mip 1 (or mip 0 on a 1-mip chain, where reduce never runs)
+                (&mip_views[1.min(mips as usize - 1)], &mip_views[0])
+            } else {
+                (&mip_views[i - 1], &mip_views[i])
+            };
+            bind_groups.push(render_device.create_bind_group(
+                "eft_pyramid_bg",
+                &res.layout,
+                &BindGroupEntries::sequential((depth_view, src_mip, dst)),
+            ));
+        }
+        info!("pyramid: {}x{} R32Float, {mips} mips", size.x, size.y);
+        res.tex = Some(tex);
+        res.mip_views = mip_views;
+        res.sample_view = Some(sample_view);
+        res.bind_groups = bind_groups;
+        res.size = size;
+        res.mips = mips;
+    }
+    res.active = true;
+}
+
+#[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
+struct EftPyramidLabel;
+
+struct EftPyramidNode;
+
+impl FromWorld for EftPyramidNode {
+    fn from_world(_: &mut World) -> Self {
+        Self
+    }
+}
+
+impl Node for EftPyramidNode {
+    fn run<'w>(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext<'w>,
+        world: &'w World,
+    ) -> Result<(), NodeRunError> {
+        if world.get::<CullCamera>(graph.view_entity()).is_none() {
+            return Ok(());
+        }
+        let Some(res) = world.get_resource::<EftPyramidResources>() else {
+            return Ok(());
+        };
+        if !res.active || res.bind_groups.is_empty() {
+            return Ok(());
+        }
+        let cache = world.resource::<PipelineCache>();
+        let (Some(copy), Some(reduce)) = (
+            cache.get_compute_pipeline(res.copy_pipeline),
+            cache.get_compute_pipeline(res.reduce_pipeline),
+        ) else {
+            return Ok(());
+        };
+        let diag = render_context.diagnostic_recorder();
+        let encoder = render_context.command_encoder();
+        let span = diag.time_span(encoder, "eft pyramid");
+        // One pass per mip: wgpu inserts the barrier that makes mip i-1 visible to mip i.
+        for i in 0..res.mips as usize {
+            let (w, h) = (
+                (res.size.x >> i).max(1).div_ceil(8),
+                (res.size.y >> i).max(1).div_ceil(8),
+            );
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("eft_pyramid_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(if i == 0 { copy } else { reduce });
+            pass.set_bind_group(0, &res.bind_groups[i], &[]);
+            pass.dispatch_workgroups(w, h, 1);
+        }
+        span.end(render_context.command_encoder());
+        Ok(())
+    }
+}
+
+struct EftPrepassNode;
+
+impl FromWorld for EftPrepassNode {
+    fn from_world(_: &mut World) -> Self {
+        Self
+    }
+}
+
+impl Node for EftPrepassNode {
+    fn run<'w>(
+        &self,
+        graph: &mut RenderGraphContext,
+        render_context: &mut RenderContext<'w>,
+        world: &'w World,
+    ) -> Result<(), NodeRunError> {
+        if world.get::<CullCamera>(graph.view_entity()).is_none() {
+            return Ok(());
+        }
+        let (Some(res), Some(buffers), Some(draw_bg), Some(material_bg)) = (
+            world.get_resource::<EftPrepassResources>(),
+            world.get_resource::<EftGpuBuffers>(),
+            world.get_resource::<EftDrawBindGroup>(),
+            world.get_resource::<EftMaterialBindGroup>(),
+        ) else {
+            return Ok(());
+        };
+        if !res.active {
+            return Ok(());
+        }
+        let (Some(normal_view), Some(depth_view)) = (&res.normal_view, &res.depth_view) else {
+            return Ok(());
+        };
+        let cache = world.resource::<PipelineCache>();
+        let Some(pipeline) = cache.get_render_pipeline(res.pipeline_id) else {
+            return Ok(()); // still compiling
+        };
+        let diag = render_context.diagnostic_recorder();
+        let span = diag.time_span(render_context.command_encoder(), "eft prepass");
+        let mut pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
+            label: Some("eft_normal_prepass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: normal_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    // Clear to ZERO: a zero normal is the ssao shader's "no prepass data here"
+                    // sentinel (sky, blend surfaces, the excluded grass), which falls back to the
+                    // derivative reconstruction for that pixel.
+                    load: LoadOp::Clear(Default::default()),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(0.0), // reverse-z far, NOT the shadow pass's 1.0
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &draw_bg.0, &[]);
+        pass.set_bind_group(1, &res.bind_group, &[]);
+        pass.set_bind_group(2, &material_bg.0, &[]);
+        pass.set_vertex_buffer(0, buffers.vertex.slice(..));
+        pass.set_index_buffer(buffers.index.slice(..), 0, buffers.index_format);
+        // Grass never enters the prepass (AO at blade scale is noise; the fragment bill is not) —
+        // same two-range skip as the shadow pass, same stored range, same sea-quad caveat.
+        match buffers.grass_mesh_range {
+            Some((gs, ge)) if ge > gs && ge <= buffers.mesh_count => {
+                if gs > 0 {
+                    pass.multi_draw_indexed_indirect(&buffers.indirect, 0, gs);
+                }
+                if buffers.mesh_count > ge {
+                    pass.multi_draw_indexed_indirect(
+                        &buffers.indirect,
+                        ge as u64 * DRAW_ARG_STRIDE,
+                        buffers.mesh_count - ge,
+                    );
+                }
+            }
+            _ => pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count),
+        }
+        drop(pass);
+        span.end(render_context.command_encoder());
+        Ok(())
+    }
+}
 
 struct EftShadowNode;
 
@@ -6805,6 +7389,8 @@ impl Node for EftShadowNode {
             return Ok(()); // shadow pipeline still compiling
         };
 
+        let diag = render_context.diagnostic_recorder();
+        let span = diag.time_span(render_context.command_encoder(), "eft shadow");
         // #5b cascade cache: prepare_shadow_uniforms marked which layers actually need
         // re-rendering this frame (camera at rest + static world = none; see EftShadowCache).
         let cache = world.get_resource::<EftShadowCache>();
@@ -6859,6 +7445,7 @@ impl Node for EftShadowNode {
                 _ => pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count),
             }
         }
+        span.end(render_context.command_encoder());
         Ok(())
     }
 }
@@ -7076,7 +7663,10 @@ mod material_stride_tests {
     fn wgsl_material_structs_match_the_rust_pod() {
         let shaders = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let rust = std::mem::size_of::<GpuMaterial>();
-        for name in ["gpu_draw.wgsl", "gpu_shadow.wgsl"] {
+        // gpu_prepass.wgsl added by the Phase-0 audit hardening: it declares the same 192-byte
+        // record and shipped UNPINNED for a night — exactly the stride-mismatch shape that faulted
+        // two Radeons. Every shader that declares MaterialGpu belongs in this list, no exceptions.
+        for name in ["gpu_draw.wgsl", "gpu_shadow.wgsl", "gpu_prepass.wgsl"] {
             let src = std::fs::read_to_string(shaders.join(name))
                 .unwrap_or_else(|e| panic!("cannot read {name}: {e}"));
             assert_eq!(
