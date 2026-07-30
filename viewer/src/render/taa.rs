@@ -181,7 +181,7 @@ fn init_taa_pipeline(
 }
 
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
-struct TaaLabel;
+pub(crate) struct TaaLabel;
 
 #[derive(Default)]
 struct TaaNode;

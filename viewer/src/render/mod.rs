@@ -21,6 +21,7 @@ pub mod gpu_driven;
 pub mod grade;
 pub mod instancing;
 pub mod ssao;
+pub mod ssr;
 pub mod standard;
 pub mod taa;
 
@@ -36,6 +37,7 @@ pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 pub use ssao::SsaoPlugin;
 pub use taa::TaaPlugin;
+pub use ssr::SsrPlugin;
 pub use standard::EftStandardPlugin;
 
 /// Runtime graphics settings, driven by the UI's "Graphics (experimental)" section and extracted
