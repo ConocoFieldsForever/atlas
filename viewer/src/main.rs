@@ -1394,7 +1394,69 @@ pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
 /// `sky_reflect` uses (so reflections agree with the visible sky) plus a soft warm sun disk +
 /// wide glow at the bake's sun_dir. HDR (disk peaks ~4.0) so Bloom picks it up. 6x128x128
 /// Rgba16Float; Skybox.brightness rescales it against the camera's physical Exposure.
+/// Phase 4 (docs/GRAPHICS_PLAN.md): the game's OWN sky when extracted, procedural fallback
+/// otherwise. eft_extract_sky.py exports the cubemaps EFT ships in StreamingAssets — for the
+/// visible sky we load `rain_1k_sharp` (the 1024px overcast raid sky; EFT raids are overcast) from
+/// packs/shared/sky/. Faces are already in wgpu order (+X,-X,+Y,-Y,+Z,-Z — Unity's order matches).
+/// PNGs are sRGB; the skybox samples linearly, so decode here (×2.2 approx, same as the sidecar's
+/// derived colors). Any failure falls through to the procedural gradient, clearly logged, so a
+/// pack-less install renders exactly as before — the fallback is legacy, and is never claimed
+/// derived.
 fn build_sky_cubemap(images: &mut Assets<Image>, sun: Vec3) -> Handle<Image> {
+    if let Some(img) = load_extracted_sky() {
+        info!("sky: EXTRACTED game cubemap (rain_1k_sharp, packs/shared/sky)");
+        return images.add(img);
+    }
+    info!("sky: no extracted cubemap - procedural overcast gradient (legacy fallback)");
+    build_procedural_sky(sun)
+        .map(|img| images.add(img))
+        .expect("procedural sky is infallible")
+}
+
+fn load_extracted_sky() -> Option<Image> {
+    let dir = crate::paths::shared_dir().join("sky");
+    let mut data: Vec<u8> = Vec::new();
+    let mut size = 0u32;
+    for i in 0..6 {
+        let p = dir.join(format!("rain_1k_sharp_DXT1_face{i}.png"));
+        let img = image::open(&p).ok()?.to_rgb8();
+        if i == 0 {
+            size = img.width();
+            data.reserve(size as usize * size as usize * 6 * 8);
+        }
+        if img.width() != size || img.height() != size {
+            return None;
+        }
+        for px in img.pixels() {
+            for c in 0..3 {
+                let lin = (px.0[c] as f32 / 255.0).powf(2.2);
+                data.extend_from_slice(&f32_to_f16_bits(lin).to_le_bytes());
+            }
+            data.extend_from_slice(&f32_to_f16_bits(1.0).to_le_bytes());
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 6,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba16Float,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+    // NO reinterpret_stacked_2d_as_array here: the Extent3d above already declares 6 layers and
+    // the face-major data IS the layer layout — reinterpreting a 6-layer image asserts (6 != 1).
+    image.texture_view_descriptor = Some(bevy::render::render_resource::TextureViewDescriptor {
+        dimension: Some(bevy::render::render_resource::TextureViewDimension::Cube),
+        ..default()
+    });
+    Some(image)
+}
+
+fn build_procedural_sky(sun: Vec3) -> Option<Image> {
     const N: usize = 128;
     let mut data = Vec::with_capacity(N * N * 6 * 8);
     for face in 0..6 {
@@ -1447,7 +1509,7 @@ fn build_sky_cubemap(images: &mut Assets<Image>, sun: Vec3) -> Handle<Image> {
         dimension: Some(TextureViewDimension::Cube),
         ..default()
     });
-    images.add(image)
+    Some(image)
 }
 
 /// Framing for a pack (or a sensible default when none): `(cam_pos, target, far, yaw, pitch)`.
