@@ -30,16 +30,19 @@ use bevy::render::{
 };
 use bytemuck::{Pod, Zeroable};
 
-/// Byte-identical to ssao.wgsl's `SsaoParams` (96 bytes).
+/// Byte-identical to ssao.wgsl's `SsaoParams` (160 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct SsaoParamsGpu {
     inv_proj: [[f32; 4]; 4],
+    /// world -> view (the prepass stores WORLD normals; this shader works in view space).
+    view_from_world: [[f32; 4]; 4],
     /// x = world radius (m), y = intensity, z = power, w = fade-end view distance (m).
     p: [f32; 4],
-    /// x,y = viewport px, z = proj11, w = pad.
+    /// x,y = viewport px, z = proj11, w = 1.0 when the normal prepass is active this frame.
     vp: [f32; 4],
 }
+const _: () = assert!(std::mem::size_of::<SsaoParamsGpu>() == 160);
 
 #[derive(Resource)]
 struct SsaoPipeline {
@@ -47,6 +50,10 @@ struct SsaoPipeline {
     pipeline_id: CachedRenderPipelineId,
     scene_sampler: Sampler,
     params: Buffer,
+    /// 1x1 zero texture bound as the normal source whenever the prepass is inactive: the shader's
+    /// per-pixel zero-normal check then routes every pixel to the derivative fallback, so SSAO
+    /// works exactly as before the prepass existed.
+    fallback_normal_view: bevy::render::render_resource::TextureView,
 }
 
 fn init_ssao_pipeline(
@@ -63,7 +70,9 @@ fn init_ssao_pipeline(
                 texture_2d(TextureSampleType::Float { filterable: true }), // scene color
                 sampler(SamplerBindingType::Filtering),
                 texture_depth_2d_multisampled(), // main-pass depth (MSAA; sample 0 read)
-                uniform_buffer_sized(false, Some(std::num::NonZeroU64::new(96).unwrap())),
+                // Prepass world-normal target (Rgba16Float, textureLoad only — no sampler).
+                texture_2d(TextureSampleType::Float { filterable: false }),
+                uniform_buffer_sized(false, Some(std::num::NonZeroU64::new(160).unwrap())),
             ),
         ),
     );
@@ -75,7 +84,7 @@ fn init_ssao_pipeline(
     });
     let params = device.create_buffer(&BufferDescriptor {
         label: Some("eft_ssao_params"),
-        size: 96,
+        size: 160,
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -105,11 +114,28 @@ fn init_ssao_pipeline(
         }),
         zero_initialize_workgroup_memory: false,
     });
+    let fallback_normal = device.create_texture(&bevy::render::render_resource::TextureDescriptor {
+        label: Some("eft_ssao_fallback_normal"),
+        size: bevy::render::render_resource::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: bevy::render::render_resource::TextureDimension::D2,
+        format: bevy::render::render_resource::TextureFormat::Rgba16Float,
+        usage: bevy::render::render_resource::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let fallback_normal_view =
+        fallback_normal.create_view(&bevy::render::render_resource::TextureViewDescriptor::default());
     commands.insert_resource(SsaoPipeline {
         layout,
         pipeline_id,
         scene_sampler,
         params,
+        fallback_normal_view,
     });
 }
 
@@ -124,6 +150,7 @@ struct SsaoNode {
         Option<(
             bevy::render::render_resource::TextureViewId,
             bevy::render::render_resource::TextureViewId,
+            bevy::render::render_resource::TextureViewId, // prepass normal view (or the fallback)
             bevy::render::render_resource::BindGroup,
         )>,
     >,
@@ -164,16 +191,25 @@ impl ViewNode for SsaoNode {
         if depth.texture.sample_count() <= 1 {
             return Ok(());
         }
-        // Live params from the UI (96 B write per frame while enabled — negligible).
+        // Normal source: the prepass target when it ran this frame, else the 1x1 zero fallback
+        // (per-pixel zero-check in the shader routes to derivative reconstruction either way).
+        let prepass = world.get_resource::<super::gpu_driven::EftPrepassResources>();
+        let normal_view = prepass
+            .filter(|p| p.active)
+            .and_then(|p| p.normal_view.as_ref())
+            .unwrap_or(&sp.fallback_normal_view);
+        let has_normals = !std::ptr::eq(normal_view, &sp.fallback_normal_view);
+        // Live params from the UI (160 B write per frame while enabled — negligible).
         let vp = view.viewport;
         let params = SsaoParamsGpu {
             inv_proj: view.clip_from_view.inverse().to_cols_array_2d(),
+            view_from_world: view.world_from_view.to_matrix().inverse().to_cols_array_2d(),
             p: [settings.ssao_radius, settings.ssao_intensity, 1.5, 80.0],
             vp: [
                 vp.z as f32,
                 vp.w as f32,
                 view.clip_from_view.y_axis.y,
-                0.0,
+                if has_normals { 1.0 } else { 0.0 },
             ],
         };
         world
@@ -183,7 +219,11 @@ impl ViewNode for SsaoNode {
         let post = target.post_process_write();
         let mut cache = self.cached_bg.lock().unwrap();
         let bind = match cache.as_ref() {
-            Some((sid, did, bg)) if *sid == post.source.id() && *did == depth.view().id() => {
+            Some((sid, did, nid, bg))
+                if *sid == post.source.id()
+                    && *did == depth.view().id()
+                    && *nid == normal_view.id() =>
+            {
                 bg.clone()
             }
             _ => {
@@ -194,10 +234,16 @@ impl ViewNode for SsaoNode {
                         post.source,
                         &sp.scene_sampler,
                         depth.view(),
+                        normal_view,
                         sp.params.as_entire_binding(),
                     )),
                 );
-                *cache = Some((post.source.id(), depth.view().id(), bg.clone()));
+                *cache = Some((
+                    post.source.id(),
+                    depth.view().id(),
+                    normal_view.id(),
+                    bg.clone(),
+                ));
                 bg
             }
         };

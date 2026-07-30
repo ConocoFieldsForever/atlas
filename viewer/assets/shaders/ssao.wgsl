@@ -11,16 +11,22 @@
 
 struct SsaoParams {
     inv_proj: mat4x4<f32>,  // view-from-clip (Bevy reverse-z infinite projection inverse)
+    // world -> view rotation (full matrix uploaded; only the 3x3 is used, on direction vectors).
+    // Needed because the prepass stores WORLD-space normals and this shader works in view space.
+    view_from_world: mat4x4<f32>,
     // x = world radius (m), y = intensity, z = power, w = fade-end view distance (m)
     p: vec4<f32>,
-    // x,y = viewport px, z = proj11 (1/tan(fov_y/2)), w = pad
+    // x,y = viewport px, z = proj11 (1/tan(fov_y/2)), w = 1 when the normal prepass is ACTIVE
     vp: vec4<f32>,
 };
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
 @group(0) @binding(1) var scene_samp: sampler;
 @group(0) @binding(2) var depth_tex: texture_depth_multisampled_2d;
-@group(0) @binding(3) var<uniform> ao: SsaoParams;
+// The normal prepass target (world normal.xyz + roughness.w). When the prepass is off this binds a
+// 1x1 zero texture and vp.w = 0 — every pixel then falls back to the derivative reconstruction.
+@group(0) @binding(3) var normal_tex: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> ao: SsaoParams;
 
 struct FsIn {
     @builtin(position) clip: vec4<f32>,
@@ -65,9 +71,22 @@ fn fs_ssao(in: FsIn) -> @location(0) vec4<f32> {
         return color;
     }
     let P = view_pos_at(px, dims);
-    let Px = view_pos_at(px + vec2<i32>(1, 0), dims);
-    let Py = view_pos_at(px + vec2<i32>(0, 1), dims);
-    var N = normalize(cross(Px - P, Py - P));
+    // REAL surface normal from the prepass when it ran and wrote this pixel; derivative face
+    // normal otherwise. The prepass clears to zero, so sky / blend surfaces / the excluded grass
+    // read (0,0,0) and take the fallback — one code path, per-pixel choice. This is the upgrade
+    // the prepass exists for: the derivative normal facets on curves and halos at silhouettes
+    // because neighbouring texels straddle depth edges; the rasterized normal does neither.
+    var N: vec3<f32>;
+    let ndims = vec2<i32>(textureDimensions(normal_tex));
+    let npx = clamp(px, vec2<i32>(0), ndims - 1);
+    let nr = textureLoad(normal_tex, npx, 0);
+    if (ao.vp.w > 0.5 && dot(nr.xyz, nr.xyz) > 0.1) {
+        N = normalize((ao.view_from_world * vec4<f32>(nr.xyz, 0.0)).xyz);
+    } else {
+        let Px = view_pos_at(px + vec2<i32>(1, 0), dims);
+        let Py = view_pos_at(px + vec2<i32>(0, 1), dims);
+        N = normalize(cross(Px - P, Py - P));
+    }
     if (dot(N, -P) < 0.0) { N = -N; } // face the camera (view looks down -Z)
 
     // Project the world-space radius to pixels at this depth; clamp so the kernel neither

@@ -138,6 +138,26 @@ pub struct GfxSettings {
     /// Shaft brightness. 1.0 is a visible-but-plausible overcast shaft; the phase function already
     /// concentrates it toward the sun, so this does not need to be large.
     pub volumetric_strength: f32,
+    // ---- Graphics-plan feature switches (docs/GRAPHICS_PLAN.md Phase 0) -----------------------
+    // All default OFF and none is preset-controlled yet: each graduates into presets only after
+    // passing its phase's acceptance criteria on the bench harness. Independent switches are the
+    // plan's precondition for honest A/Bs — a feature that can only be tested entangled with
+    // another can't be attributed a cost.
+    /// Temporal anti-aliasing (Phase 2). EFT_TAA=1.
+    pub taa: bool,
+    /// Screen-space reflections (Phase 6; needs the prepass substrate). EFT_SSR=1.
+    pub ssr: bool,
+    /// Percentage-closer soft shadows (Phase 6). EFT_PCSS=1.
+    pub pcss: bool,
+    /// Hi-Z occlusion culling (Phase 3; needs the depth pyramid + second cull stage). EFT_HIZ=1.
+    pub hiz: bool,
+    /// Depth-prime the main pass from the prepass (Phase 3; gated on the Phase-2 MSAA decision).
+    /// EFT_DEPTH_PRIME=1.
+    pub depth_prime: bool,
+    /// Froxel volumetrics replacing the in-fragment march (Phase 5). EFT_FROXELS=1.
+    pub froxels: bool,
+    /// Gerstner water displacement from extracted Water4 parameters (Phase 5). EFT_WATER_DISP=1.
+    pub water_disp: bool,
     /// Depth of field (bokeh) — photoreal extra, default off.
     pub dof: bool,
     pub dof_focal_m: f32,
@@ -228,6 +248,13 @@ impl Default for GfxSettings {
             light_intensity: 1.0,
             sun_diffuse: 1.0,
             gi_intensity: 1.0,
+            taa: std::env::var("EFT_TAA").map(|v| v.trim() == "1").unwrap_or(false),
+            ssr: std::env::var("EFT_SSR").map(|v| v.trim() == "1").unwrap_or(false),
+            pcss: std::env::var("EFT_PCSS").map(|v| v.trim() == "1").unwrap_or(false),
+            hiz: std::env::var("EFT_HIZ").map(|v| v.trim() == "1").unwrap_or(false),
+            depth_prime: std::env::var("EFT_DEPTH_PRIME").map(|v| v.trim() == "1").unwrap_or(false),
+            froxels: std::env::var("EFT_FROXELS").map(|v| v.trim() == "1").unwrap_or(false),
+            water_disp: std::env::var("EFT_WATER_DISP").map(|v| v.trim() == "1").unwrap_or(false),
             volumetric: std::env::var("EFT_VOLUMETRIC")
                 .map(|v| v.trim() == "1")
                 .unwrap_or(false),
@@ -374,8 +401,9 @@ impl QualityPreset {
     /// Placement of the three newest options, from measurements on the woods flythrough at
     /// 2560x1440 (docs/GFX_BENCH_woods_*.json):
     ///   * FXAA (`aa`): +0.04 ms — inside the run-to-run noise floor, so it is ON everywhere,
-    ///     including Low. Nothing else in this renderer anti-aliases (every pipeline is
-    ///     sample_count 1), and turning it off buys a weak GPU almost nothing.
+    ///     including Low. It supplements the main pass's MSAA+A2C (see the `aa` field doc for the
+    ///     corrected story), targeting shading aliasing MSAA cannot resolve, and turning it off
+    ///     buys a weak GPU almost nothing.
     ///   * Volumetric shafts: +5.40 ms, ~45% of the frame — ULTRA ONLY. It is the most expensive
     ///     option here by a wide margin, more than the whole distance-LOD win.
     ///   * Grass distance clamp: -3.24 ms at 150 m, -4.65 ms at 80 m. Left OFF for High/Ultra

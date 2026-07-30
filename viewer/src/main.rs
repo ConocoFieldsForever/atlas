@@ -1107,6 +1107,14 @@ fn main() {
         app.insert_resource(g);
     }
     app.add_plugins((GradePlugin, render::SsaoPlugin, render::FpvCamPlugin));
+    // Phase 0 (docs/GRAPHICS_PLAN.md): per-pass GPU timestamps. Frame averages cannot resolve the
+    // plan's sub-millisecond costs from the 0.3 ms noise floor; the phases' acceptance criteria are
+    // written against these spans ("eft cull/shadow/prepass..."). Env-gated because timestamp
+    // queries are not free and nothing reads them in normal play.
+    if std::env::var("EFT_GPU_TIMING").map(|v| v.trim() == "1").unwrap_or(false) {
+        app.add_plugins(bevy::render::diagnostic::RenderDiagnosticsPlugin);
+        app.add_systems(Update, print_gpu_timing);
+    }
     // Runtime graphics settings reach the render world on EVERY render path (grade/SSAO install
     // unconditionally, so the extraction can't live inside EftGpuDrivenPlugin — under EFT_RENDER=
     // m0/std the toggles would silently stop reaching the GPU).
@@ -2301,6 +2309,34 @@ fn arm_auto_exposure(
     }
     if !s.exposure_armed {
         s.exposure_armed = true;
+    }
+}
+
+/// EFT_GPU_TIMING=1: print smoothed per-pass GPU times once a second. The names are the
+/// diagnostic spans recorded in the render nodes; the bench harness greps `[gpu]` lines.
+fn print_gpu_timing(
+    diagnostics: Res<bevy::diagnostic::DiagnosticsStore>,
+    time: Res<Time>,
+    mut acc: Local<f32>,
+) {
+    *acc += time.delta_secs();
+    if *acc < 1.0 {
+        return;
+    }
+    *acc = 0.0;
+    let mut parts: Vec<String> = Vec::new();
+    for d in diagnostics.iter() {
+        let path = d.path().as_str();
+        if !path.contains("eft") {
+            continue;
+        }
+        if let Some(v) = d.smoothed() {
+            parts.push(format!("{}={:.3}ms", path.trim_start_matches("render/"), v));
+        }
+    }
+    if !parts.is_empty() {
+        parts.sort();
+        eprintln!("[gpu] {}", parts.join("  "));
     }
 }
 

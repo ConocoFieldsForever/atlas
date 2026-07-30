@@ -419,7 +419,12 @@ pub struct OverlayConfig {
     /// we didn't parse, and nothing at all while screenshot-locate is off. Lives here because the
     /// menu shows it beside the overlay's other live-link settings.
     pub delete_processed_shots: bool,
-    /// Restore the ordinary decorated, resizable Atlas window without disarming screenshot summon.
+    /// DISMISS the overlay: hide/minimize and (with `return_focus_to_game`) hand the keyboard back
+    /// to the game, WITHOUT leaving overlay mode — screenshot summon stays armed and the next fix
+    /// brings the panel back where it was. Configurable in the menu's overlay settings (the
+    /// "Hide-overlay hotkey" picker). Leaving overlay mode entirely is the on-overlay EXIT button,
+    /// not a key: it used to be this hotkey, which read as the overlay breaking out into a desktop
+    /// window every time you tried to get back to the game.
     pub exit_hotkey: OverlayExitHotkey,
 }
 
@@ -644,8 +649,14 @@ fn toggle_overlay(
         return;
     }
     if state.shown && keys.just_pressed(cfg.exit_hotkey.key_code()) {
+        // DISMISS, do not exit overlay mode. This used to also set `windowed = true`, which tore
+        // the window back to a decorated desktop app — reported as "the key exits overlay mode
+        // instead of minimizing the overlay". Leaving `windowed` false routes through the dismiss
+        // path in `apply_overlay`: with `return_focus_to_game` (default on) Atlas minimizes in
+        // place and the game gets the keyboard back, while overlay mode stays armed — the next
+        // screenshot (or `~`) summons it straight back to the same spot. Leaving overlay mode
+        // entirely is a deliberate, mouse-sized decision: the EXIT button on the overlay itself.
         state.shown = false;
-        state.windowed = true;
     } else if keys.just_pressed(KeyCode::Backquote) {
         // `~` remains the fast raid handoff. If Atlas is currently in ordinary window mode,
         // treat it as an explicit re-summon rather than hiding the desktop window.

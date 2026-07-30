@@ -208,8 +208,18 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>,
             // storage buffer in the draw's bind group. Deliberately not done here.
             let band = lod_centers[gid].w;
             if (band > 0.0) {
-                // Hash the instance index to a stable [-0.5, 0.5).
-                var h = i * 747796405u + 2891336453u;
+                // Hash the GROUP id — NOT the instance index — to a stable [-0.5, 0.5).
+                //
+                // BUG FIX (user-visible as "objects disappear briefly when zooming"): the first
+                // version hashed `i`, the instance index. A group's shells are DIFFERENT instances,
+                // so LOD0 and LOD1 drew with different jitters: LOD0 stopped at far*(1+b*j0) while
+                // LOD1 started at the same boundary scaled by j1 != j0 — leaving a distance band
+                // where NEITHER shell drew (or both did). A zoom changes proj11, which sweeps every
+                // instance's d*m metric through its boundaries, so the gap crossed the screen as a
+                // blink. Keying the hash on the group id gives every shell of a group the SAME
+                // offset, so their windows tile exactly again — which is what the comment below
+                // always claimed. The stagger still varies BETWEEN groups, which is its whole job.
+                var h = (inst.ids.z >> 13u) * 747796405u + 2891336453u;
                 h = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
                 let j = f32((h >> 22u) ^ h) * (1.0 / 4294967296.0) - 0.5;
                 lo = lo * (1.0 + band * j);

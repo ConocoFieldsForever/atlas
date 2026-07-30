@@ -407,12 +407,12 @@ Atlas читает только файлы, которые игра уже за�
             "ВЫЙТИ ИЗ ОВЕРЛЕЯ / ОКОННЫЙ РЕЖИМ",
         ],
         OverlayExitHotkey => [
-            "Exit-overlay hotkey",
-            "Клавиша выхода из оверлея",
+            "Hide-overlay hotkey",
+            "Клавиша скрытия оверлея",
         ],
         OverlayExitHint => [
-            "Restores the normal resizable Atlas window",
-            "Возвращает обычное изменяемое окно Atlas",
+            "Hides the overlay and returns focus to the game",
+            "Скрывает оверлей и возвращает фокус игре",
         ],
         UnbuiltNotProcessed => ["is not processed yet", "ещё не обработана"],
         UnbuiltBody => [
