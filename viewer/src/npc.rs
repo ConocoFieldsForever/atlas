@@ -342,7 +342,6 @@ fn drive_npcs(
         let (a, b) = (npc.path[npc.leg], npc.path[npc.leg + 1]);
         let leg_vec = b - a;
         let leg_len = leg_vec.length().max(1.0e-3);
-        let walk_dir = leg_vec / leg_len;
 
         // ---- animator: same parameter/state machinery as the player ----
         // The controller's REAL parameters (read from the extracted graph, not invented): MOVE is
@@ -377,14 +376,23 @@ fn drive_npcs(
         let root_speed = blended_root_speed(pack, &scratch).max(0.0);
 
         // ---- move: travel at the blend's own root-motion speed ----
+        // NOTE the ordering below. `a`/`leg_vec` above describe the leg as it was at the TOP of
+        // this frame; the block may advance to the next leg, so the position write MUST re-read
+        // the current leg afterwards. Writing with the stale `a` while `dist` had been reset to 0
+        // snapped the body back to the START of the leg it had just finished, for exactly one
+        // frame, at every leg boundary — the twitch every few steps.
         if moving && root_speed > 1.0e-3 {
             npc.dist += root_speed * dt;
             if npc.dist >= leg_len {
-                npc.dist = 0.0;
+                // Carry the OVERSHOOT into the next leg instead of discarding it: dropping it
+                // stalled the agent by a fraction of a step at every vertex.
+                let over = npc.dist - leg_len;
+                npc.dist = over;
                 if npc.leg + 2 < npc.path.len() {
                     // interior polyline vertex: keep walking, no dwell (it's one route leg).
                     npc.leg += 1;
                 } else {
+                    npc.dist = 0.0;
                     // PLAN target reached: advance the plan, dwell, and force a replan.
                     npc.dwell = WAYPOINT_DWELL_S;
                     let n = npc.targets.len() as i32;
@@ -407,8 +415,17 @@ fn drive_npcs(
                 }
             }
         }
-        let t = (npc.dist / leg_len).clamp(0.0, 1.0);
-        tf.translation = a + leg_vec * t;
+        // Re-read the CURRENT leg (it may have advanced above) and place the body on it.
+        let (ca, cb) = if npc.path.len() >= 2 && npc.leg + 1 < npc.path.len() {
+            (npc.path[npc.leg], npc.path[npc.leg + 1])
+        } else {
+            (a, b)
+        };
+        let cvec = cb - ca;
+        let clen = cvec.length().max(1.0e-3);
+        let t = (npc.dist / clen).clamp(0.0, 1.0);
+        tf.translation = ca + cvec * t;
+        let walk_dir = cvec / clen;
         // Face the walk direction, turning at a bounded rate.
         // The rig's forward is +Z (manifest `characterForward`, derived from walk_aim_0's root
         // motion), and rotation_y(yaw) maps +Z to (sin yaw, 0, cos yaw) — so the yaw that faces
