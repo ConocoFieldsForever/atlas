@@ -29,6 +29,8 @@ import sys
 import numpy as np
 import UnityPy
 
+import unity_deps
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 SA = os.environ.get("EFT_GAME_DATA",
@@ -73,22 +75,14 @@ class Bundle:
     typetree), exactly like skin.py reads skinned meshes.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, cabs=None):
         self.env = UnityPy.Environment()
-        folder = os.path.dirname(path)
-        # Siblings first so the container's cross-bundle PPtrs resolve on load.
-        for sib in sorted(os.listdir(folder)):
-            if sib.endswith(".bundle") and os.path.join(folder, sib) != path:
-                try:
-                    self.env.load_file(os.path.join(folder, sib))
-                except Exception:
-                    pass
-        # Objects from the CONTAINER file only: the siblings were loaded purely to resolve
-        # cross-bundle mesh PPtrs, and walking their renderers too baked every other weapon in
-        # client_assets.bundle into the merge (5.7M verts, 2,499 materials for one rifle).
-        before = {id(o) for o in self.env.objects}
-        self.env.load_file(path)
-        own = [o for o in self.env.objects if id(o) not in before]
+        # Resolve the container's DECLARED CAB dependencies through the prebuilt index rather
+        # than hoping a sibling happens to provide them: `m_FileID` is an index into the
+        # serialized file's externals list, and UnityPy's fallback for a miss is a recursive
+        # scan of the whole 37 GB game tree. `own` is the container's own objects — the
+        # dependency bundles carry unrelated assets and must not be baked.
+        own, _n = unity_deps.resolve_into(self.env, path, cabs if cabs is not None else {})
         self.tf = {}        # transform pid -> (typetree, go pid)
         self.children = {}  # transform pid -> [child transform pid]
         self.go_name = {}
@@ -138,11 +132,20 @@ class Bundle:
         return None
 
 
-def bake(bundle, out_v, out_i, out_sub, base_M, mat_names):
-    """Append every renderer's mesh, transformed by base_M x its local matrix."""
+def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, lod=0):
+    """Append every renderer's mesh, transformed by base_M x its local matrix.
+
+    LOD: item prefabs ship several detail shells (ak74_..._LOD0/_LOD1/...). Baking them all
+    merged 3 copies of every part. Keep only the requested level, by the GameObject's own name
+    suffix — the game's own naming, not a guess; a part with no suffix is kept (single-shell).
+    """
+    keep = f"_lod{lod}"
     for gp, obj, kind in bundle.renderers:
         tpid = bundle.go2tf.get(gp)
         if tpid is None:
+            continue
+        nm = (bundle.go_name.get(gp) or "").lower()
+        if "_lod" in nm and keep not in nm:
             continue
         M = base_M @ bundle.world_of(tpid)
         try:
@@ -204,10 +207,12 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names):
         # submeshes: one per material, so per-part materials survive the merge
         idx = list(h.m_IndexBuffer or [])
         subs = getattr(mesh, "m_SubMeshes", []) or []
+        # Index width: `firstByte` is a BYTE offset, so converting it with a hardcoded /2
+        # garbles every 32-bit-indexed mesh. MeshHandler knows which width this mesh uses.
+        isz = 2 if getattr(h, "m_Use16BitIndices", True) else 4
         for si, sm in enumerate(subs):
-            first = int(getattr(sm, "firstByte", 0)) // 2 if getattr(sm, "indexCount", None) else 0
             cnt = int(getattr(sm, "indexCount", 0) or 0)
-            first = int(getattr(sm, "firstIndex", first) or first)
+            first = int(getattr(sm, "firstByte", 0) or 0) // isz
             if cnt <= 0:
                 continue
             mat_name = ""
@@ -226,7 +231,7 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names):
             out_sub.append((mat_names.index(mat_name), start, len(out_i) - start))
 
 
-def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None):
+def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None, cabs=None):
     """Recursively assemble `item_id` and its installed mods into one merged mesh."""
     verts, idxs, subs, mat_names = [], [], [], []
     bundle_cache = bundle_cache if bundle_cache is not None else {}
@@ -244,7 +249,7 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None)
             return
         b = bundle_cache.get(p)
         if b is None:
-            b = bundle_cache[p] = Bundle(p)
+            b = bundle_cache[p] = Bundle(p, cabs)
         bake(b, verts, idxs, subs, M, mat_names)
         # children: for each installed mod, find the slot node with that name and recurse.
         for slot_name, child_id in (install or {}).get(iid, {}).items():
@@ -322,6 +327,7 @@ def main():
     ap.add_argument("--globals", default=os.path.join(REPO, "packs", "shared", "globals.json"))
     args = ap.parse_args()
     templates = json.load(open(TEMPLATES, encoding="utf-8"))
+    cabs = unity_deps.load(verbose=False)
     iid = args.item
     if iid not in templates:
         hit = next((k for k, v in templates.items()
@@ -334,7 +340,7 @@ def main():
     name = templates[iid].get("_name") or iid
     out = args.out or os.path.join(OUT_ROOT, name)
     print(f"[build] {name} ({iid}); {sum(len(v) for v in install.values())} installed mod(s)")
-    build(iid, templates, out, install=install)
+    build(iid, templates, out, install=install, cabs=cabs)
 
 
 if __name__ == "__main__":
