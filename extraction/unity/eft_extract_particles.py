@@ -52,6 +52,71 @@ def gradient_rgba(mg, default=(1.0, 1.0, 1.0, 1.0)):
     return list(default)
 
 
+def gradient_keys(mg):
+    """MinMaxGradient -> up to 6 [t, r, g, b, a] keys of maxGradient (the OVER-LIFETIME look:
+    fire's white-yellow core aging into orange then fading smoke). None when there is no real
+    gradient. Unity stores color keys (rgb + time) and alpha keys (a + time) separately —
+    merge on the union of their times."""
+    if not isinstance(mg, dict):
+        return None
+    grad = mg.get("maxGradient") or mg.get("minGradient")
+    if not isinstance(grad, dict):
+        return None
+    ckeys, akeys = [], []
+    n_c = int(grad.get("m_NumColorKeys", 0) or 0)
+    n_a = int(grad.get("m_NumAlphaKeys", 0) or 0)
+    for i in range(min(n_c, 8)):
+        k = grad.get(f"key{i}")
+        t = grad.get(f"ctime{i}", 0)
+        if isinstance(k, dict):
+            ckeys.append((float(t) / 65535.0, [float(k.get(c, 1.0)) for c in ("r", "g", "b")]))
+    for i in range(min(n_a, 8)):
+        k = grad.get(f"key{i}")
+        t = grad.get(f"atime{i}", 0)
+        if isinstance(k, dict):
+            akeys.append((float(t) / 65535.0, float(k.get("a", 1.0))))
+    if not ckeys and not akeys:
+        return None
+
+    def sample_c(t):
+        if not ckeys:
+            return [1.0, 1.0, 1.0]
+        ckeys.sort()
+        for (t0, c0), (t1, c1) in zip(ckeys, ckeys[1:]):
+            if t0 <= t <= t1:
+                f = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+                return [c0[j] + (c1[j] - c0[j]) * f for j in range(3)]
+        return ckeys[0][1] if t <= ckeys[0][0] else ckeys[-1][1]
+
+    def sample_a(t):
+        if not akeys:
+            return 1.0
+        akeys.sort()
+        for (t0, a0), (t1, a1) in zip(akeys, akeys[1:]):
+            if t0 <= t <= t1:
+                f = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+                return a0 + (a1 - a0) * f
+        return akeys[0][1] if t <= akeys[0][0] else akeys[-1][1]
+
+    times = sorted({0.0, 1.0, *(t for t, _ in ckeys), *(t for t, _ in akeys)})[:6]
+    return [[round(t, 3)] + [round(v, 4) for v in sample_c(t)] + [round(sample_a(t), 4)]
+            for t in times]
+
+
+def curve_keys(mm):
+    """MinMaxCurve -> up to 4 [t, v] keys of maxCurve (size-over-lifetime), or None."""
+    if not isinstance(mm, dict):
+        return None
+    cur = (mm.get("maxCurve") or {}).get("m_Curve")
+    if not isinstance(cur, list) or len(cur) < 2:
+        return None
+    out = []
+    for k in cur[:4]:
+        if isinstance(k, dict):
+            out.append([round(float(k.get("time", 0.0)), 3), round(float(k.get("value", 1.0)), 4)])
+    return out if len(out) >= 2 else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True)
@@ -153,7 +218,9 @@ def main():
                 continue
             n_seen += 1
             gp = (d.get("m_GameObject") or {}).get("m_PathID", 0)
-            if not (bool(d.get("looping")) and bool(d.get("playOnAwake"))):
+            # looping is the persistence signal; playOnAwake is NOT required — fire prefabs
+            # trigger some of their looping children (sparks, embers) from scripts.
+            if not bool(d.get("looping")):
                 continue
             if not active_chain(gp):
                 continue
@@ -205,8 +272,47 @@ def main():
             uv = d.get("UVModule") or {}
             emis = d.get("EmissionModule") or {}
             shape = d.get("ShapeModule") or {}
+            colmod = d.get("ColorModule") or {}
+            sizemod = d.get("SizeModule") or {}
+            lights = d.get("LightsModule") or {}
             pos, wscale = world_pos_scale(go2tf.get(gp, 0))
+            rec_extra = {}
+            # OVER-LIFETIME look (the part a constant color cannot fake): the game's own
+            # color gradient + size curve, sampled to a few keys.
+            if g(colmod, "enabled"):
+                gk = gradient_keys(g(colmod, "gradient"))
+                if gk:
+                    rec_extra["colorOverLife"] = gk
+            if g(sizemod, "enabled"):
+                ck = curve_keys(g(sizemod, "curve"))
+                if ck:
+                    rec_extra["sizeOverLife"] = ck
+            # The game's own "this effect casts light" signal + the referenced Light's values.
+            if g(lights, "enabled"):
+                lrec = {"ratio": round(float(g(lights, "ratio", 0.0) or 0.0), 3),
+                        "intensity": round(curve_scalar(g(lights, "intensityCurve"), 1.0), 3),
+                        "range": round(curve_scalar(g(lights, "rangeCurve"), 3.0), 3)}
+                try:
+                    lp = g(lights, "light") or {}
+                    if lp.get("m_PathID"):
+                        for lo in env.objects:
+                            if lo.path_id == lp["m_PathID"] and lo.type.name == "Light":
+                                ld = lo.read_typetree()
+                                lc = ld.get("m_Color") or {}
+                                lrec["color"] = [round(float(lc.get(k, 1.0)), 4)
+                                                 for k in ("r", "g", "b")]
+                                lrec["intensity"] = round(
+                                    lrec["intensity"] * float(ld.get("m_Intensity", 1.0) or 1.0), 3)
+                                lrec["range"] = round(
+                                    max(lrec["range"], float(ld.get("m_Range", 0.0) or 0.0)), 3)
+                                break
+                except Exception:
+                    pass
+                rec_extra["light"] = lrec
+            if int(g(uv, "timeMode", 0) or 0) == 1:
+                rec_extra["uvFpsMode"] = 1
             emitters.append({
+                **rec_extra,
                 # the viewer/pack X-flip (diag(-1,1,1)) — same convention as every sidecar.
                 "pos": [round(-float(pos[0]), 3), round(float(pos[1]), 3), round(float(pos[2]), 3)],
                 "lv": lv,
