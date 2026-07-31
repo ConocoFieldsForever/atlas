@@ -143,17 +143,21 @@ pub fn spawn(
                 .textures
                 .get("_BumpMap")
                 .and_then(|p| load_texture(&pack.root, p, false, images, &mut tex_cache));
-            let spec = m
+            let _spec = m
                 .textures
                 .get("_SpecMap")
                 .and_then(|p| load_texture(&pack.root, p, false, images, &mut tex_cache));
             materials.add(StandardMaterial {
                 base_color_texture: base,
                 normal_map_texture: normal,
-                // BSG's character shader is not PBR metal/rough; the spec map drives a Blinn-ish
-                // highlight. Feeding it to occlusion is a deliberate stand-in that keeps cloth from
-                // reading as wet plastic, not a claim of parity with the game's shading.
-                occlusion_texture: spec,
+                // The _SpecMap is NOT bound. It used to sit in `occlusion_texture`, but Bevy reads
+                // occlusion from the RED channel and this map is ~0.19-0.24 there, so it multiplied
+                // every character surface down to a fifth of its ambient light — with hard edges
+                // wherever the atlas's spec regions change. That was the black "skullcap" with a
+                // seam across the scalp that swung as the head turned; nothing was wrong with the
+                // hair, the normals or the sun. It is a GLOSS map (high = shiny), the inverse of
+                // Bevy's roughness, so binding it to metallic_roughness would invert the shading
+                // instead: it needs a 1-x pass at extraction before it can be used honestly.
                 perceptual_roughness: 0.75,
                 metallic: 0.0,
                 ..default()
