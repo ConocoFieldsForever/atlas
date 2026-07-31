@@ -264,7 +264,9 @@ impl Plugin for UiPlugin {
                 drone_hud,
                 fit_camera_viewport,
             )
-                .chain(),
+                .chain()
+                // EFT_CLEAN=1: no panels, no HUD — clean frames for screenshots/trailers.
+                .run_if(|| std::env::var("EFT_CLEAN").map(|v| v.trim() != "1").unwrap_or(true)),
         );
     }
 }

@@ -86,6 +86,10 @@ fn teardown_pick(mut spheres: ResMut<PickSpheres>) {
 /// Top-left, dark, semi-transparent readout. Spawned once; the pick system just
 /// rewrites its string.
 fn spawn_pick_ui(mut commands: Commands) {
+    // EFT_CLEAN=1: no HUD — clean frames for screenshots/trailers (same gate as the panels).
+    if std::env::var("EFT_CLEAN").map(|v| v.trim() == "1").unwrap_or(false) {
+        return;
+    }
     commands.spawn((
         Text::new("PICK  double-click to identify geometry"),
         TextFont {
