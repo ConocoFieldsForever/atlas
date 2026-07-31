@@ -79,6 +79,15 @@ def write_pack(
             rel = f"textures/{name}.png"
             path = os.path.join(out_dir, rel)
             try:
+                # NORMAL MAPS: Unity stores these in the DXT5nm/BC5 convention — X in ALPHA,
+                # Y in green, red a constant 1.0 (unused), Z reconstructed. Written raw, a
+                # consumer that reads X from RED (Bevy, glTF, every standard PBR shader) gets a
+                # tangent normal of about (1, y, z): pointing along the tangent instead of out
+                # of the surface, so shading flipped between lit and black as a head turned.
+                # Repack to the standard RGB layout here, where the convention is known: X from
+                # alpha, Y as-is, Z reconstructed = sqrt(1 - x^2 - y^2).
+                if name.lower().endswith(("_n", "_normal", "_nrm")):
+                    img = _repack_normal_map(img, name)
                 img.save(path)
                 written_textures.append(rel)
             except Exception as exc:
@@ -251,3 +260,25 @@ def write_pack(
         json.dump(manifest, fh, indent=1)
 
     return manifest
+
+
+def _repack_normal_map(img, name: str):
+    """DXT5nm/BC5 (X in alpha, red unused) -> standard RGB normal map. Pass-through when the
+    image is already standard (a real red channel with variation), so nothing is corrupted
+    twice and non-Unity-convention maps stay untouched."""
+    try:
+        import numpy as np
+        from PIL import Image
+    except Exception:
+        return img
+    a = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
+    r, g, b, al = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+    # A standard map has a varying red channel; DXT5nm pins red to ~1 and carries X in alpha.
+    if r.std() > 0.02:
+        return img
+    x = al * 2.0 - 1.0
+    y = g * 2.0 - 1.0
+    z = np.sqrt(np.clip(1.0 - x * x - y * y, 0.0, 1.0))
+    out = np.stack([(x + 1.0) * 0.5, (y + 1.0) * 0.5, (z + 1.0) * 0.5], axis=-1)
+    print(f"  [normal] {name}: DXT5nm (X in alpha) -> standard RGB")
+    return Image.fromarray(np.clip(out * 255.0, 0, 255).astype("uint8"), "RGB")
