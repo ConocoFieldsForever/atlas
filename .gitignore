@@ -74,6 +74,16 @@ tools/_*
 docs/_bench_logs/
 
 # No markdown in the repo: docs live locally only (working notes, not shippables).
-# Exception: the README is the release landing page.
+# Exceptions: the README (release landing page) and the notices, which MUST ship —
+# scripts/release.ps1 copies LICENSE-NOTES.md into every distribution.
 *.md
 !README.md
+!LICENSE-NOTES.md
+!third_party/**/README.md
+
+# GAME CONTENT — never tracked. The grade LUT source is extracted verbatim from the
+# game's resources.assets and its .bin is that asset's derivative; both are rebuilt
+# locally by extraction/grade/make_grade_lut_game.py.
+extraction/grade/lut_amidgen_bluegreen.png
+extraction/grade/eft_grade_lut.bin
+extraction/grade/eft_grade_lut_recon.bin
