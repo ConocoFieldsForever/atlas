@@ -89,6 +89,7 @@ class Bundle:
         self.go_name = {}
         self.go2tf = {}
         self.renderers = []  # (go pid, MeshRenderer/SkinnedMeshRenderer object)
+        self.monos = []     # MonoBehaviour objects (scope modes, optic sights, ...)
         for o in own:
             t = o.type.name
             if t == "Transform":
@@ -103,6 +104,95 @@ class Bundle:
             elif t in ("MeshRenderer", "SkinnedMeshRenderer"):
                 d = o.read_typetree()
                 self.renderers.append(((d.get("m_GameObject") or {}).get("m_PathID", 0), o, t))
+            elif t == "MonoBehaviour":
+                self.monos.append(o)
+        # Objects are addressed within their own serialized file, so a PPtr with m_FileID == 0
+        # must be resolved against the file that referenced it -- not by path id alone, which
+        # collides once dependency bundles are in the same environment.
+        self._by_file_pid = {(id(o.assets_file), o.path_id): o for o in self.env.objects}
+
+    def deref(self, owner, pptr):
+        """A same-file PPtr -> object, or None."""
+        if not isinstance(pptr, dict) or pptr.get("m_FileID", 0) != 0 or not pptr.get("m_PathID"):
+            return None
+        return self._by_file_pid.get((id(owner.assets_file), pptr["m_PathID"]))
+
+    def scope_modes(self):
+        """The game's own list of a sight's mutually exclusive MODES.
+
+        `ScopePrefabCache._scopeModeInfos` is BSG's table of what a sight can be at any moment:
+        each entry names a `ModeGameObject` (the subtree to show) and either a `CollimatorSight`
+        (a red dot) or an `OpticSight` (a magnified optic, carrying the `ScopeTransform` the eye
+        aligns to when aiming). The HHS-1 has two: the G33 magnifier INLINE behind the holo sight,
+        and the same magnifier FLIPPED ASIDE. Baking every renderer put both on the rail at once,
+        which is why the optic looked like two scopes stacked on each other.
+
+        Returns [{"tf": <mode root transform pid>, "nodes": {pids}, "optic": bool,
+                  "aim": <ScopeTransform pid or None>, "fov": float or None}], in the game's order.
+        """
+        if getattr(self, "_scope_modes", None) is None:
+            modes = []
+            for o in self.monos:
+                try:
+                    if o.read().m_Script.read().m_Name != "ScopePrefabCache":
+                        continue
+                    d = o.read_typetree()
+                except Exception:
+                    continue
+                for m in d.get("_scopeModeInfos") or []:
+                    go = self.deref(o, m.get("ModeGameObject") or {})
+                    if go is None:
+                        continue
+                    tfp = self.go2tf.get(go.path_id)
+                    if tfp is None:
+                        continue
+                    optic = self.deref(o, m.get("OpticSight") or {})
+                    aim = fov = lens = None
+                    if optic is not None:
+                        try:
+                            od = optic.read_typetree()
+                            st = self.deref(optic, od.get("ScopeTransform") or {})
+                            aim = st.path_id if st is not None else None
+                            # The LENS the eye looks through. Its position disambiguates which way
+                            # the aim node faces -- see the sign derivation in bake().
+                            lr = self.deref(optic, od.get("LensRenderer") or {})
+                            if lr is not None:
+                                lg = (lr.read_typetree().get("m_GameObject") or {}).get("m_PathID")
+                                lens = self.go2tf.get(lg)
+                            sd = self.deref(optic, od.get("ScopeData") or {})
+                            # The optic's camera data is what magnification MEANS: a field of
+                            # view in degrees, straight from the game.
+                            for cand in (sd, optic):
+                                if cand is None:
+                                    continue
+                                cd = cand.read_typetree()
+                                if "FieldOfView" in cd:
+                                    fov = float(cd["FieldOfView"])
+                                    break
+                        except Exception:
+                            pass
+                    if fov is None:
+                        fov = self._camera_fov_near(go)
+                    modes.append({"tf": tfp, "nodes": self.subtree(tfp),
+                                  "optic": optic is not None, "aim": aim, "fov": fov,
+                                  "lens": lens})
+            self._scope_modes = modes
+        return self._scope_modes
+
+    def _camera_fov_near(self, mode_go):
+        """`ScopeCameraData.FieldOfView` on any node inside this mode (the optic camera)."""
+        want = self.subtree(self.go2tf.get(mode_go.path_id))
+        for o in self.monos:
+            try:
+                if o.read().m_Script.read().m_Name != "ScopeCameraData":
+                    continue
+                d = o.read_typetree()
+            except Exception:
+                continue
+            gp = (d.get("m_GameObject") or {}).get("m_PathID", 0)
+            if self.go2tf.get(gp) in want and "FieldOfView" in d:
+                return float(d["FieldOfView"])
+        return None
 
     def roots(self):
         parented = {c for kids in self.children.values() for c in kids}
@@ -278,7 +368,8 @@ class Bundle:
         return None
 
 
-def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, props_by_mat=None):
+def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, props_by_mat=None,
+         out_aim=None):
     """Append every renderer's mesh, transformed by base_M x its local matrix.
 
     LOD: item prefabs ship several detail shells (ak74_..._LOD0/_LOD1/...). Baking them all
@@ -286,12 +377,60 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
     suffix — the game's own naming, not a guess; a part with no suffix is kept (single-shell).
     """
     keep = f"_lod{lod}"
+    # A sight's MODES are mutually exclusive states of one item, listed by the game itself in
+    # `ScopePrefabCache._scopeModeInfos`. Only the selected mode's geometry exists at any moment;
+    # baking them all stacked the HHS-1's magnifier onto its own flipped-aside copy. `EFT_SCOPE_MODE`
+    # picks which, defaulting to the game's first entry.
+    modes = bundle.scope_modes()
+    hidden_modes = set()
+    if modes:
+        want = int(os.environ.get("EFT_SCOPE_MODE", "0"))
+        want = want if 0 <= want < len(modes) else 0
+        for i, m in enumerate(modes):
+            if i != want:
+                hidden_modes |= m["nodes"]
+        hidden_modes -= modes[want]["nodes"]
+        # THE AIM ANCHOR. `OpticSight.ScopeTransform` is the node the game aligns the eye to when
+        # you bring the sight up, and `ScopeCameraData.FieldOfView` is that optic's magnification
+        # expressed as a field of view in degrees. Both come straight from the sight's own prefab,
+        # so aiming needs no authored offsets. Recorded in the ASSEMBLED weapon's space -- the same
+        # space as the baked vertices -- because that is what the viewer parents to.
+        sel = modes[want]
+        if out_aim is not None and sel.get("aim") is not None:
+            A = base_M @ bundle.root_inv() @ bundle.world_of(sel["aim"])
+            R = A[:3, :3].astype(np.float64)
+            norms = np.linalg.norm(R, axis=0)
+            R[:, norms > 1e-9] /= norms[norms > 1e-9]
+            # Same X-flip conjugation the vertices get: a point maps by G3, a basis by G3 R.
+            pos = (G3 @ A[:3, 3])
+            basis = G3 @ R
+            fwd = basis[:, 2]
+            # WHICH WAY THE EYE FACES. A Unity camera looks down +Z, but this node's +Z points
+            # back toward the shoulder -- measured on the HHS-1, where the anchor sits at Y -0.146,
+            # its lens at -0.26 and the muzzle at -0.74, so downrange is -Y while the node's +Z
+            # reads +Y. Rather than hardcode a flip, the sign is taken from the optic's OWN
+            # `LensRenderer`: you look THROUGH the lens, so forward is whichever of +/-Z agrees
+            # with the direction from the anchor to it.
+            if sel.get("lens") is not None:
+                lp = G3 @ (base_M @ bundle.root_inv() @ bundle.world_of(sel["lens"]))[:3, 3]
+                to_lens = lp - pos
+                if float(np.dot(fwd, to_lens)) < 0.0:
+                    fwd = -fwd
+            out_aim.append({
+                "position": [float(v) for v in pos],
+                "forward": [float(v) for v in fwd],
+                "up": [float(v) for v in basis[:, 1]],
+                "fov": float(sel["fov"]) if sel.get("fov") else None,
+                "source": "OpticSight.ScopeTransform",
+            })
     for gp, obj, kind in bundle.renderers:
         tpid = bundle.go2tf.get(gp)
         if tpid is None:
             continue
         if tpid not in bundle.variant():
             continue  # the other model variant's copy of this part
+        if tpid in hidden_modes:
+            continue  # belongs to a scope mode that is not the active one
         nm = (bundle.go_name.get(gp) or "").lower()
         if "_lod" in nm and keep not in nm:
             continue
@@ -438,6 +577,7 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
 def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None, cabs=None):
     """Recursively assemble `item_id` and its installed mods into one merged mesh."""
     verts, idxs, subs, mat_names = [], [], [], []
+    aim = []
     tex_by_mat = {}
     props_by_mat = {}
     bundle_cache = bundle_cache if bundle_cache is not None else {}
@@ -456,7 +596,8 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
         b = bundle_cache.get(p)
         if b is None:
             b = bundle_cache[p] = Bundle(p, cabs)
-        bake(b, verts, idxs, subs, M, mat_names, tex_by_mat, props_by_mat=props_by_mat)
+        bake(b, verts, idxs, subs, M, mat_names, tex_by_mat, props_by_mat=props_by_mat,
+             out_aim=aim)
         # children: for each installed mod, find the slot node with that name and recurse.
         for slot_name, child_id in (install or {}).get(iid, {}).items():
             node = b.slot_node(slot_name)
@@ -513,6 +654,9 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
         # understands (`_Color.a` -> opacity, `_SpecColor`/`_Shininess` -> reflectance) and
         # ignores the rest, so a new property never breaks the contract.
         "materialProps": props_by_mat,
+        # Where the eye goes when aiming, from the sight's own OpticSight component. Absent when
+        # the build carries no magnified optic (iron sights and red dots have no ScopeTransform).
+        "aim": (aim[0] if aim else None),
         "conventions": {"world": "viewer (X-flipped from Unity)", "windingFlipped": True},
     }
     json.dump(man, open(os.path.join(out_dir, "manifest.json"), "w"), indent=1)

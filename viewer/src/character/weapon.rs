@@ -35,6 +35,24 @@ struct WeapManifest {
     /// Per-material scalars/colours as the game's shader names them. See [`MatProps`].
     #[serde(rename = "materialProps", default)]
     material_props: HashMap<String, MatProps>,
+    /// Where the eye goes when aiming. See [`AimAnchor`].
+    #[serde(default)]
+    aim: Option<AimAnchor>,
+}
+
+/// The sight's own eye anchor, in the assembled weapon's space.
+///
+/// Taken from `OpticSight.ScopeTransform` in the sight prefab — the node the game aligns the eye
+/// to when the sight comes up — so aiming needs no authored offsets. `fov` is that optic's
+/// magnification as a field of view in degrees (`ScopeCameraData.FieldOfView`); it describes the
+/// image rendered THROUGH the lens, not the whole screen.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AimAnchor {
+    pub position: [f32; 3],
+    pub forward: [f32; 3],
+    pub up: [f32; 3],
+    #[serde(default)]
+    pub fov: Option<f32>,
 }
 
 /// A material's raw properties, straight from the game.
@@ -67,6 +85,8 @@ struct SubMesh {
 
 /// One loaded weapon: a mesh + material per submesh, ready to spawn as children of a bone.
 pub struct WeaponPack {
+    /// Present when the build carries an optic that declares a scope transform.
+    pub aim: Option<AimAnchor>,
     pub name: String,
     pub parts: Vec<(Handle<Mesh>, Handle<StandardMaterial>)>,
 }
@@ -232,7 +252,7 @@ pub fn load(
         return None;
     }
     info!("weapon '{}': {} part(s) from {}", man.name, parts.len(), dir.display());
-    Some(WeaponPack { name: man.name, parts })
+    Some(WeaponPack { aim: man.aim.clone(), name: man.name, parts })
 }
 
 /// `out/weapons/<id>` unless overridden.

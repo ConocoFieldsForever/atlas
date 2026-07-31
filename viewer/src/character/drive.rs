@@ -96,6 +96,7 @@ fn build_params(
     settings: &CameraSettings,
     body_yaw: f32,
     landing: bool,
+    aiming: f32,
 ) -> (HashMap<String, f32>, f32) {
     let v = ws.horizontal_velocity;
     let speed = v.length();
@@ -139,6 +140,10 @@ fn build_params(
     p.insert("ThirdPersonFloat".into(), 1.0);
     p.insert("WeapSizeModifier".into(), 0.0);
     p.insert("TransitionMultiplier".into(), 1.0);
+    // The game's own aim signal. Set so the graph sees the right value; the pose it selects lives
+    // on the additive aim LAYERS, which the evaluator does not blend yet.
+    p.insert("isAiming".into(), aiming);
+    p.insert("Aim_angle".into(), 0.0);
     let _ = settings;
     (p, speed)
 }
@@ -199,6 +204,7 @@ pub(crate) fn blended_root_speed(pack: &CharacterPack, leaves: &[WeightedClip]) 
 /// `PostUpdate`: place the character at the player's feet, pose it, then apply the boom.
 pub fn drive_character(
     time: Res<Time>,
+    aim_blend: Res<AimBlend>,
     settings: Res<CameraSettings>,
     cs: Res<CharacterSettings>,
     active: Option<Res<ActiveCharacter>>,
@@ -313,7 +319,7 @@ pub fn drive_character(
     root_tf.rotation = facing;
 
     // ---- parameters + state ----
-    let (params, speed) = build_params(ws, &settings, body_yaw, *land_timer > 0.0);
+    let (params, speed) = build_params(ws, &settings, body_yaw, *land_timer > 0.0, aim_blend.0);
     // A jump is a launch off the ground with upward velocity; walking off a ledge is not.
     if ws.grounded {
         *jumped = false;
@@ -441,6 +447,79 @@ pub fn drive_character(
     let offset = target - cam_tf.translation;
     cam_tf.translation += offset;
     boom.applied = offset;
+}
+
+/// The sight's eye anchor, ready to aim through.
+///
+/// `local` is the anchor in the WEAPON's space and `bone` the socket the weapon hangs on, so the
+/// world pose is `bone.global * local` — which follows the animation for free, exactly as the
+/// gun itself does.
+#[derive(Resource)]
+pub struct PlayerAim {
+    pub bone: Entity,
+    pub local: Transform,
+    pub fov_deg: Option<f32>,
+}
+
+/// How far into the aim we are, 0 = hip, 1 = fully on the sight.
+#[derive(Resource, Default)]
+pub struct AimBlend(pub f32);
+
+/// Aiming. Holds `isAiming` for the animator and, under `EFT_ADS_EYE=1`, snaps the eye onto the
+/// optic's own anchor.
+///
+/// WHY THE EYE SNAP IS NOT THE DEFAULT: the game does not move your eye to the sight, it plays an
+/// ADDITIVE aim pose that brings the sight up to your eye — `Additive_Aiming` and `Additive_ISaim`
+/// are real layers in this controller, and `Aim_angle` is referenced 51 times across it. Dragging
+/// the camera to the weapon instead puts it wherever the gun currently is, which at low ready is
+/// inside the receiver. The anchor itself is correct and game-derived
+/// (`OpticSight.ScopeTransform`, measured 14.6 cm behind the lens on the weapon axis); what is
+/// missing is layer support in the pose evaluator, which neither `anim` nor `pack` models yet.
+pub fn aim_down_sights(
+    time: Res<Time>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    ui: Res<crate::inspect::UiWantsKeyboard>,
+    cs: Res<CharacterSettings>,
+    settings: Res<CameraSettings>,
+    aim: Option<Res<PlayerAim>>,
+    mut blend: ResMut<AimBlend>,
+    bones: Query<&GlobalTransform, With<super::rig::CharacterBone>>,
+    mut cam: Query<(&mut Transform, &mut Projection), With<crate::CullCamera>>,
+) {
+    let Some(aim) = aim else { return };
+    // `EFT_ADS=1` holds the sight up without a mouse, so a headless capture can frame it.
+    let forced = std::env::var("EFT_ADS").map(|v| v.trim() == "1").unwrap_or(false);
+    let want = !ui.0
+        && cs.enabled
+        && settings.mode == CamMode::Walk
+        && (forced || mouse.pressed(MouseButton::Right));
+    // Ease in and out rather than snapping, the way a weapon actually comes up.
+    let rate = if want { 9.0 } else { 12.0 };
+    let target = if want { 1.0 } else { 0.0 };
+    blend.0 += (target - blend.0) * (1.0 - (-rate * time.delta_secs()).exp());
+    if blend.0 <= 0.001 {
+        return;
+    }
+    if !std::env::var("EFT_ADS_EYE").map(|v| v.trim() == "1").unwrap_or(false) {
+        return;
+    }
+    let Ok(bone_gt) = bones.get(aim.bone) else { return };
+    let Ok((mut cam_tf, mut proj)) = cam.single_mut() else { return };
+    let world = bone_gt.mul_transform(aim.local);
+    let (_, want_rot, want_pos) = world.to_scale_rotation_translation();
+    cam_tf.translation = cam_tf.translation.lerp(want_pos, blend.0);
+    cam_tf.rotation = cam_tf.rotation.slerp(want_rot, blend.0);
+    // MAGNIFICATION IS NOT A SCREEN ZOOM. `ScopeCameraData.FieldOfView` (5.03 deg on the G33)
+    // drives the optic's own camera, whose image the game renders INTO the lens circle -- the
+    // rest of the screen keeps its normal field of view. Applying it to the main camera would be
+    // a ~12x zoom of everything, which is not what aiming looks like. The value is carried in the
+    // pack for a future scope-camera pass; `EFT_ADS_ZOOM=1` opts the whole screen in meanwhile.
+    if std::env::var("EFT_ADS_ZOOM").map(|v| v.trim() == "1").unwrap_or(false) {
+        if let (Some(fov), Projection::Perspective(p)) = (aim.fov_deg, &mut *proj) {
+            let hip = settings.fov_deg.to_radians();
+            p.fov = hip + (fov.to_radians().max(0.02) - hip) * blend.0;
+        }
+    }
 }
 
 /// Marker: this mesh belongs to the character the camera is attached to. NPC meshes never carry

@@ -187,6 +187,24 @@ fn attach_weapon(
     };
     let Some(dir) = dir else { return };
     let Some(wp) = weapon::load(&dir, meshes, materials, images) else { return };
+    // Remember where the sight's eye anchor sits, in the weapon's own space. The weapon is a
+    // child of the socket bone, so bone_world * anchor is where the eye goes when aiming.
+    if let Some(a) = &wp.aim {
+        let fwd = Vec3::from_array(a.forward).normalize_or_zero();
+        let up = Vec3::from_array(a.up).normalize_or_zero();
+        if fwd.length_squared() > 0.5 {
+            commands.insert_resource(drive::PlayerAim {
+                bone,
+                local: Transform::from_translation(Vec3::from_array(a.position))
+                    .looking_to(fwd, if up.length_squared() > 0.5 { up } else { Vec3::Y }),
+                fov_deg: a.fov,
+            });
+            info!(
+                "sight anchor: {:?} fov={:?} (from OpticSight.ScopeTransform)",
+                a.position, a.fov
+            );
+        }
+    }
     for (mesh, mat) in &wp.parts {
         let child = commands
             .spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY))
@@ -231,7 +249,12 @@ impl Plugin for CharacterPlugin {
             // Pose and re-boom after all movement, before transforms propagate.
             .add_systems(
                 PostUpdate,
-                drive::drive_character.before(bevy::transform::TransformSystems::Propagate),
-            );
+                (
+                    drive::drive_character,
+                    drive::aim_down_sights.after(drive::drive_character),
+                )
+                    .before(bevy::transform::TransformSystems::Propagate),
+            )
+            .init_resource::<drive::AimBlend>();
     }
 }
