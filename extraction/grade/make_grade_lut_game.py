@@ -29,8 +29,54 @@ import numpy as np
 from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, 'lut_amidgen_bluegreen.png')
-OUT = sys.argv[2] if len(sys.argv) > 2 else os.path.join(HERE, 'eft_grade_lut.bin')
+# args: [SRC.png] [OUT.bin], or just OUT.bin. SRC is optional — when it is missing the strip is
+# EXTRACTED from the player's own installation below, which is the point: no game texture ships
+# with this tool.
+_args = sys.argv[1:]
+if len(_args) == 1 and _args[0].lower().endswith('.bin'):
+    SRC, OUT = os.path.join(HERE, 'lut_amidgen_bluegreen.png'), _args[0]
+else:
+    SRC = _args[0] if _args else os.path.join(HERE, 'lut_amidgen_bluegreen.png')
+    OUT = _args[1] if len(_args) > 1 else os.path.join(HERE, 'eft_grade_lut.bin')
+
+
+def _extract_from_game(dst_png):
+    """Pull the game's own grading LUT strip out of the installed resources.assets.
+
+    Located BY NAME (the game's own asset name), never by a hardcoded path id, so a game update
+    that renumbers assets still resolves. Requires EFT_GAME_DATA (or the default install path).
+    """
+    import UnityPy
+    data = os.environ.get(
+        'EFT_GAME_DATA', r'C:\Battlestate Games\Escape from Tarkov\EscapeFromTarkov_Data')
+    name_hint = os.environ.get('EFT_GRADE_LUT_NAME', 'amidgen').lower()
+    src = os.path.join(data, 'resources.assets')
+    if not os.path.exists(src):
+        raise SystemExit(f'no resources.assets at {src} — set EFT_GAME_DATA')
+    env = UnityPy.load(src)
+    best = None
+    for o in env.objects:
+        if o.type.name != 'Texture2D':
+            continue
+        try:
+            t = o.read()
+        except Exception:
+            continue
+        nm = (getattr(t, 'm_Name', '') or '')
+        if name_hint in nm.lower():
+            best = (nm, t)
+            break
+    if best is None:
+        raise SystemExit(f'no Texture2D matching {name_hint!r} in {src}')
+    nm, tex = best
+    os.makedirs(os.path.dirname(dst_png) or '.', exist_ok=True)
+    tex.image.save(dst_png)
+    print(f'extracted grade LUT {nm!r} -> {dst_png}')
+    return dst_png
+
+
+if not os.path.exists(SRC):
+    SRC = _extract_from_game(os.path.join(os.path.dirname(OUT) or '.', 'lut_grade_src.png'))
 
 strip = np.asarray(Image.open(SRC).convert('RGB')).astype(np.float32) / 255.0   # 32 x 1024 x 3
 assert strip.shape == (32, 1024, 3), strip.shape

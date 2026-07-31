@@ -822,6 +822,28 @@ def main():
     #    EFT_BAKE=warp to instead use the author-side CUDA baker (bake_volume2.py: NVIDIA + warp-lang,
     #    adds the diffuse bounce), which runs HERE (pre-assemble, from the dataset) and whose volume is
     #    promoted into the pack by assemble.
+    # 2b: GRADE LUT — the game's own colour grading, extracted from the player's OWN install.
+    #     It is game content, so nothing ships it: every build regenerates it into TK/out, where
+    #     assemble promotes it into packs/shared as grade_lut.bin. Cheap (seconds) and cached by
+    #     mtime, so a rebuild is a no-op once present unless --force. If the game's LUT cannot be
+    #     read, the parameter-fitted reconstruction (no game files at all) stands in, so a build
+    #     never fails for want of a grade.
+    lut_out = os.path.join(TK, "out", "eft_grade_lut.bin")
+    if force or not os.path.isfile(lut_out):
+        os.makedirs(os.path.dirname(lut_out), exist_ok=True)
+        made = run(2, total, "extract grade LUT (from your game install)",
+                   [PY_UNITY, os.path.join(VIEWER, "extraction", "grade", "make_grade_lut_game.py"),
+                    lut_out],
+                   VIEWER, optional=True)
+        if not os.path.isfile(lut_out):
+            run(2, total, "grade LUT (fitted reconstruction — no game files)",
+                [PY_UNITY, os.path.join(VIEWER, "extraction", "grade", "make_grade_lut.py"),
+                 os.path.join(VIEWER, "extraction", "grade", "eft_grade_fit.json"),
+                 lut_out.replace(".bin", ".png")],
+                VIEWER, optional=True)
+    else:
+        print(f"[STAGE 2/{total}] grade LUT: present ({lut_out})", flush=True)
+
     bake_mode = os.environ.get("EFT_BAKE", "").strip().lower()
     if bake_mode == "warp":
         v2 = os.path.join(out_dir, "volume2.bin")
