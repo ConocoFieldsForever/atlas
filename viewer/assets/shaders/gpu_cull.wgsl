@@ -62,6 +62,12 @@ struct CullGlobals {
     cam_k: vec4<f32>,
     // Distance-LOD: x=proj11, y=lod_bias, z=mode (0=max detail, 1=distance, 2=force shell w), w=forced shell.
     lod_params: vec4<f32>,
+    // HI-Z occlusion (camera stream only; the shadow stream uploads x=0): LAST frame's
+    // clip_from_world — the pyramid holds last frame's depths, so the test must project with
+    // last frame's matrices or a still camera would self-occlude at silhouettes.
+    prev_clip_from_world: mat4x4<f32>,
+    // x = enable (>0.5), y = pyramid mip count, z = pyramid width px, w = pyramid height px.
+    hiz: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> G: CullGlobals;
@@ -71,6 +77,9 @@ struct CullGlobals {
 @group(0) @binding(4) var<storage, read_write>  indirect: array<DrawArgs>;        // P1 opaque (+ shadow casters)
 @group(0) @binding(5) var<storage, read_write>  indirect_blend: array<DrawArgs>;  // P2 per-mesh blend draws
 @group(0) @binding(6) var<storage, read>        lod_centers: array<vec4<f32>>;    // B1 per-group ref center (indexed by ids.z>>13)
+// HI-Z: last frame's depth pyramid (MIN-reduced reverse-z; mip 0 = prepass depth copy). A 1x1
+// far-plane fallback binds here while the pyramid is absent — the test then never culls.
+@group(1) @binding(0) var hiz_pyramid: texture_2d<f32>;
 
 // LINEAR INVOCATION INDEX ACROSS A 2-D DISPATCH.
 //
@@ -235,6 +244,46 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>,
             let f_lo = (inst.ids.z >> 1u) & 15u;
             let f_hi = (inst.ids.z >> 5u) & 7u;
             if (f < f_lo || f > f_hi) { return; }
+        }
+    }
+
+    // HI-Z OCCLUSION (camera stream; the shadow stream's uniform ships hiz.x = 0 so hidden
+    // casters still shadow through doorways). Project the sphere with LAST frame's matrices —
+    // the pyramid holds last frame's depths — take the mip whose texel covers the sphere's
+    // screen rect, and cull only when the FARTHEST depth in that rect (MIN-reduced reverse-z)
+    // is provably nearer than the sphere's nearest point. Every guard bails toward "keep":
+    // behind-camera, rect off screen, camera inside the sphere — a wrong keep costs a draw,
+    // a wrong cull costs geometry.
+    if (G.hiz.x > 0.5) {
+        let c = G.prev_clip_from_world * vec4<f32>(sphere.xyz, 1.0);
+        if (c.w > sphere.w + 0.1) {   // fully in front of the near plane, camera not inside
+            let ndc = c.xyz / c.w;
+            let r_ndc = sphere.w * G.lod_params.x / c.w;    // radius in NDC (height-based)
+            let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+            let r_uv = vec2<f32>(r_ndc * 0.5 * (G.hiz.w / G.hiz.z), r_ndc * 0.5);
+            let lo = uv - r_uv;
+            let hi = uv + r_uv;
+            // Only when the whole rect is on screen: off-screen depth is unknowable, keep.
+            if (lo.x >= 0.0 && lo.y >= 0.0 && hi.x <= 1.0 && hi.y <= 1.0) {
+                let rpx = max(r_ndc * G.hiz.w, 1.0); // sphere diameter/2 in pixels
+                let mip = clamp(ceil(log2(rpx * 2.0)), 0.0, G.hiz.y - 1.0);
+                let mw = max(u32(G.hiz.z) >> u32(mip), 1u);
+                let mh = max(u32(G.hiz.w) >> u32(mip), 1u);
+                let p0 = vec2<u32>(clamp(lo * vec2<f32>(f32(mw), f32(mh)), vec2<f32>(0.0), vec2<f32>(f32(mw - 1u), f32(mh - 1u))));
+                let p1 = vec2<u32>(clamp(hi * vec2<f32>(f32(mw), f32(mh)), vec2<f32>(0.0), vec2<f32>(f32(mw - 1u), f32(mh - 1u))));
+                let m = u32(mip);
+                let far4 = min(
+                    min(textureLoad(hiz_pyramid, vec2<i32>(p0), i32(m)).r,
+                        textureLoad(hiz_pyramid, vec2<i32>(vec2<u32>(p1.x, p0.y)), i32(m)).r),
+                    min(textureLoad(hiz_pyramid, vec2<i32>(vec2<u32>(p0.x, p1.y)), i32(m)).r,
+                        textureLoad(hiz_pyramid, vec2<i32>(p1), i32(m)).r),
+                );
+                // Sphere's NEAREST depth in reverse-z infinite projection: z_ndc*w == near-plane
+                // constant, so nearest = near / (w - r).
+                let near_c = ndc.z * c.w;
+                let sphere_near = near_c / max(c.w - sphere.w, 1e-3);
+                if (far4 > sphere_near * 1.001) { return; } // every pixel provably nearer -> occluded
+            }
         }
     }
 
