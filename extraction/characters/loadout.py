@@ -19,14 +19,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
 SHARED = os.path.join(REPO, "packs", "shared")
 
-#: Equipment slots we can actually render today (geometry-bearing worn items).
-WEARABLE_SLOTS = ("ArmorVest", "TacticalVest", "Headwear", "Backpack", "FaceCover", "Eyewear",
-                  "Earpiece")
+def _config():
+    """Policy (which slots are wearable, which appearance slots resolve) lives in the same
+    config the fetcher uses — no slot list is hardcoded in the roller."""
+    import fetch_bot_db
+    return fetch_bot_db.load_config()
 
 
 def load_tables():
     items = json.load(open(os.path.join(SHARED, "item_templates.json"), encoding="utf-8"))
     bots = json.load(open(os.path.join(SHARED, "bot_loadouts.json"), encoding="utf-8"))
+    cust = {}
+    cp = os.path.join(SHARED, "customization.json")
+    if os.path.exists(cp):
+        cust = json.load(open(cp, encoding="utf-8"))
     presets = {}
     gp = os.path.join(SHARED, "globals.json")
     if os.path.exists(gp):
@@ -38,7 +44,7 @@ def load_tables():
             root = its[0].get("_tpl")
             if p.get("_encyclopedia") or root not in presets:
                 presets[root] = its
-    return items, bots, presets
+    return items, bots, presets, cust
 
 
 def weighted_pick(rng, table):
@@ -127,14 +133,19 @@ def build_weapon_tree(rng, items, bot_mods, presets, weapon_tpl, depth=0, seen=N
     return install
 
 
-def roll(bot_type, seed, items=None, bots=None, presets=None):
-    """A full kit for one agent: weapon (with its mod tree) + worn equipment."""
+def roll(bot_type, seed, items=None, bots=None, presets=None, cust=None, cfg=None):
+    """A full kit for one agent: appearance, weapon (with its mod tree), and worn equipment —
+    every choice drawn from THIS bot type's own tables."""
     if items is None:
-        items, bots, presets = load_tables()
+        items, bots, presets, cust = load_tables()
+    cfg = cfg or _config()
     b = bots.get(bot_type) or {}
     inv = b.get("inventory") or {}
     eq = inv.get("equipment") or {}
     mods = inv.get("mods") or {}
+    # chances.equipment: the PERCENT chance a slot is filled at all. Without it every bot wore
+    # every slot, which is not how the game spawns them (a scav often has no helmet).
+    fill = (b.get("chances") or {}).get("equipment") or {}
     rng = random.Random(f"{bot_type}:{seed}")
 
     weapon = weighted_pick(rng, eq.get("FirstPrimaryWeapon") or {})
@@ -146,7 +157,12 @@ def roll(bot_type, seed, items=None, bots=None, presets=None):
         "weaponTree": build_weapon_tree(rng, items, mods, presets, weapon) if weapon else {},
         "worn": {},
     }
-    for slot in WEARABLE_SLOTS:
+    for slot in cfg.get("wearableSlots", []):
+        # Roll the slot's own fill chance first (absent = always attempt, matching the tables
+        # that omit a slot they always fill).
+        chance = fill.get(slot)
+        if chance is not None and rng.random() * 100.0 > float(chance):
+            continue
         pick = weighted_pick(rng, eq.get(slot) or {})
         if pick:
             kit["worn"][slot] = {
@@ -154,16 +170,35 @@ def roll(bot_type, seed, items=None, bots=None, presets=None):
                 "name": (items.get(pick) or {}).get("_name"),
                 "prefab": (((items.get(pick) or {}).get("_props") or {}).get("Prefab") or {}).get("path"),
             }
+    # APPEARANCE: which body/head/hands/feet meshes this bot actually wears, from its own
+    # weighted table, resolved through customization.json to prefab bundles. This replaces any
+    # hand-picked part list.
+    ap = b.get("appearance") or {}
+    kit["appearance"] = {}
+    for slot in cfg.get("appearanceSlots", []):
+        pick = weighted_pick(rng, ap.get(slot) or {})
+        if not pick:
+            continue
+        c = (cust or {}).get(pick) or {}
+        props = c.get("_props") or {}
+        kit["appearance"][slot] = {
+            "id": pick,
+            "name": c.get("_name"),
+            "prefab": (props.get("Prefab") or {}).get("path"),
+            "bodyPart": props.get("BodyPart"),
+        }
     return kit
 
 
 if __name__ == "__main__":
     import sys
-    items, bots, presets = load_tables()
+    items, bots, presets, cust = load_tables()
     bt = sys.argv[1] if len(sys.argv) > 1 else "assault"
     for seed in range(int(sys.argv[2]) if len(sys.argv) > 2 else 3):
-        k = roll(bt, seed, items, bots, presets)
+        k = roll(bt, seed, items, bots, presets, cust)
         mods = sum(len(v) for v in k["weaponTree"].values())
         print(f"[{bt} #{seed}] {k['weaponName']} + {mods} mods")
+        for slot, a in k.get("appearance", {}).items():
+            print(f"    ~{slot:11s} {a['name']}")
         for slot, w in k["worn"].items():
             print(f"    {slot:12s} {w['name']}")

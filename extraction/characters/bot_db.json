@@ -1,0 +1,22 @@
+{
+ "_comment": "Sources + policy for the bot database bank. No bot names are hardcoded: the roster is listed from the database itself.",
+ "api": "https://api.github.com/repos/sp-tarkov/server/contents/project/assets/database",
+ "raw": "https://raw.githubusercontent.com/sp-tarkov/server/master/project/assets/database",
+ "ref": "master",
+ "roster": [],
+ "wearableSlots": [
+  "ArmorVest",
+  "TacticalVest",
+  "Headwear",
+  "Backpack",
+  "FaceCover",
+  "Eyewear",
+  "Earpiece"
+ ],
+ "appearanceSlots": [
+  "body",
+  "head",
+  "hands",
+  "feet"
+ ]
+}
