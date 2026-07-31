@@ -74,11 +74,9 @@ tools/_*
 docs/_bench_logs/
 
 # No markdown in the repo: docs live locally only (working notes, not shippables).
-# Exceptions: the README (release landing page) and the notices, which MUST ship —
-# scripts/release.ps1 copies LICENSE-NOTES.md into every distribution.
+# Exception: the README (release landing page).
 *.md
 !README.md
-!LICENSE-NOTES.md
 !third_party/**/README.md
 
 # GAME CONTENT — never tracked. The grade LUT source is extracted verbatim from the
