@@ -70,6 +70,25 @@ struct FxEmitter {
     #[serde(default = "third")]
     #[serde(rename = "shapeRadius")]
     shape_radius: f32,
+    /// The game's ColorModule gradient, sampled keys [t, r, g, b, a] — fire's white-yellow core
+    /// aging into orange and fading out. THE over-lifetime look a constant color cannot fake.
+    #[serde(default)]
+    #[serde(rename = "colorOverLife")]
+    color_over_life: Option<Vec<[f32; 5]>>,
+    /// The game's SizeModule curve, keys [t, v].
+    #[serde(default)]
+    #[serde(rename = "sizeOverLife")]
+    size_over_life: Option<Vec<[f32; 2]>>,
+    /// UVModule timeMode 1 = plain fps playback (else frames*cycles/lifetime).
+    #[serde(default)]
+    #[serde(rename = "uvFpsMode")]
+    uv_fps_mode: u32,
+    #[serde(default = "thirty")]
+    #[serde(rename = "uvFps")]
+    uv_fps: f32,
+}
+fn thirty() -> f32 {
+    30.0
 }
 
 fn one() -> f32 {
@@ -98,6 +117,14 @@ struct FxQuad {
     speed: f32,
     gravity: f32,
     size: f32,
+    /// Life-phase material bins (the ColorModule gradient discretized): the quad swaps its
+    /// handle as it ages — cheap component write, no per-frame material mutation.
+    bins: std::sync::Arc<Vec<Handle<StandardMaterial>>>,
+    bin: usize,
+    /// The game's size-over-lifetime keys [t, v] (piecewise linear), or empty (v1 ease).
+    size_curve: std::sync::Arc<Vec<[f32; 2]>>,
+    /// Constant per-quad roll about the view axis: flames stop looking like clones.
+    roll: f32,
 }
 
 /// Per-emitter flipbook driver: advances the SHARED material's uv_transform.
@@ -174,29 +201,73 @@ fn spawn_fx(
         // Normalize so the cluster's total energy ~ 2x one quad regardless of n.
         let n = ((e.rate * e.lifetime).ceil() as usize).clamp(1, 10);
         let norm = (2.0 / n as f32).min(1.0);
-        let mat = materials.add(StandardMaterial {
-            base_color_texture: Some(handle),
-            base_color: Color::linear_rgba(rgba[0], rgba[1], rgba[2], rgba[3] * norm),
-            alpha_mode: if additive { AlphaMode::Add } else { AlphaMode::Blend },
-            unlit: true,
-            cull_mode: None,
-            uv_transform: bevy::math::Affine2::from_scale_angle_translation(
-                Vec2::new(1.0 / tiles.x as f32, 1.0 / tiles.y as f32),
-                0.0,
-                Vec2::ZERO,
-            ),
-            ..default()
-        });
+        // LIFE-PHASE BINS: the game's ColorModule gradient discretized into a handful of
+        // materials; an aging quad swaps handles instead of mutating a material per frame.
+        let sample_grad = |t: f32| -> [f32; 4] {
+            let Some(keys) = e.color_over_life.as_ref().filter(|k| k.len() >= 2) else {
+                return [1.0, 1.0, 1.0, 1.0];
+            };
+            let mut prev = &keys[0];
+            for k in keys.iter() {
+                if k[0] >= t {
+                    let (t0, t1) = (prev[0], k[0]);
+                    let f = if t1 > t0 { (t - t0) / (t1 - t0) } else { 0.0 };
+                    return [
+                        prev[1] + (k[1] - prev[1]) * f,
+                        prev[2] + (k[2] - prev[2]) * f,
+                        prev[3] + (k[3] - prev[3]) * f,
+                        prev[4] + (k[4] - prev[4]) * f,
+                    ];
+                }
+                prev = k;
+            }
+            [prev[1], prev[2], prev[3], prev[4]]
+        };
+        const BINS: usize = 5;
+        let mut bin_mats: Vec<Handle<StandardMaterial>> = Vec::with_capacity(BINS);
+        let mut first_mat: Option<Handle<StandardMaterial>> = None;
+        for b in 0..BINS {
+            let gcol = sample_grad((b as f32 + 0.5) / BINS as f32);
+            let m = materials.add(StandardMaterial {
+                base_color_texture: Some(handle.clone()),
+                base_color: Color::linear_rgba(
+                    rgba[0] * gcol[0],
+                    rgba[1] * gcol[1],
+                    rgba[2] * gcol[2],
+                    (rgba[3] * gcol[3] * norm).clamp(0.0, 1.0),
+                ),
+                alpha_mode: if additive { AlphaMode::Add } else { AlphaMode::Blend },
+                unlit: true,
+                cull_mode: None,
+                uv_transform: bevy::math::Affine2::from_scale_angle_translation(
+                    Vec2::new(1.0 / tiles.x as f32, 1.0 / tiles.y as f32),
+                    0.0,
+                    Vec2::ZERO,
+                ),
+                ..default()
+            });
+            first_mat.get_or_insert_with(|| m.clone());
+            bin_mats.push(m);
+        }
+        let bins = std::sync::Arc::new(bin_mats);
+        let size_curve = std::sync::Arc::new(e.size_over_life.clone().unwrap_or_default());
         let frames = (tiles.x * tiles.y).max(1) as f32;
-        commands.spawn(FxFlipbook {
-            mat: mat.clone(),
-            tiles,
-            fps: if e.uv_enabled && frames > 1.0 {
-                (frames * e.uv_cycles.max(0.1)) / e.lifetime.max(0.05)
-            } else {
-                0.0
-            },
-        });
+        // Every bin shares the flipbook frame: drive them all.
+        for m in bins.iter() {
+            commands.spawn(FxFlipbook {
+                mat: m.clone(),
+                tiles,
+                fps: if e.uv_enabled && frames > 1.0 {
+                    if e.uv_fps_mode == 1 {
+                        e.uv_fps.max(0.1)
+                    } else {
+                        (frames * e.uv_cycles.max(0.1)) / e.lifetime.max(0.05)
+                    }
+                } else {
+                    0.0
+                },
+            });
+        }
         n_emit += 1;
         // Enough quads to cover the loop continuously, bounded so a 100-rate fire doesn't spawn
         // a hundred entities: phases are spread evenly, so even the cap reads as a full flame.
@@ -207,7 +278,7 @@ fn spawn_fx(
             let jitter = Vec3::new(ang.cos(), 0.0, ang.sin()) * e.shape_radius * h.sqrt();
             commands.spawn((
                 Mesh3d(quad.clone()),
-                MeshMaterial3d(mat.clone()),
+                MeshMaterial3d(bins[0].clone()),
                 Transform::from_translation(Vec3::from(e.pos) + jitter)
                     .with_scale(Vec3::splat(e.size.max(0.05))),
                 FxQuad {
@@ -217,6 +288,10 @@ fn spawn_fx(
                     speed: e.speed,
                     gravity: e.gravity,
                     size: e.size.max(0.05),
+                    bins: bins.clone(),
+                    bin: 0,
+                    size_curve: size_curve.clone(),
+                    roll: h * std::f32::consts::TAU,
                 },
             ));
             n_quads += 1;
@@ -229,19 +304,41 @@ fn spawn_fx(
     );
 }
 
-/// Rise with startSpeed, fall with gravityModifier, loop over startLifetime; grow slightly and
-/// vanish at wrap so the loop seam reads as turbulence rather than a pop.
-fn animate_quads(time: Res<Time>, mut q: Query<(&FxQuad, &mut Transform)>) {
+/// Rise with startSpeed, fall with gravityModifier, loop over startLifetime. Scale follows the
+/// game's OWN SizeModule curve when it shipped one (else a mild ease); color/alpha follow the
+/// ColorModule gradient via the life-phase material bins (a handle swap, not a mutation).
+fn animate_quads(
+    time: Res<Time>,
+    mut q: Query<(&mut FxQuad, &mut Transform, &mut MeshMaterial3d<StandardMaterial>)>,
+) {
     let now = time.elapsed_secs();
-    for (fx, mut tf) in &mut q {
+    for (mut fx, mut tf, mut mat) in &mut q {
         let t = ((now / fx.lifetime + fx.phase) % 1.0) * fx.lifetime;
         let y = fx.speed * t - 0.5 * fx.gravity * 9.81 * t * t;
         tf.translation = fx.base + Vec3::Y * y;
-        // life fraction: ease in fast, fade the scale near the wrap.
         let lf = t / fx.lifetime;
-        let grow = 0.75 + 0.45 * lf;
-        let fade = (1.0 - lf).min(lf * 8.0).clamp(0.0, 1.0);
-        tf.scale = Vec3::splat(fx.size * grow * (0.35 + 0.65 * fade));
+        let s = if fx.size_curve.len() >= 2 {
+            // piecewise-linear sample of the authored curve
+            let keys = &fx.size_curve;
+            let mut v = keys[keys.len() - 1][1];
+            for w in keys.windows(2) {
+                if lf <= w[1][0] {
+                    let (t0, v0, t1, v1) = (w[0][0], w[0][1], w[1][0], w[1][1]);
+                    let f = if t1 > t0 { ((lf - t0) / (t1 - t0)).clamp(0.0, 1.0) } else { 0.0 };
+                    v = v0 + (v1 - v0) * f;
+                    break;
+                }
+            }
+            v.max(0.0)
+        } else {
+            0.75 + 0.45 * lf
+        };
+        tf.scale = Vec3::splat((fx.size * s).max(1.0e-3));
+        let bin = ((lf * fx.bins.len() as f32) as usize).min(fx.bins.len() - 1);
+        if bin != fx.bin {
+            fx.bin = bin;
+            mat.0 = fx.bins[bin].clone();
+        }
     }
 }
 
@@ -272,11 +369,12 @@ fn animate_flipbooks(
 /// orientation on purpose — v1 treats them as billboards too).
 fn billboard_quads(
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
-    mut q: Query<&mut Transform, With<FxQuad>>,
+    mut q: Query<(&mut Transform, &FxQuad)>,
 ) {
     let Ok(cam) = cam.single() else { return };
     let rot = cam.to_scale_rotation_translation().1;
-    for mut tf in &mut q {
-        tf.rotation = rot;
+    for (mut tf, fx) in &mut q {
+        // camera facing, plus this quad's constant roll about the view axis.
+        tf.rotation = rot * Quat::from_rotation_z(fx.roll);
     }
 }
