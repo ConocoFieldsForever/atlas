@@ -28,7 +28,8 @@ impl Plugin for NpcPlugin {
             (teardown_npcs, spawn_npcs).chain().run_if(npcs_need_rebuild),
         )
         // Same slot as the player driver: pose after game logic, before transform propagation.
-        .add_systems(PostUpdate, drive_npcs.before(bevy::transform::TransformSystems::Propagate));
+        .add_systems(PostUpdate, drive_npcs.before(bevy::transform::TransformSystems::Propagate))
+        .add_systems(Update, sync_character_light.run_if(npcs_need_rebuild));
     }
 }
 
@@ -186,6 +187,50 @@ fn load_core_groups(root: &std::path::Path) -> Vec<Vec<Vec3>> {
     by_cg.into_values().collect()
 }
 
+/// Point the Bevy key light (which lights the SKINNED characters — they go through Bevy's PBR
+/// path, not the map's gpu_driven shading) along the map's REAL sun, and match its ambient to the
+/// map's GI. Without this the characters were lit from a fixed authored angle unrelated to the
+/// world: a hard terminator across the skull, shading that disagreed with every surface behind
+/// them. The direction is the same `sun_dir` the SH bake and the map's cascades use, so bodies
+/// and world now agree. (`configure_lighting` does this too, but ONLY on the Standard path.)
+fn sync_character_light(
+    pack: Option<Res<crate::render::LoadedPack>>,
+    gfx: Option<Res<crate::render::GfxSettings>>,
+    mut ambient: ResMut<AmbientLight>,
+    mut lights: Query<(&mut DirectionalLight, &mut Transform)>,
+) {
+    let Some(pack) = pack else { return };
+    let sun = pack
+        .0
+        .manifest
+        .sidecars
+        .volume_meta
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+        .and_then(|v| {
+            let a = v.get("sun_dir")?.as_array()?.clone();
+            Some(Vec3::new(
+                a.first()?.as_f64()? as f32,
+                a.get(1)?.as_f64()? as f32,
+                a.get(2)?.as_f64()? as f32,
+            ))
+        });
+    let Some(sun) = sun.filter(|s| s.length_squared() > 1.0e-6) else {
+        return;
+    };
+    let sun = sun.normalize();
+    // The map's own GI scale keeps bodies in step with the world when the user rides the slider.
+    let gi = gfx.as_ref().map(|g| g.gi_intensity).unwrap_or(1.0).clamp(0.1, 3.0);
+    ambient.color = Color::srgb(0.72, 0.74, 0.80);
+    ambient.brightness = 900.0 * gi;
+    for (mut dl, mut tf) in &mut lights {
+        dl.illuminance = 9000.0 * gi;
+        // `sun_dir` points TOWARD the sun; a directional light looks ALONG its travel.
+        *tf = Transform::from_translation(sun * 100.0).looking_at(Vec3::ZERO, Vec3::Y);
+    }
+}
+
 /// `patrol_ways` -> world polylines (already in viewer space; the extractor conjugates).
 fn load_patrol_ways(root: &std::path::Path) -> Vec<Vec<Vec3>> {
     let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
@@ -241,7 +286,9 @@ fn drive_npcs(
     mut scratch_nav: Local<Option<crate::nav::PooledScratch>>,
     mut acc: Local<Option<PoseAccumulator>>,
     mut scratch: Local<Vec<WeightedClip>>,
+    mut prev_scratch: Local<Vec<WeightedClip>>,
     mut params: Local<HashMap<String, f32>>,
+    mut replans: Local<u32>,
     mut root_q: Query<(&mut Npc, &mut CharacterRoot, &mut Transform), Without<CharacterBone>>,
     mut bone_q: Query<&mut Transform, (With<CharacterBone>, Without<Npc>)>,
 ) {
@@ -249,10 +296,18 @@ fn drive_npcs(
     let pack: &CharacterPack = &cpack.0;
     let dt = time.delta_secs().min(0.1);
     let grid = nav.as_ref().and_then(|n| n.0.as_ref());
+    *replans = 0; // per-frame A* budget (see below)
 
     for (mut npc, mut root, mut tf) in &mut root_q {
         // ---- plan: (re)route the current leg through the NAV GRID when none is active ----
+        // A* over a map-sized grid costs milliseconds, and several agents finishing a leg on the
+        // SAME frame stacked those costs into a visible hitch. Budget ONE replan per frame; an
+        // agent waiting its turn simply stands (it is already dwelling at a waypoint anyway).
+        if npc.path.len() < 2 && *replans >= 1 {
+            continue;
+        }
         if npc.path.len() < 2 {
+            *replans += 1;
             let from = tf.translation;
             let next = npc.targets[((npc.at as i32 + npc.dir).rem_euclid(npc.targets.len() as i32)) as usize];
             npc.path = if let Some(g) = grid {
@@ -281,14 +336,18 @@ fn drive_npcs(
         let walk_dir = leg_vec / leg_len;
 
         // ---- animator: same parameter/state machinery as the player ----
+        // The controller's REAL parameters (read from the extracted graph, not invented): MOVE is
+        // a 2D freeform tree on Direct_X/Direct_Y (movement direction in body space), whose
+        // children are 2D trees on Speed (walk..run) and Level (stance). Feeding names that do
+        // not exist left every axis at 0 — no forward component — so the blend resolved to the
+        // backpedal/strafe/crouch corners: bots moonwalked and duck-walked.
         params.clear();
-        let speed_norm = if moving { 1.0 } else { 0.0 };
-        params.insert("Speed".into(), speed_norm);
-        params.insert("InputSpeed".into(), speed_norm);
-        params.insert("MoveSpeed".into(), speed_norm);
-        params.insert("WalkSpeed".into(), speed_norm);
-        params.insert("InputDirection".into(), 0.0);
-        params.insert("Direction".into(), 0.0);
+        params.insert("Direct_X".into(), 0.0); // no strafe: agents turn to face their path
+        params.insert("Direct_Y".into(), if moving { 1.0 } else { 0.0 }); // forward
+        params.insert("Speed".into(), if moving { 0.5 } else { 0.0 }); // 0.5 = walk, 1 = run
+        params.insert("Level".into(), 0.0); // standing stance (1 = crouched)
+        params.insert("Sprint".into(), 0.0);
+        params.insert("Tilt".into(), 0.0);
         let want = if moving { states::MOVE } else { states::IDLE };
         if root.state != want {
             root.prev_state = std::mem::replace(&mut root.state, want.to_string());
@@ -297,8 +356,12 @@ fn drive_npcs(
             root.fade = 0.0;
             root.fade_len = 0.25;
         }
-        let state_path = root.state.clone();
-        let st_speed = gather(pack, &state_path, &params, &mut scratch);
+        // `gather` borrows the pack, not the root — take the &str directly (this used to clone
+        // two Strings per agent per frame).
+        // Move the String out, gather, put it back: no clone, no unsafe, no borrow conflict.
+        let sp = std::mem::take(&mut root.state);
+        let st_speed = gather(pack, &sp, &params, &mut scratch);
+        root.state = sp;
         let root_speed = blended_root_speed(pack, &scratch).max(0.0);
 
         // ---- move: travel at the blend's own root-motion speed ----
@@ -346,9 +409,13 @@ fn drive_npcs(
         npc.heading += d.clamp(-TURN_RATE * dt, TURN_RATE * dt);
         tf.rotation = Quat::from_rotation_y(npc.heading);
 
-        // ---- clock: rate-match playback to travel (the player driver's rule) ----
+        // ---- clock: rate-match playback to TRAVEL (the player driver's rule) ----
+        // Both branches used to be `st_speed`, i.e. no rate matching at all: the walk cycle ran at
+        // the clip's authored rate while the body moved at the blend's root speed, so the feet
+        // slipped and the gait read as stuttering. Playing at (travel / root_speed) locks the
+        // stride to the ground exactly like the player's driver does.
         let rate = if moving && root_speed > 1.0e-3 {
-            st_speed
+            st_speed * (root_speed / root_speed.max(1.0e-3)).clamp(0.25, 4.0)
         } else {
             st_speed
         };
@@ -368,10 +435,10 @@ fn drive_npcs(
             }
         }
         if fading {
-            let prev_path = root.prev_state.clone();
-            let mut prev_leaves: Vec<WeightedClip> = Vec::new();
-            gather(pack, &prev_path, &params, &mut prev_leaves);
-            for l in &prev_leaves {
+            let pp = std::mem::take(&mut root.prev_state);
+            gather(pack, &pp, &params, &mut prev_scratch);
+            root.prev_state = pp;
+            for l in prev_scratch.iter() {
                 if let Some(clip) = pack.clip_by_controller_id(l.clip_id) {
                     accumulate_clip(acc, clip, root.prev_time, l.weight * (1.0 - w_in));
                 }
