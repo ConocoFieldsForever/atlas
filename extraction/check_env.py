@@ -120,8 +120,12 @@ def check_env():
         lut = os.path.join(outd, "eft_grade_lut.bin")
         if not os.path.exists(lut):
             warn(f"no grade LUT at {lut}",
-                 f"copy \"{os.path.join(KIT, 'grade', 'eft_grade_lut.bin')}\" there (or rerun --init); "
-                 "assemble_bevy ships it into every pack (in-game color grading)")
+                 "generate it from YOUR game install: "
+                 "python extraction/grade/make_grade_lut_game.py   "
+                 "(no game asset ships with this tool — the LUT is game content, so it is built "
+                 "locally like every pack. Offline fallback, no game files needed: "
+                 "python extraction/grade/make_grade_lut.py, which bakes the reconstructed look "
+                 "from the fitted parameters in extraction/grade/eft_grade_fit.json)")
         else:
             ok("grade LUT present in tarkmap/out")
 
@@ -134,6 +138,32 @@ def check_env():
         warn("EFT_ASSETS_ROOT is not <EFT_TARKMAP_ROOT>\\..\\eft_assets",
              "the map configs + pack emitter resolve datasets against the tarkmap parent dir; keep the "
              "standard layout (workspace\\tarkmap + workspace\\eft_assets) unless you know what you're doing")
+
+
+def _build_grade_lut(dst):
+    """Generate the grade LUT locally: authentic from the user's game install when available,
+    else the parameter-fitted reconstruction. Never copies a game asset."""
+    import subprocess
+    grade_dir = os.path.join(KIT, "grade")
+    game_data = os.environ.get("EFT_GAME_DATA")
+    scripts = [("authentic (from your game install)",
+                [sys.executable, os.path.join(grade_dir, "make_grade_lut_game.py")], bool(game_data)),
+               ("reconstructed (fitted parameters, no game files)",
+                [sys.executable, os.path.join(grade_dir, "make_grade_lut.py")], True)]
+    for label, cmd, usable in scripts:
+        if not usable:
+            continue
+        try:
+            r = subprocess.run(cmd + [dst], capture_output=True, text=True, timeout=600)
+            if r.returncode == 0 and os.path.exists(dst):
+                print(f"  built grade LUT [{label}] -> {dst}")
+                return True
+            print(f"  grade LUT [{label}] failed: {(r.stderr or r.stdout or '').strip()[:120]}")
+        except Exception as exc:
+            print(f"  grade LUT [{label}] error: {str(exc)[:120]}")
+    print("  NOTE: no grade LUT yet — run extraction/grade/make_grade_lut_game.py "
+          "(or make_grade_lut.py for the no-game-files fallback)")
+    return False
 
 
 def init_workspace(root):
@@ -149,10 +179,14 @@ def init_workspace(root):
         print(f"  copied map configs -> {maps_dst}")
     else:
         print(f"  {maps_dst} already exists (left untouched)")
+    # GRADE LUT: game content, so it is never shipped — it is BUILT here from the user's own
+    # installation (make_grade_lut_game.py reads the game's own grading LUT out of
+    # resources.assets). If the game is not reachable, fall back to the reconstructed look, which
+    # is baked from fitted PARAMETERS (extraction/grade/eft_grade_fit.json) and needs no game
+    # files at all. Either way nothing copyrighted is redistributed by this tool.
     lut_dst = os.path.join(out_dst, "eft_grade_lut.bin")
     if not os.path.exists(lut_dst):
-        shutil.copy2(os.path.join(KIT, "grade", "eft_grade_lut.bin"), lut_dst)
-        print(f"  copied grade LUT -> {lut_dst}")
+        _build_grade_lut(lut_dst)
     print("\n  now set the env vars (new shells pick them up):")
     print(f"    setx EFT_TARKMAP_ROOT \"{tk}\"")
     print(f"    setx EFT_ASSETS_ROOT \"{assets}\"")
