@@ -259,10 +259,22 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0):
                         mesh_pptr = co.m_Mesh
                         break
             if mesh_pptr is None or not getattr(mesh_pptr, "path_id", 0):
+                print(f"  [skip] {nm}: renderer has no mesh pointer")
                 continue
+            # Cross-bundle: m_FileID > 0 means the mesh lives in a DEPENDENCY, which must have
+            # been resolved into this environment. A miss here reads as "the item has no
+            # geometry", so it is reported with the CAB that is missing — swallowing it is how
+            # Killa's armour silently assembled to nothing.
             mesh = mesh_pptr.read()
             mats = list(getattr(r, "m_Materials", []) or [])
-        except Exception:
+        except Exception as e:
+            # Unity's BUILT-IN library ("unity default resources") holds the editor primitives —
+            # the sphere/cube a prefab uses as a gizmo or collider proxy. It is part of the
+            # engine, not of the game, so it is absent from StreamingAssets by design and
+            # carries no geometry we want. Everything else is a genuine broken reference.
+            if "unity default resources" in str(e) or "unity_builtin" in str(e):
+                continue
+            print(f"  [skip] {nm}: mesh unreadable ({type(e).__name__}: {str(e)[:70]})")
             continue
         # MeshHandler decodes the vertex/index STREAMS; the typetree attributes are empty for
         # these bundles (m_Vertices == []), which is why a raw read assembled nothing.

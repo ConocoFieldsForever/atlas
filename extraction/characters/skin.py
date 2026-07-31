@@ -154,6 +154,11 @@ def _script_name(obj) -> str:
         return ""
 
 
+class ForeignRigError(RuntimeError):
+    """A mesh that binds a skeleton other than the canonical rig (the FPV hands, for example).
+    Callers SKIP these rather than failing: they are not meant to be drawn on this body."""
+
+
 def _resolve_remap(
     skel: Skeleton,
     bone_paths: Optional[Sequence[str]],
@@ -167,9 +172,19 @@ def _resolve_remap(
 
     from_paths: Optional[List[int]] = None
     if bone_paths:
+        # A mesh binding a DIFFERENT skeleton is not an error to fix — it is a mesh that does not
+        # belong on this rig, and the only correct action is to leave it out. Body prefabs ship a
+        # first-person `*_firstHands` renderer alongside the third-person body, and it binds the
+        # FPV hands rig: its paths start at `Base HumanPelvis`, not at the canonical rig's root.
+        # Distinguish "wrong rig" (NONE of the paths resolve -> skip) from "our rig, with a bad
+        # entry" (some resolve -> still a hard error, because that is corruption).
+        resolved = [by_path.get(p) for p in bone_paths]
+        if resolved and all(i is None for i in resolved):
+            raise ForeignRigError(
+                f"{mesh_name}: binds a different skeleton "
+                f"(e.g. {bone_paths[0]!r}) — not part of the canonical rig")
         from_paths = []
-        for p in bone_paths:
-            idx = by_path.get(p)
+        for p, idx in zip(bone_paths, resolved):
             if idx is None:
                 raise RuntimeError(
                     f"{mesh_name}: Skin._bonePaths entry {p!r} is not a bone of the canonical rig"
@@ -189,16 +204,24 @@ def _resolve_remap(
 
     if from_paths is not None and from_hashes is not None:
         if from_paths != from_hashes:
+            # WHICH SOURCE WINS: the mesh's own m_BoneNameHashes. The vertex bone INDICES address
+            # the mesh's bind-pose array, and that array is parallel to the hash list — so the
+            # hashes are authoritative by construction, and a remap of any other length would be
+            # indexed out of range. `Skin._bonePaths` is a component-level list alongside it and
+            # can differ in order or length (measured: usec_upper_commando is shifted by two
+            # slots, Top_BOSS_Killa_base has a different length entirely). Disagreement is a data
+            # quirk in the source asset, not corruption, so it is reported and the authoritative
+            # source is used rather than failing the build.
             bad = [
                 (i, skel.names[a], skel.names[b])
                 for i, (a, b) in enumerate(zip(from_paths, from_hashes))
                 if a != b
             ]
-            msg = f"{mesh_name}: bone remap disagreement between _bonePaths and m_BoneNameHashes: {bad[:6]}"
-            if strict:
-                raise RuntimeError(msg)
-            print(f"  [warn] {msg} -- trusting _bonePaths")
-        return from_paths
+            print(f"  [bones] {mesh_name}: _bonePaths disagrees with m_BoneNameHashes "
+                  f"(len {len(from_paths)} vs {len(from_hashes)}"
+                  + (f", first {bad[0][1]!r} vs {bad[0][2]!r}" if bad else "")
+                  + ") -- using the mesh's own hashes")
+        return from_hashes
 
     remap = from_paths if from_paths is not None else from_hashes
     if remap is None:
@@ -376,7 +399,14 @@ def load_part(
 
         # ---- bone remap, cross-validated ----
         bone_hashes = tt.get("m_BoneNameHashes") or []
-        remap = _resolve_remap(skel, skin_bone_paths, bone_hashes, name, strict)
+        try:
+            remap = _resolve_remap(skel, skin_bone_paths, bone_hashes, name, strict)
+        except ForeignRigError as exc:
+            # Not our rig -> not our mesh. Body prefabs ship the first-person hands renderer
+            # next to the third-person body; it binds the FPV hands skeleton and must simply be
+            # left out. Reported, never silent.
+            print(f"  [skip] {exc}")
+            continue
         n_slots = len(remap)
         if int(local_joints.max(initial=0)) >= n_slots:
             raise RuntimeError(

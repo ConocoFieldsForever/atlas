@@ -10,7 +10,11 @@ UnityPy will fall back to a recursive scan of the whole environment path on a mi
 tens of gigabytes per lookup. So we build the CAB -> bundle map ONCE and cache it, stamped with
 the game root, file count and newest mtime so it self-invalidates when the game updates.
 
-Nothing here is authored: the mapping is read out of the bundles themselves.
+Nothing here is authored: the mapping is read out of the bundles themselves — and a bundle is
+recognised by its CONTENT (the UnityFS signature), never by its filename. 1,160 of the game's
+bundles ship with no extension at all (`.../character/vest/ar_6b13_mesh` is where Killa's armour
+mesh lives), so an index that walked `*.bundle` silently lacked them and every item whose geometry
+they provide assembled to nothing.
 """
 import json
 import os
@@ -26,22 +30,39 @@ SA_WIN = os.path.join(SA, "StreamingAssets", "Windows")
 CACHE = os.path.join(REPO, "packs", "shared", "unity_cabs.json")
 
 
+#: Unity's own container signatures. A file starting with one of these IS a bundle, whatever it
+#: happens to be called.
+BUNDLE_MAGIC = (b"UnityFS", b"UnityWeb", b"UnityRaw", b"UnityArchive")
+
+
+def is_bundle(path):
+    """True if the file's header says Unity bundle. Content, not extension."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+    except OSError:
+        return False
+    return any(head.startswith(m) for m in BUNDLE_MAGIC)
+
+
 def _stamp(root):
-    """Cheap fingerprint of the bundle tree: count, total size, newest mtime."""
+    """Cheap fingerprint of the bundle tree: count, total size, newest mtime.
+
+    Counts EVERY file, so adding or touching an extensionless bundle invalidates the cache too.
+    """
     n = 0
     total = 0
     newest = 0.0
     for dirpath, _dirs, files in os.walk(root):
         for f in files:
-            if f.endswith(".bundle"):
-                try:
-                    st = os.stat(os.path.join(dirpath, f))
-                except OSError:
-                    continue
-                n += 1
-                total += st.st_size
-                newest = max(newest, st.st_mtime)
-    return {"root": root, "bundles": n, "bytes": total, "newest": round(newest, 3)}
+            try:
+                st = os.stat(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            n += 1
+            total += st.st_size
+            newest = max(newest, st.st_mtime)
+    return {"root": root, "files": n, "bytes": total, "newest": round(newest, 3)}
 
 
 def build(root=SA_WIN, out=CACHE, verbose=True):
@@ -49,18 +70,22 @@ def build(root=SA_WIN, out=CACHE, verbose=True):
     index = {}
     t0 = time.time()
     n = 0
+    failed = []
     for dirpath, _dirs, files in os.walk(root):
         for f in sorted(files):
-            if not f.endswith(".bundle"):
-                continue
             p = os.path.join(dirpath, f)
+            if not is_bundle(p):
+                continue
             rel = os.path.relpath(p, root).replace(os.sep, "/")
             try:
                 env = UnityPy.Environment()
                 env.load_file(p)
                 for cab in list(getattr(env, "cabs", {}) or {}):
                     index.setdefault(str(cab).lower(), rel)
-            except Exception:
+            except Exception as e:
+                # A bundle that fails to load provides no CABs, and every PPtr into it will
+                # later dead-end. Collect and report rather than vanish.
+                failed.append((rel, f"{type(e).__name__}: {str(e)[:60]}"))
                 continue
             n += 1
             if verbose and n % 500 == 0:
@@ -69,6 +94,10 @@ def build(root=SA_WIN, out=CACHE, verbose=True):
     json.dump({"stamp": _stamp(root), "cabs": index}, open(out, "w"), separators=(",", ":"))
     if verbose:
         print(f"[cabs] {len(index)} CABs from {n} bundles -> {out} ({time.time()-t0:.0f}s)")
+        for rel, why in failed[:20]:
+            print(f"  [unreadable] {rel}: {why}")
+        if len(failed) > 20:
+            print(f"  [unreadable] ... and {len(failed)-20} more")
     return index
 
 

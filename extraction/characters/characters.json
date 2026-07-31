@@ -26,7 +26,33 @@
   "to see a character's actual states before authoring one."
  ],
  "clipSets": {
-  "all": null
+  "all": null,
+  "locomotion": [
+   "Base Layer.Stand.Idle_Aim",
+   "Base Layer.Stand.Turn_Left_90_Aim",
+   "Base Layer.Stand.Turn_Right_90_Aim",
+   "Base Layer.Stand.SideStep_Left",
+   "Base Layer.Stand.SideStep_Right",
+   "Base Layer.Stand.SideStep_In_Left",
+   "Base Layer.Stand.SideStep_In_Right",
+   "Base Layer.Stand.SideStep_Out_Left",
+   "Base Layer.Stand.SideStep_Out_Right",
+   "Base Layer.StateMachine_Move.MOVE",
+   "Base Layer.StateMachine_Move.Start_Top",
+   "Base Layer.StateMachine_Move.Move_Top",
+   "Base Layer.StateMachine_Move.End_Top",
+   "Base Layer.JUMP.Jump_Idle",
+   "Base Layer.JUMP.Jump_Loop",
+   "Base Layer.JUMP.Jump_Move",
+   "Base Layer.JUMP.Jump_Sprint",
+   "Base Layer.JUMP.Fall",
+   "Base Layer.JUMP.Fall_End",
+   "Base Layer.JUMP.Land_Idle",
+   "Base Layer.JUMP.Land_Move"
+  ],
+  "idle": [
+   "Base Layer.Stand.Idle_Aim"
+  ]
  },
  "characters": {
   "tagilla": {

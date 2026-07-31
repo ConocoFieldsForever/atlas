@@ -14,6 +14,10 @@ across frames, across a reload, and across machines.
 import json
 import os
 import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import appearance
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -170,23 +174,10 @@ def roll(bot_type, seed, items=None, bots=None, presets=None, cust=None, cfg=Non
                 "name": (items.get(pick) or {}).get("_name"),
                 "prefab": (((items.get(pick) or {}).get("_props") or {}).get("Prefab") or {}).get("path"),
             }
-    # APPEARANCE: which body/head/hands/feet meshes this bot actually wears, from its own
-    # weighted table, resolved through customization.json to prefab bundles. This replaces any
-    # hand-picked part list.
-    ap = b.get("appearance") or {}
-    kit["appearance"] = {}
-    for slot in cfg.get("appearanceSlots", []):
-        pick = weighted_pick(rng, ap.get(slot) or {})
-        if not pick:
-            continue
-        c = (cust or {}).get(pick) or {}
-        props = c.get("_props") or {}
-        kit["appearance"][slot] = {
-            "id": pick,
-            "name": c.get("_name"),
-            "prefab": (props.get("Prefab") or {}).get("path"),
-            "bodyPart": props.get("BodyPart"),
-        }
+    # APPEARANCE is resolved by appearance.py, which OWNS that question -- the same call the
+    # character builder makes, so a kit and the body it is worn on can never disagree about
+    # which meshes the bot has. Seeded identically, so kit N and character N are the same bot.
+    kit["appearance"] = appearance.resolve(bot_type, seed, bots, cust)["appearance"]
     return kit
 
 

@@ -67,6 +67,7 @@ def main():
     cabs = unity_deps.load(verbose=False)
 
     types = args.bot or (sorted(bots) if args.all else ["assault"])
+    dropped = []
     os.makedirs(args.out, exist_ok=True)
     index = {}
     for bt in types:
@@ -93,36 +94,55 @@ def main():
                 if os.path.exists(os.path.join(wdir, "manifest.json")):
                     built["weapon"] = os.path.relpath(wdir, REPO).replace(os.sep, "/")
 
-            # --- appearance + worn equipment ---
-            sources = [("appearance", s, v) for s, v in (kit.get("appearance") or {}).items()]
-            sources += [("worn", s, v) for s, v in (kit.get("worn") or {}).items()]
-            for group, slot, v in sources:
-                rel = v.get("prefab")
+            # --- the BODY -------------------------------------------------------------
+            # A kit does not rebuild appearance geometry. The body/head/feet meshes ARE the
+            # character pack, which build_character.py bakes from the very same
+            # appearance.resolve(bot, seed) call this roll used -- so naming the pack is not a
+            # loose reference, it is the same answer by construction. (Routing appearance
+            # through the item-template builder was never possible anyway: those are
+            # CUSTOMIZATION ids and are absent from the item table.)
+            built["character"] = f"{bt}_{seed}"
+            built["appearance"] = kit.get("appearance") or {}
+
+            # --- worn equipment -------------------------------------------------------
+            for slot, v in (kit.get("worn") or {}).items():
+                rel, name = v.get("prefab"), (v.get("name") or v.get("id"))
                 kind, _bone = classify(rel, cabs)
                 if kind is None:
+                    # No renderer of either kind: the item is real but carries no worn
+                    # geometry (ammo, a container). Recorded, never silently swallowed.
+                    dropped.append((kid, slot, name, "no renderer in prefab"))
                     continue
-                name = v.get("name") or v.get("id")
                 pdir = os.path.join(args.out, "_parts", str(name))
                 if not os.path.exists(os.path.join(pdir, "manifest.json")):
                     try:
                         build_weapon.build(v["id"], items, pdir, install={}, cabs=cabs)
-                    except SystemExit:
+                    except (SystemExit, Exception) as e:
+                        dropped.append((kid, slot, name, str(e)[:70] or type(e).__name__))
                         continue
-                    except Exception as e:
-                        print(f"  [warn] {name}: {str(e)[:60]}")
-                        continue
-                if os.path.exists(os.path.join(pdir, "manifest.json")):
-                    built["parts"].append({
-                        "group": group, "slot": slot, "name": name, "kind": kind,
-                        "dir": os.path.relpath(pdir, REPO).replace(os.sep, "/"),
-                    })
+                if not os.path.exists(os.path.join(pdir, "manifest.json")):
+                    dropped.append((kid, slot, name, "builder wrote no manifest"))
+                    continue
+                built["parts"].append({
+                    "group": "worn", "slot": slot, "name": name, "kind": kind,
+                    "dir": os.path.relpath(pdir, REPO).replace(os.sep, "/"),
+                })
             json.dump(built, open(os.path.join(kdir, "kit.json"), "w"), indent=1)
             index[kid] = {"bot": bt, "seed": seed,
                           "dir": os.path.relpath(kdir, REPO).replace(os.sep, "/")}
             print(f"[kit] {kid}: weapon={bool(built['weapon'])} parts={len(built['parts'])}")
     json.dump({"kits": index}, open(os.path.join(args.out, "index.json"), "w"), indent=1)
     print(f"[kits] {len(index)} kit(s) -> {args.out}")
+    # A rolled slot that produced no geometry is a REGRESSION, not a footnote: the bot spawns
+    # wearing it in game. Report every one, and exit non-zero so a pipeline run cannot pass
+    # while quietly stripping a bot's armour.
+    if dropped:
+        print(f"\n[DROPPED] {len(dropped)} rolled slot(s) produced no geometry:")
+        for kid, slot, name, why in dropped:
+            print(f"  {kid:16s} {slot:12s} {str(name)[:40]:40s} {why}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

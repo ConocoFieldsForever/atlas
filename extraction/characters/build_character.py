@@ -232,9 +232,20 @@ def build(
 ) -> str:
     reg = load_registry()
     chars = reg["characters"]
-    if character not in chars:
-        raise SystemExit(f"unknown character {character!r}; known: {', '.join(sorted(chars))}")
-    spec = chars[character]
+    if isinstance(character, dict):
+        # A RESOLVED SPEC (extraction/characters/appearance.py): the bot's own weighted
+        # appearance roll, resolved through the game's customization table. This is the
+        # authoritative path — characters.json entries are hand-authored and only kept for
+        # named one-offs and for facts the tables do not carry.
+        spec = dict(character)
+        spec.setdefault("clipSets", reg.get("clipSets") or {})
+        character = spec.get("id") or spec.get("displayName", "rolled").replace(" ", "_").replace("#", "")
+    elif character in chars:
+        spec = chars[character]
+    else:
+        raise SystemExit(
+            f"unknown character {character!r}; known: {', '.join(sorted(chars))} "
+            f"(or build a rolled bot with --bot <type> [--seed N])")
 
     t0 = time.time()
     used_bundles: List[str] = []
@@ -505,6 +516,9 @@ def main() -> None:
         "bot graphs.",
     )
     ap.add_argument("--grep", help="with --dump-states, filter states by substring")
+    ap.add_argument("--bot", help="bot type from the game's own tables (assault, pmcusec, "
+                                  "bosskilla, ...) — appearance is ROLLED, not authored")
+    ap.add_argument("--seed", type=int, default=0, help="roll seed for --bot (default 0)")
     args = ap.parse_args()
 
     if args.list:
@@ -515,8 +529,19 @@ def main() -> None:
         print("clip sets:", ", ".join(sorted(reg["clipSets"])))
         return
 
+    if args.bot:
+        from appearance import resolve as resolve_appearance
+        reg = load_registry()
+        spec = resolve_appearance(args.bot, args.seed, clip_sets=reg.get("clipSets"))
+        spec["id"] = f"{args.bot}_{args.seed}"
+        print(f"[appearance] {args.bot} #{args.seed}: "
+              + ", ".join(f"{k}={v['name']}" for k, v in spec["appearance"].items()))
+        build(character=spec, clip_set=args.clips, skip_clips=args.skip_clips, lods=args.lod,
+              strict=not args.no_strict, out_dir=args.out)
+        return
+
     if not args.character:
-        ap.error("--character is required (or --list)")
+        ap.error("--character, --bot or --list is required")
 
     if args.dump_states:
         dump_states(args.character, args.grep)
