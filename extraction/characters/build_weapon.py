@@ -76,6 +76,7 @@ class Bundle:
     """
 
     def __init__(self, path, cabs=None):
+        self.path = path
         self.env = UnityPy.Environment()
         # Resolve the container's DECLARED CAB dependencies through the prebuilt index rather
         # than hoping a sibling happens to provide them: `m_FileID` is an index into the
@@ -188,12 +189,16 @@ class Bundle:
                 # the receiver then runs ALONG the barrel (Y) like the body, and the magazine sits
                 # PERPENDICULAR (Z) hanging below it — an AK. Falls back to the root when a prefab
                 # has no renderer to anchor on.
-                for gp, obj, kind in self.renderers:
-                    t = self.go2tf.get(gp)
-                    nm = (self.go_name.get(gp) or "").lower()
-                    if t is not None and ("_lod0" in nm or "_lod" not in nm):
-                        anchor = t
-                        break
+                #
+                # The anchor must be a node that actually CONTRIBUTES BAKED GEOMETRY. Matching
+                # any name without "_lod" also matched the Unity primitive gizmos a prefab uses
+                # as markers -- the LA-5's laser emitters are `Sphere` nodes carrying a ~1/252
+                # scale, and anchoring on one inverted that scale into every vertex, baking the
+                # 8 cm device as a 51 m object. Preferring a renderer whose mesh actually
+                # resolves excludes gizmos structurally: they point at Unity's built-in library,
+                # which the game does not ship.
+                lod0 = [t for t in (self._anchor_candidates("_lod0"))]
+                anchor = next(iter(lod0), None) or next(iter(self._anchor_candidates(None)), None)
             if anchor is None:
                 roots = [r for r in self.roots() if r in self.variant()] or self.roots()
                 anchor = None
@@ -208,11 +213,60 @@ class Bundle:
                     if n > best_n:
                         anchor, best_n = r, n
             M = self.world_of(anchor) if anchor is not None else np.eye(4)
+            # A mount is a FRAME: it says where the part sits and which way it faces, not how
+            # big it is. Scale on the anchor is an authoring artifact of that one node, and
+            # inverting it rescales the geometry -- so the basis is orthonormalised first,
+            # keeping orientation and handedness and dropping scale. This is safe because the
+            # meshes are already authored in metres (measured: LA-5 8 cm, receiver 21 cm,
+            # PMAG 19 cm), so nothing needs a compensating scale.
+            R = M[:3, :3].astype(np.float64).copy()
+            norms = np.linalg.norm(R, axis=0)
+            scaled = np.any(np.abs(norms - 1.0) > 1e-3)
+            R[:, norms > 1e-9] /= norms[norms > 1e-9]
+            F = np.eye(4)
+            F[:3, :3], F[:3, 3] = R, M[:3, 3]
+            if scaled:
+                print(f"  [anchor] {os.path.basename(self.path)}: mount frame carried scale "
+                      f"{np.round(norms, 4)} -- using orientation only")
             try:
-                self._root_inv = np.linalg.inv(M)
+                self._root_inv = np.linalg.inv(F)
             except np.linalg.LinAlgError:
                 self._root_inv = np.eye(4)
         return self._root_inv
+
+    def _anchor_candidates(self, name_contains):
+        """Transform pids of renderers that will actually bake, in bundle order.
+
+        `name_contains=None` accepts any renderer that has no explicit `_lod` suffix. A renderer
+        whose mesh cannot be resolved (Unity's built-in primitives — the gizmo spheres) is never
+        a candidate: it contributes no geometry, so it cannot define the part's frame.
+        """
+        for gp, obj, kind in self.renderers:
+            t = self.go2tf.get(gp)
+            nm = (self.go_name.get(gp) or "").lower()
+            if t is None:
+                continue
+            if name_contains is None:
+                if "_lod" in nm:
+                    continue
+            elif name_contains not in nm:
+                continue
+            try:
+                r = obj.read()
+                mp = getattr(r, "m_Mesh", None)
+                if mp is None:
+                    for c in r.m_GameObject.read().m_Component:
+                        cp = c[1] if isinstance(c, (list, tuple)) else c.component
+                        co = cp.read()
+                        if co.__class__.__name__ == "MeshFilter":
+                            mp = co.m_Mesh
+                            break
+                if mp is None or not getattr(mp, "path_id", 0):
+                    continue
+                mp.read()          # resolves, or raises for a built-in / missing dependency
+            except Exception:
+                continue
+            yield t
 
     def slot_node(self, name):
         """Transform pid of the GameObject named `name` (a `mod_*` socket) WITHIN the chosen
@@ -310,6 +364,11 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0):
             UV = UV[:n] if UV.shape[0] >= n else np.zeros((n, 2))
         else:
             UV = np.zeros((n, 2))
+        if os.environ.get("EFT_WEAPON_DEBUG"):
+            sz = P.max(0) - P.min(0)
+            ctr = (P.max(0) + P.min(0)) / 2
+            print(f"  [part] {nm[:38]:38s} mesh={getattr(mesh,'m_Name','?')[:28]:28s} "
+                  f"verts={n:6d} size={np.round(sz,2)} ctr={np.round(ctr,2)}")
         base = len(out_v)
         for i in range(n):
             out_v.append((P[i], N[i], UV[i]))
