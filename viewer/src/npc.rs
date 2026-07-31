@@ -398,7 +398,12 @@ fn drive_npcs(
         let t = (npc.dist / leg_len).clamp(0.0, 1.0);
         tf.translation = a + leg_vec * t;
         // Face the walk direction, turning at a bounded rate.
-        let want_yaw = (-walk_dir.x).atan2(-walk_dir.z);
+        // The rig's forward is +Z (manifest `characterForward`, derived from walk_aim_0's root
+        // motion), and rotation_y(yaw) maps +Z to (sin yaw, 0, cos yaw) — so the yaw that faces
+        // `d` is atan2(d.x, d.z). The old (-x, -z) form is the CAMERA convention (cameras look
+        // down -Z); using it here pointed every body 180 degrees away from its travel, which is
+        // why they moonwalked down the route with a correct forward-walk animation playing.
+        let want_yaw = walk_dir.x.atan2(walk_dir.z);
         let mut d = want_yaw - npc.heading;
         while d > std::f32::consts::PI {
             d -= std::f32::consts::TAU;
