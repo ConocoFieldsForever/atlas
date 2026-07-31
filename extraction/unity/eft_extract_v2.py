@@ -185,6 +185,60 @@ class _TexPool:
             self.pool.shutdown(wait=True)
 
 
+_CUBE_MEAN_CACHE = {}
+
+
+def cube_mean_rgb(pptr):
+    """Mean LINEAR rgb of a Cubemap asset (all 6 faces, top mip), memoized per path_id.
+
+    The TRS glass family's `_Cube` is the reflection the game actually shows on windows; its
+    mean replaces the viewer's bright analytic sky as the reflection tint (folded into the
+    authored _ReflectColor downstream). Unity stores cubemaps FACE-MAJOR (face0's full mip
+    chain, then face1's, ...); m_StreamData resolves through get_image_data() (the sky
+    extractor's proven path). Fail-safe: ANY decode problem -> None -> that material keeps the
+    analytic environment."""
+    pid = getattr(pptr, "path_id", 0)
+    if not pid:
+        return None
+    if pid in _CUBE_MEAN_CACHE:
+        return _CUBE_MEAN_CACHE[pid]
+    mean = None
+    try:
+        import texture2ddecoder
+        tex = pptr.read()
+        data = bytes(tex.get_image_data())
+        face = int(getattr(tex, "m_Width", 0) or 0)
+        mips = int(getattr(tex, "m_MipCount", 1) or 1)
+        fmt = int(getattr(tex, "m_TextureFormat", 0) or 0)
+        # (decoder, bytes-per-4x4-block) for the BC formats EFT ships; RGBA32 handled below.
+        dec = {10: (texture2ddecoder.decode_bc1, 8),
+               12: (texture2ddecoder.decode_bc3, 16),
+               25: (texture2ddecoder.decode_bc7, 16)}.get(fmt)
+        if face > 0 and data and (dec or fmt == 4):
+            if dec:
+                def mip_bytes(w, h):
+                    return max(1, w // 4) * max(1, h // 4) * dec[1]
+            else:
+                def mip_bytes(w, h):
+                    return w * h * 4
+            chain = sum(mip_bytes(max(1, face >> m), max(1, face >> m)) for m in range(mips))
+            if len(data) >= chain * 6:
+                acc = np.zeros(3, np.float64)
+                for i in range(6):
+                    raw = data[i * chain: i * chain + mip_bytes(face, face)]
+                    if dec:
+                        bgra = dec[0](raw, face, face)
+                        px = np.frombuffer(bgra, np.uint8).reshape(face, face, 4)[..., 2::-1]
+                    else:
+                        px = np.frombuffer(raw, np.uint8).reshape(face, face, 4)[..., :3]
+                    acc += np.power(px.astype(np.float64) / 255.0, 2.2).mean(axis=(0, 1))
+                mean = [round(float(v) / 6.0, 5) for v in acc]
+    except Exception:
+        mean = None
+    _CUBE_MEAN_CACHE[pid] = mean
+    return mean
+
+
 def g(o, *names, default=None):
     for n in names:
         if hasattr(o, n):
@@ -994,6 +1048,16 @@ def main():
                 #  - specCol/shin: _SpecColor + _Shininess, the Blinn-Phong response.
                 if "transparent" in _shl and ("reflective" in _shl or "dithered" in _shl):
                     extra["glassTRS"] = 1
+                    # The family's authored _Cube is the reflection the game ACTUALLY shows on
+                    # these panes — a baked urban cubemap several times darker than open sky.
+                    # Capture its mean linear rgb; the viewer folds it into the reflection tint,
+                    # which is what stops facade windows mirroring the bright analytic sky as a
+                    # white-out. Fail-safe: no capture -> the viewer keeps the analytic env.
+                    _cube = slots.get("_Cube")
+                    if _cube:
+                        _cm = cube_mean_rgb(_cube[0])
+                        if _cm:
+                            extra["reflCube"] = _cm
                     # The dithered family scales tex.a BEFORE its dither (_OpacityScale x
                     # _AlphaMult; streets glass tiles ship 4.0 over a 0.24-mean alpha). Without
                     # it the tiles read as 52% holes; with it they are the game's near-opaque

@@ -167,6 +167,7 @@ const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpG
 const MAT_FLAG_PARALLAX: u32 = 2048u;     // bit11: steep parallax mapping (offset UV by parallax_index height)
 const MAT_FLAG_GLASS_MASK: u32 = 4096u;   // bit12: glass tex.a is COVERAGE (shard atlas) -> masks ALL terms
 const MAT_FLAG_GLASS_TRS: u32 = 8192u;    // bit13: legacy Transparent/Reflective/Specular glass (authored response)
+const MAT_FLAG_GLASS_CUBE: u32 = 16384u;  // bit14: glass_refl rgb IS the extracted _Cube reflection (skip analytic env)
 const MAT_FLAG_PUDDLE_LUMA: u32 = 256u;   // bit8: puddle shape mask in luma(rgb), not alpha (atlas)
 const MAT_FLAG_WATER_MATTE: u32 = 512u;   // bit9: STRETCHED floor water-decal (tire marks / wet-ground) -> matte, no mirror
 const MAT_FLAG_DECAL: u32 = 1024u;        // bit10: plain surface decal; mask ALL lighting terms by texture coverage
@@ -1602,13 +1603,46 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
         f32((m.glass_spec >> 8u) & 255u),
         f32(m.glass_spec & 255u),
     ) / 255.0;
-    let refl_g = select(refl_rgb, env * trs_refl * (1.0 - shadow_event), is_trs);
-    let spec_g = select(spec_rgb, spec_rgb * trs_spec * albedo.a, is_trs);
+    // Reflection source, in authority order: the material's own extracted _Cube mean when it
+    // authored one (bit14); else the BAKED scene irradiance along the reflection vector
+    // (sh_env) — the game's runtime weather probe has no scene-data twin (RenderSettings ships
+    // customReflection=null on every level; zero ReflectionProbes), and the analytic sky the
+    // old path mixed in is raw sky RADIANCE, ~4x brighter than any environment the game ever
+    // mirrors — it washed every facade pane to white milk over its dark interior.
+    // The family's reflection input is texCUBE(_Cube) — an LDR IMAGE, bounded [0,1], so the
+    // game's whole term can never exceed _ReflectColor. Our scene irradiance is HDR (~2.0
+    // toward open sky) and overflowed that contract, washing panes to milk over their dark
+    // interiors (bisected: diffuse-only 0.11, +reflection 0.76). Reinhard-compress into the
+    // LDR domain the shader was authored against — the water mirror does the same.
+    let sh_ldr = sh_env / (vec3<f32>(1.0) + sh_env);
+    // Fresnel gates the whole term: real (and the game's) window glass reflects ~4% head-on
+    // and only mirrors at grazing angles — without it even the LDR-bounded probe reads as a
+    // uniform milk sheet facing the pane. Schlick view-fresnel is already in scope.
+    let trs_env = select(sh_ldr * trs_refl, trs_refl, (m.flags & MAT_FLAG_GLASS_CUBE) != 0u)
+        * fresnel_v;
+    let refl_g = select(refl_rgb, trs_env * (1.0 - shadow_event), is_trs);
+    // Specular, same authoring contract: the family is legacy BLINN-PHONG (_SpecColor *
+    // pow(NdotH, _Shininess*128) * NdotL) against an LDR light — our GGX lobe with HDR sun
+    // radiance and the global SPEC_STRENGTH boost measured ~0.26 of flat wash on a facade
+    // pane. Evaluate the family's own BRDF with the sun Reinhard-bounded like the probe.
+    var spec_trs = vec3<f32>(0.0);
+    if (is_trs && dom.mag >= 1e-4) {
+        let Hh = normalize(V + dom.dir);
+        let blinn = pow(max(dot(N, Hh), 0.0), max(m.glass_shin, 0.01) * 128.0);
+        let sun_ldr = dom.radiance / (vec3<f32>(1.0) + dom.radiance);
+        spec_trs = sun_ldr * trs_spec * blinn
+            * max(dot(N, dom.dir), 0.0) * albedo.a * (1.0 - shadow_event);
+    }
+    let spec_g = select(spec_rgb, spec_trs, is_trs);
     // Coverage-mask glass (broken-shard atlases, LEGACY packs without the TRS capture): alpha 0 =
     // NO SURFACE, so the additive terms die with it too — otherwise the empty atlas area still
     // mirrors the sky as a ghost pane. The steep ramp keeps shard bodies at full strength and
     // feathers only the mask fringe.
     let cov = select(1.0, smoothstep(0.02, 0.30, albedo.a), (m.flags & MAT_FLAG_GLASS_MASK) != 0u);
+    // (Diagnosed from both sides of interchange's Nikitskaya panes: the interior behind them is
+    // a REAL dark room and the pane is near-clear looking out — so the outside "white window"
+    // was almost entirely the REFLECTION term mirroring the bright analytic sky. The extracted
+    // _Cube mean above is the cure; transmission needs no help.)
     return vec4<f32>(
         (apply_fog(lit, o.world_pos, dom.directionality) * glass_a + spec_g + refl_g + em_rgb) * cov,
         glass_a * cov

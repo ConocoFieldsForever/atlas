@@ -468,6 +468,11 @@ pub struct Material {
     /// streets' glass blocks ship 4.0). Absent = 1.0 (the reflective family).
     #[serde(rename = "opacityScale", default)]
     pub opacity_scale: Option<f32>,
+    /// Mean linear rgb of the material's own `_Cube` cubemap — the reflection the game actually
+    /// shows on this glass (a baked urban probe, several times darker than open sky). When
+    /// present the viewer's TRS reflection uses it instead of the analytic sky environment.
+    #[serde(rename = "reflectCube", default)]
+    pub reflect_cube: Option<[f32; 3]>,
 }
 
 /// Unity parallax-offset mapping. Optional grayscale HEIGHT map (`_ParallaxMap`) + the `_Parallax`
