@@ -16,6 +16,7 @@ use crate::character::pack::CharacterPack;
 use crate::character::rig::{self, CharacterBone, CharacterRoot};
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::prelude::*;
+use bevy::tasks::{block_on, futures_lite::future, AsyncComputeTaskPool, Task};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -74,6 +75,16 @@ struct NpcWeapon(Arc<crate::character::weapon::WeaponPack>);
 /// Marks an agent whose weapon has been parented, so the attach runs once per agent.
 #[derive(Component)]
 struct WeaponAttached;
+
+/// An A* route being computed OFF the main thread.
+///
+/// A single search over a map-sized nav grid measured 246 ms and 121 ms on ground_zero — a
+/// visible freeze every time an agent finished a leg (a ~60 m leg at the walk's own 2.5 m/s is
+/// ~24 s, which is exactly the cadence the freeze appeared at). Budgeting one replan per frame
+/// limited how many ran at once but not the cost of one, so the search now runs on the async
+/// compute pool and the agent simply keeps dwelling until it lands.
+#[derive(Component)]
+struct PendingRoute(Task<Option<Vec<Vec3>>>);
 
 /// Parent the weapon's parts to each agent's `Weapon_root` bone. A separate system because the
 /// bone entities are created by deferred commands during spawn and are only readable afterwards;
@@ -343,54 +354,69 @@ fn drive_npcs(
     time: Res<Time>,
     cpack: Option<Res<NpcCharacter>>,
     nav: Option<Res<crate::pathfind::Nav>>,
-    mut scratch_nav: Local<Option<crate::nav::PooledScratch>>,
     mut acc: Local<Option<PoseAccumulator>>,
     mut scratch: Local<Vec<WeightedClip>>,
     mut prev_scratch: Local<Vec<WeightedClip>>,
     mut params: Local<HashMap<String, f32>>,
-    mut replans: Local<u32>,
-    mut root_q: Query<(&mut Npc, &mut CharacterRoot, &mut Transform), Without<CharacterBone>>,
+    mut commands: Commands,
+    mut pending: Query<&mut PendingRoute>,
+    mut root_q: Query<(Entity, &mut Npc, &mut CharacterRoot, &mut Transform), Without<CharacterBone>>,
     mut bone_q: Query<&mut Transform, (With<CharacterBone>, Without<Npc>)>,
 ) {
     let Some(cpack) = cpack else { return };
     let pack: &CharacterPack = &cpack.0;
     let dt = time.delta_secs().min(0.1);
     let grid = nav.as_ref().and_then(|n| n.0.as_ref());
-    *replans = 0; // per-frame A* budget (see below)
 
-    for (mut npc, mut root, mut tf) in &mut root_q {
-        // ---- plan: (re)route the current leg through the NAV GRID when none is active ----
-        // A* over a map-sized grid costs milliseconds, and several agents finishing a leg on the
-        // SAME frame stacked those costs into a visible hitch. Budget ONE replan per frame; an
-        // agent waiting its turn simply stands (it is already dwelling at a waypoint anyway).
-        if npc.path.len() < 2 && *replans >= 1 {
-            continue;
-        }
+    for (e, mut npc, mut root, mut tf) in &mut root_q {
+        // ---- plan: (re)route the current leg through the NAV GRID, OFF the main thread ----
         if npc.path.len() < 2 {
-            *replans += 1;
-            let from = tf.translation;
-            let next = npc.targets[((npc.at as i32 + npc.dir).rem_euclid(npc.targets.len() as i32)) as usize];
-            npc.path = if let Some(g) = grid {
-                let sn = scratch_nav.get_or_insert_with(|| crate::nav::pooled_scratch(g.nodes()));
-                match g.path(from, next, &mut *sn, None) {
-                    Some((mut poly, _)) if poly.len() >= 2 => {
-                        // A* returns a polyline through grid-CELL CENTRES, so poly[0] is the
-                        // snapped cell, not where the agent is standing — adopting it verbatim
-                        // teleported the body up to a cell sideways at every replan. Walk from
-                        // the true position into the routed line instead.
-                        if poly[0].distance_squared(from) > 0.01 {
-                            poly.insert(0, from);
-                        }
-                        poly
+            match pending.get_mut(e) {
+                Ok(mut task) => {
+                    // A route is in flight: take it when it lands, else keep standing.
+                    if let Some(res) = block_on(future::poll_once(&mut task.0)) {
+                        let from = tf.translation;
+                        let next = npc.targets
+                            [((npc.at as i32 + npc.dir).rem_euclid(npc.targets.len() as i32)) as usize];
+                        npc.path = match res {
+                            Some(mut poly) if poly.len() >= 2 => {
+                                // A* walks grid CELL CENTRES, so poly[0] is the snapped cell and
+                                // not where the agent stands; adopting it verbatim teleported the
+                                // body up to a cell sideways at every replan.
+                                if poly[0].distance_squared(from) > 0.01 {
+                                    poly.insert(0, from);
+                                }
+                                poly
+                            }
+                            _ => vec![from, next], // unreachable: straight, never a frozen agent
+                        };
+                        npc.leg = 0;
+                        npc.dist = 0.0;
+                        commands.entity(e).remove::<PendingRoute>();
+                    } else {
+                        continue; // still computing — the agent is dwelling anyway
                     }
-                    // unreachable by grid: straight fallback rather than a frozen agent.
-                    _ => vec![from, next],
                 }
-            } else {
-                vec![from, next] // nav still streaming in: straight fallback, replanned next target
-            };
-            npc.leg = 0;
-            npc.dist = 0.0;
+                Err(_) => {
+                    // No task yet: dispatch one and stand until it returns.
+                    let from = tf.translation;
+                    let next = npc.targets
+                        [((npc.at as i32 + npc.dir).rem_euclid(npc.targets.len() as i32)) as usize];
+                    if let Some(g) = grid.cloned() {
+                        let pool = AsyncComputeTaskPool::get();
+                        let task = pool.spawn(async move {
+                            let mut sc = crate::nav::pooled_scratch(g.nodes());
+                            g.path(from, next, &mut sc, None).map(|(poly, _)| poly)
+                        });
+                        commands.entity(e).insert(PendingRoute(task));
+                    } else {
+                        npc.path = vec![from, next]; // nav still streaming in
+                        npc.leg = 0;
+                        npc.dist = 0.0;
+                    }
+                    continue;
+                }
+            }
         }
         // ---- agent step: dwell at plan targets, else walk the current path leg ----
         let moving = if npc.dwell > 0.0 {
