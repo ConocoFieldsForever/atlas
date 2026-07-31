@@ -158,9 +158,15 @@ pub struct CullUniform {
     /// shell w), w = forced shell index (mode 2). Instances with ids.w == 0 (sentinel) ignore all of
     /// this and always draw (lean packs, ungrouped, single-shell groups).
     pub lod_params: [f32; 4],
+    /// HI-Z occlusion (camera stream only; the SHADOW stream uploads hiz[0]=0 so hidden casters
+    /// still shadow through doorways): LAST frame's clip_from_world — the pyramid holds last
+    /// frame's depths, so the test must project with last frame's matrices.
+    pub prev_clip_from_world: [[f32; 4]; 4],
+    /// x = enable (>0.5), y = pyramid mip count, z = pyramid width px, w = pyramid height px.
+    pub hiz: [f32; 4],
 }
-// #6: LOCK the byte layout — matches `CullGlobals` in gpu_cull.wgsl (array<vec4,6> + 3×vec4 = 144).
-const _: () = assert!(std::mem::size_of::<CullUniform>() == 144);
+// #6: LOCK the byte layout — matches `CullGlobals` in gpu_cull.wgsl (6+3 vec4 + mat4 + vec4 = 224).
+const _: () = assert!(std::mem::size_of::<CullUniform>() == 224);
 
 /// Stride of one indirect draw record, in bytes.
 pub const DRAW_ARG_STRIDE: u64 = 20;
@@ -1621,7 +1627,7 @@ impl Plugin for EftGpuDrivenPlugin {
                     // SSAO AO lane: (re)create the target, then swap the draw bind group's AO
                     // binding between it and the white fallback. Registered HERE (not in
                     // SsaoPlugin) so the ordering can name the private `prepare_gpu_buffers`.
-                    (super::ssao::prepare_ao_target, sync_draw_bg_ao)
+                    (super::ssao::prepare_ao_target, sync_draw_bg_ao, sync_cull_hiz)
                         .chain()
                         .in_set(RenderSystems::PrepareResources)
                         .after(prepare_gpu_buffers),
@@ -3927,9 +3933,47 @@ fn init_gpu_pipelines(
     let prepass_shader = asset_server.load("shaders/gpu_prepass.wgsl"); // normal+roughness prepass
     let pyramid_shader = asset_server.load("shaders/depth_pyramid.wgsl"); // Phase-1 shared depth pyramid
 
+    // HI-Z group(1): last frame's depth pyramid, or a 1x1 zero fallback (0.0 = reverse-z far
+    // plane = the occlusion test can never cull). Its own tiny group so a pyramid resize
+    // rebuilds ONE bind group, not the eight-entry cull set.
+    let hiz_layout = render_device.create_bind_group_layout(
+        "eft_cull_hiz_layout",
+        &BindGroupLayoutEntries::sequential(
+            ShaderStages::COMPUTE,
+            (texture_2d(TextureSampleType::Float { filterable: false }),),
+        ),
+    );
+    let hiz_fallback = render_device.create_texture(&TextureDescriptor {
+        label: Some("eft_hiz_fallback"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let hiz_fallback_view = hiz_fallback.create_view(&TextureViewDescriptor::default());
+    let hiz_bg = render_device.create_bind_group(
+        "eft_cull_hiz_bg",
+        &hiz_layout,
+        &BindGroupEntries::sequential((&hiz_fallback_view,)),
+    );
+    commands.insert_resource(EftHizBind {
+        bg: hiz_bg,
+        bound: None,
+        fallback_view: hiz_fallback_view,
+        layout: hiz_layout.clone(),
+        _fallback_tex: hiz_fallback,
+    });
+
     let reset_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("eft_cull_reset".into()),
-        layout: vec![cull_layout.clone()],
+        layout: vec![cull_layout.clone(), hiz_layout.clone()],
         push_constant_ranges: vec![],
         shader: cull_shader.clone(),
         shader_defs: vec![],
@@ -3938,7 +3982,7 @@ fn init_gpu_pipelines(
     });
     let cull_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("eft_cull".into()),
-        layout: vec![cull_layout.clone()],
+        layout: vec![cull_layout.clone(), hiz_layout.clone()],
         push_constant_ranges: vec![],
         shader: cull_shader,
         shader_defs: vec![],
@@ -3950,7 +3994,7 @@ fn init_gpu_pipelines(
     // cs_cull, before the main pass.
     let sort_blend_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("eft_cull_sort_blend".into()),
-        layout: vec![cull_layout.clone()],
+        layout: vec![cull_layout.clone(), hiz_layout],
         push_constant_ranges: vec![],
         shader: cull_shader_sort,
         shader_defs: vec![],
@@ -4670,9 +4714,18 @@ pub(crate) fn prepare_gpu_buffers(
         counts: [instance_total, cpu.mesh_count, 0, 0],
         cam_k: [0.0; 4],
         lod_params: [1.0, 1.0, 0.0, 0.0], // proj11=1, bias=1, mode=0 (max detail) until upload_frustum
+        prev_clip_from_world: [[0.0; 4]; 4],
+        hiz: [0.0; 4],
     };
     let cull_uniform = render_device.create_buffer_with_data(&BufferInitDescriptor {
         label: Some("eft_cull_uniform"),
+        contents: bytemuck::bytes_of(&seed),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+    // SHADOW STREAM uniform: same frustum/counts, but lod_params is pinned to DISTANCE-tiered
+    // shells and hiz stays off (see upload_frustum). Only meaningful on multi-LOD packs.
+    let cull_uniform2 = render_device.create_buffer_with_data(&BufferInitDescriptor {
+        label: Some("eft_cull_uniform_shadow"),
         contents: bytemuck::bytes_of(&seed),
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     });
@@ -4711,6 +4764,51 @@ pub(crate) fn prepare_gpu_buffers(
             blend_ids_buf.as_entire_binding(),
         )),
     );
+    // ---- SHADOW CULL STREAM (multi-LOD packs): a second reset+cull over the SAME instances,
+    // with shells always DISTANCE-tiered and Hi-Z off. The camera stream can then keep the
+    // user's finest-shell choice (and Hi-Z-cull its occludees) while the four shadow cascades
+    // rasterize shells a 3072^2 map can actually resolve — measured 12.3 ms of the 19.6 ms
+    // LOD-off frame was the cascades re-drawing finest shells. Lean packs skip all of it:
+    // every window is the sentinel, both streams would be identical. ----
+    let multi_lod_pack = cpu.instances.iter().any(|r| r.ids[3] != 0);
+    let mut shadow_stream_parts: Option<(Buffer, Buffer, BindGroup)> = None;
+    if multi_lod_pack {
+        let visible2 = render_device.create_buffer(&BufferDescriptor {
+            label: Some("eft_gpu_visible_shadow"),
+            size: instance_total as u64 * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let indirect2 = render_device.create_buffer(&BufferDescriptor {
+            label: Some("eft_gpu_indirect_shadow"),
+            size: cpu.mesh_count as u64 * DRAW_ARG_STRIDE,
+            usage: BufferUsages::INDIRECT | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        // cs_cull mirrors every survivor into the blend counter; the shadow stream never draws
+        // blend, so its writes land in this sink.
+        let indirect_blend2 = render_device.create_buffer(&BufferDescriptor {
+            label: Some("eft_gpu_indirect_blend_shadow_sink"),
+            size: cpu.mesh_count as u64 * DRAW_ARG_STRIDE,
+            usage: BufferUsages::INDIRECT | BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let cull_bg2 = render_device.create_bind_group(
+            "eft_cull_bg_shadow",
+            &compute.cull_layout,
+            &BindGroupEntries::sequential((
+                cull_uniform2.as_entire_binding(),
+                instances.as_entire_binding(),
+                mesh_meta.as_entire_binding(),
+                visible2.as_entire_binding(),
+                indirect2.as_entire_binding(),
+                indirect_blend2.as_entire_binding(),
+                lod_centers.as_entire_binding(),
+                blend_ids_buf.as_entire_binding(),
+            )),
+        );
+        shadow_stream_parts = Some((visible2, indirect2, cull_bg2));
+    }
     // Loot-glow highlight lane: one u32 per instance (0 = no glow), zero-initialized; the
     // per-frame `prepare_loot_glow` rewrites it whenever the loot overlay's visible set changes.
     let loot_glow_buf = render_device.create_buffer(&BufferDescriptor {
@@ -4751,6 +4849,35 @@ pub(crate) fn prepare_gpu_buffers(
         loot_glow: loot_glow_buf.clone(),
         bound_ao: None, // fallback bound; sync swaps in the live lane when SSAO is on
     });
+    // Shadow-stream draw bind group: same layout, visible2 in the visible slot. The AO slot stays
+    // on the white fallback FOREVER (the shadow shader never reads it), so unlike the camera
+    // draw_bg this one never needs the AO sync rebuild.
+    if let Some((visible2, indirect2, cull_bg2)) = shadow_stream_parts.take() {
+        let draw_bg2 = render_device.create_bind_group(
+            "eft_draw_bg_shadow",
+            &draw.ssbo_layout,
+            &BindGroupEntries::with_indices((
+                (0, instances.as_entire_binding()),
+                (1, visible2.as_entire_binding()),
+                (2, loot_glow_buf.as_entire_binding()),
+                (
+                    3,
+                    bevy::render::render_resource::BindingResource::TextureView(
+                        ao_fallback.as_ref().expect(
+                            "SsaoPipeline initializes in RenderStartup, before any map build",
+                        ),
+                    ),
+                ),
+            )),
+        );
+        commands.insert_resource(EftShadowStream {
+            cull_uniform2: cull_uniform2.clone(),
+            indirect2,
+            cull_bg2,
+            draw_bg2,
+            _visible2: visible2,
+        });
+    }
 
     // ---- M3: bindless material table + albedo texture array (built ONCE) -----------
     // material-table SSBO (indexed by the per-vertex global materialId in the fragment).
@@ -6480,6 +6607,10 @@ fn upload_frustum(
     shadow: Option<Res<EftShadowConfig>>,
     settings: Option<Res<crate::render::GfxSettings>>,
     views: Query<&ExtractedView, With<CullCamera>>,
+    // HI-Z inputs (camera stream) + the shadow stream's uniform.
+    pre: Option<Res<EftPrepassResources>>,
+    pyr: Option<Res<EftPyramidResources>>,
+    stream: Option<Res<EftShadowStream>>,
 ) {
     let Some(buffers) = buffers else {
         return;
@@ -6518,7 +6649,7 @@ fn upload_frustum(
     let vh = view.viewport.w.max(1) as f32;
     let denom = (0.5 * vh * proj11).max(1e-4);
     let cam_pos = view.world_from_view.translation();
-    let uniform = CullUniform {
+    let mut uniform = CullUniform {
         frustum: [
             planes[0].to_array(),
             planes[1].to_array(),
@@ -6564,8 +6695,34 @@ fn upload_frustum(
                 .unwrap_or((0.0, 1.0, 0.0));
             [proj11, bias, mode, forced]
         },
+        // HI-Z: enabled only when the toggle is on AND last frame's pyramid + matrices exist.
+        // The seed zeros keep the test off on frame 0 / resize / map swap.
+        prev_clip_from_world: [[0.0; 4]; 4], // filled below with hiz together
+        hiz: [0.0; 4],
     };
+    // HI-Z: enabled only when the toggle is on AND last frame's pyramid, matrices and prepass
+    // all exist. Zeros (the seed) keep the test off on frame 0 / resize / map swap.
+    if settings.as_ref().map(|s| s.hiz).unwrap_or(false) {
+        if let (Some(pre), Some(p)) = (&pre, &pyr) {
+            if let (Some(prev), true, true, true) =
+                (pre.prev_clip_from_world, pre.active, p.active, p.sample_view.is_some())
+            {
+                uniform.prev_clip_from_world = prev;
+                uniform.hiz = [1.0, p.mips as f32, p.size.x as f32, p.size.y as f32];
+            }
+        }
+    }
     render_queue.write_buffer(&buffers.cull_uniform, 0, bytemuck::bytes_of(&uniform));
+    // SHADOW STREAM: identical frustum/counts, but shells are ALWAYS distance-tiered (a 3072^2
+    // cascade cannot resolve finest-vs-tiered shells) and Hi-Z stays off so camera-occluded
+    // casters still shadow through doorways.
+    if let Some(stream) = stream {
+        let mut u2 = uniform;
+        u2.lod_params = [proj11, 1.0, 1.0, 0.0];
+        u2.prev_clip_from_world = [[0.0; 4]; 4];
+        u2.hiz = [0.0; 4];
+        render_queue.write_buffer(&stream.cull_uniform2, 0, bytemuck::bytes_of(&u2));
+    }
 }
 
 // ---- PrepareResources: #5 fit + upload the 2 cascade matrices each frame ----
@@ -6673,6 +6830,62 @@ struct EftLootGlow {
     buffer: Buffer,
     len: u32,
     last_gen: u64,
+}
+
+/// SHADOW cull stream (multi-LOD packs only): the second reset+cull writes `_visible2`/`indirect2`
+/// with shells always DISTANCE-tiered and Hi-Z off, so the cascades rasterize what a shadow map
+/// can resolve while the camera stream keeps the user's finest-shell choice (and its occludees
+/// still cast). Absent on lean packs — the shadow node then reuses the camera stream unchanged.
+/// HI-Z bind state for the cull's group(1): the pyramid's full-chain view while Hi-Z is on and
+/// the pyramid exists, else the 1x1 zero fallback (test never culls). Rebuilt by
+/// `sync_cull_hiz` only when the bound view actually changes (toggle, resize, map swap).
+#[derive(Resource)]
+struct EftHizBind {
+    bg: BindGroup,
+    bound: Option<bevy::render::render_resource::TextureViewId>,
+    fallback_view: TextureView,
+    layout: BindGroupLayout,
+    #[allow(dead_code)] // keeps the fallback view valid
+    _fallback_tex: Texture,
+}
+
+/// Swap the cull's Hi-Z binding between the live pyramid and the fallback as the toggle /
+/// pyramid change. The uniform's `hiz.x` gate is authoritative; this just keeps the binding in
+/// step so the shader never samples a stale or absent view.
+pub(crate) fn sync_cull_hiz(
+    device: Res<RenderDevice>,
+    settings: Option<Res<super::GfxSettings>>,
+    pyr: Option<Res<EftPyramidResources>>,
+    hiz: Option<ResMut<EftHizBind>>,
+) {
+    let Some(mut hiz) = hiz else { return };
+    let on = settings.map(|s| s.hiz).unwrap_or(false);
+    let want_view = pyr
+        .as_ref()
+        .filter(|p| on && p.active)
+        .and_then(|p| p.sample_view.as_ref());
+    let want_id = want_view.map(|v| v.id());
+    if want_id == hiz.bound {
+        return;
+    }
+    let view = want_view.unwrap_or(&hiz.fallback_view);
+    hiz.bg = device.create_bind_group(
+        "eft_cull_hiz_bg",
+        &hiz.layout,
+        &BindGroupEntries::sequential((view,)),
+    );
+    hiz.bound = want_id;
+}
+
+#[derive(Resource)]
+struct EftShadowStream {
+    cull_uniform2: Buffer,
+    indirect2: Buffer,
+    cull_bg2: BindGroup,
+    draw_bg2: BindGroup,
+    /// Kept alive for the bind groups; never read CPU-side.
+    #[allow(dead_code)]
+    _visible2: Buffer,
 }
 
 /// Everything needed to REBUILD the draw bind group when the AO lane view changes (SSAO toggle,
@@ -7530,13 +7743,15 @@ impl Node for EftCullNode {
         if world.get::<CullCamera>(graph.view_entity()).is_none() {
             return Ok(());
         }
-        let (Some(buffers), Some(bind), Some(pipelines)) = (
+        let (Some(buffers), Some(bind), Some(pipelines), Some(hiz)) = (
             world.get_resource::<EftGpuBuffers>(),
             world.get_resource::<EftCullBindGroup>(),
             world.get_resource::<EftComputePipelines>(),
+            world.get_resource::<EftHizBind>(),
         ) else {
             return Ok(()); // buffers not built yet (or feature-disabled)
         };
+        let stream = world.get_resource::<EftShadowStream>();
         let cache = world.resource::<PipelineCache>();
         let (Some(reset), Some(cull)) = (
             cache.get_compute_pipeline(pipelines.reset_id),
@@ -7561,7 +7776,13 @@ impl Node for EftCullNode {
             });
             pass.set_pipeline(reset);
             pass.set_bind_group(0, &**bg, &[]);
+            pass.set_bind_group(1, &hiz.bg, &[]);
             pass.dispatch_workgroups(reset_groups.0, reset_groups.1, 1);
+            // SHADOW STREAM reset rides the same pass (disjoint buffers, no barrier needed).
+            if let Some(s) = stream {
+                pass.set_bind_group(0, &s.cull_bg2, &[]);
+                pass.dispatch_workgroups(reset_groups.0, reset_groups.1, 1);
+            }
         }
         {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -7570,7 +7791,13 @@ impl Node for EftCullNode {
             });
             pass.set_pipeline(cull);
             pass.set_bind_group(0, &**bg, &[]);
+            pass.set_bind_group(1, &hiz.bg, &[]);
             pass.dispatch_workgroups(cull_groups.0, cull_groups.1, 1);
+            // SHADOW STREAM cull: same instances, distance-tiered shells, Hi-Z off (its uniform).
+            if let Some(s) = stream {
+                pass.set_bind_group(0, &s.cull_bg2, &[]);
+                pass.dispatch_workgroups(cull_groups.0, cull_groups.1, 1);
+            }
         }
         // Third pass (its own barrier): order each BLEND mesh's survivors back-to-front. cs_cull
         // compacts with atomics, so without this the per-instance draw order inside a transparent
@@ -7582,6 +7809,7 @@ impl Node for EftCullNode {
             });
             pass.set_pipeline(sort_blend);
             pass.set_bind_group(0, &**bg, &[]);
+            pass.set_bind_group(1, &hiz.bg, &[]);
             pass.dispatch_workgroups(blend_groups.0, blend_groups.1, 1);
         }
         span.end(render_context.command_encoder());
@@ -7987,6 +8215,15 @@ impl Node for EftShadowNode {
         let Some(pipeline) = cache.get_render_pipeline(pipe.pipeline_id) else {
             return Ok(()); // shadow pipeline still compiling
         };
+        // SHADOW STREAM (multi-LOD packs): draw from the distance-tiered second cull instead of
+        // the camera stream — the cascades stop re-rasterizing finest shells when the user
+        // forces max detail, and camera-Hi-Z-occluded casters still cast. Lean packs have no
+        // stream and keep the shared-buffer behavior bit-exact.
+        let stream = world.get_resource::<EftShadowStream>();
+        let (caster_bg, caster_indirect) = match stream {
+            Some(s) => (&s.draw_bg2, &s.indirect2),
+            None => (&draw_bg.0, &buffers.indirect),
+        };
 
         let diag = render_context.diagnostic_recorder();
         let span = diag.time_span(render_context.command_encoder(), "eft shadow");
@@ -8016,7 +8253,7 @@ impl Node for EftShadowNode {
                 occlusion_query_set: None,
             });
             pass.set_render_pipeline(pipeline);
-            pass.set_bind_group(0, &draw_bg.0, &[]); // instances + visible (shared)
+            pass.set_bind_group(0, caster_bg, &[]); // instances + the CASTER stream's visible[]
             pass.set_bind_group(1, &res.cascade_bind_groups[c], &[]); // this cascade's view_proj
             pass.set_bind_group(2, &material_bg.0, &[]); // material table + albedo (alpha test)
             pass.set_vertex_buffer(0, buffers.vertex.slice(..));
@@ -8031,17 +8268,17 @@ impl Node for EftShadowNode {
             match buffers.grass_mesh_range.filter(|_| !grass_shadows()) {
                 Some((gs, ge)) if ge > gs && ge <= buffers.mesh_count => {
                     if gs > 0 {
-                        pass.multi_draw_indexed_indirect(&buffers.indirect, 0, gs);
+                        pass.multi_draw_indexed_indirect(caster_indirect, 0, gs);
                     }
                     if buffers.mesh_count > ge {
                         pass.multi_draw_indexed_indirect(
-                            &buffers.indirect,
+                            caster_indirect,
                             ge as u64 * IND_STRIDE,
                             buffers.mesh_count - ge,
                         );
                     }
                 }
-                _ => pass.multi_draw_indexed_indirect(&buffers.indirect, 0, buffers.mesh_count),
+                _ => pass.multi_draw_indexed_indirect(caster_indirect, 0, buffers.mesh_count),
             }
         }
         span.end(render_context.command_encoder());

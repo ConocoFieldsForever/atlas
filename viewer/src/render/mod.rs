@@ -255,7 +255,11 @@ impl Default for GfxSettings {
             taa: std::env::var("EFT_TAA").map(|v| v.trim() == "1").unwrap_or(false),
             ssr: std::env::var("EFT_SSR").map(|v| v.trim() == "1").unwrap_or(false),
             pcss: std::env::var("EFT_PCSS").map(|v| v.trim() == "1").unwrap_or(false),
-            hiz: std::env::var("EFT_HIZ").map(|v| v.trim() == "1").unwrap_or(false),
+            // Hi-Z occlusion culling: DEFAULT ON (EFT_HIZ=0 opts out). Conservative test against
+            // last frame's depth pyramid — A/B screenshot diff sits inside run-to-run animation
+            // noise (zero visual loss) while the interchange fly went 81->124 fps (LOD on) and
+            // 51->110 fps (distance LOD off).
+            hiz: std::env::var("EFT_HIZ").map(|v| v.trim() != "0").unwrap_or(true),
             depth_prime: std::env::var("EFT_DEPTH_PRIME").map(|v| v.trim() == "1").unwrap_or(false),
             froxels: std::env::var("EFT_FROXELS").map(|v| v.trim() == "1").unwrap_or(false),
             water_disp: std::env::var("EFT_WATER_DISP").map(|v| v.trim() == "1").unwrap_or(false),

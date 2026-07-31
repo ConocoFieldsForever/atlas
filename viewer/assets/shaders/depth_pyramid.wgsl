@@ -38,9 +38,13 @@ fn cs_reduce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let p10 = clamp(base + vec2<i32>(1, 0), vec2<i32>(0), sdims - 1);
     let p01 = clamp(base + vec2<i32>(0, 1), vec2<i32>(0), sdims - 1);
     let p11 = clamp(base + vec2<i32>(1, 1), vec2<i32>(0), sdims - 1);
-    let m = max(
-        max(textureLoad(src_mip, p00, 0).r, textureLoad(src_mip, p10, 0).r),
-        max(textureLoad(src_mip, p01, 0).r, textureLoad(src_mip, p11, 0).r),
+    // MIN reduce (reverse-z: smaller = farther). Each texel of mip i is the FARTHEST depth in
+    // its 2x2 footprint, so the whole tile is provably at-or-nearer — exactly what the Hi-Z
+    // occlusion test needs ("everything here is nearer than the sphere" => cull). Was MAX
+    // (nearest) from the speculative Phase-1 build, which no pass ever consumed.
+    let m = min(
+        min(textureLoad(src_mip, p00, 0).r, textureLoad(src_mip, p10, 0).r),
+        min(textureLoad(src_mip, p01, 0).r, textureLoad(src_mip, p11, 0).r),
     );
     textureStore(dst, vec2<i32>(gid.xy), vec4<f32>(m, 0.0, 0.0, 0.0));
 }
