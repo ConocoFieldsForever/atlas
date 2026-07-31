@@ -20,6 +20,7 @@ mod overlay;
 mod i18n;
 mod inspect;
 mod jobs;
+mod fx;
 mod loot;
 mod maps;
 mod menu;
@@ -1156,6 +1157,7 @@ fn main() {
     })
         .add_plugins(pick::PickPlugin) // double-LEFT-click raycast-vs-pack-data debug pick
         .add_plugins(loot::LootPlugin) // 823 loot containers from tarkmap out/loot.json
+        .add_plugins(fx::FxPlugin) // looping fires/smoke/steam from the game's ParticleSystems
         .add_plugins(overlay::OverlayPlugin) // in-game screenshot summons the map over the game (same window)
         .add_plugins(insights::InsightsPlugin) // netcode position breadcrumbs mined from the logs
         .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
