@@ -125,16 +125,25 @@ class Bundle:
         return M
 
     def root_inv(self):
-        """Inverse of the prefab root's world matrix (cached): makes every baked vertex local
-        to the prefab, which is what an attachment socket expects."""
+        """Inverse of the ANCHOR's world matrix — what makes baked geometry land correctly when
+        the result is parented to the character rig.
+
+        THE GAME'S OWN CONTRACT (read out of the bundle, not guessed): a weapon container ships
+        a `*.generated` root carrying a partial arm rig — `Base HumanLCollarbone`,
+        `Base HumanRCollarbone`, `Camera_animated` — and the weapon itself under
+        `Weapon_root / Weapon_root_anim / weapon`. That `Weapon_root` node is the SAME NAME as
+        the socket bone in the 79-bone character rig (index 68): the game aligns the two, which
+        is precisely how a gun ends up in the hands with the arms posed around it.
+
+        So the anchor is that node when present. Equipment prefabs (armor, helmets) have no such
+        node and fall back to the prefab root, which is their own authored origin.
+        """
         if getattr(self, "_root_inv", None) is None:
-            roots = self.roots()
-            M = np.eye(4)
-            if roots:
-                # The root that actually owns geometry-bearing children is the prefab root; the
-                # first root is it in every container we have seen, but pick the one with the
-                # most descendants to be safe.
-                best, best_n = roots[0], -1
+            anchor = self.slot_node("Weapon_root")
+            if anchor is None:
+                roots = self.roots()
+                anchor = None
+                best_n = -1
                 for r in roots:
                     n, stack = 0, [r]
                     while stack:
@@ -143,8 +152,8 @@ class Bundle:
                         n += len(kids)
                         stack.extend(kids)
                     if n > best_n:
-                        best, best_n = r, n
-                M = self.world_of(best)
+                        anchor, best_n = r, n
+            M = self.world_of(anchor) if anchor is not None else np.eye(4)
             try:
                 self._root_inv = np.linalg.inv(M)
             except np.linalg.LinAlgError:
