@@ -107,6 +107,45 @@ class Bundle:
         parented = {c for kids in self.children.values() for c in kids}
         return [p for p in self.tf if p not in parented]
 
+    def subtree(self, root):
+        """Transform pids under `root` (inclusive)."""
+        out, stack = set(), [root]
+        while stack:
+            t = stack.pop()
+            if t in out:
+                continue
+            out.add(t)
+            stack.extend(self.children.get(t, []))
+        return out
+
+    def variant(self):
+        """The ONE model variant to read.
+
+        A weapon container ships several roots: `<name>_container`, `<name>_model.generated` and
+        `<name>_model_simple.generated`. Both `.generated` trees carry their own `Weapon_root`
+        and `mod_*` sockets, in DIFFERENT frames — so resolving a socket by name across the whole
+        bundle mixed the two and threw individual parts onto the wrong axis. The game loads one
+        variant; prefer the full `_model.generated` over `_model_simple`.
+        """
+        if getattr(self, "_variant", None) is None:
+            best, best_score = None, -1
+            for r in self.roots():
+                name = (self.go_name.get(self.tf[r][1], "") or "").lower()
+                sub = self.subtree(r)
+                has_anchor = any(
+                    (self.go_name.get(self.tf[t][1], "") or "") == "Weapon_root" for t in sub
+                )
+                # full model > simple model > anything else; ties by size
+                score = len(sub)
+                if has_anchor:
+                    score += 100_000
+                if "simple" in name:
+                    score -= 50_000
+                if score > best_score:
+                    best, best_score = r, score
+            self._variant = self.subtree(best) if best is not None else set(self.tf)
+        return self._variant
+
     def world_of(self, tpid, upto=None):
         """Local-to-bundle-root matrix of a transform."""
         M = np.eye(4)
@@ -141,7 +180,7 @@ class Bundle:
         if getattr(self, "_root_inv", None) is None:
             anchor = self.slot_node("Weapon_root")
             if anchor is None:
-                roots = self.roots()
+                roots = [r for r in self.roots() if r in self.variant()] or self.roots()
                 anchor = None
                 best_n = -1
                 for r in roots:
@@ -161,10 +200,12 @@ class Bundle:
         return self._root_inv
 
     def slot_node(self, name):
-        """Transform pid of the GameObject named `name` (a `mod_*` socket), or None."""
-        for gp, nm in self.go_name.items():
-            if nm == name:
-                return self.go2tf.get(gp)
+        """Transform pid of the GameObject named `name` (a `mod_*` socket) WITHIN the chosen
+        model variant — searching the whole bundle mixed the full and simple frames."""
+        var = self.variant()
+        for t in var:
+            if (self.go_name.get(self.tf[t][1], "") or "") == name:
+                return t
         return None
 
 
@@ -180,6 +221,8 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0):
         tpid = bundle.go2tf.get(gp)
         if tpid is None:
             continue
+        if tpid not in bundle.variant():
+            continue  # the other model variant's copy of this part
         nm = (bundle.go_name.get(gp) or "").lower()
         if "_lod" in nm and keep not in nm:
             continue
