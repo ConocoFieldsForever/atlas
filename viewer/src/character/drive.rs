@@ -31,7 +31,7 @@ use std::collections::HashMap;
 /// WHICH state to play for a given movement situation is this module's decision, not data.
 /// A missing path degrades to the idle state, so a character whose graph uses different paths is
 /// visibly wrong rather than crashing.
-mod states {
+pub(crate) mod states {
     pub const IDLE: &str = "Base Layer.Stand.Idle_Aim";
     pub const MOVE: &str = "Base Layer.StateMachine_Move.MOVE";
     pub const JUMP_IDLE: &str = "Base Layer.JUMP.Jump_Idle";
@@ -172,7 +172,7 @@ fn select_state(ws: &WalkState, speed: f32, land_timer: f32, jumped: bool) -> &'
 }
 
 /// Resolve a state's blend tree to weighted clips, plus the state's playback speed.
-fn gather(
+pub(crate) fn gather(
     pack: &CharacterPack,
     state_path: &str,
     params: &HashMap<String, f32>,
@@ -189,7 +189,7 @@ fn gather(
 }
 
 /// Blend-weighted root speed, for rate-matching playback so feet do not skate.
-fn blended_root_speed(pack: &CharacterPack, leaves: &[WeightedClip]) -> f32 {
+pub(crate) fn blended_root_speed(pack: &CharacterPack, leaves: &[WeightedClip]) -> f32 {
     leaves
         .iter()
         .filter_map(|l| pack.clip_by_controller_id(l.clip_id).map(|c| c.root_speed * l.weight))

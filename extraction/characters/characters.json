@@ -1,0 +1,174 @@
+{
+ "_comment": [
+  "Character registry. Adding a character is DATA, not code.",
+  "Paths are relative to <EFT_GAME_DATA>/StreamingAssets/Windows/assets/content/characters/.",
+  "'parts' are SkinnedMeshRenderer prefab bundles; a part contributes every submesh it owns, so a",
+  "part that carries a head as its 2nd submesh (Tagilla) needs no separate head entry."
+ ],
+ "_shared": {
+  "skeleton": "character/skeleton.bundle",
+  "_animationsComment": [
+   "A controller's m_AnimationClips are PPtrs that reach ACROSS bundles: TagillaBotAnimController",
+   "declares 847 clip slots but its own bundle carries only 430, the rest living in the shared",
+   "animation bundles. These are loaded into the SAME UnityPy environment as the controller so",
+   "those external references resolve; without them ~half of every blend tree reads as nameless."
+  ],
+  "animations": [
+   "animations/character_animations.bundle"
+  ]
+ },
+ "_clipSetsComment": [
+  "A clip set names STATES; the build expands each to every clip its blend trees reach.",
+  "Use FULL PATHS ('Base Layer.Stand.Idle_Aim'): leaf names like 'Idle_Aim' or 'MOVE' recur on",
+  "several layers, and a bare name resolves to whichever the walk reached first.",
+  "State paths are GRAPH-SPECIFIC -- the player controller and the bot controllers do not share",
+  "them -- so a character may override any set by name in its own 'clipSets'. Run --dump-states",
+  "to see a character's actual states before authoring one."
+ ],
+ "clipSets": {
+  "all": null
+ },
+ "characters": {
+  "tagilla": {
+   "displayName": "Tagilla",
+   "note": "Head mesh + Head_BOSS_Tagilla material are the 2nd submesh of the top prefab, which is why no head_boss_tagilla.bundle exists.",
+   "parts": [
+    "character/prefabs/top_boss_tagilla.bundle",
+    "character/prefabs/pants_boss_tagilla.bundle"
+   ],
+   "controller": "controllers/animationcontrollers/tagillabotanimcontroller.bundle",
+   "rootMotion": "rootmotiontable/tagillabotrootmotiontable.bundle",
+   "defaultClipSet": "locomotion",
+   "lod": 0,
+   "_equipmentComment": [
+    "RIGID items parented to a rig bone. These prefabs are MeshFilter+MeshRenderer with zero",
+    "bindposes, and their `Dress` component lists only renderers -- the slot->bone mapping lives",
+    "in the runtime's PlayerBody.SlotView, not in the asset. So `bone` here is an AUTHORED choice,",
+    "not game-derived, and the manifest flags it. WHICH mask Tagilla wears is likewise a choice:",
+    "the bot loadout comes from the server's bot-generation templates, which are not captured.",
+    "'gorilla' and 'kill' (UBEY) are the two welding masks; head_tagillacap is his cap.",
+    "Paths beginning 'assets/' resolve from StreamingAssets/Windows, not the characters root."
+   ],
+   "equipment": [
+    {
+     "bundle": "assets/content/items/equipment/facecover_welding/item_equipment_facecover_welding_gorilla.bundle",
+     "bone": "Base HumanHead"
+    }
+   ],
+   "clipSets": {
+    "locomotion": [
+     "Base Layer.Stand.Idle_Aim",
+     "Base Layer.Stand.Turn_Left_90_Aim",
+     "Base Layer.Stand.Turn_Right_90_Aim",
+     "Base Layer.Stand.SideStep_Left",
+     "Base Layer.Stand.SideStep_Right",
+     "Base Layer.Stand.SideStep_In_Left",
+     "Base Layer.Stand.SideStep_In_Right",
+     "Base Layer.Stand.SideStep_Out_Left",
+     "Base Layer.Stand.SideStep_Out_Right",
+     "Base Layer.StateMachine_Move.MOVE",
+     "Base Layer.StateMachine_Move.Start_Top",
+     "Base Layer.StateMachine_Move.Move_Top",
+     "Base Layer.StateMachine_Move.End_Top",
+     "Base Layer.JUMP.Jump_Idle",
+     "Base Layer.JUMP.Jump_Loop",
+     "Base Layer.JUMP.Jump_Move",
+     "Base Layer.JUMP.Jump_Sprint",
+     "Base Layer.JUMP.Fall",
+     "Base Layer.JUMP.Fall_End",
+     "Base Layer.JUMP.Land_Idle",
+     "Base Layer.JUMP.Land_Move"
+    ],
+    "idle": [
+     "Base Layer.Stand.Idle_Aim"
+    ]
+   }
+  },
+  "glukhar": {
+   "displayName": "Glukhar",
+   "note": "Complete outfit with NO equipment attachment: head_boss_glukhar carries his own headgear, unlike Tagilla whose look depends on a separate facecover item. Uses the generic bot graph.",
+   "parts": [
+    "character/prefabs/head_boss_glukhar.bundle",
+    "character/prefabs/top_boss_glukhar.bundle",
+    "character/prefabs/pants_boss_glukhar.bundle",
+    "character/prefabs/wild_feet.bundle"
+   ],
+   "controller": "controllers/animationcontrollers/basebotanimcontroller.bundle",
+   "rootMotion": "rootmotiontable/basebotrootmotiontable.bundle",
+   "defaultClipSet": "locomotion",
+   "lod": 0,
+   "clipSets": {
+    "locomotion": [
+     "Base Layer.Stand.Idle_Aim",
+     "Base Layer.Stand.Turn_Left_90_Aim",
+     "Base Layer.Stand.Turn_Right_90_Aim",
+     "Base Layer.Stand.SideStep_Left",
+     "Base Layer.Stand.SideStep_Right",
+     "Base Layer.StateMachine_Move.MOVE",
+     "Base Layer.JUMP.Jump_Idle",
+     "Base Layer.JUMP.Jump_Loop",
+     "Base Layer.JUMP.Jump_Move",
+     "Base Layer.JUMP.Fall",
+     "Base Layer.JUMP.Fall_End",
+     "Base Layer.JUMP.Land_Idle",
+     "Base Layer.JUMP.Land_Move"
+    ]
+   }
+  },
+  "pmc_bear": {
+   "displayName": "BEAR PMC",
+   "note": "Clip sets not authored yet -- the player graph's state paths differ from the bot graphs'. Run --dump-states before using anything but 'all'.",
+   "parts": [
+    "character/prefabs/bear_body.bundle",
+    "character/prefabs/bear_feet.bundle",
+    "character/prefabs/bear_head_0.bundle"
+   ],
+   "controller": "controllers/player_anim_controller.bundle",
+   "controllerName": "Player_anim_controller_CURRENT_REWORK_ACTUAL_USE_THIS",
+   "rootMotion": "rootmotiontable/playerrootmotiontable.bundle",
+   "defaultClipSet": "all",
+   "lod": 0
+  },
+  "scav": {
+   "displayName": "Scav",
+   "note": "The everyman scav: bomber jacket + matching pants + a civilian head. Any other top_wild_*/pants_wild_* pair drops in the same way (outfit variety is data).",
+   "parts": [
+    "character/prefabs/top_wild_bomber.bundle",
+    "character/prefabs/pants_wild_bomber.bundle",
+    "character/prefabs/head_civilian_1.bundle"
+   ],
+   "controller": "controllers/animationcontrollers/basebotanimcontroller.bundle",
+   "rootMotion": "rootmotiontable/basebotrootmotiontable.bundle",
+   "defaultClipSet": "locomotion",
+   "lod": 0,
+   "clipSets": {
+    "locomotion": [
+     "Base Layer.Stand.Idle_Aim",
+     "Base Layer.Stand.Turn_Left_90_Aim",
+     "Base Layer.Stand.Turn_Right_90_Aim",
+     "Base Layer.Stand.SideStep_Left",
+     "Base Layer.Stand.SideStep_Right",
+     "Base Layer.Stand.SideStep_In_Left",
+     "Base Layer.Stand.SideStep_In_Right",
+     "Base Layer.Stand.SideStep_Out_Left",
+     "Base Layer.Stand.SideStep_Out_Right",
+     "Base Layer.StateMachine_Move.MOVE",
+     "Base Layer.StateMachine_Move.Start_Top",
+     "Base Layer.StateMachine_Move.Move_Top",
+     "Base Layer.StateMachine_Move.End_Top",
+     "Base Layer.JUMP.Jump_Idle",
+     "Base Layer.JUMP.Jump_Loop",
+     "Base Layer.JUMP.Jump_Move",
+     "Base Layer.JUMP.Jump_Sprint",
+     "Base Layer.JUMP.Fall",
+     "Base Layer.JUMP.Fall_End",
+     "Base Layer.JUMP.Land_Idle",
+     "Base Layer.JUMP.Land_Move"
+    ],
+    "idle": [
+     "Base Layer.Stand.Idle_Aim"
+    ]
+   }
+  }
+ }
+}
