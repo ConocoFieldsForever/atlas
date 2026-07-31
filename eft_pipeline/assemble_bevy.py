@@ -355,6 +355,9 @@ class MaterialFactory:
             rec["roughnessFromAlbedoAlpha"] = False
             if sb.get('opacS') is not None:
                 rec["opacityScale"] = round(float(sb['opacS']), 4)
+            if sb.get('reflCube') is not None:
+                # mean linear rgb of the material's own _Cube — the game's actual reflection.
+                rec["reflectCube"] = [round(float(x), 5) for x in sb['reflCube']]
             if sb.get('reflCol') is not None:
                 rec["reflectColor"] = [round(float(x), 6) for x in sb['reflCol']]
             if sb.get('specCol') is not None:

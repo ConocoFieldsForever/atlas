@@ -362,6 +362,11 @@ pub const MAT_FLAG_GLASS_MASK: u32 = 1 << 12;
 /// painted bullet holes as dark smoothness spots. Only set on packs whose extraction captured
 /// the family (glassTRS in materials.json); older packs keep the probe/RFA path bit-exact.
 pub const MAT_FLAG_GLASS_TRS: u32 = 1 << 13;
+/// `GpuMaterial::flags` bit: the TRS material's `glass_refl` rgb is a FINAL reflection radiance
+/// (the extracted `_Cube` cubemap's mean folded into `_ReflectColor`) — the shader uses it
+/// directly instead of tinting the analytic sky environment, which is what washed facade
+/// windows to white (the game's urban probes are several times darker than open sky).
+pub const MAT_FLAG_GLASS_CUBE: u32 = 1 << 14;
 /// Per-mesh transparent-pass membership. A mixed-material mesh may set more than one bit and is
 /// then submitted to each relevant specialization; the fragment material flag keeps only its class.
 const BLEND_MESH_SOFTCUTOUT: u32 = 1 << 0;
@@ -2268,7 +2273,16 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         // _SpecColor + _Shininess, with Unity's legacy defaults where the material didn't author
         // one (grey 0.5 reflection/specular, gloss 0.078 — the legacy shader's UI defaults).
         let (glass_refl, glass_spec, glass_shin) = if glass_trs {
-            let rc = mat.reflect_color.unwrap_or([0.5, 0.5, 0.5, 0.5]);
+            let mut rc = mat.reflect_color.unwrap_or([0.5, 0.5, 0.5, 0.5]);
+            // Extracted _Cube mean: fold it in so the lane IS the game's reflection radiance
+            // (LDR x LDR stays in RGB8 range); the flag tells the shader to skip the analytic
+            // sky environment for this material.
+            if let Some(cube) = mat.reflect_cube {
+                for k in 0..3 {
+                    rc[k] *= cube[k];
+                }
+                flags |= MAT_FLAG_GLASS_CUBE;
+            }
             let sc = mat.spec_color.unwrap_or([0.5, 0.5, 0.5]);
             let pk = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
             // glass_refl's top byte carries the family's opacity PRE-SCALE (0..8 quantized) —
