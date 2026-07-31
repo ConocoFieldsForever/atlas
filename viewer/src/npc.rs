@@ -313,7 +313,16 @@ fn drive_npcs(
             npc.path = if let Some(g) = grid {
                 let sn = scratch_nav.get_or_insert_with(|| crate::nav::pooled_scratch(g.nodes()));
                 match g.path(from, next, &mut *sn, None) {
-                    Some((poly, _)) if poly.len() >= 2 => poly,
+                    Some((mut poly, _)) if poly.len() >= 2 => {
+                        // A* returns a polyline through grid-CELL CENTRES, so poly[0] is the
+                        // snapped cell, not where the agent is standing — adopting it verbatim
+                        // teleported the body up to a cell sideways at every replan. Walk from
+                        // the true position into the routed line instead.
+                        if poly[0].distance_squared(from) > 0.01 {
+                            poly.insert(0, from);
+                        }
+                        poly
+                    }
                     // unreachable by grid: straight fallback rather than a frozen agent.
                     _ => vec![from, next],
                 }
@@ -345,7 +354,10 @@ fn drive_npcs(
         params.insert("Direct_X".into(), 0.0); // no strafe: agents turn to face their path
         params.insert("Direct_Y".into(), if moving { 1.0 } else { 0.0 }); // forward
         params.insert("Speed".into(), if moving { 0.5 } else { 0.0 }); // 0.5 = walk, 1 = run
-        params.insert("Level".into(), 0.0); // standing stance (1 = crouched)
+        // Level is the STANCE axis and 1 is STANDING, not 0 — the tree's Level-0 row is
+        // crouch_slow_aim / crouch_aim / crouch_run_aim, its Level-1 row walk_aim_slow /
+        // walk_aim / run_aim. Feeding 0 duck-walked every agent down the route.
+        params.insert("Level".into(), 1.0);
         params.insert("Sprint".into(), 0.0);
         params.insert("Tilt".into(), 0.0);
         let want = if moving { states::MOVE } else { states::IDLE };
