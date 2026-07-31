@@ -180,6 +180,21 @@ class Bundle:
         if getattr(self, "_root_inv", None) is None:
             anchor = self.slot_node("Weapon_root")
             if anchor is None:
+                # MOD PREFABS: the mount frame is the MESH node's, not the prefab root's.
+                # Measured: a mod's LOD node carries a -90 deg X rotation relative to its root
+                # (mesh-local Y -> -Z). Anchoring on the root therefore baked that rotation in and
+                # every mod came out turned 90 deg from the weapon body, whose own chain is
+                # rotation-free relative to Weapon_root. Anchoring on the mesh node cancels it:
+                # the receiver then runs ALONG the barrel (Y) like the body, and the magazine sits
+                # PERPENDICULAR (Z) hanging below it — an AK. Falls back to the root when a prefab
+                # has no renderer to anchor on.
+                for gp, obj, kind in self.renderers:
+                    t = self.go2tf.get(gp)
+                    nm = (self.go_name.get(gp) or "").lower()
+                    if t is not None and ("_lod0" in nm or "_lod" not in nm):
+                        anchor = t
+                        break
+            if anchor is None:
                 roots = [r for r in self.roots() if r in self.variant()] or self.roots()
                 anchor = None
                 best_n = -1
