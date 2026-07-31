@@ -39,18 +39,23 @@ fn npcs_need_rebuild(
     epoch.is_changed() || pack.is_some_and(|p| p.is_added())
 }
 
-/// One patrolling agent: its route (the game's waypoints), where it is along it, and its
-/// dwell clock at the current waypoint.
+/// One agent: a plan (the game's own target points) and the nav-routed path currently walked.
 #[derive(Component)]
 struct Npc {
-    route: Vec<Vec3>,
-    /// Current leg START index; the agent walks route[leg] -> route[leg+dir].
-    leg: usize,
-    /// +1 forward, -1 backward (ping-pong at the ends, like the game's patrols).
+    /// Plan targets — patrol_ways waypoints (ping-pong) or a core-point group (cycle).
+    targets: Vec<Vec3>,
+    at: usize,
+    /// +1/-1 for patrol ping-pong; wanderers always cycle forward.
     dir: i32,
-    /// Distance covered along the current leg (m).
+    ping_pong: bool,
+    /// The current leg, as a NAV-ROUTED polyline from the grid built with the game's own agent
+    /// parameters — so agents take doors, ramps and stairs, never a chord through a wall.
+    /// Recomputed lazily (the nav grid streams in after spawn); empty = needs (re)planning.
+    path: Vec<Vec3>,
+    leg: usize,
+    /// Distance covered along the current path leg (m).
     dist: f32,
-    /// Seconds left standing at the waypoint before walking the next leg.
+    /// Seconds left standing at the current target before walking on.
     dwell: f32,
     /// Body yaw (rad), turned smoothly toward the walk direction.
     heading: f32,
@@ -100,39 +105,85 @@ fn spawn_npcs(
             return;
         }
     };
+    // Wander plans: the game's own bot interest points, grouped by ITS `cg` core-group id.
+    let groups = load_core_groups(&pack.0.root);
     let mut n = 0usize;
-    for route in &routes {
-        if route.len() < 2 {
-            continue;
-        }
-        let root = rig::spawn(
-            &cpack,
-            0,
-            &mut commands,
-            &mut meshes,
-            &mut materials,
-            &mut images,
-            &mut ibms,
-        );
-        let start = route[0];
+    let mut spawn_agent = |targets: Vec<Vec3>, ping_pong: bool,
+                           commands: &mut Commands,
+                           meshes: &mut Assets<Mesh>,
+                           materials: &mut Assets<StandardMaterial>,
+                           images: &mut Assets<Image>,
+                           ibms: &mut Assets<SkinnedMeshInverseBindposes>| {
+        let root = rig::spawn(&cpack, 0, commands, meshes, materials, images, ibms);
+        let start = targets[0];
         commands.entity(root).insert((
             Transform::from_translation(start),
             Npc {
-                route: route.clone(),
-                leg: 0,
+                targets,
+                at: 0,
                 dir: 1,
+                ping_pong,
+                path: Vec::new(),
+                leg: 0,
                 dist: 0.0,
-                // Stagger initial dwell so simultaneous routes don't step in lockstep.
-                dwell: 0.5 + (n as f32) * 0.7,
+                // Stagger initial dwell so agents don't step in lockstep.
+                dwell: 0.5 + (n as f32) * 0.9,
                 heading: 0.0,
             },
         ));
         n += 1;
+    };
+    for route in &routes {
+        if route.len() >= 2 {
+            spawn_agent(route.clone(), true, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+        }
+    }
+    // One wanderer per core group with enough points to circulate; capped so big maps stay light.
+    const MAX_WANDERERS: usize = 8;
+    let mut wanderers = 0usize;
+    for pts in groups {
+        if pts.len() >= 3 && wanderers < MAX_WANDERERS {
+            spawn_agent(pts, false, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+            wanderers += 1;
+        }
     }
     if n > 0 {
-        info!("npc: {n} patrol agent(s) walking the game's own patrol_ways");
+        info!(
+            "npc: {n} agent(s) — {} on patrol_ways, {wanderers} circulating core-point groups",
+            n - wanderers
+        );
         commands.insert_resource(NpcCharacter(cpack));
     }
+}
+
+/// `core_points` grouped by the game's own `cg` (core-group) id -> wander circuits.
+fn load_core_groups(root: &std::path::Path) -> Vec<Vec<Vec3>> {
+    let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Vec::new();
+    };
+    let mut by_cg: std::collections::BTreeMap<i64, Vec<Vec3>> = Default::default();
+    for c in v
+        .get("core_points")
+        .and_then(|x| x.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        let (Some(pos), Some(cg)) = (
+            c.get("pos").and_then(|p| p.as_array()).filter(|p| p.len() >= 3),
+            c.get("cg").and_then(|x| x.as_i64()),
+        ) else {
+            continue;
+        };
+        by_cg.entry(cg).or_default().push(Vec3::new(
+            pos[0].as_f64().unwrap_or(0.0) as f32,
+            pos[1].as_f64().unwrap_or(0.0) as f32,
+            pos[2].as_f64().unwrap_or(0.0) as f32,
+        ));
+    }
+    by_cg.into_values().collect()
 }
 
 /// `patrol_ways` -> world polylines (already in viewer space; the extractor conjugates).
@@ -186,6 +237,8 @@ const TURN_RATE: f32 = 3.0;
 fn drive_npcs(
     time: Res<Time>,
     cpack: Option<Res<NpcCharacter>>,
+    nav: Option<Res<crate::pathfind::Nav>>,
+    mut scratch_nav: Local<Option<crate::nav::PooledScratch>>,
     mut acc: Local<Option<PoseAccumulator>>,
     mut scratch: Local<Vec<WeightedClip>>,
     mut params: Local<HashMap<String, f32>>,
@@ -195,20 +248,34 @@ fn drive_npcs(
     let Some(cpack) = cpack else { return };
     let pack: &CharacterPack = &cpack.0;
     let dt = time.delta_secs().min(0.1);
+    let grid = nav.as_ref().and_then(|n| n.0.as_ref());
 
     for (mut npc, mut root, mut tf) in &mut root_q {
-        // ---- agent step: dwell at waypoints, else walk the current leg ----
+        // ---- plan: (re)route the current leg through the NAV GRID when none is active ----
+        if npc.path.len() < 2 {
+            let from = tf.translation;
+            let next = npc.targets[((npc.at as i32 + npc.dir).rem_euclid(npc.targets.len() as i32)) as usize];
+            npc.path = if let Some(g) = grid {
+                let sn = scratch_nav.get_or_insert_with(|| crate::nav::pooled_scratch(g.nodes()));
+                match g.path(from, next, &mut *sn, None) {
+                    Some((poly, _)) if poly.len() >= 2 => poly,
+                    // unreachable by grid: straight fallback rather than a frozen agent.
+                    _ => vec![from, next],
+                }
+            } else {
+                vec![from, next] // nav still streaming in: straight fallback, replanned next target
+            };
+            npc.leg = 0;
+            npc.dist = 0.0;
+        }
+        // ---- agent step: dwell at plan targets, else walk the current path leg ----
         let moving = if npc.dwell > 0.0 {
             npc.dwell -= dt;
             false
         } else {
             true
         };
-        let (a, b) = {
-            let i = npc.leg;
-            let j = (npc.leg as i32 + npc.dir) as usize;
-            (npc.route[i], npc.route[j])
-        };
+        let (a, b) = (npc.path[npc.leg], npc.path[npc.leg + 1]);
         let leg_vec = b - a;
         let leg_len = leg_vec.length().max(1.0e-3);
         let walk_dir = leg_vec / leg_len;
@@ -238,19 +305,30 @@ fn drive_npcs(
         if moving && root_speed > 1.0e-3 {
             npc.dist += root_speed * dt;
             if npc.dist >= leg_len {
-                // waypoint reached: step the leg, ping-pong at the ends, dwell.
                 npc.dist = 0.0;
-                npc.dwell = WAYPOINT_DWELL_S;
-                let next = npc.leg as i32 + npc.dir;
-                let last = npc.route.len() as i32 - 1;
-                if next <= 0 {
-                    npc.leg = 0;
-                    npc.dir = 1;
-                } else if next >= last {
-                    npc.leg = last as usize;
-                    npc.dir = -1;
+                if npc.leg + 2 < npc.path.len() {
+                    // interior polyline vertex: keep walking, no dwell (it's one route leg).
+                    npc.leg += 1;
                 } else {
-                    npc.leg = next as usize;
+                    // PLAN target reached: advance the plan, dwell, and force a replan.
+                    npc.dwell = WAYPOINT_DWELL_S;
+                    let n = npc.targets.len() as i32;
+                    let next = npc.at as i32 + npc.dir;
+                    if npc.ping_pong {
+                        if next <= 0 {
+                            npc.at = 0;
+                            npc.dir = 1;
+                        } else if next >= n - 1 {
+                            npc.at = (n - 1) as usize;
+                            npc.dir = -1;
+                        } else {
+                            npc.at = next as usize;
+                        }
+                    } else {
+                        npc.at = next.rem_euclid(n) as usize;
+                    }
+                    npc.path.clear();
+                    npc.leg = 0;
                 }
             }
         }
