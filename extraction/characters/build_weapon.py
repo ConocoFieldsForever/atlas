@@ -124,6 +124,33 @@ class Bundle:
             seen += 1
         return M
 
+    def root_inv(self):
+        """Inverse of the prefab root's world matrix (cached): makes every baked vertex local
+        to the prefab, which is what an attachment socket expects."""
+        if getattr(self, "_root_inv", None) is None:
+            roots = self.roots()
+            M = np.eye(4)
+            if roots:
+                # The root that actually owns geometry-bearing children is the prefab root; the
+                # first root is it in every container we have seen, but pick the one with the
+                # most descendants to be safe.
+                best, best_n = roots[0], -1
+                for r in roots:
+                    n, stack = 0, [r]
+                    while stack:
+                        cur = stack.pop()
+                        kids = self.children.get(cur, [])
+                        n += len(kids)
+                        stack.extend(kids)
+                    if n > best_n:
+                        best, best_n = r, n
+                M = self.world_of(best)
+            try:
+                self._root_inv = np.linalg.inv(M)
+            except np.linalg.LinAlgError:
+                self._root_inv = np.eye(4)
+        return self._root_inv
+
     def slot_node(self, name):
         """Transform pid of the GameObject named `name` (a `mod_*` socket), or None."""
         for gp, nm in self.go_name.items():
@@ -132,7 +159,7 @@ class Bundle:
         return None
 
 
-def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, lod=0):
+def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0):
     """Append every renderer's mesh, transformed by base_M x its local matrix.
 
     LOD: item prefabs ship several detail shells (ak74_..._LOD0/_LOD1/...). Baking them all
@@ -147,7 +174,10 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, lod=0):
         nm = (bundle.go_name.get(gp) or "").lower()
         if "_lod" in nm and keep not in nm:
             continue
-        M = base_M @ bundle.world_of(tpid)
+        # Relative to the prefab ROOT, not the bundle's absolute space: a container's root
+        # transform can sit far from the origin, and baking that in put the assembled weapon
+        # metres away from the hand once parented to the rig's socket.
+        M = base_M @ bundle.root_inv() @ bundle.world_of(tpid)
         try:
             r = obj.read()
             if kind == "SkinnedMeshRenderer":
@@ -218,7 +248,20 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, lod=0):
             mat_name = ""
             try:
                 if si < len(mats):
-                    mat_name = mats[si].read().m_Name
+                    mobj = mats[si].read()
+                    mat_name = mobj.m_Name
+                    if mat_name not in tex_by_mat:
+                        slots = {}
+                        te = mobj.m_SavedProperties.m_TexEnvs
+                        for k, v in (te.items() if hasattr(te, "items") else te):
+                            tp = getattr(v, "m_Texture", None)
+                            if getattr(tp, "path_id", 0):
+                                try:
+                                    timg = tp.read()
+                                    slots[str(k)] = (timg.m_Name, timg)
+                                except Exception:
+                                    pass
+                        tex_by_mat[mat_name] = slots
             except Exception:
                 pass
             if mat_name not in mat_names:
@@ -234,6 +277,7 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, lod=0):
 def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None, cabs=None):
     """Recursively assemble `item_id` and its installed mods into one merged mesh."""
     verts, idxs, subs, mat_names = [], [], [], []
+    tex_by_mat = {}
     bundle_cache = bundle_cache if bundle_cache is not None else {}
 
     def rec(iid, M, slot_path):
@@ -250,14 +294,16 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
         b = bundle_cache.get(p)
         if b is None:
             b = bundle_cache[p] = Bundle(p, cabs)
-        bake(b, verts, idxs, subs, M, mat_names)
+        bake(b, verts, idxs, subs, M, mat_names, tex_by_mat)
         # children: for each installed mod, find the slot node with that name and recurse.
         for slot_name, child_id in (install or {}).get(iid, {}).items():
             node = b.slot_node(slot_name)
             if node is None:
                 print(f"  [warn] {t.get('_name')}: no node '{slot_name}' in prefab")
                 continue
-            rec(child_id, M @ b.world_of(node), slot_path + "/" + slot_name)
+            # The socket matrix must be root-RELATIVE too, or each child inherits the parent
+            # bundle's absolute offset (which stretched the assembled gun to 1.75 m).
+            rec(child_id, M @ b.root_inv() @ b.world_of(node), slot_path + "/" + slot_name)
 
     rec(item_id, np.eye(4), "")
     if not verts:
@@ -269,8 +315,29 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
             fh.write(struct.pack("<8f", *P, *N, *UV))
         for i in idxs:
             fh.write(struct.pack("<I", i))
+    # ---- textures: same conventions as the character packer ----
+    tex_dir = os.path.join(out_dir, "textures")
+    written = {}
+    for mname, slots in tex_by_mat.items():
+        for slot, (tname, timg) in slots.items():
+            safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(tname))
+            rel = f"textures/{safe}.png"
+            if rel not in written.values():
+                try:
+                    os.makedirs(tex_dir, exist_ok=True)
+                    img = timg.image
+                    # Unity DXT5nm normal maps carry X in ALPHA; repack to standard RGB or every
+                    # PBR consumer reads a tangent normal pointing along the surface.
+                    if slot in ("_BumpMap", "_NormalMap") or safe.lower().endswith(("_n", "_normal")):
+                        img = _repack_normal(img, safe)
+                    img.save(os.path.join(out_dir, rel))
+                except Exception as e:
+                    print(f"  [warn] texture {safe}: {str(e)[:50]}")
+                    continue
+            written.setdefault(mname, {})[slot] = rel
     man = {
         "item": item_id,
+        "materialTextures": written,
         "name": (templates.get(item_id) or {}).get("_name", ""),
         "vertexCount": len(verts),
         "indexCount": len(idxs),
@@ -343,5 +410,25 @@ def main():
     build(iid, templates, out, install=install, cabs=cabs)
 
 
+def _repack_normal(img, name):
+    """Unity DXT5nm -> standard RGB normal (X from ALPHA, Z reconstructed). Detected by
+    MEASUREMENT (red pinned near-constant), so a standard map passes through untouched. Same
+    rule as extraction/characters/pack.py and eft_extract_v2.unswizzle_normal."""
+    try:
+        from PIL import Image
+    except Exception:
+        return img
+    a = np.asarray(img.convert("RGBA"), dtype=np.float32) / 255.0
+    r, g, al = a[..., 0], a[..., 1], a[..., 3]
+    if r.std() > 0.02:
+        return img
+    x = al * 2.0 - 1.0
+    y = g * 2.0 - 1.0
+    z = np.sqrt(np.clip(1.0 - x * x - y * y, 0.0, 1.0))
+    out = np.stack([(x + 1.0) * 0.5, (y + 1.0) * 0.5, (z + 1.0) * 0.5], axis=-1)
+    return Image.fromarray(np.clip(out * 255.0, 0, 255).astype("uint8"), "RGB")
+
+
 if __name__ == "__main__":
     main()
+

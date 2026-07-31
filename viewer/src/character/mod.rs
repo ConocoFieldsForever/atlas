@@ -21,6 +21,7 @@ pub mod anim;
 pub mod drive;
 pub mod pack;
 pub mod rig;
+pub mod weapon;
 
 use bevy::mesh::skinning::SkinnedMeshInverseBindposes;
 use bevy::prelude::*;

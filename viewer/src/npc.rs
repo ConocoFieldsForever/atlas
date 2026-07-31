@@ -29,7 +29,8 @@ impl Plugin for NpcPlugin {
         )
         // Same slot as the player driver: pose after game logic, before transform propagation.
         .add_systems(PostUpdate, drive_npcs.before(bevy::transform::TransformSystems::Propagate))
-        .add_systems(Update, sync_character_light.run_if(npcs_need_rebuild));
+        .add_systems(Update, sync_character_light.run_if(npcs_need_rebuild))
+        .add_systems(Update, attach_weapons);
     }
 }
 
@@ -65,6 +66,44 @@ struct Npc {
 /// The shared character data every NPC instance samples from.
 #[derive(Resource)]
 struct NpcCharacter(Arc<CharacterPack>);
+
+/// The weapon every agent carries (one `.eftweap`, shared handles).
+#[derive(Resource)]
+struct NpcWeapon(Arc<crate::character::weapon::WeaponPack>);
+
+/// Marks an agent whose weapon has been parented, so the attach runs once per agent.
+#[derive(Component)]
+struct WeaponAttached;
+
+/// Parent the weapon's parts to each agent's `Weapon_root` bone. A separate system because the
+/// bone entities are created by deferred commands during spawn and are only readable afterwards;
+/// from then on the weapon follows the animation with no per-frame work.
+fn attach_weapons(
+    mut commands: Commands,
+    weapon: Option<Res<NpcWeapon>>,
+    cpack: Option<Res<NpcCharacter>>,
+    agents: Query<(Entity, &CharacterRoot), (With<Npc>, Without<WeaponAttached>)>,
+) {
+    let (Some(weapon), Some(cpack)) = (weapon, cpack) else { return };
+    let Some(bi) = cpack
+        .0
+        .bones
+        .iter()
+        .position(|b| b.name == crate::character::weapon::WEAPON_BONE)
+    else {
+        return;
+    };
+    for (e, root) in &agents {
+        let Some(&bone) = root.bones.get(bi) else { continue };
+        for (mesh, mat) in &weapon.0.parts {
+            let child = commands
+                .spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY))
+                .id();
+            commands.entity(bone).add_child(child);
+        }
+        commands.entity(e).insert(WeaponAttached);
+    }
+}
 
 fn teardown_npcs(mut commands: Commands, q: Query<Entity, With<Npc>>) {
     for e in &q {
@@ -108,6 +147,24 @@ fn spawn_npcs(
     };
     // Wander plans: the game's own bot interest points, grouped by ITS `cg` core-group id.
     let groups = load_core_groups(&pack.0.root);
+    // The agent's WEAPON: `.eftweap` packs built by extraction/characters/build_weapon.py from
+    // BSG's own item tree. EFT_NPC_WEAPON names one explicitly; otherwise the first pack present
+    // in out/weapons is used. (Per-agent rolled kits from bot_loadouts.json land next; the roll
+    // itself already exists in extraction/characters/loadout.py.)
+    let weapon = std::env::var("EFT_NPC_WEAPON")
+        .ok()
+        .map(|id| crate::character::weapon::weapon_dir(&id))
+        .or_else(|| {
+            std::fs::read_dir("out/weapons").ok().and_then(|rd| {
+                let mut dirs: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.join("manifest.json").is_file())
+                    .collect();
+                dirs.sort();
+                dirs.into_iter().next()
+            })
+        })
+        .and_then(|d| crate::character::weapon::load(&d, &mut meshes, &mut materials, &mut images));
+
     let mut n = 0usize;
     let mut spawn_agent = |targets: Vec<Vec3>, ping_pong: bool,
                            commands: &mut Commands,
@@ -147,6 +204,9 @@ fn spawn_npcs(
             spawn_agent(pts, false, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
             wanderers += 1;
         }
+    }
+    if let Some(w) = weapon {
+        commands.insert_resource(NpcWeapon(std::sync::Arc::new(w)));
     }
     if n > 0 {
         info!(
