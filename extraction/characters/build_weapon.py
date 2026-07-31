@@ -278,7 +278,7 @@ class Bundle:
         return None
 
 
-def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0):
+def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, props_by_mat=None):
     """Append every renderer's mesh, transformed by base_M x its local matrix.
 
     LOD: item prefabs ship several detail shells (ak74_..._LOD0/_LOD1/...). Baking them all
@@ -400,6 +400,29 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0):
                                 except Exception:
                                     pass
                         tex_by_mat[mat_name] = slots
+                        # The material's own SCALARS and COLOURS, kept raw and named as the
+                        # shader names them. This is how glass survives the trip: EFT's
+                        # transparent-reflective family carries its opacity in `_Color.a`
+                        # (the EOTech's is 0.128) alongside `_ReflectColor` / `_SpecColor` /
+                        # `_FresPow`. Dropping them left the viewer with a default material,
+                        # which is opaque WHITE -- so every scope lens rendered as a solid pane.
+                        if props_by_mat is not None:
+                            sp = mobj.m_SavedProperties
+                            fl, co = {}, {}
+                            src = sp.m_Floats
+                            for k, v in (src.items() if hasattr(src, "items") else src):
+                                try:
+                                    fl[str(k)] = float(v)
+                                except Exception:
+                                    pass
+                            src = sp.m_Colors
+                            for k, v in (src.items() if hasattr(src, "items") else src):
+                                try:
+                                    fl_c = [float(v.r), float(v.g), float(v.b), float(v.a)]
+                                except Exception:
+                                    continue
+                                co[str(k)] = fl_c
+                            props_by_mat[mat_name] = {"floats": fl, "colors": co}
             except Exception:
                 pass
             if mat_name not in mat_names:
@@ -416,6 +439,7 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
     """Recursively assemble `item_id` and its installed mods into one merged mesh."""
     verts, idxs, subs, mat_names = [], [], [], []
     tex_by_mat = {}
+    props_by_mat = {}
     bundle_cache = bundle_cache if bundle_cache is not None else {}
 
     def rec(iid, M, slot_path):
@@ -432,7 +456,7 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
         b = bundle_cache.get(p)
         if b is None:
             b = bundle_cache[p] = Bundle(p, cabs)
-        bake(b, verts, idxs, subs, M, mat_names, tex_by_mat)
+        bake(b, verts, idxs, subs, M, mat_names, tex_by_mat, props_by_mat=props_by_mat)
         # children: for each installed mod, find the slot node with that name and recurse.
         for slot_name, child_id in (install or {}).get(iid, {}).items():
             node = b.slot_node(slot_name)
@@ -485,6 +509,10 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
             {"name": "uv", "fmt": "f32x2", "offset": 24}]},
         "submeshes": [{"material": m, "idxStart": s, "idxCount": c} for m, s, c in subs],
         "materials": mat_names,
+        # Per-material scalars/colours exactly as the shader names them. The viewer maps what it
+        # understands (`_Color.a` -> opacity, `_SpecColor`/`_Shininess` -> reflectance) and
+        # ignores the rest, so a new property never breaks the contract.
+        "materialProps": props_by_mat,
         "conventions": {"world": "viewer (X-flipped from Unity)", "windingFlipped": True},
     }
     json.dump(man, open(os.path.join(out_dir, "manifest.json"), "w"), indent=1)

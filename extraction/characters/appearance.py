@@ -33,15 +33,22 @@ RM_DIR = f"{CHAR_ROOT}/rootmotiontable"
 #: Appearance slots, in the order the rig wants them. Body first: it carries the most bones.
 SLOTS = ("body", "feet", "hands", "head")
 
-#: Slots that contribute GEOMETRY to a third-person character.
+#: Which VIEW each slot's geometry belongs to.
 #:
-#: `hands` is deliberately absent. The game's hands slot points at the FIRST-PERSON hand prefabs
-#: (assets/content/hands/..., e.g. wild_body_1_firsthands), which bind the FPV hands skeleton —
-#: a different rig — and are what the player sees down their own arms. A third-person body mesh
-#: already includes its arms and hands, so building the hands slot would both fail the rig check
-#: and duplicate geometry. It is still RESOLVED and reported, because it is part of the roll and
-#: a first-person view would need exactly it.
-BUILD_SLOTS = ("body", "feet", "head")
+#: `hands` points at the first-person prefabs (assets/content/hands/..., e.g.
+#: wild_body_1_firsthands) — what the player sees down their own arms. They are NOT a different
+#: skeleton, which an earlier reading assumed: measured, all 40 of their bone paths are exact
+#: suffixes of canonical rig paths, rooted at `Base HumanPelvis` where the rig says
+#: `Root_Joint/Base HumanPelvis`. So they bind the same biped, animate off the same clips, and
+#: hang a weapon on the same `Weapon_root` socket.
+#:
+#: They are still tagged separately because a third-person body already includes its own arms:
+#: drawing both would put two pairs of hands on one rig. The viewer shows exactly one view's
+#: parts at a time.
+SLOT_VIEW = {"body": "third", "feet": "third", "head": "third", "hands": "first"}
+
+#: Slots that contribute geometry to a character pack, in rig-preference order.
+BUILD_SLOTS = ("body", "feet", "head", "hands")
 
 
 class AppearanceError(RuntimeError):
@@ -135,9 +142,11 @@ def resolve(bot_type, seed=0, bots=None, cust=None, game_root=None, clip_sets=No
         exists = os.path.exists(os.path.join(game_root, rel.replace("/", os.sep)))
         chosen[slot] = {"id": iid, "name": entry.get("_name"), "prefab": rel,
                         "bodyPart": props.get("BodyPart"), "present": exists,
-                        "built": slot in BUILD_SLOTS}
+                        "built": slot in BUILD_SLOTS, "view": SLOT_VIEW.get(slot, "third")}
         if exists and slot in BUILD_SLOTS:
-            parts.append(part)
+            # A part carries the VIEW it belongs to, so the pack can hold both the third-person
+            # body and the first-person hands and the viewer can show one at a time.
+            parts.append({"path": part, "slot": slot, "view": SLOT_VIEW.get(slot, "third")})
     if not parts:
         # Distinguish the two failures, because they need opposite responses: an EMPTY table is
         # the source data saying this bot type has no appearance of its own (BSG's `*test`

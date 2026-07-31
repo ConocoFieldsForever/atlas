@@ -32,6 +32,23 @@ struct WeapManifest {
     materials: Vec<String>,
     #[serde(rename = "materialTextures", default)]
     material_textures: HashMap<String, HashMap<String, String>>,
+    /// Per-material scalars/colours as the game's shader names them. See [`MatProps`].
+    #[serde(rename = "materialProps", default)]
+    material_props: HashMap<String, MatProps>,
+}
+
+/// A material's raw properties, straight from the game.
+///
+/// EFT's transparent-reflective family (the scope lenses, vehicle glass) carries its OPACITY in
+/// `_Color.a` — the EOTech's is 0.128 — with `_ReflectColor` / `_SpecColor` / `_Shininess`
+/// describing the reflection. A pack built before these were exported simply has none, and every
+/// material stays opaque, which is the old behaviour.
+#[derive(Debug, Deserialize, Default)]
+struct MatProps {
+    #[serde(default)]
+    floats: HashMap<String, f32>,
+    #[serde(default)]
+    colors: HashMap<String, [f32; 4]>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,14 +155,75 @@ pub fn load(
         let normal = slots
             .and_then(|s| s.get("_BumpMap"))
             .and_then(|r| load_tex(r, false, images));
+        // ---- the game's own material description ----------------------------------------
+        // Everything below is keyed off PROPERTIES, never off the material's name: BSG names the
+        // same shader `_glass`, `_linza` and `mag_glass` interchangeably, and `mag_glass` is
+        // actually opaque. What a surface IS shows up in which properties it carries.
+        let props = man.material_props.get(&mat_name);
+        let f = |k: &str| props.and_then(|p| p.floats.get(k)).copied();
+        let c = |k: &str| props.and_then(|p| p.colors.get(k)).copied();
+        let color = c("_Color").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+
+        // A RETICLE lens carries `_MarkTex` — the reticle image, whose alpha is its shape — with
+        // `_Color` as its tint and `_HDR` as its overdrive. It is a projected light, not a lit
+        // surface, so it is drawn unlit and emissive; lighting it would let shadow darken a
+        // holographic sight.
+        let mark = slots.and_then(|s| s.get("_MarkTex")).and_then(|r| load_tex(r, true, images));
+        let is_reticle = mark.is_some();
+        // GLASS: either the game states the opacity outright (`_Color.a < 1`, the EXPS3 window at
+        // 0.128), or the material has no `_MainTex` at all and shades itself from a reflection
+        // probe (`_EnvTex`/`_Cube`) — the fresnel lens family, whose opacity is the reflection
+        // blend in `_ReflectColor.a`.
+        let has_env = slots.is_some_and(|s| s.contains_key("_EnvTex") || s.contains_key("_Cube"));
+        let refl = c("_ReflectColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let stated_alpha = color[3];
+        let is_glass = !is_reticle && (stated_alpha < 0.999 || (base.is_none() && has_env));
+        let alpha = if stated_alpha < 0.999 { stated_alpha } else { refl[3] };
+
+        // The lens TINT is `_MainColor` where the fresnel family provides it (the G33's blue-grey),
+        // otherwise `_Color`. Falling back to white here is what made every untextured lens — and
+        // the black `back_linza` backing disc — render as a solid white pane.
+        let tint = c("_MainColor").unwrap_or(color);
+        let base_color = if is_reticle {
+            Color::srgba(color[0], color[1], color[2], 1.0)
+        } else if is_glass {
+            Color::srgba(tint[0], tint[1], tint[2], alpha.clamp(0.05, 0.95))
+        } else {
+            Color::srgba(color[0], color[1], color[2], 1.0)
+        };
+        // `_Shininess`/`_Glossiness` are BSG GLOSS: high = shiny, the inverse of Bevy roughness.
+        let gloss = f("_Shininess").or_else(|| f("_Glossiness")).unwrap_or(0.45);
+        let roughness = (1.0 - gloss.clamp(0.0, 1.0)).clamp(0.03, 1.0);
+        let hdr = f("_HDR").unwrap_or(1.0).max(1.0);
         let mat = materials.add(StandardMaterial {
-            base_color_texture: base,
-            normal_map_texture: normal,
+            base_color,
+            base_color_texture: if is_reticle { mark } else { base },
+            normal_map_texture: if is_reticle { None } else { normal },
+            // A reticle emits; `_HDR` is how hard. Bevy wants linear emissive, and the tint is
+            // already in `_Color`.
+            emissive: if is_reticle {
+                LinearRgba::rgb(color[0] * hdr, color[1] * hdr, color[2] * hdr)
+            } else {
+                LinearRgba::BLACK
+            },
+            unlit: is_reticle,
             // The _SpecMap is BSG GLOSS (high = shiny), the inverse of Bevy roughness, so it is
             // deliberately NOT bound (binding a gloss map to occlusion once crushed all
-            // character ambient — see character/rig.rs). Constant until the extractor inverts it.
-            perceptual_roughness: 0.55,
+            // character ambient — see character/rig.rs).
+            perceptual_roughness: if is_glass { 0.05 } else { roughness },
             metallic: 0.0,
+            // Glass reflects hard at grazing angles; without this a lens reads as a flat tinted
+            // hole rather than a curved piece of glass.
+            reflectance: if is_glass { 0.9 } else { 0.5 },
+            alpha_mode: if is_reticle || is_glass { AlphaMode::Blend } else { AlphaMode::Opaque },
+            // A lens is a thin double-sided shell; culling its back face shows the inside of the
+            // housing through it.
+            double_sided: is_reticle || is_glass,
+            cull_mode: if is_reticle || is_glass {
+                None
+            } else {
+                Some(bevy::render::render_resource::Face::Back)
+            },
             ..default()
         });
         parts.push((meshes.add(mesh), mat));

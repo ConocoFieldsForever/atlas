@@ -222,7 +222,10 @@ pub fn drive_character(
             Without<CharacterRoot>,
         ),
     >,
-    mut mesh_vis: Query<&mut Visibility, (With<CharacterMesh>, Without<CharacterRoot>)>,
+    mut mesh_vis: Query<
+        (&mut Visibility, Option<&crate::character::rig::MeshView>),
+        (With<CharacterMesh>, With<PlayerMesh>, Without<CharacterRoot>),
+    >,
 ) {
     let Some(active) = active else { return };
     let pack: &CharacterPack = &active.pack;
@@ -233,15 +236,24 @@ pub fn drive_character(
 
     // Walk mode only: in fly/drone the character would be dragged through the air.
     let walking = settings.mode == CamMode::Walk && cs.enabled;
-    let show_body = walking && cs.third_person;
-    let want = if show_body { Visibility::Inherited } else { Visibility::Hidden };
-    if *root_vis != want {
-        *root_vis = want;
+    // The rig itself is present whenever we are walking; which GEOMETRY is drawn depends on the
+    // view. EFT's first-person arms are a separate asset (the `hands/` bundles) that binds this
+    // same rig, so first-person shows those instead of showing nothing -- and never shows the
+    // third-person body, whose own arms would otherwise appear inside the FPV ones.
+    let want_root = if walking { Visibility::Inherited } else { Visibility::Hidden };
+    if *root_vis != want_root {
+        *root_vis = want_root;
     }
-    // First-person hides the whole body rather than just the head: EFT's first-person arms are a
-    // SEPARATE asset (the `hands/` bundles), so showing this third-person mesh from inside its own
-    // skull would be worse than showing nothing.
-    for mut v in &mut mesh_vis {
+    let shown = if cs.third_person {
+        crate::character::rig::MeshView::Third
+    } else {
+        crate::character::rig::MeshView::First
+    };
+    for (mut v, view) in &mut mesh_vis {
+        // A pack with no first-person hands has nothing to show in that view; its third-person
+        // meshes stay hidden, which is the old behaviour.
+        let on = walking && view.copied().unwrap_or(crate::character::rig::MeshView::Third) == shown;
+        let want = if on { Visibility::Inherited } else { Visibility::Hidden };
         if *v != want {
             *v = want;
         }
@@ -430,6 +442,11 @@ pub fn drive_character(
     cam_tf.translation += offset;
     boom.applied = offset;
 }
+
+/// Marker: this mesh belongs to the character the camera is attached to. NPC meshes never carry
+/// it, so switching your own view leaves every other character alone.
+#[derive(Component)]
+pub struct PlayerMesh;
 
 /// Toggle first/third person.
 pub fn toggle_view(

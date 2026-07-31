@@ -183,7 +183,7 @@ fn spawn_npcs(
                            materials: &mut Assets<StandardMaterial>,
                            images: &mut Assets<Image>,
                            ibms: &mut Assets<SkinnedMeshInverseBindposes>| {
-        let root = rig::spawn(&cpack, 0, commands, meshes, materials, images, ibms);
+        let root = rig::spawn(&cpack, 0, commands, meshes, materials, images, ibms).root;
         let start = targets[0];
         commands.entity(root).insert((
             Transform::from_translation(start),

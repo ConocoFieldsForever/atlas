@@ -70,6 +70,10 @@ class SkinMesh:
     inverse_bindposes: np.ndarray
     bound_bones: List[int]  #: rig indices this mesh actually skins to (for debug/validation)
     vertex_count: int = 0
+    #: Which VIEW this geometry belongs to: "third" (the body) or "first" (the FPV hands). Both
+    #: bind the same rig; the viewer draws one view at a time so a body's own arms and a pair of
+    #: first-person hands never appear together.
+    view: str = "third"
 
     def __post_init__(self) -> None:
         self.vertex_count = int(self.vertices.shape[0])
@@ -154,6 +158,50 @@ def _script_name(obj) -> str:
         return ""
 
 
+#: Marker for a root-relative suffix that matches more than one rig bone.
+AMBIGUOUS = -1
+
+_SUFFIX_CACHE: dict = {}
+
+
+def _suffix_index(skel: Skeleton) -> dict:
+    """Every root-relative suffix of every canonical bone path -> that bone's index.
+
+    A suffix shared by two bones maps to AMBIGUOUS so the caller fails rather than guessing.
+    Built once per skeleton: 79 bones x ~10 segments is a few hundred entries.
+    """
+    key = id(skel)
+    hit = _SUFFIX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    idx: dict = {}
+    for path, bone in skel.by_path.items():
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            suf = "/".join(parts[i:])
+            if not suf:
+                continue
+            idx[suf] = AMBIGUOUS if (suf in idx and idx[suf] != bone) else bone
+    _SUFFIX_CACHE[key] = idx
+    return idx
+
+
+def _suffix_hash_index(skel: Skeleton) -> dict:
+    """CRC32 of every root-relative bone-path suffix -> bone index (AMBIGUOUS on collision)."""
+    key = ("hash", id(skel))
+    hit = _SUFFIX_CACHE.get(key)
+    if hit is not None:
+        return hit
+    idx: dict = {}
+    for suf, bone in _suffix_index(skel).items():
+        if bone == AMBIGUOUS:
+            continue
+        h = path_hash(suf) & 0xFFFFFFFF
+        idx[h] = AMBIGUOUS if (h in idx and idx[h] != bone) else bone
+    _SUFFIX_CACHE[key] = idx
+    return idx
+
+
 class ForeignRigError(RuntimeError):
     """A mesh that binds a skeleton other than the canonical rig (the FPV hands, for example).
     Callers SKIP these rather than failing: they are not meant to be drawn on this body."""
@@ -172,13 +220,28 @@ def _resolve_remap(
 
     from_paths: Optional[List[int]] = None
     if bone_paths:
-        # A mesh binding a DIFFERENT skeleton is not an error to fix — it is a mesh that does not
-        # belong on this rig, and the only correct action is to leave it out. Body prefabs ship a
-        # first-person `*_firstHands` renderer alongside the third-person body, and it binds the
-        # FPV hands rig: its paths start at `Base HumanPelvis`, not at the canonical rig's root.
-        # Distinguish "wrong rig" (NONE of the paths resolve -> skip) from "our rig, with a bad
-        # entry" (some resolve -> still a hard error, because that is corruption).
+        # ROOT-RELATIVE PATHS. The first-person hands bind the SAME biped as the body, but their
+        # paths are rooted one level down: `Base HumanPelvis/...` where the canonical rig says
+        # `Root_Joint/Base HumanPelvis/...`. Measured: all 40 of the FPV hand paths are exact
+        # suffixes of canonical paths, none unmatched. So a path is resolved by its full name
+        # first and by its unique root-relative suffix second — an ambiguous suffix (matching two
+        # different bones) is a hard error, never a silent pick.
         resolved = [by_path.get(p) for p in bone_paths]
+        if any(i is None for i in resolved):
+            suffix = _suffix_index(skel)
+            for j, (p, idx) in enumerate(zip(bone_paths, resolved)):
+                if idx is not None:
+                    continue
+                hit = suffix.get(p)
+                if hit == AMBIGUOUS:
+                    raise RuntimeError(
+                        f"{mesh_name}: bone path {p!r} matches more than one bone of the "
+                        f"canonical rig — cannot be resolved root-relatively")
+                resolved[j] = hit
+        # A mesh binding a genuinely DIFFERENT skeleton is not an error to fix — it is a mesh that
+        # does not belong on this rig, and the only correct action is to leave it out. Distinguish
+        # that (NONE of the paths resolve -> skip) from "our rig, with a bad entry" (some resolve
+        # -> still a hard error, because that is corruption).
         if resolved and all(i is None for i in resolved):
             raise ForeignRigError(
                 f"{mesh_name}: binds a different skeleton "
@@ -194,8 +257,20 @@ def _resolve_remap(
     from_hashes: Optional[List[int]] = None
     if bone_hashes:
         from_hashes = []
+        suffix_hash = None
         for h in bone_hashes:
             idx = by_hash.get(int(h) & 0xFFFFFFFF)
+            if idx is None:
+                # Same root-relative case as the paths above: these hashes are CRC32 of the path
+                # AS THE PART WRITES IT, so a part rooted below `Root_Joint` hashes the shorter
+                # string and misses the canonical table.
+                if suffix_hash is None:
+                    suffix_hash = _suffix_hash_index(skel)
+                idx = suffix_hash.get(int(h) & 0xFFFFFFFF)
+                if idx == AMBIGUOUS:
+                    raise RuntimeError(
+                        f"{mesh_name}: bone hash {int(h):#010x} matches more than one rig bone "
+                        f"root-relatively")
             if idx is None:
                 raise RuntimeError(
                     f"{mesh_name}: m_BoneNameHashes entry {int(h):#010x} matches no rig bone path"

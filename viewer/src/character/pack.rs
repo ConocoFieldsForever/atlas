@@ -82,6 +82,10 @@ impl VertexLayout {
     }
 }
 
+fn view_third() -> String {
+    "third".into()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubMeshManifest {
@@ -95,6 +99,10 @@ pub struct SubMeshManifest {
 pub struct MeshManifest {
     pub name: String,
     pub part: String,
+    /// Which view this geometry belongs to: `"third"` (the body) or `"first"` (the FPV hands).
+    /// Packs built before the hands existed carry no field and are all third-person.
+    #[serde(default = "view_third")]
+    pub view: String,
     pub lod: u32,
     pub vertex_count: usize,
     pub vertex_byte_offset: usize,
@@ -279,6 +287,8 @@ fn fwd_z() -> [f32; 3] {
 /// `Mesh::insert_attribute` wants.
 pub struct MeshData {
     pub name: String,
+    /// `"third"` or `"first"` — see [`MeshManifest::view`].
+    pub view: String,
     pub lod: u32,
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
@@ -603,6 +613,7 @@ pub fn load(dir: impl AsRef<Path>) -> Result<CharacterPack> {
 
         meshes.push(MeshData {
             name: mm.name.clone(),
+            view: mm.view.clone(),
             lod: mm.lod,
             positions,
             normals,

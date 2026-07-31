@@ -78,7 +78,12 @@ impl Default for CharacterSettings {
     fn default() -> Self {
         Self {
             enabled: true,
-            third_person: true,
+            // `EFT_CHARACTER_VIEW=first` starts in first person. V still toggles; this exists so a
+            // headless capture can frame the weapon without a keypress.
+            third_person: !matches!(
+                std::env::var("EFT_CHARACTER_VIEW").as_deref().map(str::trim),
+                Ok("first") | Ok("fpv") | Ok("1")
+            ),
             boom_distance: 2.6,
             boom_pivot_height: 1.45,
             lod: None,
@@ -135,7 +140,7 @@ fn load_character(
         }
     };
     let lod = cs.lod.unwrap_or(loaded.default_lod);
-    let root = rig::spawn(
+    let spawned = rig::spawn(
         &loaded,
         lod,
         &mut commands,
@@ -144,7 +149,62 @@ fn load_character(
         &mut images,
         &mut ibms,
     );
-    commands.insert_resource(ActiveCharacter { pack: Arc::new(loaded), root });
+    attach_weapon(&loaded, &spawned, &mut commands, &mut meshes, &mut materials, &mut images);
+    // Mark OUR meshes. The first/third-person switch is a property of the character you are
+    // looking through, not of every character in the world.
+    for &e in &spawned.meshes {
+        commands.entity(e).insert(drive::PlayerMesh);
+    }
+    commands.insert_resource(ActiveCharacter { pack: Arc::new(loaded), root: spawned.root });
+}
+
+/// Put a weapon in the character's hands, on the rig's own `Weapon_root` socket.
+///
+/// The same socket the NPCs use and the same anchor `build_weapon.py` bakes against, so the gun
+/// sits in the hands in both views: third-person you watch yourself carry it, first-person it is
+/// what you see past the FPV hands. `EFT_PLAYER_WEAPON` names a pack explicitly; otherwise the
+/// first one present in `out/weapons` is used, and no weapon at all is simply empty hands.
+///
+/// Done here rather than in a later system because `Commands::spawn` hands back usable entity ids
+/// immediately -- the bone entities are already parentable, so the weapon is in place on the very
+/// first frame the character exists.
+fn attach_weapon(
+    pack: &pack::CharacterPack,
+    spawned: &rig::SpawnedRig,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    images: &mut Assets<Image>,
+) {
+    let Some(bi) = pack.bones.iter().position(|b| b.name == weapon::WEAPON_BONE) else {
+        warn!("character rig has no {:?} bone -- no weapon attached", weapon::WEAPON_BONE);
+        return;
+    };
+    let Some(&bone) = spawned.bones.get(bi) else { return };
+    let dir = match std::env::var("EFT_PLAYER_WEAPON") {
+        Ok(id) => Some(weapon::weapon_dir(id.trim())),
+        Err(_) => first_weapon_pack(),
+    };
+    let Some(dir) = dir else { return };
+    let Some(wp) = weapon::load(&dir, meshes, materials, images) else { return };
+    for (mesh, mat) in &wp.parts {
+        let child = commands
+            .spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY))
+            .id();
+        commands.entity(bone).add_child(child);
+    }
+    info!("player weapon: {} part(s) from {}", wp.parts.len(), dir.display());
+}
+
+/// First `.eftweap` pack on disk, in name order — a stable default when none is named.
+fn first_weapon_pack() -> Option<PathBuf> {
+    let mut dirs: Vec<_> = std::fs::read_dir("out/weapons")
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("manifest.json").is_file())
+        .collect();
+    dirs.sort();
+    dirs.into_iter().next()
 }
 
 /// Attach the boom bookkeeping to the cull camera once it exists.

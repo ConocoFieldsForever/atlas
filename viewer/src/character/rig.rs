@@ -26,6 +26,18 @@ use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use std::collections::HashMap;
 
+/// What [`spawn`] hands back: the root entity plus the bone entities in rig order, so a caller
+/// can parent something to a named socket (the weapon rides `Weapon_root`) without waiting a
+/// frame for the deferred `CharacterRoot` component to become readable.
+pub struct SpawnedRig {
+    pub root: Entity,
+    pub bones: Vec<Entity>,
+    /// Every spawned mesh entity, so a caller can mark the ones IT owns. Without this the
+    /// player's first/third-person toggle reached every character in the world, hiding the NPCs'
+    /// bodies and leaving their first-person hands floating in mid-air.
+    pub meshes: Vec<Entity>,
+}
+
 /// Marker + runtime state on the character's root entity.
 #[derive(Component)]
 pub struct CharacterRoot {
@@ -62,6 +74,21 @@ pub struct CharacterBone(#[allow(dead_code)] pub usize);
 /// Marker on the skinned mesh entities, so a teardown can find them.
 #[derive(Component)]
 pub struct CharacterMesh;
+
+/// Which view a mesh belongs to. A pack holds BOTH the third-person body and the first-person
+/// hands -- they bind the same rig and animate off the same clips -- so exactly one view is drawn
+/// at a time; showing both would put two pairs of hands on one skeleton.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MeshView {
+    Third,
+    First,
+}
+
+impl MeshView {
+    pub fn of(s: &str) -> Self {
+        if s == "first" { Self::First } else { Self::Third }
+    }
+}
 
 fn load_texture(
     dir: &std::path::Path,
@@ -127,7 +154,7 @@ pub fn spawn(
     materials: &mut Assets<StandardMaterial>,
     images: &mut Assets<Image>,
     ibms: &mut Assets<SkinnedMeshInverseBindposes>,
-) -> Entity {
+) -> SpawnedRig {
     // ---- materials ----
     let mut tex_cache: HashMap<(String, bool), Option<Handle<Image>>> = HashMap::new();
     let mat_handles: Vec<Handle<StandardMaterial>> = pack
@@ -198,6 +225,7 @@ pub fn spawn(
 
     // ---- skinned meshes ----
     let mut spawned_meshes = 0usize;
+    let mut mesh_entities: Vec<Entity> = Vec::new();
     for md in &pack.meshes {
         if md.lod != lod {
             continue;
@@ -207,26 +235,32 @@ pub fn spawn(
             if sub.index_count == 0 {
                 continue;
             }
+            let view = MeshView::of(&md.view);
             let mesh = meshes.add(build_mesh(md, sub.index_start, sub.index_count));
             let material = mat_handles
                 .get(sub.material)
                 .cloned()
                 .unwrap_or_else(|| materials.add(StandardMaterial::default()));
-            commands.spawn((
+            let mesh_entity = commands.spawn((
                 Mesh3d(mesh),
                 MeshMaterial3d(material),
                 // Identity: the bindposes already live in rig space and the joints are this root's
                 // descendants, so any transform here would double-apply.
                 Transform::IDENTITY,
-                Visibility::default(),
+                // Every character shows its THIRD-person geometry; the first-person hands spawn
+                // hidden. Only the character holding the camera ever flips this, so an NPC is
+                // always a body and never a pair of disembodied arms.
+                if view == MeshView::First { Visibility::Hidden } else { Visibility::default() },
                 SkinnedMesh { inverse_bindposes: ibm.clone(), joints: bone_entities.clone() },
                 // A skinned mesh's Aabb is computed from the BIND pose; an animated character
                 // reaching outside it would pop out of view. One character is not worth culling.
                 NoFrustumCulling,
                 CharacterMesh,
+                view,
                 Name::new(md.name.clone()),
                 ChildOf(root),
-            ));
+            )).id();
+            mesh_entities.push(mesh_entity);
             spawned_meshes += 1;
         }
     }
@@ -275,6 +309,7 @@ pub fn spawn(
     }
 
     let bone_count = pack.bones.len();
+    let bones_out = bone_entities.clone();
     commands.entity(root).insert(CharacterRoot {
         bones: bone_entities,
         state: String::new(),
@@ -298,5 +333,5 @@ pub fn spawn(
         pack.forward,
         if pack.forward_derived { "" } else { " (NOT derived — fell back to +Z)" }
     );
-    root
+    SpawnedRig { root, bones: bones_out, meshes: mesh_entities }
 }

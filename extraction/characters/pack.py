@@ -106,6 +106,7 @@ def write_pack(
             {
                 "name": m.name,
                 "part": m.part,
+                "view": getattr(m, "view", "third"),
                 "lod": m.lod,
                 "vertexCount": m.vertex_count,
                 "vertexByteOffset": vert_cursor,

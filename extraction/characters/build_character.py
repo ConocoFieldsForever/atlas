@@ -263,15 +263,26 @@ def build(
     meshes: List[skin_mod.SkinMesh] = []
     materials: List[skin_mod.Material] = []
     images: Dict[str, object] = {}
-    for rel in spec["parts"]:
-        print(f"[part] {rel}")
+    for entry in spec["parts"]:
+        # A part is either a bare bundle path (characters.json, all third-person) or a resolved
+        # {path, slot, view} from appearance.py. Both shapes read the same way.
+        rel = entry["path"] if isinstance(entry, dict) else entry
+        view = entry.get("view", "third") if isinstance(entry, dict) else "third"
+        print(f"[part] {rel}" + (f"  ({view}-person)" if view != "third" else ""))
         part_name = os.path.splitext(os.path.basename(rel))[0]
-        res = skin_mod.load_part(
-            _resolve(rel), part_name, skel, material_base=len(materials), strict=strict, lods=lod_filter
-        )
+        try:
+            res = skin_mod.load_part(
+                _resolve(rel), part_name, skel, material_base=len(materials), strict=strict,
+                lods=lod_filter
+            )
+        except skin_mod.ForeignRigError as e:
+            print(f"  [skip] {e}")
+            continue
         for name, img in res.images.items():
             images.setdefault(name, img)
         materials.extend(res.materials)
+        for m in res.meshes:
+            m.view = view
         meshes.extend(res.meshes)
         used_bundles.append(rel)
         for m in res.meshes:
