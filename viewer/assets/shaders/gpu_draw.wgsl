@@ -60,6 +60,13 @@ struct InstanceGpu {
 
 @group(1) @binding(0) var<storage, read> instances: array<InstanceGpu>;
 @group(1) @binding(1) var<storage, read> visible: array<u32>;
+// Loot glow (loot.rs overlay): u32 per instance. 0 = no glow; else bit31 = on,
+// bits 24..27 = pulse phase, bits 0..23 = the marker class colour (RGB8).
+@group(1) @binding(2) var<storage, read> loot_glow: array<u32>;
+// SSAO AO lane (R8, prepass-derived, written BEFORE this pass; white fallback when off).
+// Sampled by the OPAQUE shading only — BLEND glass keeps ao = 1, so the occlusion of what is
+// BEHIND a pane no longer darkens the pane itself (the "SSAO through glass" bug).
+@group(1) @binding(3) var ao_tex: texture_2d<f32>;
 
 // M3 material table â€” one entry per materials.json material (id == index, 4409 entries).
 // 160 bytes, 16-aligned (Phase 2b added the normal block @64; #6 added the detail block @80).
@@ -103,7 +110,7 @@ struct MaterialGpu {
     detail_albedo_index: u32,      // @80
     detail_normal_index: u32,      // @84
     detail_flags: u32,             // @88
-    _detpad: u32,                  // @92
+    glass_refl: u32,               // @92  GLASS_TRS: _ReflectColor packed RGBA8 (0 elsewhere)
     detail_albedo_uv: vec4<f32>,   // @96
     detail_normal_uv: vec4<f32>,   // @112
     detail_params: vec4<f32>,      // @128
@@ -117,8 +124,8 @@ struct MaterialGpu {
     // Parallax (steep/occlusion) mapping @176 (size -> 192). Byte-identical to the Rust POD.
     parallax_index: u32,           // @176  bindless albedo_tex index of the grayscale HEIGHT map, or NONE
     parallax_scale: f32,           // @180  Unity _Parallax amount (max tangent-space UV offset)
-    _ppad0: u32,                   // @184
-    _ppad1: u32,                   // @188  -> 192
+    glass_spec: u32,               // @184  GLASS_TRS: _SpecColor packed RGB8 (0 elsewhere)
+    glass_shin: f32,               // @188  GLASS_TRS: _Shininess (Blinn gloss 0..1)  -> 192
 };
 
 // Phase 1.6 GGX specular tuning: global multiplier on the dielectric spec lobe. 1.0 = physical.
@@ -158,6 +165,8 @@ const MAT_FLAG_DETAIL: u32 = 32u;         // bit5: #6 detail maps (secondary alb
 const MAT_FLAG_RFA: u32 = 64u;            // bit6: per-pixel roughness = 1 - RAW tex.a (smoothness-in-alpha)
 const MAT_FLAG_VP: u32 = 128u;            // bit7: vert-paint 3-layer splat (VpGpu at _pad2)
 const MAT_FLAG_PARALLAX: u32 = 2048u;     // bit11: steep parallax mapping (offset UV by parallax_index height)
+const MAT_FLAG_GLASS_MASK: u32 = 4096u;   // bit12: glass tex.a is COVERAGE (shard atlas) -> masks ALL terms
+const MAT_FLAG_GLASS_TRS: u32 = 8192u;    // bit13: legacy Transparent/Reflective/Specular glass (authored response)
 const MAT_FLAG_PUDDLE_LUMA: u32 = 256u;   // bit8: puddle shape mask in luma(rgb), not alpha (atlas)
 const MAT_FLAG_WATER_MATTE: u32 = 512u;   // bit9: STRETCHED floor water-decal (tire marks / wet-ground) -> matte, no mirror
 const MAT_FLAG_DECAL: u32 = 1024u;        // bit10: plain surface decal; mask ALL lighting terms by texture coverage
@@ -854,6 +863,7 @@ struct VOut {
     @location(2) @interpolate(flat) material_index: u32,
     @location(3) color: vec4<f32>, // interpolated (NOT flat): SoftCutout feathers across the tri
     @location(4) world_pos: vec3<f32>, // Phase1 SH-GI: world position -> irradiance-volume uvw
+    @location(5) @interpolate(flat) glow: u32, // loot-glow packed state (0 = none)
 };
 
 // cofactor(linear 3x3) = det Â· inverse-transpose; columns = cross products of the linear
@@ -985,6 +995,7 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     o.material_index = v.material_index;
     o.color = v.color;
     o.world_pos = world; // Phase1 SH-GI: fragment samples the irradiance volume at this point
+    o.glow = loot_glow[min(real, arrayLength(&loot_glow) - 1u)];
     return o;
 }
 
@@ -1421,9 +1432,17 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // SH is a flat ~0.28 dummy, so this is the gentle base the realtime bubbles sit on. Both terms are
     // zero when realtime is off (params.z==0), so the baked-SH path renders byte-identically.
     let rt = eval_realtime_lights(o.world_pos, N, V, rough);
+    // SSAO lane (pre-main AO; white fallback when off): scales the AMBIENT terms of OPAQUE
+    // surfaces only. BLEND materials read 1 — their pixels carry the AO of what's BEHIND them
+    // (glass never writes the prepass), which is exactly the through-glass darkening this lane
+    // replaced. Sun + emissive stay untouched (they are shadow-mapped / self-lit, not ambient).
+    let ao_uv = (o.clip.xy - view.viewport.xy) / view.viewport.zw;
+    let ao_s = textureSampleLevel(ao_tex, sh_samp, ao_uv, 0.0).r;
+    let ao_f = select(ao_s, 1.0, (m.flags & MAT_FLAG_BLEND) != 0u);
     // SH ambient (× gi_intensity × ambient_scale) + the realtime diffuse (which carries its own
     // light_scale, independent of gi_intensity), all modulated by albedo.
-    let lit = albedo.rgb * (gi_shadowed * sh.vol_min.w * lgrid.params.y + rt.diffuse + sun_diffuse);
+    let lit = albedo.rgb
+        * ((gi_shadowed * sh.vol_min.w * lgrid.params.y + rt.diffuse) * ao_f + sun_diffuse);
 
     var spec_rgb = vec3<f32>(0.0);
     if (dom.mag >= 1e-4) {
@@ -1550,10 +1569,49 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // multiplying it into opacity painted the smoothness pattern (shard shapes on the dusty retail
     // panes) as opacity blotches. Coverage is the authored _Color.a alone; tex.a already feeds the
     // per-pixel roughness above, so the pattern shows up in reflection sharpness — as authored.
-    let glass_a = select(albedo.a, m.tint.a, (m.flags & MAT_FLAG_RFA) != 0u);
+    // LEGACY TRANSPARENT/REFLECTIVE/SPECULAR (MAT_FLAG_GLASS_TRS — packs whose extraction
+    // captured the family): the game's OWN semantics. tex.a = TRANSPARENCY x gloss, so
+    //   coverage   = tex.a * _Color.a           (bullet holes at a~0 are real HOLES -> discard),
+    //   reflection = env * _ReflectColor        (authored tint — dark on car glass; NO fresnel
+    //                                            ramp: the legacy shader adds it flat, which is
+    //                                            what keeps crumpled panes from mirroring the
+    //                                            whole sky as white foil),
+    //   specular   = GGX(_Shininess-derived roughness) * _SpecColor * tex.a (alpha doubles as
+    //                                            the gloss mask, legacy convention).
+    let is_trs = (m.flags & MAT_FLAG_GLASS_TRS) != 0u;
+    // Family opacity pre-scale (glass_refl top byte, 0..8): the DITHERED glass blocks multiply
+    // tex.a by _OpacityScale before deciding coverage (streets ships 4.0 over a 0.24-mean
+    // alpha texture — without it the tiles are 52% holes); the reflective family packs 1.0.
+    let trs_opac = f32((m.glass_refl >> 24u) & 255u) * (8.0 / 255.0);
+    let trs_a = clamp(albedo.a * max(trs_opac, 0.03), 0.0, 1.0) * m.tint.a;
+    if (is_trs && trs_a < 0.03) {
+        discard; // a genuine hole in the pane, not a dark smoothness spot
+    }
+    let glass_a = select(
+        select(albedo.a, m.tint.a, (m.flags & MAT_FLAG_RFA) != 0u),
+        trs_a,
+        is_trs,
+    );
+    let trs_refl = vec3<f32>(
+        f32((m.glass_refl >> 16u) & 255u),
+        f32((m.glass_refl >> 8u) & 255u),
+        f32(m.glass_refl & 255u),
+    ) / 255.0;
+    let trs_spec = vec3<f32>(
+        f32((m.glass_spec >> 16u) & 255u),
+        f32((m.glass_spec >> 8u) & 255u),
+        f32(m.glass_spec & 255u),
+    ) / 255.0;
+    let refl_g = select(refl_rgb, env * trs_refl * (1.0 - shadow_event), is_trs);
+    let spec_g = select(spec_rgb, spec_rgb * trs_spec * albedo.a, is_trs);
+    // Coverage-mask glass (broken-shard atlases, LEGACY packs without the TRS capture): alpha 0 =
+    // NO SURFACE, so the additive terms die with it too — otherwise the empty atlas area still
+    // mirrors the sky as a ghost pane. The steep ramp keeps shard bodies at full strength and
+    // feathers only the mask fringe.
+    let cov = select(1.0, smoothstep(0.02, 0.30, albedo.a), (m.flags & MAT_FLAG_GLASS_MASK) != 0u);
     return vec4<f32>(
-        apply_fog(lit, o.world_pos, dom.directionality) * glass_a + spec_rgb + refl_rgb + em_rgb,
-        glass_a
+        (apply_fog(lit, o.world_pos, dom.directionality) * glass_a + spec_g + refl_g + em_rgb) * cov,
+        glass_a * cov
     );
 #else
     // DEEP WATER (untextured role=water: the sea + treatment basins) — OPAQUE pass, so depth-write
@@ -1687,10 +1745,33 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     // coverage ramp for alpha-to-coverage (MSAA dithers the edge); everything else is alpha 1.0.
     let is_cut = (m.flags & MAT_FLAG_CUTOUT) != 0u;
     let cov = clamp((albedo.a - m.alpha_cutoff) / cutout_aw + 0.5, 0.0, 1.0);
-    return vec4<f32>(
-        apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality),
-        select(1.0, cov, is_cut)
-    );
+    var final_rgb = apply_fog(lit + spec_rgb + refl_rgb + em_rgb, o.world_pos, dom.directionality);
+    // LOOT GLOW (loot.rs overlay): the container MODEL cycles between its normal shading and a
+    // see-through emissive glass ghost in its marker class colour. At the pulse peak the interior
+    // dissolves through a screen-door (Bayer) mask while the fresnel rim stays solid — reads as
+    // glowing glass from any angle; MSAA/FXAA smooth the dither. Phase rides the packed word so
+    // neighbouring containers breathe out of step instead of the whole aisle pulsing in unison.
+    if ((o.glow & 0x80000000u) != 0u) {
+        let gcol = vec3<f32>(
+            f32((o.glow >> 16u) & 255u),
+            f32((o.glow >> 8u) & 255u),
+            f32(o.glow & 255u),
+        ) / 255.0;
+        let phase = f32((o.glow >> 24u) & 15u) * 0.41;
+        let pulse = 0.5 + 0.5 * sin(sun.gfx.w * 2.2 + phase);
+        let fres = pow(1.0 - NdotV, 2.0);
+        var bayer: array<f32, 16> = array<f32, 16>(
+            0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,
+            3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0,
+        );
+        let px = vec2<u32>(o.clip.xy);
+        let thr = (bayer[(px.y % 4u) * 4u + (px.x % 4u)] + 0.5) / 16.0;
+        if (thr < pulse * (1.0 - fres) * 0.8) {
+            discard;
+        }
+        final_rgb = mix(final_rgb, gcol * (0.8 + 2.4 * fres), pulse * 0.7);
+    }
+    return vec4<f32>(final_rgb, select(1.0, cov, is_cut));
 #endif
 #endif
 #endif

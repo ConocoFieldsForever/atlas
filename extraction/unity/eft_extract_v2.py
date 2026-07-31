@@ -892,6 +892,15 @@ def main():
                 if rt == "transparentcutout":  role = "cutout"
                 elif rt == "transparent":      role = "glass" if rq >= 2900 else "decal"
                 else:                          role = "opaque"
+                # Transparent/DepthZwriteDithered — EFT's depth-writing DITHERED glass (streets'
+                # glass-block walls). Its RenderType tag reads as cutout (it discards on a dither
+                # pattern so it can write depth), which alpha-tested the tiles into a pegboard.
+                # It IS glass, with the same authored _Color/_ReflectColor/_SpecColor response as
+                # the legacy reflective family — classify by the SHADER, the authoritative source,
+                # never the tag.
+                _shd = (sh or "").lower()
+                if "transparent" in _shd and "dithered" in _shd:
+                    role = "glass"
                 # WATER (map-agnostic, material-level): any shader that NAMES water is genuine water — puddles, wet-ground
                 # decals, lakes/seas on every map (woods `Decal/Water Deferred Decal`, shoreline ocean, etc.). Unambiguous
                 # (never a false glass/floor). The big untextured water PLANES whose shader does NOT name water (the woods
@@ -973,6 +982,35 @@ def main():
                 #    rocks bind '_BaseAlbedoASmoothness'; the slot name IS the semantic, no shader-name matching)
                 if alb is not None and ("specular" in _shl or "smap" in _shl
                                         or "asmoothness" in (alb_slot or "").lower()): extra["smA"] = 1
+                # LEGACY TRANSPARENT/REFLECTIVE/SPECULAR — the glass family (9,623 submeshes on
+                # ground_zero, incl. every car window). Its per-material response colours were
+                # DROPPED until now, so the viewer guessed one global reflection strength (white
+                # crumpled windshields) and the 'specular' name-rule above misread tex.a as
+                # smoothness (dark spots where bullet holes belong: in THIS family tex.a is
+                # TRANSPARENCY x gloss, legacy Unity convention). Presence-gated like every other
+                # capture, so non-glass materials re-extract identically:
+                #  - glassTRS=1 records the family semantics;
+                #  - reflCol: _ReflectColor, the authored cubemap-reflection tint (dark on cars);
+                #  - specCol/shin: _SpecColor + _Shininess, the Blinn-Phong response.
+                if "transparent" in _shl and ("reflective" in _shl or "dithered" in _shl):
+                    extra["glassTRS"] = 1
+                    # The dithered family scales tex.a BEFORE its dither (_OpacityScale x
+                    # _AlphaMult; streets glass tiles ship 4.0 over a 0.24-mean alpha). Without
+                    # it the tiles read as 52% holes; with it they are the game's near-opaque
+                    # glass blocks. Presence-gated: the reflective family has neither float.
+                    if "_OpacityScale" in fd or "_AlphaMult" in fd:
+                        extra["opacS"] = round(
+                            fd.get("_OpacityScale", 1.0) * fd.get("_AlphaMult", 1.0), 4)
+                    rv = cd.get("_ReflectColor")
+                    if rv is not None:
+                        extra["reflCol"] = [round(float(rv.r), 4), round(float(rv.g), 4),
+                                            round(float(rv.b), 4), round(float(getattr(rv, "a", 1.0)), 4)]
+                    sv = cd.get("_SpecColor")
+                    if sv is not None:
+                        extra["specCol"] = [round(float(sv.r), 4), round(float(sv.g), 4),
+                                            round(float(sv.b), 4)]
+                    if "_Shininess" in fd:
+                        extra["shin"] = round(fd["_Shininess"], 4)
                 # DETAIL MAPS (the up-close micro-texture layer the game blends over the albedo/normal). Presence-
                 # gated: keys written ONLY when a slot is bound (like astr), so other maps re-extract identically.
                 # TWO authoring conventions observed (census probe 2026-07-12, map-agnostic slot/float names only):
@@ -1131,6 +1169,7 @@ def main():
         # (Unity's lossyScale rule). center stays in UNITY world here -- assemble conjugates it by the map global_matrix when
         # it writes lod.json (same as instance placement). No hardcoded thresholds; keyed on path_ids present in every scene.
         lod0_rids = set(); all_lod_rids = set(); billboard_only_rids = set()
+        _otype = {o.path_id: o.type.name for o in env.objects}    # path_id -> type (billboard-vs-mesh check below)
         rid2lod = {}                                              # renderer path_id -> (GLOBAL groupIdx, lodIndex)  [min index if shared]
         rid2levels = {}                                           # renderer path_id -> {(groupIdx, lodIndex)}: the FULL span (AUDIT #3)
         group_min_lod = {}                                        # gidx -> FINEST non-billboard lodIndex that actually has renderers
@@ -1148,6 +1187,16 @@ def main():
                 rpl = np.array([rp.get("x", 0.0), rp.get("y", 0.0), rp.get("z", 0.0)], np.float64)
                 center = (M3 @ rpl + T3).tolist()
                 last_bb = bool(d.get("m_LastLODIsBillboard", False))
+                # EFT sets m_LastLODIsBillboard on groups whose last level is REAL MeshRenderers —
+                # ground_zero's police cruze lists body_LOD1/door_*_LOD1 there. Trusting the flag
+                # classified those shells billboard-only and ERASED the car past LOD0's ~18 m band.
+                # A genuine impostor level (SpeedTree) references BillboardRenderers, so believe the
+                # flag only when the last level resolves to NO Mesh/SkinnedMeshRenderer.
+                if last_bb:
+                    _lastr = ((mlods[-1] or {}).get("renderers") or [])
+                    if any(_otype.get((rpp.get("renderer") or {}).get("m_PathID", 0))
+                           in ("MeshRenderer", "SkinnedMeshRenderer") for rpp in _lastr):
+                        last_bb = False
                 # `x or 0.0` does NOT catch NaN (NaN is truthy): Reserve ships a LODGroup with
                 # fadeTransitionWidth=NaN, which later poisoned the pack manifest (allow_nan=False).
                 def _fin(x, d=0.0):

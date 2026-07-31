@@ -29,7 +29,7 @@ struct InstanceGpu {
     m0: vec4<f32>,      // ROW-MAJOR world 3x4 affine, row 0 (incl shear+mirror)
     m1: vec4<f32>,      // row 1
     m2: vec4<f32>,      // row 2
-    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class(1=grass)+lod bits(8=is_default,9..12=lod_index,13..31=lod_group id)  w=lod window (pack2x16float(near',far'); 0=sentinel/always-draw)
+    ids: vec4<u32>,     // x=mesh_id  y=flags  z=class(1=grass)+lod bits(1..4=force-lo,5..7=force-hi,8=is_default,9..12=lod_index,13..31=lod_group id)  w=lod window (pack2x16float(near',far'); 0=sentinel/always-draw)
     sphere: vec4<f32>,  // xyz = world-space center, w = conservative world radius
 };
 
@@ -227,8 +227,14 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>,
             }
             if (!(d > lo && d <= hi)) { return; }
         } else {
-            // Force a single shell index (debug).
-            if (((inst.ids.z >> 9u) & 15u) != u32(G.lod_params.w)) { return; }
+            // Force a single shell index (debug). The instance carries a coverage window
+            // (ids.z bits 1..4 = lo, 5..7 = hi) instead of matching its own index exactly:
+            // a group forced to a level it doesn't ship draws its nearest present shell
+            // (the CPU selector's clamp rule) instead of vanishing.
+            let f = u32(G.lod_params.w);
+            let f_lo = (inst.ids.z >> 1u) & 15u;
+            let f_hi = (inst.ids.z >> 5u) & 7u;
+            if (f < f_lo || f > f_hi) { return; }
         }
     }
 

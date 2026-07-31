@@ -251,7 +251,8 @@ pub struct GpuMaterial {
     pub detail_normal_index: u32,
     /// detail sub-flags: bit0 = has detail albedo, bit1 = has detail normal. @88
     pub detail_flags: u32,
-    pub _detpad: u32, // @92
+    /// GLASS_TRS: `_ReflectColor` packed RGBA8 (was padding; 0 on every non-TRS material). @92
+    pub glass_refl: u32,
     /// RAW _DetailAlbedoMap_ST (sx,sy,ox,oy). Shader derives the relative transform vs `uv_xform`. @96
     pub detail_albedo_uv: [f32; 4],
     /// RAW _DetailNormalMap_ST (sx,sy,ox,oy). @112
@@ -276,8 +277,10 @@ pub struct GpuMaterial {
     pub parallax_index: u32,
     /// Unity `_Parallax` amount (max tangent-space UV offset; typical 0.02-0.08). @180
     pub parallax_scale: f32,
-    pub _ppad0: u32, // @184
-    pub _ppad1: u32, // @188  -> total 192 bytes (16-aligned)
+    /// GLASS_TRS: `_SpecColor` packed RGB8 (was padding; 0 on every non-TRS material). @184
+    pub glass_spec: u32,
+    /// GLASS_TRS: `_Shininess` (Blinn-Phong gloss 0..1; was padding). @188 -> total 192 bytes
+    pub glass_shin: f32,
 }
 
 // #6: compile-time guard that GpuMaterial stays byte-matched to the WGSL `MaterialGpu` (192 B, all
@@ -345,6 +348,20 @@ pub const MAT_FLAG_DECAL: u32 = 1 << 10;
 /// along the tangent-space view vector using `parallax_index`'s height map. Set only when a valid
 /// height map is present; skipped entirely otherwise (byte-identical to the pre-parallax path).
 pub const MAT_FLAG_PARALLAX: u32 = 1 << 11;
+/// `GpuMaterial::flags` bit: glass whose albedo ALPHA is a COVERAGE MASK (broken-shard atlases),
+/// not packed smoothness. Alpha 0 there means NO SURFACE — so the glass branch masks EVERY term
+/// by it, including the additive specular/reflection that clear panes deliberately keep outside
+/// their alpha. Without this the empty atlas area still rendered as a ghost pane of sky
+/// reflection. Detected at load by `glass_alpha_is_mask`; mutually exclusive with MAT_FLAG_RFA.
+pub const MAT_FLAG_GLASS_MASK: u32 = 1 << 12;
+/// `GpuMaterial::flags` bit: legacy Transparent/Reflective/Specular glass (the game's car and
+/// storefront glass family). tex.a = TRANSPARENCY x gloss (legacy Unity convention, never
+/// smoothness); reflection is tinted by the material's own `_ReflectColor` (`glass_refl`) and
+/// specular by `_SpecColor`/`_Shininess` (`glass_spec`/`glass_shin`) — the authored values whose
+/// absence made crumpled windshields mirror the full-strength analytic sky as WHITE FOIL and
+/// painted bullet holes as dark smoothness spots. Only set on packs whose extraction captured
+/// the family (glassTRS in materials.json); older packs keep the probe/RFA path bit-exact.
+pub const MAT_FLAG_GLASS_TRS: u32 = 1 << 13;
 /// Per-mesh transparent-pass membership. A mixed-material mesh may set more than one bit and is
 /// then submitted to each relevant specialization; the fragment material flag keeps only its class.
 const BLEND_MESH_SOFTCUTOUT: u32 = 1 << 0;
@@ -1362,6 +1379,14 @@ pub struct CpuData {
     /// shell's own bounding-sphere centroid, so every renderer/shell in a group switches together
     /// (no per-boundary double-draw/hole from mismatched centroids). >=1 element (never zero-sized).
     lod_centers: Vec<[f32; 4]>,
+    /// Loot-glow model match, AUTHORITATIVE: (gamedata container index, model-center world pos,
+    /// GPU instances). Joined by PREFAB ANCESTRY — the container's folded transform chain
+    /// (gamedata `tf`) intersected with each instance's shipped `par`/`par2` at the same level —
+    /// never by name or radius (which lit decorative same-mesh neighbours and missed
+    /// offset-pivot parts). Cloned into the persistent main-world `loot::LootModelIndex` at
+    /// insert time — this blob itself is dropped after upload. Empty when either side predates
+    /// the ancestry capture: no guess, no glow, markers stay boxes.
+    loot_models: Vec<(u32, [f32; 3], Vec<u32>)>,
 }
 
 /// The repacked CPU geometry blob + the `MapEpoch` it was built for. `prepare_gpu_buffers` builds
@@ -1548,8 +1573,12 @@ impl Plugin for EftGpuDrivenPlugin {
             ExtractResourcePlugin::<super::MapEpoch>::default(),
             // Door click-to-open: the pick's world point crosses into the render world.
             ExtractResourcePlugin::<DoorClick>::default(),
+            // Loot glow: the overlay's visible container->instance set crosses per frame (slim;
+            // cloned only when its generation bumps).
+            ExtractResourcePlugin::<crate::loot::LootGlowState>::default(),
         ))
         .init_resource::<DoorClick>()
+        .init_resource::<crate::loot::LootGlowState>()
         // The CPU staging build re-runs on every map epoch (the initial insert included) so an
         // in-place .eftpack swap rebuilds the blob; the render-world reset then rebuilds the GPU
         // side. Step 3: `kick_cpu_build` spawns the heavy build onto the AsyncComputeTaskPool (so
@@ -1579,6 +1608,18 @@ impl Plugin for EftGpuDrivenPlugin {
                         .in_set(RenderSystems::PrepareResources)
                         .before(prepare_gpu_buffers),
                     prepare_gpu_buffers.in_set(RenderSystems::PrepareResources),
+                    // Loot glow: rewrite the per-instance highlight lane when the overlay's
+                    // visible set changed (toggle flip, min-value change, marker respawn).
+                    prepare_loot_glow
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
+                    // SSAO AO lane: (re)create the target, then swap the draw bind group's AO
+                    // binding between it and the white fallback. Registered HERE (not in
+                    // SsaoPlugin) so the ordering can name the private `prepare_gpu_buffers`.
+                    (super::ssao::prepare_ao_target, sync_draw_bg_ao)
+                        .chain()
+                        .in_set(RenderSystems::PrepareResources)
+                        .after(prepare_gpu_buffers),
                     // Runtime UI shadow toggle: refresh the effective switch BEFORE the frustum
                     // extrusion + uniform upload + shadow node read it this frame.
                     sync_gfx_shadow_toggle
@@ -1766,6 +1807,22 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         let prev_present = present.iter().rev().find(|&&p| p < idx).copied();
         let near = prev_present.map(far).unwrap_or(0.0);
         let is_coarsest = idx >= *present.last().unwrap();
+        // Force-shell coverage window (cull mode 2), ids.z bits 1..4 = lo, bits 5..7 = hi: the
+        // instance draws when the forced shell F lands in [lo, hi] — its own level, widened down
+        // to 0 on the group's finest-present shell and up to 7 on its coarsest, ending where the
+        // next PRESENT shell begins. Forcing a level a group doesn't ship thus falls back to its
+        // nearest present shell instead of vanishing — the CPU selector's clamp rule
+        // (eftpack.rs::keep_lod) that the shader's plain index-equality test lost. Bit 0 stays
+        // clear: the grass checks are exact `ids.z == 1` and must never alias.
+        let min_present = *present.first().unwrap();
+        let f_lo = if idx <= min_present { 0u32 } else { (idx as u32).min(15) };
+        let f_hi = if is_coarsest {
+            7u32
+        } else {
+            let next = present.iter().find(|&&p| p > idx).copied().unwrap_or(idx + 1);
+            ((next.max(idx + 1) - 1) as u32).min(7)
+        };
+        let z = z | (f_lo << 1) | (f_hi << 5);
         let far_b = if is_coarsest {
             if g.last_is_billboard && g.cull_h > 1.0e-6 {
                 g.size / (2.0 * g.cull_h) // billboard groups cull past their last threshold (no billboard geom ships)
@@ -1876,6 +1933,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         }
     }
 
+    // Per-albedo memo for the glass alpha-semantics probe below: glass shares atlas textures
+    // heavily (streets: 489 glass materials over a handful of atlases), so each PNG is probed once.
+    let mut glass_mask_memo: std::collections::HashMap<String, bool> = Default::default();
     for mat in &pack.materials {
         let albedo_index = match mat.albedo.as_deref() {
             Some(p) if !p.is_empty() => *path_to_index.entry(p.to_string()).or_insert_with(|| {
@@ -1921,13 +1981,45 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         if mat.role == "decal" {
             flags |= MAT_FLAG_DECAL;
         }
+        // Legacy Transparent/Reflective/Specular glass: the game's OWN semantics, captured at
+        // extraction (glassTRS + _ReflectColor/_SpecColor/_Shininess). Supersedes both the RFA
+        // rule and the per-texture mask probe below — tex.a is transparency for the whole family.
+        let glass_trs = mat.glass_trs && mat.role == "glass";
+        if glass_trs {
+            flags |= MAT_FLAG_GLASS_TRS;
+        }
+        // Glass alpha semantics, decided per TEXTURE (LEGACY PACKS ONLY — a glassTRS capture is
+        // authoritative and skips the probe): shard atlases pack COVERAGE in tex.a, nearly all
+        // other glass packs SMOOTHNESS there (streets: 479/489). Both live on the same game
+        // shader (Transparent Reflective Specular), so only the texture can tell them apart —
+        // ground_zero's broken-glass atlas is 67% fully-transparent texels, while smoothness panes
+        // are nowhere near zero anywhere. Probe once per texture, memoized.
+        let glass_alpha_mask = !glass_trs
+            && mat.role == "glass"
+            && mat
+                .albedo
+                .as_deref()
+                .map(|p| {
+                    *glass_mask_memo
+                        .entry(p.to_string())
+                        .or_insert_with(|| glass_alpha_is_mask(p))
+                })
+                .unwrap_or(false);
+        if glass_alpha_mask {
+            // Coverage-mask glass: tex.a gates EVERY lighting term, including the additive
+            // reflection clear panes keep outside their alpha — the empty atlas area must render
+            // as nothing, not a ghost pane (nor RFA's constant-tint.a solid dark pane).
+            flags |= MAT_FLAG_GLASS_MASK;
+        }
         // Per-pixel roughness from the albedo alpha (Unity Standard smoothness-in-alpha).
         // Opaque AND glass (cutout alpha is coverage). 82% of materials carry this — without it
         // everything specular-shades at one constant roughness. For GLASS the flag additionally
-        // switches the shader's coverage source to tint.a alone: nearly every glass material
-        // (streets: 479/489) packs SMOOTHNESS in tex.a, and multiplying it into opacity painted
-        // the smoothness pattern as opacity blotches (the "shattered" dusty retail panes).
-        if mat.roughness_from_albedo_alpha && (mat.role == "opaque" || mat.role == "glass") {
+        // switches the shader's coverage source to tint.a alone: multiplying smoothness into
+        // opacity painted the pattern as opacity blotches (the "shattered" dusty retail panes).
+        if mat.roughness_from_albedo_alpha
+            && (mat.role == "opaque" || mat.role == "glass")
+            && !glass_alpha_mask
+        {
             flags |= MAT_FLAG_RFA;
         }
         // M3b2 SoftCutout / water classification. The Vert-Paint SoftCutout family (Custom/Vert
@@ -2172,13 +2264,39 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                 flags |= MAT_FLAG_PARALLAX;
             }
         }
+        // GLASS_TRS response lanes (zeros on every other material): packed _ReflectColor /
+        // _SpecColor + _Shininess, with Unity's legacy defaults where the material didn't author
+        // one (grey 0.5 reflection/specular, gloss 0.078 — the legacy shader's UI defaults).
+        let (glass_refl, glass_spec, glass_shin) = if glass_trs {
+            let rc = mat.reflect_color.unwrap_or([0.5, 0.5, 0.5, 0.5]);
+            let sc = mat.spec_color.unwrap_or([0.5, 0.5, 0.5]);
+            let pk = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+            // glass_refl's top byte carries the family's opacity PRE-SCALE (0..8 quantized) —
+            // the dithered glass blocks multiply tex.a by _OpacityScale before their dither
+            // (streets ships 4.0 over a 0.24-mean alpha); the reflective family packs 1.0.
+            // _ReflectColor.a itself is unused by both game shaders.
+            let opac = ((mat.opacity_scale.unwrap_or(1.0).clamp(0.0, 8.0) / 8.0) * 255.0).round() as u32;
+            (
+                pk(rc[0]) << 16 | pk(rc[1]) << 8 | pk(rc[2]) | opac << 24,
+                pk(sc[0]) << 16 | pk(sc[1]) << 8 | pk(sc[2]),
+                mat.shininess.unwrap_or(0.078).clamp(0.01, 1.0),
+            )
+        } else {
+            (0u32, 0u32, 0.0f32)
+        };
         materials_gpu.push(GpuMaterial {
             albedo_index,
             flags,
             alpha_cutoff: mat.alpha_cutoff,
             // Phase 1.6 GGX spec: per-material roughness (was _pad). Glass ships ~0.05 (sharp);
-            // default 0.55 for unspecified. Clamp [0.03,1.0] so the NDF can't blow up / go mirror-hard.
-            roughness: mat.roughness.unwrap_or(0.55).clamp(0.03, 1.0),
+            // default 0.55 for unspecified. Clamp [0.03,1.0] so the NDF can't blow up / go
+            // mirror-hard. TRS glass derives it from the authored Blinn-Phong _Shininess
+            // (power = shin x 128; GGX rough = sqrt(2/(power+2))) instead of the flat 0.05.
+            roughness: if glass_trs {
+                (2.0 / (glass_shin * 128.0 + 2.0)).sqrt().clamp(0.03, 1.0)
+            } else {
+                mat.roughness.unwrap_or(0.55).clamp(0.03, 1.0)
+            },
             uv_xform: mat.uv_xform, // reference only (uvTilingBaked=true); shader must NOT apply
             tint: mat.tint,
             vp: vp_params.unwrap_or([0.0; 4]),
@@ -2193,7 +2311,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             detail_albedo_index,
             detail_normal_index,
             detail_flags,
-            _detpad: 0,
+            glass_refl,
             detail_albedo_uv,
             detail_normal_uv,
             detail_params,
@@ -2202,8 +2320,8 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             emissive_rgb,
             parallax_index,
             parallax_scale,
-            _ppad0: 0,
-            _ppad1: 0,
+            glass_spec,
+            glass_shin,
         });
     }
 
@@ -2419,6 +2537,8 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     let mut mesh_meta: Vec<MeshMeta> = Vec::new();
     let mut mesh_names: Vec<String> = Vec::new();
     let mut inst_lod_group: Vec<i32> = Vec::new();
+    // (par, par2, lv) per GPU instance — the loot-glow ancestry join key, parallel to `instances`.
+    let mut inst_ancestry: Vec<(u32, u32, u32)> = Vec::new();
     // Blend-pass restructure (Codex review): per-mesh material class + a representative center
     // for back-to-front sorting of the per-mesh blend draws. class: 0=opaque-only, 1=blend-only,
     // 2=mixed (drawn in both passes; fragment class-discard splits it).
@@ -2458,6 +2578,20 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             }
             tot_v += m.vtx_count as usize;
             tot_i += m.idx_count as usize;
+            // Shard-glass side walls (mesh loop below) append geometry; reserve their worst case
+            // (4 verts / 6 indices per boundary edge, boundary edges <= submesh index count) so
+            // the append can't force a doubling realloc of these near-exact-sized buffers.
+            for sm in &m.submeshes {
+                let is_mask = materials_gpu
+                    .get(sm.material_id as usize)
+                    .map_or(false, |mt| {
+                        mt.flags & (MAT_FLAG_GLASS_MASK | MAT_FLAG_GLASS_TRS) != 0
+                    });
+                if is_mask {
+                    tot_v += 4 * sm.idx_count as usize;
+                    tot_i += 6 * sm.idx_count as usize;
+                }
+            }
             tot_inst += by_mesh[mi].len();
             tot_mesh += 1;
         }
@@ -2475,6 +2609,9 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     // Reused per-mesh scratch (cleared+resized each mesh; avoids the per-mesh Vec allocations).
     let mut vert_mat: Vec<u32> = Vec::new();
     let mut vert_uv: Vec<[f32; 2]> = Vec::new();
+    // Shard-glass wall emission (logged after the loop so a silent no-op is visible).
+    let mut glass_wall_quads = 0usize;
+    let mut glass_wall_meshes = 0usize;
 
     for (mi, m) in pack.manifest.meshes.iter().enumerate() {
         let inst_ids = &by_mesh[mi];
@@ -2654,11 +2791,179 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
                 f32::from_bits(col_bits),    // color Unorm8x4 @28 (interpolated in the shader)
             ]);
         }
-        vtx_cursor += n as u32;
+        // --- Shard-glass thickness: the game ships broken panes as TWO coincident shard layers
+        // (front + back — 23 mm apart on ground_zero's Window_plastic_02) with no side walls, so
+        // shards vanish into dark films seen side-on. Bridge each layer's boundary edges toward
+        // its twin: every vertex's wall depth is HALF its distance to the nearest neighbour that
+        // lies behind its normal (the twin layer), so the wall spans the pane's own authored
+        // thickness — derived per vertex, nothing hardcoded. A single-layer pane has no twin and
+        // gets no walls: the game gave it no thickness to draw. Side walls only — no new sheets —
+        // so the face-on look (and its calibrated blend depth) is unchanged.
+        // Boundary edge = undirected edge referenced by exactly one triangle.
+        let mut side_edges: Vec<(u32, u32, u32, Vec3)> = Vec::new(); // (a, b, material, face normal)
+        let mut twin_half: std::collections::HashMap<u32, f32> = Default::default();
+        {
+            let local_idx = &index_data[idx_data_start..];
+            for sm in &m.submeshes {
+                // Mask glass always; TRS glass too — its alpha is coverage as well, and the
+                // twin-layer requirement below keeps single-sheet panes wall-free for free.
+                let is_mask = materials_gpu
+                    .get(sm.material_id as usize)
+                    .map_or(false, |mt| {
+                        mt.flags & (MAT_FLAG_GLASS_MASK | MAT_FLAG_GLASS_TRS) != 0
+                    });
+                if !is_mask {
+                    continue;
+                }
+                let s0 = sm.idx_start as usize;
+                let s1 = (s0 + sm.idx_count as usize).min(local_idx.len());
+                // Referenced vertex set (positions + normals) for the twin search.
+                let mut verts: Vec<u32> = local_idx[s0..s1]
+                    .iter()
+                    .copied()
+                    .filter(|&v| (v as usize) < n)
+                    .collect();
+                verts.sort_unstable();
+                verts.dedup();
+                if verts.len() > 4096 {
+                    continue; // perf guard: shard meshes are small; a giant sheet is not one
+                }
+                let pn: Vec<(Vec3, Vec3)> = verts
+                    .iter()
+                    .map(|&v| {
+                        let base = v as usize * vstride;
+                        let p = crate::eftpack::read_vec3(vb, base + pos_off);
+                        let nrm = match nrm_off {
+                            Some(o) => crate::eftpack::read_vec3(vb, base + o).normalize_or_zero(),
+                            None => Vec3::Y,
+                        };
+                        (p, nrm)
+                    })
+                    .collect();
+                // Twin distance: nearest vertex within a ~45° cone BEHIND this vertex's normal.
+                // Both layers find each other symmetrically (each looks behind its own face).
+                for (i, &vi) in verts.iter().enumerate() {
+                    let (p, nrm) = pn[i];
+                    let mut best = f32::INFINITY;
+                    for (j, &(q, _)) in pn.iter().enumerate() {
+                        if i == j {
+                            continue;
+                        }
+                        let d = q - p;
+                        let len = d.length();
+                        if len < 1.0e-5 || len >= best {
+                            continue;
+                        }
+                        if d.dot(nrm) < -0.7 * len {
+                            best = len;
+                        }
+                    }
+                    if best.is_finite() {
+                        twin_half.insert(vi, 0.5 * best);
+                    }
+                }
+                // undirected edge -> (directed a, b, owning-face normal, refcount)
+                let mut edges: std::collections::HashMap<(u32, u32), (u32, u32, Vec3, u32)> =
+                    Default::default();
+                for tri in local_idx[s0..s1].chunks_exact(3) {
+                    let (i0, i1, i2) = (tri[0], tri[1], tri[2]);
+                    if i0 as usize >= n || i1 as usize >= n || i2 as usize >= n {
+                        continue;
+                    }
+                    let p0 = crate::eftpack::read_vec3(vb, i0 as usize * vstride + pos_off);
+                    let p1 = crate::eftpack::read_vec3(vb, i1 as usize * vstride + pos_off);
+                    let p2 = crate::eftpack::read_vec3(vb, i2 as usize * vstride + pos_off);
+                    let fnrm = (p1 - p0).cross(p2 - p0);
+                    if fnrm.length_squared() < 1.0e-12 {
+                        continue; // degenerate sliver: no reliable outward direction
+                    }
+                    let fnrm = fnrm.normalize();
+                    for (a, b) in [(i0, i1), (i1, i2), (i2, i0)] {
+                        edges
+                            .entry((a.min(b), a.max(b)))
+                            .and_modify(|e| e.3 += 1)
+                            .or_insert((a, b, fnrm, 1));
+                    }
+                }
+                for (_, (a, b, fnrm, cnt)) in edges {
+                    if cnt == 1 {
+                        side_edges.push((a, b, sm.material_id, fnrm));
+                    }
+                }
+            }
+        }
+        let mut extra_v = 0u32;
+        let mut extra_i = 0u32;
+        for (a, b, mat_id, fnrm) in side_edges {
+            // No measured twin layer on either end -> no authored thickness -> no wall.
+            let (Some(&ta), Some(&tb)) = (twin_half.get(&a), twin_half.get(&b)) else {
+                continue;
+            };
+            let read_vert = |vi: u32| -> (Vec3, Vec3, [f32; 2], u32) {
+                let base = vi as usize * vstride;
+                let p = crate::eftpack::read_vec3(vb, base + pos_off);
+                let nrm = match nrm_off {
+                    Some(o) => crate::eftpack::read_vec3(vb, base + o),
+                    None => Vec3::Y,
+                };
+                let uv = *vert_uv.get(vi as usize).unwrap_or(&[0.0, 0.0]);
+                let col = match col_off {
+                    Some(o) => {
+                        u32::from(vb[base + o])
+                            | (u32::from(vb[base + o + 1]) << 8)
+                            | (u32::from(vb[base + o + 2]) << 16)
+                            | (u32::from(vb[base + o + 3]) << 24)
+                    }
+                    None => 0xFFFF_FFFF,
+                };
+                (p, nrm, uv, col)
+            };
+            let (pa, na, uva, ca) = read_vert(a);
+            let (pb, nb, uvb, cb) = read_vert(b);
+            let dir = pb - pa;
+            if dir.length_squared() < 1.0e-12 {
+                continue;
+            }
+            // Outward wall normal: for a CCW front face the interior lies LEFT of a->b, so
+            // edge x face-normal points away from the shard.
+            let ns = dir.normalize().cross(fnrm).normalize();
+            let ns_bits = oct_bits(ns);
+            // Quad [a-front, b-front, b-back, a-back]; back rides the VERTEX normal toward the
+            // twin layer so both layers' walls meet mid-gap. UV/color copied from the edge
+            // vertex: the wall samples the shard's own edge texel (inside the coverage mask).
+            let quad = [
+                (pa, uva, ca),
+                (pb, uvb, cb),
+                (pb - nb.normalize_or_zero() * tb, uvb, cb),
+                (pa - na.normalize_or_zero() * ta, uva, ca),
+            ];
+            let lbase = n as u32 + extra_v;
+            for (p, uv, col) in quad {
+                vertex_data.extend_from_slice(&[
+                    p.x, p.y, p.z,
+                    ns_bits,
+                    uv[0], uv[1],
+                    f32::from_bits(mat_id),
+                    f32::from_bits(col),
+                ]);
+            }
+            // Outward winding (verified against the CCW-interior rule above).
+            index_data.extend_from_slice(&[
+                lbase, lbase + 2, lbase + 1,
+                lbase, lbase + 3, lbase + 2,
+            ]);
+            extra_v += 4;
+            extra_i += 6;
+        }
+        glass_wall_quads += (extra_i / 6) as usize;
+        if extra_i > 0 {
+            glass_wall_meshes += 1;
+        }
+        vtx_cursor += n as u32 + extra_v;
 
         // indices were appended (from bytes) at the top of the loop; record the run.
         let first_index = idx_cursor;
-        let index_count = ni as u32;
+        let index_count = ni as u32 + extra_i;
         idx_cursor += index_count;
 
         // --- instances (grouped-by-mesh, contiguous) with conservative world sphere ---
@@ -2680,6 +2985,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             // Distance-LOD encode into ids.z/ids.w on multi-LOD packs; (0,0) on lean = unchanged.
             let (lz, lw) = if multi_lod { lod_encode(i) } else { (0, 0) };
             inst_lod_group.push(inst.lod_group);
+            inst_ancestry.push((inst.par, inst.par2, inst.lv));
             instances.push(InstanceGpuRecord {
                 m0: [a[0], a[1], a[2], a[3]],
                 m1: [a[4], a[5], a[6], a[7]],
@@ -2739,6 +3045,10 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
             _pad: [0, 0],
         });
     }
+    info!(
+        "shard-glass walls: {glass_wall_quads} edge quads across {glass_wall_meshes} meshes \
+         (depth = each pane's own twin-layer gap; 0 quads = no mask-glass or single-layer panes)"
+    );
     let t_geo = build_t0.elapsed(); // phase: the mesh geometry loop (parse + repack + append)
     let grass_instance_base = instances.len();
     let mut grass_instances = 0usize;
@@ -3193,6 +3503,10 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         if index_u16 { " (halved; all meshes < 64Ki verts)" } else { " (a mesh exceeds 64Ki verts)" },
     );
     drop(index_data); // the wide staging copy is dead now — free it before the upload
+    // Loot-glow model match (loot.rs overlay): join the game's own LootableContainer records to
+    // the GPU instances built above by PREFAB ANCESTRY (see match_loot_models). LOD shells join
+    // through the same parent chain, so whichever shell the cull draws still glows.
+    let loot_models = match_loot_models(&pack.root, &instances, &inst_ancestry);
     Some(CpuData {
         vertex_data,
         index_bytes,
@@ -3219,6 +3533,7 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         instance_total,
         mesh_count,
         doors: pack.doors.clone(),
+        loot_models,
         // B1: per-group reference center for the mode-1 distance metric, indexed by lod_group.
         // Padded to >=1 so the storage buffer is never zero-sized (wgpu rejects that); on a lean
         // pack it's bound but never read (every instance is a sentinel, mode-1 is skipped).
@@ -3302,6 +3617,10 @@ fn kick_cpu_build(
         commands.remove_resource::<PendingCpuBuild>();
         match compute_cpu_blob(&pack_arc, lod) {
             Some(cpu) => {
+                // Slim persistent copy for loot.rs: the blob itself is dropped after upload.
+                commands.insert_resource(crate::loot::LootModelIndex {
+                    models: cpu.loot_models.clone(),
+                });
                 commands.insert_resource(ExtractedCpuData(Arc::new(cpu), ep));
                 if tags.is_empty() {
                     commands.spawn((GpuDrivenTag, Name::new("eft_gpu_driven_draw")));
@@ -3351,6 +3670,10 @@ fn poll_cpu_build(
     }
     match result {
         Some(cpu) => {
+            // Slim persistent copy for loot.rs: the blob itself is dropped after upload.
+            commands.insert_resource(crate::loot::LootModelIndex {
+                models: cpu.loot_models.clone(),
+            });
             commands.insert_resource(ExtractedCpuData(Arc::new(cpu), built_epoch));
             // one entity to hang the draw phase item on (ignored by the draw command). Idempotent:
             // a SECOND GpuDrivenTag would make queue_gpu_driven emit every phase item twice (the
@@ -3565,11 +3888,20 @@ fn init_gpu_pipelines(
 
     let ssbo_layout = render_device.create_bind_group_layout(
         "eft_draw_ssbo_layout",
-        &BindGroupLayoutEntries::sequential(
+        &BindGroupLayoutEntries::with_indices(
             ShaderStages::VERTEX,
             (
-                storage_buffer_read_only_sized(false, None), // 0: instances
-                storage_buffer_read_only_sized(false, None), // 1: visible
+                (0, storage_buffer_read_only_sized(false, None)), // instances
+                (1, storage_buffer_read_only_sized(false, None)), // visible
+                (2, storage_buffer_read_only_sized(false, None)), // loot-glow (u32 per instance)
+                // 3: the SSAO AO lane (R8, prepass-derived), FRAGMENT-sampled by the opaque
+                // shading; the white fallback binds here while SSAO is off. The shadow/prepass
+                // pipelines share this layout and simply don't declare the binding (allowed).
+                (
+                    3,
+                    texture_2d(TextureSampleType::Float { filterable: true })
+                        .visibility(ShaderStages::FRAGMENT),
+                ),
             ),
         ),
     );
@@ -3795,13 +4127,14 @@ fn compact_without_grass(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_gpu_buffers(
+pub(crate) fn prepare_gpu_buffers(
     mut commands: Commands,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>, // #5 shadows: queue the shadow depth pipeline once here
     cpu: Option<Res<ExtractedCpuData>>,
     already: Option<Res<EftGpuBuffers>>,
+    ssao_pipe: Option<Res<super::ssao::SsaoPipeline>>,
     compute: Option<Res<EftComputePipelines>>,
     draw: Option<Res<EftDrawPipeline>>,
     map_epoch: Option<Res<super::MapEpoch>>,
@@ -4364,14 +4697,46 @@ fn prepare_gpu_buffers(
             blend_ids_buf.as_entire_binding(),
         )),
     );
+    // Loot-glow highlight lane: one u32 per instance (0 = no glow), zero-initialized; the
+    // per-frame `prepare_loot_glow` rewrites it whenever the loot overlay's visible set changes.
+    let loot_glow_buf = render_device.create_buffer(&BufferDescriptor {
+        label: Some("eft_loot_glow"),
+        size: (instance_total.max(1) as u64) * 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    commands.insert_resource(EftLootGlow {
+        buffer: loot_glow_buf.clone(),
+        len: instance_total.max(1),
+        last_gen: u64::MAX,
+    });
+    // Draw bind group starts on the WHITE AO fallback; `sync_draw_bg_ao` swaps in the live AO
+    // lane (and back) as the SSAO toggle / window size change. The inputs resource is what lets
+    // it rebuild this group without re-running the whole map build.
+    let ao_fallback = ssao_pipe.as_ref().map(|s| s.fallback_ao_view.clone());
     let draw_bg = render_device.create_bind_group(
         "eft_draw_bg",
         &draw.ssbo_layout,
-        &BindGroupEntries::sequential((
-            instances.as_entire_binding(),
-            visible.as_entire_binding(),
+        &BindGroupEntries::with_indices((
+            (0, instances.as_entire_binding()),
+            (1, visible.as_entire_binding()),
+            (2, loot_glow_buf.as_entire_binding()),
+            (
+                3,
+                bevy::render::render_resource::BindingResource::TextureView(
+                    ao_fallback.as_ref().expect(
+                        "SsaoPipeline initializes in RenderStartup, before any map build",
+                    ),
+                ),
+            ),
         )),
     );
+    commands.insert_resource(EftDrawBgInputs {
+        instances: instances.clone(),
+        visible: visible.clone(),
+        loot_glow: loot_glow_buf.clone(),
+        bound_ao: None, // fallback bound; sync swaps in the live lane when SSAO is on
+    });
 
     // ---- M3: bindless material table + albedo texture array (built ONCE) -----------
     // material-table SSBO (indexed by the per-vertex global materialId in the fragment).
@@ -5208,6 +5573,142 @@ fn puddle_alpha_is_constant(path: &str) -> bool {
         hi = hi.max(a);
     }
     (hi - lo) < 13 // < ~0.05 of full range
+}
+
+/// Loot-glow model match, AUTHORITATIVE: every ACTIVE gamedata LootableContainer -> the GPU
+/// instances that share its PREFAB ANCESTRY. The container record carries its folded transform
+/// chain (`tf` = self/parent/grandparent, from the game's own scene hierarchy); every shipped
+/// instance carries its renderer's folded `par`/`par2` + source level. An instance belongs to a
+/// container iff the two chains INTERSECT at the same level. No names, no radius: a decorative
+/// crate stacked beside a lootable one shares neither ancestor (the streets false-positive), and
+/// a prefab part whose pivot sits meters away still joins (the suitcase false-negative).
+///
+/// Scene-ORGANIZATION nodes (one parent holding dozens of containers) would over-join, so any
+/// ancestor id claimed by more than 3 containers on its level is dropped from every chain — a
+/// real multi-container prop prefab (a stacked-crates set) stays under the cap; "Design_Stuff"
+/// roots do not. `tf[0]` (the container's own transform) is always kept: it is unique.
+///
+/// Returns (gamedata container index, model-center world pos, instances). A container with no
+/// model isn't listed — loot.rs keeps its box marker so the overlay never silently loses an
+/// item. Packs or gamedata from before the ancestry capture yield an EMPTY result: authoritative
+/// or nothing, per the project's derive-don't-author rule.
+fn match_loot_models(
+    root: &std::path::Path,
+    instances: &[InstanceGpuRecord],
+    inst_ancestry: &[(u32, u32, u32)],
+) -> Vec<(u32, [f32; 3], Vec<u32>)> {
+    let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Vec::new();
+    };
+    let none = Vec::new();
+    let containers = v
+        .get("containers")
+        .and_then(|c| c.as_array())
+        .unwrap_or(&none);
+    if containers.is_empty() {
+        return Vec::new();
+    }
+    // Container chains: (index, lv, kept tf ids). Absent `tf` (pre-capture gamedata) -> skipped.
+    let mut chains: Vec<(u32, u32, Vec<u32>)> = Vec::new();
+    let mut ancestor_claims: std::collections::HashMap<(u32, u32), u32> = Default::default();
+    for (ci, c) in containers.iter().enumerate() {
+        if !c.get("active").and_then(|a| a.as_bool()).unwrap_or(true) {
+            continue; // not present at raid start — no marker, no glow
+        }
+        let lv = c.get("lv").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let tf: Vec<u32> = c
+            .get("tf")
+            .and_then(|t| t.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_u64()).map(|x| x as u32).collect())
+            .unwrap_or_default();
+        if tf.is_empty() {
+            continue;
+        }
+        for (k, &id) in tf.iter().enumerate() {
+            if k > 0 && id != 0 {
+                *ancestor_claims.entry((lv, id)).or_insert(0) += 1;
+            }
+        }
+        chains.push((ci as u32, lv, tf));
+    }
+    if chains.is_empty() {
+        return Vec::new();
+    }
+    // (lv, folded id) -> container-chain slots that keep it (organization nodes dropped).
+    let mut key_to_chain: std::collections::HashMap<(u32, u32), Vec<u32>> = Default::default();
+    for (slot, (_, lv, tf)) in chains.iter().enumerate() {
+        for (k, &id) in tf.iter().enumerate() {
+            if id == 0 || (k > 0 && ancestor_claims.get(&(*lv, id)).copied().unwrap_or(0) > 3) {
+                continue;
+            }
+            key_to_chain.entry((*lv, id)).or_default().push(slot as u32);
+        }
+    }
+    // One pass over the instances: an instance whose (lv, par) or (lv, par2) is a kept key
+    // belongs to those containers.
+    let mut hits: Vec<Vec<u32>> = vec![Vec::new(); chains.len()];
+    for (i, &(par, par2, lv)) in inst_ancestry.iter().enumerate() {
+        for id in [par, par2] {
+            if id == 0 {
+                continue;
+            }
+            if let Some(slots) = key_to_chain.get(&(lv, id)) {
+                for &s in slots {
+                    hits[s as usize].push(i as u32);
+                }
+            }
+        }
+    }
+    let mut out: Vec<(u32, [f32; 3], Vec<u32>)> = Vec::new();
+    let mut missed = 0usize;
+    for (slot, (ci, _, _)) in chains.iter().enumerate() {
+        let mut idxs = std::mem::take(&mut hits[slot]);
+        idxs.sort_unstable();
+        idxs.dedup();
+        if idxs.is_empty() {
+            missed += 1;
+            continue;
+        }
+        // Marker anchor = the MODEL's world center (mean of instance bounding-sphere centers) —
+        // the container's own pivot can sit hundreds of meters from the visible prop (DesignStuff
+        // scenes author verts in scene space with near-origin pivots).
+        let mut c = Vec3::ZERO;
+        for &i in &idxs {
+            let s = instances[i as usize].sphere;
+            c += Vec3::new(s[0], s[1], s[2]);
+        }
+        c /= idxs.len() as f32;
+        out.push((*ci, [c.x, c.y, c.z], idxs));
+    }
+    info!(
+        "loot-glow: {}/{} active containers ancestry-matched to scene models ({} instance refs); \
+         {missed} without a model keep their marker box",
+        out.len(),
+        chains.len(),
+        out.iter().map(|(_, _, v)| v.len()).sum::<usize>(),
+    );
+    out
+}
+
+/// True when a glass albedo's alpha channel is a COVERAGE mask (mostly fully-transparent texels)
+/// rather than packed smoothness. Strided sampling like `puddle_alpha_is_constant`; undecodable
+/// counts as smoothness (keep the streets-calibrated RFA behavior).
+fn glass_alpha_is_mask(path: &str) -> bool {
+    let Ok(img) = image::open(path) else {
+        return false;
+    };
+    let rgba = img.to_rgba8();
+    let (mut zero, mut n) = (0u32, 0u32);
+    for px in rgba.pixels().step_by(101) {
+        n += 1;
+        if px.0[3] < 26 {
+            zero += 1;
+        }
+    }
+    n > 0 && (zero as f32 / n as f32) > 0.4
 }
 
 fn load_albedo_texture(
@@ -6150,6 +6651,89 @@ struct EftDoors {
     instances_buf: Buffer,
 }
 
+/// Render-world half of the loot glow: the per-instance highlight lane bound at
+/// group(1) binding(2) of the draw pass, rewritten only when the main world's
+/// [`crate::loot::LootGlowState`] generation moves.
+#[derive(Resource)]
+struct EftLootGlow {
+    buffer: Buffer,
+    len: u32,
+    last_gen: u64,
+}
+
+/// Everything needed to REBUILD the draw bind group when the AO lane view changes (SSAO toggle,
+/// window resize) without re-running the map build. `bound_ao` tracks which live AO view is
+/// currently bound (`None` = the white fallback).
+#[derive(Resource)]
+struct EftDrawBgInputs {
+    instances: Buffer,
+    visible: Buffer,
+    loot_glow: Buffer,
+    bound_ao: Option<bevy::render::render_resource::TextureViewId>,
+}
+
+/// Swap the draw bind group's AO binding between the live SSAO lane and the white fallback as
+/// the toggle / target change. Runs after `prepare_ao_target` (ssao.rs chains it) so a fresh
+/// resize target is bound the same frame it appears.
+pub(crate) fn sync_draw_bg_ao(
+    mut commands: Commands,
+    device: Res<RenderDevice>,
+    settings: Option<Res<super::GfxSettings>>,
+    pipe: Option<Res<EftDrawPipeline>>,
+    ssao_pipe: Option<Res<super::ssao::SsaoPipeline>>,
+    ao: Option<Res<super::ssao::EftAoTarget>>,
+    inputs: Option<ResMut<EftDrawBgInputs>>,
+) {
+    let (Some(pipe), Some(ssao_pipe), Some(mut inputs)) = (pipe, ssao_pipe, inputs) else {
+        return;
+    };
+    let ssao_on = settings.map(|s| s.ssao).unwrap_or(false);
+    let live = ao.as_ref().and_then(|t| t.view.as_ref()).filter(|_| ssao_on);
+    let want = live.map(|v| v.id());
+    if want == inputs.bound_ao {
+        return;
+    }
+    let view = live.unwrap_or(&ssao_pipe.fallback_ao_view);
+    let bg = device.create_bind_group(
+        "eft_draw_bg",
+        &pipe.ssbo_layout,
+        &BindGroupEntries::with_indices((
+            (0, inputs.instances.as_entire_binding()),
+            (1, inputs.visible.as_entire_binding()),
+            (2, inputs.loot_glow.as_entire_binding()),
+            (
+                3,
+                bevy::render::render_resource::BindingResource::TextureView(view),
+            ),
+        )),
+    );
+    inputs.bound_ao = want;
+    commands.insert_resource(EftDrawBindGroup(bg));
+}
+
+/// Scatter the visible loot set into the highlight lane. Full-buffer rewrite (u32 per instance,
+/// ~370 KiB on ground_zero) on a GENERATION change only — toggle flips are user-rate events.
+fn prepare_loot_glow(
+    glow: Option<Res<crate::loot::LootGlowState>>,
+    res: Option<ResMut<EftLootGlow>>,
+    queue: Res<RenderQueue>,
+) {
+    let (Some(glow), Some(mut res)) = (glow, res) else {
+        return;
+    };
+    if glow.gen == res.last_gen {
+        return;
+    }
+    res.last_gen = glow.gen;
+    let mut lane = vec![0u32; res.len as usize];
+    for &(idx, packed) in &glow.entries {
+        if let Some(slot) = lane.get_mut(idx as usize) {
+            *slot = packed;
+        }
+    }
+    queue.write_buffer(&res.buffer, 0, bytemuck::cast_slice(&lane));
+}
+
 /// Main-world one-shot: the last world point a non-switch left click landed on (pick.rs writes it).
 /// A generation counter makes it a one-shot across the world boundary without a clear-back channel.
 #[derive(Resource, Clone, Default)]
@@ -7028,7 +7612,7 @@ struct EftShadowLabel;
 // pass — same shared buffers, different camera and targets.
 // ===========================================================================
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
-struct EftPrepassLabel;
+pub(crate) struct EftPrepassLabel;
 
 /// Per-frame: write the camera clip_from_world into the prepass uniform and (re)create the
 /// normal/depth targets when the view size changes. Sets `active` false whenever there is no

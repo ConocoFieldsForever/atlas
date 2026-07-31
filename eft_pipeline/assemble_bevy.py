@@ -94,9 +94,13 @@ VERTEX_ATTRS = [
 ]
 
 # instance stride padded to 80 (multiple of 16) so a WGSL storage-buffer read maps to
-# 3x vec4 (affine) + 2x vec4 (ids+flags+pad) with no straddling. The 3 trailing u32 are pad.
+# 3x vec4 (affine) + 2x vec4 (ids+flags+ancestry) with no straddling. The former 3 pad u32 now
+# carry the renderer's folded transform ancestry + level — the AUTHORITATIVE loot-glow join key
+# (gamedata containers record the same folded chain; the viewer intersects them, replacing the
+# name+radius guesses that lit decorative same-mesh neighbours and missed offset-pivot parts).
 IDT = np.dtype([('affine', '<f4', (12,)), ('meshId', '<u4'), ('lodGroup', '<i4'),
-                ('lodIndex', '<i4'), ('rootId', '<u4'), ('flags', '<u4'), ('_pad', '<u4', (3,))])
+                ('lodIndex', '<i4'), ('rootId', '<u4'), ('flags', '<u4'),
+                ('par', '<u4'), ('par2', '<u4'), ('lv', '<u4')])
 assert IDT.itemsize == 80
 INSTANCE_FIELDS = [
     {"name": "affine",   "fmt": "f32x12", "offset": 0,  "note": "ROW-MAJOR world 3x4 incl shear = apply_global(m)[:12]"},
@@ -105,7 +109,16 @@ INSTANCE_FIELDS = [
     {"name": "lodIndex", "fmt": "i32",    "offset": 56, "note": "scene lod.i, or -1"},
     {"name": "rootId",   "fmt": "u32",    "offset": 60, "note": "index into manifest.roots"},
     {"name": "flags",    "fmt": "u32",    "offset": 64},
+    {"name": "par",      "fmt": "u32",    "offset": 68, "note": "folded parent Transform id (0 = none)"},
+    {"name": "par2",     "fmt": "u32",    "offset": 72, "note": "folded grandparent Transform id (0 = none)"},
+    {"name": "lv",       "fmt": "u32",    "offset": 76, "note": "source scene level (folded ids are level-local)"},
 ]
+
+def _fold32(x):
+    """Fold a signed 64-bit Unity path_id to the u32 the pack carries (same expression on the
+    gamedata side, so the join keys agree). 0 stays 0 = 'no ancestor'."""
+    x = int(x or 0)
+    return int((x ^ (x >> 32)) & 0xFFFFFFFF)
 
 # instance flag bits
 FLAG_MIRROR  = 1 << 0   # det3(affine) < 0 -> renderer flips front-face / winding for this instance
@@ -332,6 +345,22 @@ class MaterialFactory:
             # / Standard). Referenced in place from tex/ like the normal; uploaded LINEAR (height=data).
             "parallax": self._parallax(sb),
         }
+        # LEGACY TRANSPARENT/REFLECTIVE/SPECULAR glass (glassTRS): the family's own response
+        # values, presence-gated so packs without the re-extract keep their exact old records.
+        # In this family tex.a is TRANSPARENCY x gloss — NOT smoothness — so the smA name-rule
+        # above must not stand for it (it painted bullet holes as dark smoothness spots and let
+        # a global reflection guess blow crumpled windshields out to white).
+        if sb.get('glassTRS'):
+            rec["glassTRS"] = True
+            rec["roughnessFromAlbedoAlpha"] = False
+            if sb.get('opacS') is not None:
+                rec["opacityScale"] = round(float(sb['opacS']), 4)
+            if sb.get('reflCol') is not None:
+                rec["reflectColor"] = [round(float(x), 6) for x in sb['reflCol']]
+            if sb.get('specCol') is not None:
+                rec["specColor"] = [round(float(x), 6) for x in sb['specCol']]
+            if sb.get('shin') is not None:
+                rec["shininess"] = round(float(sb['shin']), 4)
         return rec
 
     def _parallax(self, sb):
@@ -842,7 +871,8 @@ def main():
             if det3(mg) < 0.0: flags |= FLAG_MIRROR         # renderer flips winding; we do NOT bake
             if is_terrain: flags |= FLAG_TERRAIN
             L = it.get('lod'); lg, li = (L['g'], L['i']) if L else (-1, -1)
-            inst_records.append((list(mg[:12]), meshId, int(lg), int(li), rid(it.get('root') or ''), flags))
+            inst_records.append((list(mg[:12]), meshId, int(lg), int(li), rid(it.get('root') or ''), flags,
+                                 _fold32(it.get('par')), _fold32(it.get('par2')), int(it.get('lv') or 0)))
             upd_bounds(corners @ M3.T + T)
 
         if gi % 2000 == 0:
@@ -873,7 +903,7 @@ def main():
                             "_idxLocal": idx_off_local, "idxCount": int(len(mesh_idx)),
                             "submeshes": submeshes})
         identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-        inst_records.append((identity, meshId, -1, -1, 0, FLAG_BAKED))
+        inst_records.append((identity, meshId, -1, -1, 0, FLAG_BAKED, 0, 0, 0))
         utris += len(mesh_idx) // 3
         print(f"[bevy] degenerate fallback: baked {n_baked} rank-deficient instances -> 1 world mesh "
               f"({len(submeshes)} submeshes)")
@@ -887,9 +917,10 @@ def main():
 
     # ---- write instances.bin ---------------------------------------------------------------------------------
     ia = np.zeros(len(inst_records), IDT)
-    for i, (aff, mid, lg, li, rt, fl) in enumerate(inst_records):
+    for i, (aff, mid, lg, li, rt, fl, pr, pr2, lvv) in enumerate(inst_records):
         ia['affine'][i] = aff; ia['meshId'][i] = mid; ia['lodGroup'][i] = lg
         ia['lodIndex'][i] = li; ia['rootId'][i] = rt; ia['flags'][i] = fl
+        ia['par'][i] = pr; ia['par2'][i] = pr2; ia['lv'][i] = lvv
     with open(os.path.join(OUT, 'instances.bin'), 'wb') as fh:
         fh.write(ia.tobytes())
 

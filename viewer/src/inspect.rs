@@ -220,7 +220,11 @@ fn pick_markers(
     place: Res<crate::pathfind::PlaceMode>,
     windows: Query<&Window, With<PrimaryWindow>>,
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
-    markers: Query<(Entity, &GlobalTransform, &PickRadius, &ViewVisibility, &MarkerInfo)>,
+    // InheritedVisibility, NOT ViewVisibility: loot markers whose container glows its scene
+    // MODEL carry no mesh of their own, and Bevy only ever raises ViewVisibility on renderable
+    // entities — the old gate made every glowing container unclickable. Inherited reflects the
+    // layer-panel Visibility chain, which is the semantic "is this marker on" signal.
+    markers: Query<(Entity, &GlobalTransform, &PickRadius, &InheritedVisibility, &MarkerInfo)>,
     mut open: ResMut<OpenCards>,
 ) {
     if !mouse.just_pressed(MouseButton::Left) || pointer_on_ui.0 {
@@ -246,11 +250,11 @@ fn pick_markers(
     let ro: Vec3 = ray.origin;
     let rd: Vec3 = *ray.direction; // unit world direction
 
-    // Nearest ray_sphere hit among markers whose layer is toggled ON and on-screen
-    // (ViewVisibility is the resolved bool — NOT `Visibility`, which can be Inherited).
+    // Nearest ray_sphere hit among markers whose layer is toggled ON (the resolved parent-chain
+    // bool; render-side ViewVisibility would drop the mesh-less glow markers entirely).
     let mut best: Option<(Entity, f32)> = None;
-    for (e, tf, radius, view_vis, _info) in &markers {
-        if !view_vis.get() {
+    for (e, tf, radius, vis, _info) in &markers {
+        if !vis.get() {
             continue;
         }
         if let Some(t) = ray_sphere(ro, rd, tf.translation(), radius.0) {
@@ -426,7 +430,7 @@ fn debug_autoselect(
     mut frame: Local<u32>,
     mut done: Local<bool>,
     cameras: Query<(&Camera, &GlobalTransform), With<CullCamera>>,
-    markers: Query<(Entity, &GlobalTransform, &ViewVisibility), With<MarkerInfo>>,
+    markers: Query<(Entity, &GlobalTransform, &InheritedVisibility), With<MarkerInfo>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut open: ResMut<OpenCards>,
 ) {
