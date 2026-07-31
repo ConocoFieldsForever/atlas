@@ -64,16 +64,37 @@ def trs(d):
 
 
 class Bundle:
-    """One item prefab bundle: its transform tree, renderers, and named slot nodes."""
+    """One item prefab bundle: its transform tree, renderers, and named slot nodes.
+
+    A container bundle holds the PREFAB (GameObjects/Transforms/MeshFilters) but its meshes live
+    in sibling asset bundles — the MeshFilter PPtrs carry m_FileID > 0 and the AssetBundle lists
+    CAB dependencies. Loading the folder's sibling bundles into the SAME UnityPy Environment
+    resolves them; the vertex/index data then needs MeshHandler (the streams are not in the
+    typetree), exactly like skin.py reads skinned meshes.
+    """
 
     def __init__(self, path):
-        self.env = UnityPy.load(path)
+        self.env = UnityPy.Environment()
+        folder = os.path.dirname(path)
+        # Siblings first so the container's cross-bundle PPtrs resolve on load.
+        for sib in sorted(os.listdir(folder)):
+            if sib.endswith(".bundle") and os.path.join(folder, sib) != path:
+                try:
+                    self.env.load_file(os.path.join(folder, sib))
+                except Exception:
+                    pass
+        # Objects from the CONTAINER file only: the siblings were loaded purely to resolve
+        # cross-bundle mesh PPtrs, and walking their renderers too baked every other weapon in
+        # client_assets.bundle into the merge (5.7M verts, 2,499 materials for one rifle).
+        before = {id(o) for o in self.env.objects}
+        self.env.load_file(path)
+        own = [o for o in self.env.objects if id(o) not in before]
         self.tf = {}        # transform pid -> (typetree, go pid)
         self.children = {}  # transform pid -> [child transform pid]
         self.go_name = {}
         self.go2tf = {}
         self.renderers = []  # (go pid, MeshRenderer/SkinnedMeshRenderer object)
-        for o in self.env.objects:
+        for o in own:
             t = o.type.name
             if t == "Transform":
                 d = o.read_typetree()
@@ -143,25 +164,45 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names):
             mats = list(getattr(r, "m_Materials", []) or [])
         except Exception:
             continue
-        verts = getattr(mesh, "m_Vertices", None)
+        # MeshHandler decodes the vertex/index STREAMS; the typetree attributes are empty for
+        # these bundles (m_Vertices == []), which is why a raw read assembled nothing.
+        try:
+            from UnityPy.helpers.MeshHelper import MeshHandler
+            h = MeshHandler(mesh)
+            h.process()
+        except Exception as e:
+            print(f"  [skip] mesh decode failed: {str(e)[:60]}")
+            continue
+        verts = h.m_Vertices
         if not verts:
             continue
-        n = len(verts) // 3
-        P = np.array(verts, np.float64).reshape(n, 3)
+        # MeshHandler returns either a FLAT float list or a list of 3-vectors depending on the
+        # source layout — normalise to (N, 3) rather than assuming one shape.
+        P = np.asarray(verts, np.float64)
+        P = P.reshape(-1, 3) if P.ndim == 1 else P[:, :3]
+        n = P.shape[0]
         P = (M[:3, :3] @ P.T).T + M[:3, 3]
         P = (G3 @ P.T).T                              # viewer conjugation
-        nrm = getattr(mesh, "m_Normals", None)
-        N = (np.array(nrm, np.float64).reshape(-1, 3) if nrm and len(nrm) == len(verts)
-             else np.tile([0.0, 1.0, 0.0], (n, 1)))
+        nrm = h.m_Normals
+        if nrm:
+            N = np.asarray(nrm, np.float64)
+            N = N.reshape(-1, 3) if N.ndim == 1 else N[:, :3]
+            N = N[:n] if N.shape[0] >= n else np.tile([0.0, 1.0, 0.0], (n, 1))
+        else:
+            N = np.tile([0.0, 1.0, 0.0], (n, 1))
         N = (G3 @ (M[:3, :3] @ N.T)).T
-        uv = getattr(mesh, "m_UV0", None) or getattr(mesh, "m_UV", None)
-        UV = (np.array(uv, np.float64).reshape(-1, 2) if uv and len(uv) >= 2 * n
-              else np.zeros((n, 2)))
+        uv = getattr(h, "m_UV0", None) or getattr(h, "m_UV1", None)
+        if uv:
+            UV = np.asarray(uv, np.float64)
+            UV = UV.reshape(-1, 2) if UV.ndim == 1 else UV[:, :2]
+            UV = UV[:n] if UV.shape[0] >= n else np.zeros((n, 2))
+        else:
+            UV = np.zeros((n, 2))
         base = len(out_v)
         for i in range(n):
             out_v.append((P[i], N[i], UV[i]))
         # submeshes: one per material, so per-part materials survive the merge
-        idx = list(getattr(mesh, "m_Indices", []) or [])
+        idx = list(h.m_IndexBuffer or [])
         subs = getattr(mesh, "m_SubMeshes", []) or []
         for si, sm in enumerate(subs):
             first = int(getattr(sm, "firstByte", 0)) // 2 if getattr(sm, "indexCount", None) else 0
