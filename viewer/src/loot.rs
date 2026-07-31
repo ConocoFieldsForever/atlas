@@ -29,11 +29,20 @@ impl Plugin for LootPlugin {
         // Rebuild the loot overlay on each MapEpoch (initial epoch-0 insert included), despawning
         // the old map's markers first. Despawn is UNCONDITIONAL (chained before spawn_loot, which
         // has early-returns): a new pack may have no loot.json, so its markers must clear regardless.
-        app.add_systems(
+        // Also re-run when the container->model match lands (LootModelIndex arrives AFTER the async
+        // geometry build), so markers upgrade from box to model-glow without a map swap.
+        app.init_resource::<LootGlowState>().add_systems(
             Update,
             (teardown_loot, spawn_loot)
                 .chain()
                 .run_if(loot_needs_rebuild),
+        );
+        // Mirror the overlay's effective per-marker visibility into the glow lane AFTER the panel
+        // logic ran — every rule (master toggle, class filters, min-value, dense clustering)
+        // transfers to the model glow without a second implementation.
+        app.add_systems(
+            Update,
+            update_loot_glow.after(crate::ui::apply_loot_visibility),
         );
     }
 }
@@ -41,8 +50,80 @@ impl Plugin for LootPlugin {
 fn loot_needs_rebuild(
     epoch: Res<crate::render::MapEpoch>,
     pack: Option<Res<LoadedPack>>,
+    index: Option<Res<LootModelIndex>>,
 ) -> bool {
-    epoch.is_changed() || pack.is_some_and(|p| p.is_added())
+    epoch.is_changed()
+        || pack.is_some_and(|p| p.is_added())
+        || index.is_some_and(|i| i.is_changed())
+}
+
+/// Container -> GPU-instance match, built by the geometry blob build (`match_loot_models` in
+/// gpu_driven.rs, prefab-ancestry join) and inserted as a slim persistent copy — the blob itself
+/// is dropped after upload. Entries: (gamedata container index, model-center world pos, GPU
+/// instances of every part + LOD shell).
+#[derive(Resource, Default)]
+pub struct LootModelIndex {
+    pub models: Vec<(u32, [f32; 3], Vec<u32>)>,
+}
+
+/// The GPU instances a loot marker's MODEL occupies (all parts + LOD shells). Present only on
+/// markers that matched a scene model — those spawn without the cuboid and glow instead.
+#[derive(Component)]
+pub struct GlowInstances(pub Vec<u32>);
+
+/// The marker's class colour packed for the glow lane (bits 0..23 = RGB8).
+#[derive(Component)]
+pub struct GlowColor(pub u32);
+
+/// Cross-world glow state: (gpu instance, packed colour+phase+enable) for every VISIBLE matched
+/// marker. `gen` bumps only on real change, so the render world rewrites its lane at user rate.
+#[derive(Resource, Default, Clone)]
+pub struct LootGlowState {
+    pub entries: Vec<(u32, u32)>,
+    pub gen: u64,
+}
+
+impl bevy::render::extract_resource::ExtractResource for LootGlowState {
+    type Source = LootGlowState;
+    fn extract_resource(s: &Self) -> Self {
+        s.clone()
+    }
+}
+
+/// Compose the glow lane from the markers the panel decided to SHOW. Runs after
+/// `apply_loot_visibility`, so its Visibility verdict is this frame's truth. Gated on actual
+/// Visibility flips (that system writes only on a real change) + marker spawns, so the compose
+/// runs at user rate, not per frame.
+pub(crate) fn update_loot_glow(
+    mut state: ResMut<LootGlowState>,
+    changed: Query<
+        (),
+        (
+            With<LootMarker>,
+            Or<(Changed<Visibility>, Added<GlowInstances>)>,
+        ),
+    >,
+    q: Query<(&GlowInstances, &GlowColor, &Visibility), With<LootMarker>>,
+) {
+    if changed.is_empty() {
+        return;
+    }
+    let mut entries: Vec<(u32, u32)> = Vec::new();
+    for (gi, col, vis) in &q {
+        if *vis == Visibility::Hidden {
+            continue;
+        }
+        for &idx in &gi.0 {
+            // col.0 already carries the phase nibble (per CONTAINER, so body+lid pulse together).
+            entries.push((idx, 0x8000_0000 | col.0));
+        }
+    }
+    entries.sort_unstable();
+    entries.dedup();
+    if entries != state.entries {
+        state.entries = entries;
+        state.gen = state.gen.wrapping_add(1);
+    }
 }
 
 /// In-place map swap: despawn every loot marker so `spawn_loot` rebuilds for the new pack (freeing
@@ -98,12 +179,23 @@ pub struct LootTime(pub f32);
 #[derive(Component, Clone, Copy)]
 pub struct SpawnChance(pub f32);
 
-/// Container spawn odds from gamedata.json, as (position, probability).
-///
-/// Joined to the priced loot.json containers BY POSITION: the two sets come from different sources
-/// (823 priced entries vs 907 typed ones on interchange) and share no id, but both are already in
-/// viewer space, so the nearest typed container within a tight radius is the same object.
-fn load_group_odds(pack_root: Option<&std::path::Path>) -> Vec<(Vec3, f32)> {
+/// One LootableContainer as the GAME ships it (gamedata.json — the authoritative overlay
+/// driver). `idx` is its position in the file's containers array: the same index
+/// `LootModelIndex` keys its ancestry-matched model instances on.
+struct GdContainer {
+    idx: u32,
+    pos: Vec3,
+    /// The game's own container template name ("Weapon box", "Drawer", ...).
+    tpl_name: String,
+    /// The game's per-area spawn odds (LootableContainersGroup), when grouped.
+    grp_p: Option<f32>,
+}
+
+/// Every ACTIVE LootableContainer from the pack's gamedata.json — the authoritative set the
+/// overlay spawns from. tarkov.dev's loot.json only ENRICHES these (prices/classes); it can no
+/// longer add or subtract a marker (its stale entries were both missing real containers and
+/// placing ghosts).
+fn load_gamedata_containers(pack_root: Option<&std::path::Path>) -> Vec<GdContainer> {
     let Some(root) = pack_root else { return Vec::new() };
     let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
         return Vec::new();
@@ -112,24 +204,34 @@ fn load_group_odds(pack_root: Option<&std::path::Path>) -> Vec<(Vec3, f32)> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for c in v.get("containers").and_then(|c| c.as_array()).unwrap_or(&Vec::new()) {
-        let (Some(p), Some(pos)) = (
-            c.get("grp_p").and_then(|x| x.as_f64()),
-            c.get("pos").and_then(|x| x.as_array()),
-        ) else {
-            continue;
-        };
-        if pos.len() < 3 {
+    for (idx, c) in v
+        .get("containers")
+        .and_then(|c| c.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .enumerate()
+    {
+        if !c.get("active").and_then(|a| a.as_bool()).unwrap_or(true) {
             continue;
         }
-        out.push((
-            Vec3::new(
+        let Some(pos) = c.get("pos").and_then(|x| x.as_array()).filter(|p| p.len() >= 3) else {
+            continue;
+        };
+        out.push(GdContainer {
+            idx: idx as u32,
+            pos: Vec3::new(
                 pos[0].as_f64().unwrap_or(0.0) as f32,
                 pos[1].as_f64().unwrap_or(0.0) as f32,
                 pos[2].as_f64().unwrap_or(0.0) as f32,
             ),
-            p as f32,
-        ));
+            tpl_name: c
+                .get("tpl_name")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string(),
+            grp_p: c.get("grp_p").and_then(|x| x.as_f64()).map(|p| p as f32),
+        });
     }
     out
 }
@@ -197,37 +299,36 @@ pub(crate) fn spawn_loot(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     pack: Option<Res<LoadedPack>>,
+    model_index: Option<Res<LootModelIndex>>,
 ) {
-    let Some(path) = resolve_loot_json(pack.as_ref().map(|lp| lp.0.root.as_path())) else {
-        warn!(
-            "loot: no loot.json found (set EFT_LOOT_JSON, or drop loot.json next to the .eftpack) — no loot overlay"
-        );
+    // AUTHORITATIVE set: the game's own LootableContainers from the pack's gamedata. tarkov.dev
+    // (loot.json) is loaded below as optional ENRICHMENT only — it prices and classifies, it
+    // never adds or removes a marker (its stale entries both missed real containers and placed
+    // ghosts, e.g. the streets weapon-box stack).
+    let gd = load_gamedata_containers(pack.as_ref().map(|lp| lp.0.root.as_path()));
+    if gd.is_empty() {
+        warn!("loot: pack has no gamedata containers — no loot overlay");
         return;
-    };
-    let txt = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) => {
-            warn!("loot: {} unreadable ({e}) — no loot overlay", path.display());
-            return;
-        }
-    };
-    let lf: LootFile = match serde_json::from_str(&txt) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("loot: parse failed: {e}");
-            return;
-        }
-    };
+    }
+    let lf: Option<LootFile> = resolve_loot_json(pack.as_ref().map(|lp| lp.0.root.as_path()))
+        .and_then(|path| match std::fs::read_to_string(&path) {
+            Ok(t) => match serde_json::from_str::<LootFile>(&t) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    warn!("loot: {} parse failed ({e}) — markers unpriced", path.display());
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("loot: {} unreadable ({e}) — markers unpriced", path.display());
+                None
+            }
+        });
 
-    // Candidate map keys derived from the pack (never a hardcoded literal): the
-    // exact `dataset`, then its version-suffix-stripped base name — the pack dir is
-    // named e.g. "interchange_v2" while build_loot.py keys by the canonical
-    // tarkov.dev map "interchange". First matching candidate wins; with no pack (or
-    // no match) fall back to the sole map if the file is unambiguous.
+    // Enrichment map key: canonical map id first, dataset dir basename + `_vN` strip as
+    // fallbacks for older packs (the pack dir is "interchange_v2", tarkov.dev keys "interchange").
     let mut keys: Vec<String> = Vec::new();
     if let Some(p) = pack.as_ref() {
-        // Canonical map id FIRST (the stable join key build_loot.py keys on); the dataset dir basename
-        // + `_vN` strip stay as fallbacks for older packs that predate the `map` manifest field.
         let m = &p.0.manifest.map;
         if !m.is_empty() {
             keys.push(m.clone());
@@ -240,121 +341,206 @@ pub(crate) fn spawn_loot(
             }
         }
     }
-    let resolved = keys
-        .iter()
-        .find_map(|k| lf.maps.get(k).map(|m| (k.clone(), m)))
-        .or_else(|| {
-            (lf.maps.len() == 1)
-                .then(|| lf.maps.iter().next().map(|(k, m)| (k.clone(), m)))
-                .flatten()
-        });
-    let Some((map_key, ml)) = resolved else {
-        warn!(
-            "loot: pack dataset {:?} matched no map in {} (have: {:?})",
-            pack.as_ref().map(|p| p.0.manifest.dataset.as_str()),
-            path.display(),
-            lf.maps.keys().collect::<Vec<_>>()
-        );
-        return;
-    };
+    let ml: Option<&MapLoot> = lf.as_ref().and_then(|f| {
+        keys.iter()
+            .find_map(|k| f.maps.get(k))
+            .or_else(|| (f.maps.len() == 1).then(|| f.maps.values().next()).flatten())
+    });
 
-    // The game's own per-area spawn odds, joined to the priced containers below by position.
-    let group_odds = load_group_odds(pack.as_ref().map(|lp| lp.0.root.as_path()));
-    let mut n_grouped = 0usize;
+    // Per-TYPE stats from the enrichment set: a container whose position has no tarkov.dev twin
+    // (jittered or missing entry) still gets its type's class/value/search figures by joining on
+    // the game's OWN template name ("Weapon box" matches "Weapon box (5x2)").
+    struct TypeAgg {
+        cls: String,
+        evs: Vec<i64>,
+        spawn: (f32, u32),
+        t: (f32, u32),
+    }
+    let mut by_type: HashMap<String, TypeAgg> = HashMap::new();
+    if let Some(ml) = ml {
+        for c in &ml.containers {
+            let key = c.type_.to_ascii_lowercase();
+            let a = by_type.entry(key).or_insert_with(|| TypeAgg {
+                cls: c.cls.clone(),
+                evs: Vec::new(),
+                spawn: (0.0, 0),
+                t: (0.0, 0),
+            });
+            if c.ev > 0 {
+                a.evs.push(c.ev);
+            }
+            if c.spawn > 0.0 {
+                a.spawn.0 += c.spawn;
+                a.spawn.1 += 1;
+            }
+            if let Some(t) = c.t {
+                a.t.0 += t;
+                a.t.1 += 1;
+            }
+        }
+        for a in by_type.values_mut() {
+            a.evs.sort_unstable();
+        }
+    }
+
+    // Model matches keyed by gamedata container index (the authoritative ancestry join).
+    let models: HashMap<u32, (&[f32; 3], &Vec<u32>)> = model_index
+        .as_ref()
+        .map(|ix| {
+            ix.models
+                .iter()
+                .map(|(ci, p, ids)| (*ci, (p, ids)))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let unit_cube = meshes.add(Cuboid::new(1.0, 1.0, 1.0));
     let mut mats: HashMap<String, Handle<StandardMaterial>> = HashMap::new();
-    for c in &ml.containers {
-        let (color, half) = class_look(&c.cls);
-        let mat = mats
-            .entry(c.cls.clone())
-            .or_insert_with(|| {
-                let l = color.to_linear();
-                materials.add(StandardMaterial {
-                    base_color: color,
-                    // self-lit so the container never vanishes in a dark aisle
-                    emissive: LinearRgba::new(l.red * 0.7, l.green * 0.7, l.blue * 0.7, 1.0),
-                    perceptual_roughness: 0.85,
-                    ..default()
+    let mut claimed = ml.map(|m| vec![false; m.containers.len()]).unwrap_or_default();
+    let (mut n_grouped, mut n_model, mut n_priced) = (0usize, 0usize, 0usize);
+    for gc in &gd {
+        // Positional twin ≤ 2 m for THIS container's pivot (both sources record the component
+        // pivot, so they agree even when the visible model sits meters away).
+        let twin = ml.and_then(|m| {
+            m.containers
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    (i, Vec3::new(c.pos[0], c.pos[1], c.pos[2]).distance_squared(gc.pos), c)
                 })
-            })
-            .clone();
-        // Card copy: title from the human `type` (fall back to the title-cased class),
-        // value/spawn-chance details only when present.
-        let title = if c.type_.is_empty() {
-            titlecase(&c.cls)
-        } else {
-            c.type_.clone()
+                .filter(|(_, d, _)| *d <= 4.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+        });
+        let (cls, title, ev, spawn_avg, t_est) = match twin {
+            Some((i, _, c)) => {
+                if let Some(slot) = claimed.get_mut(i) {
+                    *slot = true;
+                }
+                n_priced += 1;
+                let title = if c.type_.is_empty() {
+                    titlecase(&c.cls)
+                } else {
+                    c.type_.clone()
+                };
+                (c.cls.clone(), title, c.ev, c.spawn, c.t)
+            }
+            None => match by_type
+                .iter()
+                .find(|(ty, _)| ty.starts_with(&gc.tpl_name.to_ascii_lowercase()) && !gc.tpl_name.is_empty())
+                .map(|(_, a)| a)
+            {
+                Some(a) => {
+                    n_priced += 1;
+                    let ev = a.evs.get(a.evs.len() / 2).copied().unwrap_or(0);
+                    let spawn = if a.spawn.1 > 0 { a.spawn.0 / a.spawn.1 as f32 } else { 0.0 };
+                    let t = (a.t.1 > 0).then(|| a.t.0 / a.t.1 as f32);
+                    (a.cls.clone(), gc.tpl_name.clone(), ev, spawn, t)
+                }
+                // Unpriced: the game says it's lootable; show it honestly with type only.
+                None => ("crate".to_string(), gc.tpl_name.clone(), 0, 0.0, None),
+            },
         };
-        // Spawn odds: the GAME's per-group figure when this container matches a typed one,
-        // else loot.json's per-type average. 0.75 m: containers are metre-scale and the two
-        // sources agree closely, so a tight radius avoids binding to a neighbour on a shelf.
-        let gpos = Vec3::new(c.pos[0], c.pos[1], c.pos[2]);
-        let group_p = group_odds
-            .iter()
-            .filter(|(p, _)| p.distance_squared(gpos) <= 0.75 * 0.75)
-            .min_by(|a, b| {
-                a.0.distance_squared(gpos).total_cmp(&b.0.distance_squared(gpos))
-            })
-            .map(|(_, p)| *p);
-        let spawn_p = group_p.unwrap_or(if c.spawn > 0.0 { c.spawn } else { 1.0 }).clamp(0.0, 1.0);
-        if group_p.is_some() {
+        let (color, half) = class_look(&cls);
+        // The game's own per-area odds beat every estimate; type average is the fallback.
+        let spawn_p = gc.grp_p.unwrap_or(if spawn_avg > 0.0 { spawn_avg } else { 1.0 }).clamp(0.0, 1.0);
+        if gc.grp_p.is_some() {
             n_grouped += 1;
         }
         let mut detail = Vec::new();
-        if c.ev > 0 {
-            detail.push(format!("Value  {}", money(c.ev)));
+        if ev > 0 {
+            detail.push(format!("Value  {}", money(ev)));
             // Expected value is what actually decides a route; show it next to the raw worth.
-            detail.push(format!("Expected  {}", money((c.ev as f32 * spawn_p) as i64)));
+            detail.push(format!("Expected  {}", money((ev as f32 * spawn_p) as i64)));
         }
         if spawn_p > 0.0 {
             detail.push(format!(
                 "Spawn {:.0}%{}",
                 spawn_p * 100.0,
-                if group_p.is_some() { " (this area)" } else { "" }
+                if gc.grp_p.is_some() { " (this area)" } else { "" }
             ));
         }
-        let search_s = c.t.unwrap_or(7.0).max(0.0);
+        let search_s = t_est.unwrap_or(7.0).max(0.0);
         detail.push(format!("Search ~{search_s:.0}s"));
-        // Bounding sphere of the scaled cube (half-diagonal of the full extent),
-        // clamped up so small markers stay easy to click.
+        // Marker anchor: the MODEL's center when matched (the container pivot can sit far from
+        // the visible prop in DesignStuff scenes), else the container pivot.
+        let glow = models.get(&gc.idx);
+        let anchor = glow
+            .map(|(p, _)| Vec3::from(**p))
+            .unwrap_or(gc.pos + Vec3::Y * half.y);
+        if glow.is_some() {
+            n_model += 1;
+        }
         let pick_r = ((half * 2.0).length() * 0.5).max(0.9);
-        // pos is the container's floor point; lift by half-height so the box sits ON the floor.
-        commands.spawn((
-            Mesh3d(unit_cube.clone()),
-            MeshMaterial3d(mat),
-            Transform::from_xyz(c.pos[0], c.pos[1] + half.y, c.pos[2]).with_scale(half * 2.0),
+        let mut e = commands.spawn((
+            Transform::from_translation(anchor).with_scale(half * 2.0),
+            Visibility::default(),
             LootMarker,
-            LootClass(c.cls.clone()),
+            LootClass(cls.clone()),
             // The ev estimate feeds the panel's min-value filter (0 = no estimate, hides under
             // an active filter).
-            MarkerValue(c.ev),
+            MarkerValue(ev),
             SpawnChance(spawn_p),
             LootTime(search_s),
             crate::poi::DenseMarker,
             PickRadius(pick_r),
             MarkerInfo {
                 title,
-                subtitle: format!("Loot \u{00B7} {}", c.cls),
+                subtitle: format!("Loot \u{00B7} {cls}"),
                 detail,
                 accent: color,
             },
         ));
+        match glow {
+            Some((_, ids)) => {
+                // Phase rides the CONTAINER index so every part of one prop (body + lid + LOD
+                // shells) breathes in unison while neighbours stay out of step.
+                let l = color.to_linear();
+                let packed = ((gc.idx % 16) << 24)
+                    | ((l.red * 255.0) as u32) << 16
+                    | ((l.green * 255.0) as u32) << 8
+                    | (l.blue * 255.0) as u32;
+                e.insert((GlowInstances((*ids).clone()), GlowColor(packed)));
+            }
+            None => {
+                // No ancestry-matched model (pre-capture pack, or a model-less stash): honest box.
+                let mat = mats
+                    .entry(cls.clone())
+                    .or_insert_with(|| {
+                        let l = color.to_linear();
+                        materials.add(StandardMaterial {
+                            base_color: color,
+                            // self-lit so the container never vanishes in a dark aisle
+                            emissive: LinearRgba::new(l.red * 0.7, l.green * 0.7, l.blue * 0.7, 1.0),
+                            perceptual_roughness: 0.85,
+                            ..default()
+                        })
+                    })
+                    .clone();
+                e.insert((Mesh3d(unit_cube.clone()), MeshMaterial3d(mat)));
+            }
+        }
     }
+    let orphans = claimed.iter().filter(|c| !**c).count();
     info!(
-        "loot: {} container markers spawned from {} (map '{}', {} classes); {} matched the game's \
-         per-area spawn odds, {} fell back to the per-type average",
-        ml.containers.len(),
-        path.display(),
-        map_key,
-        mats.len(),
+        "loot: {} markers from the pack's OWN containers; {} glow their model, {} boxed; \
+         {} priced ({} via positional twin), {} area-odds; {} stale tarkov.dev entries dropped{}",
+        gd.len(),
+        n_model,
+        gd.len().saturating_sub(n_model),
+        n_priced,
+        claimed.iter().filter(|c| **c).count(),
         n_grouped,
-        ml.containers.len().saturating_sub(n_grouped)
+        orphans,
+        if model_index.is_none() {
+            " — model index not built yet; markers respawn when it lands"
+        } else {
+            ""
+        },
     );
 }
 
 #[derive(Component)]
-struct LootMarker;
+pub(crate) struct LootMarker;
 
 /// The loot class of a marker ("weapon"/"medical"/…), so the layer panel can filter by class.
 #[derive(Component)]

@@ -1,12 +1,14 @@
-// eft::ssao — depth-only screen-space ambient occlusion (Graphics (experimental) toggle).
+// eft::ssao — SSAO as a PRE-MAIN AO LANE (Graphics (experimental) toggle).
 //
-// The custom GPU-driven path renders no normal prepass, so this is CLASSIC depth-reconstructed
-// SSAO: view-space position from the (multisampled, reverse-z) depth buffer, face normal from
-// neighboring texels, a per-pixel-rotated spiral of range-checked horizon taps, then a MULTIPLY
-// onto the scene color. Runs between the main pass and Bloom, so the grade LUT tonemaps the
-// occluded color like everything else. Physically it darkens *all* light (not just ambient) —
-// the classic SSAO approximation; intensity is UI-tunable and the whole pass is off by default.
+// Runs AFTER the normal/depth prepass and BEFORE the main pass, writing an R8 occlusion factor
+// the main pass samples during OPAQUE shading (ambient + lamp diffuse). This replaces the old
+// post-multiply over the finished frame, which darkened every pixel by the occlusion of whatever
+// the PREPASS saw there — glass is excluded from the prepass, so a pane was darkened by the AO of
+// the interior BEHIND it (the "SSAO through glass" bug). As a lane, BLEND surfaces simply don't
+// sample it (ao = 1), and AO correctly scales only the ambient terms instead of sun + emissive.
 //
+// Positions reconstruct from the prepass 1x depth (reverse-z, cleared to 0 = sky); normals come
+// from the prepass target with a per-pixel derivative fallback where it wrote none (blend/grass).
 // Distance fade (p.w) keeps AO out of the fog band — far geometry is haze-lit, not crevice-lit.
 
 struct SsaoParams {
@@ -16,17 +18,15 @@ struct SsaoParams {
     view_from_world: mat4x4<f32>,
     // x = world radius (m), y = intensity, z = power, w = fade-end view distance (m)
     p: vec4<f32>,
-    // x,y = viewport px, z = proj11 (1/tan(fov_y/2)), w = 1 when the normal prepass is ACTIVE
+    // x,y = viewport px, z = proj11 (1/tan(fov_y/2)), w = reserved
     vp: vec4<f32>,
 };
 
-@group(0) @binding(0) var scene_tex: texture_2d<f32>;
-@group(0) @binding(1) var scene_samp: sampler;
-@group(0) @binding(2) var depth_tex: texture_depth_multisampled_2d;
-// The normal prepass target (world normal.xyz + roughness.w). When the prepass is off this binds a
-// 1x1 zero texture and vp.w = 0 — every pixel then falls back to the derivative reconstruction.
-@group(0) @binding(3) var normal_tex: texture_2d<f32>;
-@group(0) @binding(4) var<uniform> ao: SsaoParams;
+@group(0) @binding(0) var depth_tex: texture_depth_2d;   // prepass depth (1x, reverse-z, 0 = sky)
+// The prepass normal target (world normal.xyz + class/roughness.w). Zero where the prepass wrote
+// nothing (sky / blend / grass) — those pixels take the derivative fallback below.
+@group(0) @binding(1) var normal_tex: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> ao: SsaoParams;
 
 struct FsIn {
     @builtin(position) clip: vec4<f32>,
@@ -42,7 +42,7 @@ fn vs_fullscreen(@builtin(vertex_index) vid: u32) -> FsIn {
     return out;
 }
 
-// View-space position of a pixel (sample 0 of the MSAA depth — AO is a low-frequency term).
+// View-space position of a pixel from the prepass depth.
 fn view_pos_at(px: vec2<i32>, dims: vec2<i32>) -> vec3<f32> {
     let c = clamp(px, vec2<i32>(0), dims - 1);
     let d = textureLoad(depth_tex, c, 0);
@@ -62,25 +62,23 @@ const TAPS: i32 = 10;
 
 @fragment
 fn fs_ssao(in: FsIn) -> @location(0) vec4<f32> {
-    let color = textureSampleLevel(scene_tex, scene_samp, in.uv, 0.0);
     let dims = vec2<i32>(textureDimensions(depth_tex));
     let px = vec2<i32>(in.clip.xy);
 
     let d0 = textureLoad(depth_tex, clamp(px, vec2<i32>(0), dims - 1), 0);
     if (d0 <= 1e-7) { // reverse-z far plane = sky: nothing to occlude
-        return color;
+        return vec4<f32>(1.0, 0.0, 0.0, 1.0);
     }
     let P = view_pos_at(px, dims);
-    // REAL surface normal from the prepass when it ran and wrote this pixel; derivative face
-    // normal otherwise. The prepass clears to zero, so sky / blend surfaces / the excluded grass
-    // read (0,0,0) and take the fallback — one code path, per-pixel choice. This is the upgrade
-    // the prepass exists for: the derivative normal facets on curves and halos at silhouettes
-    // because neighbouring texels straddle depth edges; the rasterized normal does neither.
+    // REAL surface normal from the prepass when it wrote this pixel; derivative face normal
+    // otherwise (the prepass clears to zero, so sky / blend surfaces / the excluded grass read
+    // (0,0,0) and take the fallback — one code path, per-pixel choice). The rasterized normal
+    // neither facets on curves nor halos at silhouettes like the derivative one does.
     var N: vec3<f32>;
     let ndims = vec2<i32>(textureDimensions(normal_tex));
     let npx = clamp(px, vec2<i32>(0), ndims - 1);
     let nr = textureLoad(normal_tex, npx, 0);
-    if (ao.vp.w > 0.5 && dot(nr.xyz, nr.xyz) > 0.1) {
+    if (dot(nr.xyz, nr.xyz) > 0.1) {
         N = normalize((ao.view_from_world * vec4<f32>(nr.xyz, 0.0)).xyz);
     } else {
         let Px = view_pos_at(px + vec2<i32>(1, 0), dims);
@@ -113,5 +111,5 @@ fn fs_ssao(in: FsIn) -> @location(0) vec4<f32> {
     // Fade AO out with view distance — the fog band owns the far field.
     let fade = 1.0 - smoothstep(ao.p.w * 0.6, ao.p.w, view_z);
     a = mix(1.0, a, ao.p.y * fade);
-    return vec4<f32>(color.rgb * a, color.a);
+    return vec4<f32>(a, 0.0, 0.0, 1.0);
 }

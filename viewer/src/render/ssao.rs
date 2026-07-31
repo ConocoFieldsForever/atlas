@@ -1,12 +1,15 @@
-//! eft::ssao — depth-only SSAO post pass (Graphics (experimental) toggle; shaders/ssao.wgsl).
+//! eft::ssao — SSAO as a PRE-MAIN AO LANE (Graphics (experimental) toggle; shaders/ssao.wgsl).
 //!
-//! The custom GPU-driven path writes no normal/motion prepass, so Bevy's built-in SSAO/TAA can't
-//! see our geometry. This is a self-contained ViewNode (same pattern as render::grade): it binds
-//! the resolved scene color + the MULTISAMPLED reverse-z depth (sample 0), reconstructs view-space
-//! positions/normals, and multiplies a spiral-tap occlusion term onto the color. It runs between
-//! the main pass and Bloom so the grade LUT sees the occluded color. Off by default (GfxSettings.
-//! ssao / EFT_SSAO=1); radius/intensity are live UI sliders — the tiny uniform is rewritten in
-//! the node each frame from the extracted settings.
+//! Ordered prepass -> SSAO -> main pass: reconstructs occlusion from the PREPASS depth + normals
+//! and writes an R8 factor the main pass samples during OPAQUE shading (group(1) binding(3) in
+//! gpu_draw.wgsl). This replaced the old post-multiply over the finished frame, which darkened
+//! glass panes by the occlusion of the interior BEHIND them (glass never writes the prepass, so
+//! its pixels carried the background's AO). As a lane, BLEND surfaces read ao = 1 by material
+//! flag and the term scales only ambient + lamp diffuse — sun and emissive stay untouched.
+//!
+//! The target is (re)created to the view size by `prepare_ao_target` and initialized WHITE, so a
+//! frame where the node skips (toggle off, prepass idle) shades exactly as ao = 1. gpu_driven's
+//! `sync_draw_bg_ao` swaps the draw bind group between this target and the 1x1 white fallback.
 
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::ecs::query::QueryItem;
@@ -16,16 +19,16 @@ use bevy::render::{
         NodeRunError, RenderGraphContext, RenderGraphExt, RenderLabel, ViewNode, ViewNodeRunner,
     },
     render_resource::{
-        binding_types::{sampler, texture_2d, texture_depth_2d_multisampled, uniform_buffer_sized},
+        binding_types::{texture_2d, texture_depth_2d, uniform_buffer_sized},
         BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries, Buffer, BufferDescriptor,
-        BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites, FilterMode,
+        BufferUsages, CachedRenderPipelineId, ColorTargetState, ColorWrites, Extent3d,
         FragmentState, LoadOp, MultisampleState, Operations, PipelineCache, PrimitiveState,
-        RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, Sampler,
-        SamplerBindingType, SamplerDescriptor, ShaderStages, StoreOp, TextureSampleType,
-        VertexState,
+        RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor, ShaderStages,
+        StoreOp, TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType,
+        TextureUsages, TextureView, TextureViewDescriptor, VertexState,
     },
     renderer::{RenderContext, RenderDevice, RenderQueue},
-    view::{ExtractedView, ViewDepthTexture, ViewTarget},
+    view::ExtractedView,
     RenderApp, RenderStartup,
 };
 use bytemuck::{Pod, Zeroable};
@@ -39,26 +42,32 @@ struct SsaoParamsGpu {
     view_from_world: [[f32; 4]; 4],
     /// x = world radius (m), y = intensity, z = power, w = fade-end view distance (m).
     p: [f32; 4],
-    /// x,y = viewport px, z = proj11, w = 1.0 when the normal prepass is active this frame.
+    /// x,y = viewport px, z = proj11, w = reserved.
     vp: [f32; 4],
 }
 const _: () = assert!(std::mem::size_of::<SsaoParamsGpu>() == 160);
 
 #[derive(Resource)]
-struct SsaoPipeline {
+pub(crate) struct SsaoPipeline {
     layout: BindGroupLayout,
     pipeline_id: CachedRenderPipelineId,
-    scene_sampler: Sampler,
     params: Buffer,
-    /// 1x1 zero texture bound as the normal source whenever the prepass is inactive: the shader's
-    /// per-pixel zero-normal check then routes every pixel to the derivative fallback, so SSAO
-    /// works exactly as before the prepass existed.
-    fallback_normal_view: bevy::render::render_resource::TextureView,
+    /// 1x1 WHITE R8 texture the draw pass binds while SSAO is off / has no target yet: every
+    /// opaque fragment then shades with ao = 1, byte-identical to no-SSAO.
+    pub(crate) fallback_ao_view: TextureView,
+}
+
+/// The viewport-sized AO lane. `view` is `None` until the first `prepare_ao_target` run.
+#[derive(Resource, Default)]
+pub(crate) struct EftAoTarget {
+    pub(crate) view: Option<TextureView>,
+    size: (u32, u32),
 }
 
 fn init_ssao_pipeline(
     mut commands: Commands,
     device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
     cache: Res<PipelineCache>,
     asset_server: Res<AssetServer>,
 ) {
@@ -67,21 +76,13 @@ fn init_ssao_pipeline(
         &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
             (
-                texture_2d(TextureSampleType::Float { filterable: true }), // scene color
-                sampler(SamplerBindingType::Filtering),
-                texture_depth_2d_multisampled(), // main-pass depth (MSAA; sample 0 read)
+                texture_depth_2d(), // prepass depth (1x, reverse-z)
                 // Prepass world-normal target (Rgba16Float, textureLoad only — no sampler).
                 texture_2d(TextureSampleType::Float { filterable: false }),
                 uniform_buffer_sized(false, Some(std::num::NonZeroU64::new(160).unwrap())),
             ),
         ),
     );
-    let scene_sampler = device.create_sampler(&SamplerDescriptor {
-        label: Some("eft_ssao_scene_sampler"),
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Linear,
-        ..default()
-    });
     let params = device.create_buffer(&BufferDescriptor {
         label: Some("eft_ssao_params"),
         size: 160,
@@ -101,104 +102,161 @@ fn init_ssao_pipeline(
         },
         primitive: PrimitiveState::default(),
         depth_stencil: None,
-        multisample: MultisampleState::default(), // post-process on the resolved color target
+        multisample: MultisampleState::default(),
         fragment: Some(FragmentState {
             shader,
             shader_defs: vec![],
             entry_point: Some("fs_ssao".into()),
             targets: vec![Some(ColorTargetState {
-                format: ViewTarget::TEXTURE_FORMAT_HDR,
+                format: TextureFormat::R8Unorm,
                 blend: None,
                 write_mask: ColorWrites::ALL,
             })],
         }),
         zero_initialize_workgroup_memory: false,
     });
-    let fallback_normal = device.create_texture(&bevy::render::render_resource::TextureDescriptor {
-        label: Some("eft_ssao_fallback_normal"),
-        size: bevy::render::render_resource::Extent3d {
+    let fallback = device.create_texture(&TextureDescriptor {
+        label: Some("eft_ssao_fallback_white"),
+        size: Extent3d {
             width: 1,
             height: 1,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
         sample_count: 1,
-        dimension: bevy::render::render_resource::TextureDimension::D2,
-        format: bevy::render::render_resource::TextureFormat::Rgba16Float,
-        usage: bevy::render::render_resource::TextureUsages::TEXTURE_BINDING,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let fallback_normal_view =
-        fallback_normal.create_view(&bevy::render::render_resource::TextureViewDescriptor::default());
+    queue.write_texture(
+        fallback.as_image_copy(),
+        &[255u8],
+        bevy::render::render_resource::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: None, // single row: alignment rules don't apply
+            rows_per_image: None,
+        },
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let fallback_ao_view = fallback.create_view(&TextureViewDescriptor::default());
     commands.insert_resource(SsaoPipeline {
         layout,
         pipeline_id,
-        scene_sampler,
         params,
-        fallback_normal_view,
+        fallback_ao_view,
     });
+    commands.insert_resource(EftAoTarget::default());
+}
+
+/// (Re)create the AO lane at the view size, initialized WHITE so frames where the SSAO node
+/// skips (toggle off, prepass idle, pipeline compiling) shade exactly as ao = 1.
+pub(crate) fn prepare_ao_target(
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+    views: Query<&ExtractedView>,
+    target: Option<ResMut<EftAoTarget>>,
+) {
+    let Some(mut target) = target else { return };
+    let Some(view) = views.iter().next() else {
+        return;
+    };
+    let (w, h) = (view.viewport.z.max(1), view.viewport.w.max(1));
+    if target.size == (w, h) && target.view.is_some() {
+        return;
+    }
+    let tex = device.create_texture(&TextureDescriptor {
+        label: Some("eft_ssao_ao_lane"),
+        size: Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING
+            | TextureUsages::RENDER_ATTACHMENT
+            | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // wgpu zero-inits textures; zero would mean "fully occluded" and black out ambient on any
+    // frame the node skips. Stamp WHITE once at creation.
+    let row = ((w + 255) / 256) * 256; // 256-byte row alignment for write_texture
+    queue.write_texture(
+        tex.as_image_copy(),
+        &vec![255u8; (row * h) as usize],
+        bevy::render::render_resource::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(row),
+            rows_per_image: None,
+        },
+        Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+    target.view = Some(tex.create_view(&TextureViewDescriptor::default()));
+    target.size = (w, h);
 }
 
 #[derive(RenderLabel, Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct SsaoLabel;
 
-/// Bind-group cache keyed on (source view id, depth view id) — same pattern as render::grade
-/// (the depth view is also swapped when the window resizes).
+/// Bind-group cache keyed on (prepass depth id, prepass normal id).
 #[derive(Default)]
 struct SsaoNode {
     cached_bg: std::sync::Mutex<
         Option<(
             bevy::render::render_resource::TextureViewId,
             bevy::render::render_resource::TextureViewId,
-            bevy::render::render_resource::TextureViewId, // prepass normal view (or the fallback)
             bevy::render::render_resource::BindGroup,
         )>,
     >,
 }
 
 impl ViewNode for SsaoNode {
-    type ViewQuery = (
-        &'static ViewTarget,
-        &'static ViewDepthTexture,
-        &'static ExtractedView,
-    );
+    type ViewQuery = &'static ExtractedView;
 
     fn run<'w>(
         &self,
         _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
-        (target, depth, view): QueryItem<'w, '_, Self::ViewQuery>,
+        view: QueryItem<'w, '_, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
-        let Some(sp) = world.get_resource::<SsaoPipeline>() else {
-            return Ok(());
-        };
-        let Some(settings) = world.get_resource::<crate::render::GfxSettings>() else {
+        let (Some(sp), Some(settings), Some(target)) = (
+            world.get_resource::<SsaoPipeline>(),
+            world.get_resource::<crate::render::GfxSettings>(),
+            world.get_resource::<EftAoTarget>(),
+        ) else {
             return Ok(());
         };
         if !settings.ssao {
             return Ok(());
         }
+        let Some(ao_view) = target.view.as_ref() else {
+            return Ok(());
+        };
+        let Some(pre) = world.get_resource::<super::gpu_driven::EftPrepassResources>() else {
+            return Ok(());
+        };
+        if !pre.active {
+            return Ok(());
+        }
+        let (Some(depth_view), Some(normal_view)) = (&pre.depth_view, &pre.normal_view) else {
+            return Ok(());
+        };
         let cache = world.resource::<PipelineCache>();
         let Some(pipeline) = cache.get_render_pipeline(sp.pipeline_id) else {
             return Ok(());
         };
-        if target.main_texture_format() != ViewTarget::TEXTURE_FORMAT_HDR {
-            return Ok(());
-        }
-        // The pipeline binds texture_depth_2d_multisampled — a 1x-MSAA view would fail bind-group
-        // validation (latent: this app always runs MSAA 4x; guard anyway per the Codex review).
-        if depth.texture.sample_count() <= 1 {
-            return Ok(());
-        }
-        // Normal source: the prepass target when it ran this frame, else the 1x1 zero fallback
-        // (per-pixel zero-check in the shader routes to derivative reconstruction either way).
-        let prepass = world.get_resource::<super::gpu_driven::EftPrepassResources>();
-        let normal_view = prepass
-            .filter(|p| p.active)
-            .and_then(|p| p.normal_view.as_ref())
-            .unwrap_or(&sp.fallback_normal_view);
-        let has_normals = !std::ptr::eq(normal_view, &sp.fallback_normal_view);
         // Live params from the UI (160 B write per frame while enabled — negligible).
         let vp = view.viewport;
         let params = SsaoParamsGpu {
@@ -209,21 +267,16 @@ impl ViewNode for SsaoNode {
                 vp.z as f32,
                 vp.w as f32,
                 view.clip_from_view.y_axis.y,
-                if has_normals { 1.0 } else { 0.0 },
+                0.0,
             ],
         };
         world
             .resource::<RenderQueue>()
             .write_buffer(&sp.params, 0, bytemuck::bytes_of(&params));
 
-        let post = target.post_process_write();
-        let mut cache = self.cached_bg.lock().unwrap();
-        let bind = match cache.as_ref() {
-            Some((sid, did, nid, bg))
-                if *sid == post.source.id()
-                    && *did == depth.view().id()
-                    && *nid == normal_view.id() =>
-            {
+        let mut cached = self.cached_bg.lock().unwrap();
+        let bind = match cached.as_ref() {
+            Some((did, nid, bg)) if *did == depth_view.id() && *nid == normal_view.id() => {
                 bg.clone()
             }
             _ => {
@@ -231,33 +284,26 @@ impl ViewNode for SsaoNode {
                     "eft_ssao_bg",
                     &sp.layout,
                     &BindGroupEntries::sequential((
-                        post.source,
-                        &sp.scene_sampler,
-                        depth.view(),
+                        depth_view,
                         normal_view,
                         sp.params.as_entire_binding(),
                     )),
                 );
-                *cache = Some((
-                    post.source.id(),
-                    depth.view().id(),
-                    normal_view.id(),
-                    bg.clone(),
-                ));
+                *cached = Some((depth_view.id(), normal_view.id(), bg.clone()));
                 bg
             }
         };
-        drop(cache);
+        drop(cached);
         let mut pass = render_context
             .command_encoder()
             .begin_render_pass(&RenderPassDescriptor {
                 label: Some("eft_ssao_pass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
-                    view: post.destination,
+                    view: ao_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
-                        load: LoadOp::Clear(Default::default()),
+                        load: LoadOp::Clear(bevy::color::LinearRgba::WHITE.into()),
                         store: StoreOp::Store,
                     },
                 })],
@@ -272,7 +318,8 @@ impl ViewNode for SsaoNode {
     }
 }
 
-/// SSAO between the main pass and Bloom (the grade LUT then tonemaps the occluded color).
+/// SSAO between the prepass and the main pass: the AO lane must be written before the opaque
+/// shading samples it. `sync_draw_bg_ao` (gpu_driven) swaps the sampled view per the toggle.
 pub struct SsaoPlugin;
 
 impl Plugin for SsaoPlugin {
@@ -280,9 +327,18 @@ impl Plugin for SsaoPlugin {
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        // NOTE: `prepare_ao_target` + gpu_driven's `sync_draw_bg_ao` are registered by
+        // EftGpuDrivenPlugin (they order against its private `prepare_gpu_buffers`).
         render_app
             .add_systems(RenderStartup, init_ssao_pipeline)
             .add_render_graph_node::<ViewNodeRunner<SsaoNode>>(Core3d, SsaoLabel)
-            .add_render_graph_edges(Core3d, (Node3d::EndMainPass, SsaoLabel, Node3d::Bloom));
+            .add_render_graph_edges(
+                Core3d,
+                (
+                    super::gpu_driven::EftPrepassLabel,
+                    SsaoLabel,
+                    Node3d::StartMainPass,
+                ),
+            );
     }
 }

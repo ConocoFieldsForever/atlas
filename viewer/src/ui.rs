@@ -581,7 +581,7 @@ fn teardown_ui(mut plan: ResMut<PlanList>) {
 /// Show/hide loot markers by the master toggle AND the per-class filter AND the min-value
 /// filter. Only touches the markers when the toggles change (true on the first run too, so the
 /// initial state is applied once the markers exist), so it's ~free per frame.
-fn apply_loot_visibility(
+pub(crate) fn apply_loot_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
@@ -679,8 +679,6 @@ fn min_value_label(v: i64) -> String {
 #[derive(bevy::ecs::system::SystemParam)]
 struct GfxUiParams<'w, 's> {
     gfx: ResMut<'w, crate::render::GfxSettings>,
-    /// Forced LOD level (graphics-panel LOD selector); meaningful on --alllod packs, no-op on lean.
-    forced_lod: ResMut<'w, crate::ForcedLod>,
     /// Active render path — the graphics panel greys out the GPU-driven-only controls when the
     /// viewer fell back to the M0/Standard path (which don't consume them; finding 9).
     render_path: Option<Res<'w, crate::render::RenderPath>>,

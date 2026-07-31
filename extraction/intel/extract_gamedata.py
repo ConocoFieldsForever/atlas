@@ -1104,6 +1104,21 @@ def scan_level(lv, sink, ai=False):
                 rec["id"] = cid
             if tpl:
                 rec["template"] = tpl
+            # AUTHORITATIVE model join (loot glow): the container's own transform chain
+            # (self, parent, grandparent), folded to u32 exactly like the geometry extractor
+            # folds renderer `par`/`par2`. The assembler attaches the prefab's renderer
+            # instances by ANCESTRY INTERSECTION — never by name or radius, which both missed
+            # prefab parts with offset pivots and lit same-mesh DECORATIVE neighbours on
+            # shelves (the streets weapon-box stack).
+            _ch, _t = [], tpid
+            for _ in range(3):
+                if not _t:
+                    break
+                _ch.append(int((_t ^ (_t >> 32)) & 0xFFFFFFFF))
+                _d = tt(_t, tr_obj)
+                _t = (_d.get("m_Father") or {}).get("m_PathID", 0) if _d else 0
+            if _ch:
+                rec["tf"] = _ch
             # Attribute the container to the nearest ANCESTOR group. Membership is hierarchical in
             # the scene (a group is the parent GameObject), so walking up beats any spatial guess.
             g = group_of(tpid)

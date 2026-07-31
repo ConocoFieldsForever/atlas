@@ -450,6 +450,24 @@ pub struct Material {
     /// Parallax block (grayscale height map + `_Parallax` amount), or `null`/absent. See `ParallaxMap`.
     #[serde(default)]
     pub parallax: Option<ParallaxMap>,
+    /// Legacy Transparent/Reflective/Specular glass family (EFT's car/storefront glass shader).
+    /// When true, tex.a is TRANSPARENCY x gloss (never smoothness) and the response colours
+    /// below are the game's own. Absent on packs from before the capture -> old behavior.
+    #[serde(rename = "glassTRS", default)]
+    pub glass_trs: bool,
+    /// `_ReflectColor` — the authored cubemap-reflection tint (dark on car glass).
+    #[serde(rename = "reflectColor", default)]
+    pub reflect_color: Option<[f32; 4]>,
+    /// `_SpecColor` — Blinn-Phong specular response colour.
+    #[serde(rename = "specColor", default)]
+    pub spec_color: Option<[f32; 3]>,
+    /// `_Shininess` — Blinn-Phong gloss (0..1, higher = tighter highlight).
+    #[serde(default)]
+    pub shininess: Option<f32>,
+    /// `_OpacityScale x _AlphaMult` (the DITHERED glass family scales tex.a before its dither;
+    /// streets' glass blocks ship 4.0). Absent = 1.0 (the reflective family).
+    #[serde(rename = "opacityScale", default)]
+    pub opacity_scale: Option<f32>,
 }
 
 /// Unity parallax-offset mapping. Optional grayscale HEIGHT map (`_ParallaxMap`) + the `_Parallax`
@@ -497,7 +515,14 @@ pub struct GpuInstance {
     pub lod_index: i32,
     pub root_id: u32,
     pub flags: u32,
-    pub _pad: [u32; 3],
+    /// Folded parent Transform id (0 = absent). With `par2`/`lv`, the AUTHORITATIVE loot-glow
+    /// join key: gamedata containers carry the same folded chain, so container->model matching
+    /// is prefab ANCESTRY, never name or radius. All zero on packs from before the capture.
+    pub par: u32,
+    /// Folded grandparent Transform id (0 = absent).
+    pub par2: u32,
+    /// Source scene level — folded ids are level-local, so joins must match on it.
+    pub lv: u32,
 }
 
 impl GpuInstance {
@@ -1639,6 +1664,10 @@ fn parse_instances(layout: &InstanceLayout, bin: &[u8]) -> Result<Vec<GpuInstanc
     let o_li = find("lodIndex")?.offset as usize;
     let o_root = find("rootId")?.offset as usize;
     let o_flags = find("flags")?.offset as usize;
+    // Optional ancestry lanes (packs from before the capture simply don't declare them -> zeros).
+    let o_par = find("par").ok().map(|f| f.offset as usize);
+    let o_par2 = find("par2").ok().map(|f| f.offset as usize);
+    let o_lv = find("lv").ok().map(|f| f.offset as usize);
     // Validate every field fits inside one stride record: a malformed manifest must Err at load
     // (message names the field), not panic on a slice index deep in the record loop (Codex review).
     for (name, off, sz) in [
@@ -1648,6 +1677,9 @@ fn parse_instances(layout: &InstanceLayout, bin: &[u8]) -> Result<Vec<GpuInstanc
         ("lodIndex", o_li, 4),
         ("rootId", o_root, 4),
         ("flags", o_flags, 4),
+        ("par", o_par.unwrap_or(0), 4),
+        ("par2", o_par2.unwrap_or(0), 4),
+        ("lv", o_lv.unwrap_or(0), 4),
     ] {
         if off + sz > stride {
             return Err(anyhow!(
@@ -1675,7 +1707,9 @@ fn parse_instances(layout: &InstanceLayout, bin: &[u8]) -> Result<Vec<GpuInstanc
             lod_index: read_i32(bin, base + o_li),
             root_id: read_u32(bin, base + o_root),
             flags: read_u32(bin, base + o_flags),
-            _pad: [0; 3],
+            par: o_par.map(|o| read_u32(bin, base + o)).unwrap_or(0),
+            par2: o_par2.map(|o| read_u32(bin, base + o)).unwrap_or(0),
+            lv: o_lv.map(|o| read_u32(bin, base + o)).unwrap_or(0),
         });
     }
     Ok(out)
