@@ -361,3 +361,37 @@ fn cs_sort_blend(@builtin(global_invocation_id) gid: vec3<u32>,
         visible[base + u32(j) + 1u] = vi;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// PER-FRAME DRAW-ORDER GATHER (cs_blend_gather)
+//
+// The transparent phase used to carry ONE item per blend MESH, each issuing a single-record
+// multi_draw — 11,032 items on streets, and the per-item encode overhead alone was 48 ms of CPU
+// per frame (the entire 16-fps mystery; the GPU executed the same pass in 5.5 ms). The CPU now
+// sorts the ITEMS once per camera move (queue_gpu_driven), uploads the item->mesh map into
+// `blend_order`, and this kernel copies each item's LIVE indirect record (cs_cull just wrote its
+// instance_count) into `indirect_blend_sorted` at its draw position — so a whole run of
+// same-pipeline items becomes ONE contiguous multi_draw. Record CONTENTS stay per-frame fresh
+// even when the order is cached: the gather re-copies every slot every frame.
+//
+// A mesh referenced by two items (SoftCutout color + depth) is simply copied twice; the source
+// record is read-only here. Runs after cs_cull in its own pass boundary (barrier), beside
+// cs_sort_blend (disjoint buffers: that one reorders visible[], this one reads indirect_blend).
+@group(0) @binding(8) var<storage, read>       blend_order: array<u32>;
+@group(0) @binding(9) var<storage, read_write> indirect_blend_sorted: array<DrawArgs>;
+
+@compute @workgroup_size(64)
+fn cs_blend_gather(@builtin(global_invocation_id) gid: vec3<u32>,
+                   @builtin(num_workgroups) ng: vec3<u32>) {
+    let k = linear_index(gid, ng);
+    if (k >= arrayLength(&blend_order)) { return; }
+    let m = min(blend_order[k], arrayLength(&indirect_blend) - 1u);
+    indirect_blend_sorted[k].index_count = indirect_blend[m].index_count;
+    indirect_blend_sorted[k].first_index = indirect_blend[m].first_index;
+    indirect_blend_sorted[k].base_vertex = indirect_blend[m].base_vertex;
+    indirect_blend_sorted[k].first_instance = indirect_blend[m].first_instance;
+    atomicStore(
+        &indirect_blend_sorted[k].instance_count,
+        atomicLoad(&indirect_blend[m].instance_count),
+    );
+}

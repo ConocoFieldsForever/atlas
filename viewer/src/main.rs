@@ -2369,12 +2369,15 @@ fn print_gpu_timing(
     let mut parts: Vec<String> = Vec::new();
     for d in diagnostics.iter() {
         let path = d.path().as_str();
-        if !path.contains("eft") {
+        let Some(v) = d.smoothed() else { continue };
+        // Our own nodes always print; Bevy's pass spans (main_opaque_pass_3d & co) print when
+        // they cost real time — without them the report has a hole exactly where the frame goes.
+        // CPU spans matter as much as GPU: a pass encoding thousands of items burns main-thread
+        // time that no elapsed_gpu number shows.
+        if !path.contains("eft") && v < 0.25 {
             continue;
         }
-        if let Some(v) = d.smoothed() {
-            parts.push(format!("{}={:.3}ms", path.trim_start_matches("render/"), v));
-        }
+        parts.push(format!("{}={:.3}ms", path.trim_start_matches("render/"), v));
     }
     if !parts.is_empty() {
         parts.sort();

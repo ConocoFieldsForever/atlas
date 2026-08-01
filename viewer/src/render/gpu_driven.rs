@@ -3069,6 +3069,18 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
         "shard-glass walls: {glass_wall_quads} edge quads across {glass_wall_meshes} meshes \
          (depth = each pane's own twin-layer gap; 0 quads = no mask-glass or single-layer panes)"
     );
+    {
+        let soft = blend_meshes.iter().filter(|(_, _, p)| p & BLEND_MESH_SOFTCUTOUT != 0).count();
+        let over = blend_meshes.iter().filter(|(_, _, p)| p & BLEND_MESH_OVERLAY != 0).count();
+        let tran = blend_meshes.iter().filter(|(_, _, p)| p & BLEND_MESH_TRANSPARENT != 0).count();
+        let centers: usize = blend_meshes.iter().map(|(_, c, _)| c.len()).sum();
+        info!(
+            "gpu-driven blend: {} blend meshes ({soft} softcutout, {over} overlay, {tran} \
+             transparent; {centers} instance centers) -> {} transparent-phase items per frame",
+            blend_meshes.len(),
+            2 * soft + over + tran + 1,
+        );
+    }
     let t_geo = build_t0.elapsed(); // phase: the mesh geometry loop (parse + repack + append)
     let grass_instance_base = instances.len();
     let mut grass_instances = 0usize;
@@ -3719,6 +3731,7 @@ struct EftComputePipelines {
     reset_id: CachedComputePipelineId,
     cull_id: CachedComputePipelineId,
     sort_blend_id: CachedComputePipelineId,
+    blend_gather_id: CachedComputePipelineId,
     cull_layout: BindGroupLayout,
 }
 
@@ -3759,9 +3772,20 @@ struct EftGpuBuffers {
     /// P1 OPAQUE indirect args (multidraw over all meshes; blend-only records zeroed by cs_reset).
     /// Also drives the shadow casters (blend never casts).
     indirect: Buffer,
-    /// P2 BLEND indirect args (opaque-only records zeroed). Drawn as ONE record per blend mesh
-    /// from depth-sorted Transparent3d items — no whole-scene re-raster, stable back-to-front.
+    /// P2 BLEND indirect args at STATIC mesh slots — cs_cull's write target and the SOURCE for
+    /// `cs_blend_gather`; the phase no longer draws from it directly.
     indirect_blend: Buffer,
+    /// P2 BLEND indirect args copied into DRAW ORDER each frame by `cs_blend_gather` (one record
+    /// per transparent-phase ITEM, `blend_order` gives the mapping). Whole same-pipeline runs of
+    /// the sorted item list draw from here as single multi_draws — the per-item encode of 11k
+    /// one-record draws was 48 ms of CPU per frame on streets.
+    indirect_blend_sorted: Buffer,
+    /// Item slot -> source mesh index for the gather, uploaded by `queue_gpu_driven` whenever the
+    /// camera has moved enough to re-sort (a parked camera re-uploads nothing).
+    blend_order: Buffer,
+    /// Number of transparent-phase items (== records in `indirect_blend_sorted`). Zero on a map
+    /// with no blend geometry — the gather dispatch and the run items are skipped entirely.
+    blend_items: u32,
     cull_uniform: Buffer,
     /// (mesh index, first-instance world center, transparent-pass mask) for every mesh with a
     /// BLEND submesh — the per-frame sort key and render-state classification source.
@@ -3902,6 +3926,8 @@ fn init_gpu_pipelines(
                 storage_buffer_sized(false, None),           // 5: indirect BLEND (rw)
                 storage_buffer_read_only_sized(false, None), // 6: lod_centers (B1 group-center metric)
                 storage_buffer_read_only_sized(false, None), // 7: blend mesh ids (cs_sort_blend)
+                storage_buffer_read_only_sized(false, None), // 8: blend draw order (cs_blend_gather)
+                storage_buffer_sized(false, None),           // 9: indirect BLEND, draw-sorted (rw)
             ),
         ),
     );
@@ -3994,11 +4020,22 @@ fn init_gpu_pipelines(
     // cs_cull, before the main pass.
     let sort_blend_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
         label: Some("eft_cull_sort_blend".into()),
+        layout: vec![cull_layout.clone(), hiz_layout.clone()],
+        push_constant_ranges: vec![],
+        shader: cull_shader_sort.clone(),
+        shader_defs: vec![],
+        entry_point: Some("cs_sort_blend".into()),
+        zero_initialize_workgroup_memory: false,
+    });
+    // Copy each transparent ITEM's indirect record into draw order (see cs_blend_gather) so the
+    // phase can issue whole same-pipeline runs as single multi_draws.
+    let blend_gather_id = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("eft_cull_blend_gather".into()),
         layout: vec![cull_layout.clone(), hiz_layout],
         push_constant_ranges: vec![],
         shader: cull_shader_sort,
         shader_defs: vec![],
-        entry_point: Some("cs_sort_blend".into()),
+        entry_point: Some("cs_blend_gather".into()),
         zero_initialize_workgroup_memory: false,
     });
 
@@ -4006,6 +4043,7 @@ fn init_gpu_pipelines(
         reset_id,
         cull_id,
         sort_blend_id,
+        blend_gather_id,
         cull_layout,
     });
     commands.insert_resource(EftDrawPipeline {
@@ -4750,6 +4788,31 @@ pub(crate) fn prepare_gpu_buffers(
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
     });
     let blend_sort_groups = (blend_ids.len() as u32).div_ceil(64);
+    // Transparent-phase item capacity: SoftCutout meshes carry TWO items (decal color + coverage
+    // depth), overlay and transparent one each. Sized exactly — cs_blend_gather bounds on
+    // arrayLength(&blend_order), so capacity IS the dispatch domain. max(1): empty buffers are
+    // invalid; a lean pack gets one dummy slot that nothing ever draws (blend_items stays 0).
+    let blend_items: u32 = cpu
+        .blend_meshes
+        .iter()
+        .map(|(_, _, p)| {
+            2 * u32::from(p & BLEND_MESH_SOFTCUTOUT != 0)
+                + u32::from(p & BLEND_MESH_OVERLAY != 0)
+                + u32::from(p & BLEND_MESH_TRANSPARENT != 0)
+        })
+        .sum();
+    let blend_order_buf = render_device.create_buffer(&BufferDescriptor {
+        label: Some("eft_gpu_blend_order"),
+        size: blend_items.max(1) as u64 * 4,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let indirect_blend_sorted = render_device.create_buffer(&BufferDescriptor {
+        label: Some("eft_gpu_indirect_blend_sorted"),
+        size: blend_items.max(1) as u64 * DRAW_ARG_STRIDE,
+        usage: BufferUsages::INDIRECT | BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let cull_bg = render_device.create_bind_group(
         "eft_cull_bg",
         &compute.cull_layout,
@@ -4762,6 +4825,8 @@ pub(crate) fn prepare_gpu_buffers(
             indirect_blend.as_entire_binding(),
             lod_centers.as_entire_binding(),
             blend_ids_buf.as_entire_binding(),
+            blend_order_buf.as_entire_binding(),
+            indirect_blend_sorted.as_entire_binding(),
         )),
     );
     // ---- SHADOW CULL STREAM (multi-LOD packs): a second reset+cull over the SAME instances,
@@ -4805,6 +4870,10 @@ pub(crate) fn prepare_gpu_buffers(
                 indirect_blend2.as_entire_binding(),
                 lod_centers.as_entire_binding(),
                 blend_ids_buf.as_entire_binding(),
+                // Layout parity only: the shadow stream never dispatches cs_blend_gather, so
+                // sharing the camera stream's order/sorted buffers writes nothing here.
+                blend_order_buf.as_entire_binding(),
+                indirect_blend_sorted.as_entire_binding(),
             )),
         );
         shadow_stream_parts = Some((visible2, indirect2, cull_bg2));
@@ -5661,6 +5730,9 @@ pub(crate) fn prepare_gpu_buffers(
         index,
         indirect,
         indirect_blend,
+        indirect_blend_sorted,
+        blend_order: blend_order_buf,
+        blend_items,
         cull_uniform,
         blend_meshes: cpu.blend_meshes.clone(),
         mesh_count: cpu.mesh_count,
@@ -7352,10 +7424,14 @@ fn queue_gpu_driven(
     markers: Query<(Entity, &MainEntity), With<GpuDrivenTag>>,
     mut transparent_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
     views: Query<(&ExtractedView, &Msaa)>,
+    render_queue: Res<RenderQueue>,
+    mut order_cache: Local<BlendOrderCache>,
 ) {
     let (Some(draw_pipeline), Some(_buffers)) = (draw_pipeline, buffers) else {
         return;
     };
+    // A fresh map build re-created the buffers (and invalidated every cached slot index).
+    let buffers_changed = _buffers.is_changed();
     // M3: don't specialize until the material layout exists (built in prepare_gpu_buffers once
     // the albedo count is known). specialize() needs it for the group(2) pipeline layout, and
     // DrawGpuDrivenInner needs the matching EftMaterialBindGroup â€” both land in the same prepare
@@ -7392,15 +7468,6 @@ fn queue_gpu_driven(
                 pass: DrawPass::Blend,
             },
         );
-        let overlay_pipeline = pipelines.specialize(
-            &pipeline_cache,
-            &draw_pipeline,
-            EftDrawKey {
-                samples: msaa.samples(),
-                hdr: view.hdr,
-                pass: DrawPass::Overlay,
-            },
-        );
         let decal_depth_pipeline = pipelines.specialize(
             &pipeline_cache,
             &draw_pipeline,
@@ -7421,14 +7488,92 @@ fn queue_gpu_driven(
         );
 
         let cam_pos = view.world_from_view.translation();
+        // Re-sort ONLY when the camera moved (5 cm) or the map was rebuilt. The sorted ORDER is
+        // all that depends on the camera; the record CONTENTS are re-gathered on the GPU every
+        // frame regardless (cs_blend_gather), so a parked camera skips the sort, the
+        // nearest-instance scan and the `blend_order` upload without going stale.
+        let moved = order_cache
+            .cam
+            .is_none_or(|c| c.distance_squared(cam_pos) > 0.05f32 * 0.05f32);
+        if (buffers_changed || moved) && _buffers.blend_items > 0 {
+            // Keys replicate the retired one-item-per-mesh scheme EXACTLY (ascending phase sort):
+            //
+            //  DecalColor  -2e6 - mesh_idx   THE road-decal flicker fix: SoftCutout colors
+            //                                composite FIRST, in a stable camera-INDEPENDENT
+            //                                mesh_idx order, tested only against real opaque
+            //                                scene depth — decals never cull or reorder against
+            //                                each other (base 2e6 keeps idx increments
+            //                                f32-distinct; the +1e-3*w clip push in gpu_draw.wgsl
+            //                                still lifts them over the coplanar opaque ground).
+            //  DecalDepth  -1.5e6            coverage-only depth AFTER the colors: re-asserts road
+            //                                depth for later occlusion without gating the colors.
+            //  Overlay     -d - 0.001        plain decals/water, back-to-front, biased to draw
+            //                                just before an equally-distant Blend mesh.
+            //  Blend       -d                true transparency, back-to-front.
+            //
+            // d = distance to the mesh's NEAREST instance — the FIRST instance is an arbitrary
+            // copy that can sit anywhere on the map, and keying off it made glass panes seen
+            // through each other composite backwards and swap on camera movement (interchange
+            // Nikitskaya_2_Outdoor_Glass_04 field report). NOTE this orders MESHES, not instances
+            // within one mesh — cs_sort_blend handles the per-instance order.
+            let mut entries: Vec<(f32, u32, DrawPass)> =
+                Vec::with_capacity(_buffers.blend_items as usize);
+            for (mesh_idx, centers, pass_mask) in &_buffers.blend_meshes {
+                if pass_mask & BLEND_MESH_SOFTCUTOUT != 0 {
+                    entries.push((-2.0e6 - (*mesh_idx as f32), *mesh_idx, DrawPass::DecalColor));
+                    entries.push((-1.5e6, *mesh_idx, DrawPass::DecalDepth));
+                }
+                if pass_mask & (BLEND_MESH_OVERLAY | BLEND_MESH_TRANSPARENT) != 0 {
+                    let d = centers
+                        .iter()
+                        .map(|c| (cam_pos - Vec3::from_array(*c)).length())
+                        .fold(f32::INFINITY, f32::min);
+                    let d = if d.is_finite() { d } else { 0.0 };
+                    // ONE entry even when the mesh carries BOTH classes: the unified pipeline
+                    // keeps overlay AND glass fragments of a record, so the retired two-entry
+                    // scheme would draw every fragment twice here (double-blend — showed up as
+                    // brightened glazing on the interchange skylights). Overlay-only meshes keep
+                    // the -0.001 bias that draws them just before an equally-distant blend mesh;
+                    // a mixed mesh sits at the overlay point, within 0.001 of both old slots.
+                    let key = if pass_mask & BLEND_MESH_OVERLAY != 0 { -d - 0.001 } else { -d };
+                    entries.push((key, *mesh_idx, DrawPass::Blend));
+                }
+            }
+            // STABLE sort: equal keys keep blend_meshes (mesh build) order, reproducing the tie
+            // order of the retired per-item path (bevy's phase radsort is stable and items were
+            // queued in this same order) — repeated identical-distance panes stay deterministic.
+            entries.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // Chunk the sorted item list into same-pipeline RUNS and record each item's source
+            // mesh slot; cs_blend_gather materializes the records at these slots on the GPU.
+            let mut order: Vec<u32> = Vec::with_capacity(entries.len());
+            order_cache.runs.clear();
+            for (key, mesh_idx, kind) in entries {
+                match order_cache.runs.last_mut() {
+                    Some((k, _, _, len)) if *k == kind => *len += 1,
+                    _ => order_cache.runs.push((kind, key, order.len() as u32, 1)),
+                }
+                order.push(mesh_idx);
+            }
+            render_queue.write_buffer(&_buffers.blend_order, 0, bytemuck::cast_slice(&order));
+            order_cache.cam = Some(cam_pos);
+            if buffers_changed {
+                info!(
+                    "gpu-driven blend: {} items collapse into {} same-pipeline runs at this pose",
+                    order.len(),
+                    order_cache.runs.len()
+                );
+            }
+        }
         for (entity, main_entity) in &markers {
             // Transparent3d sorts ASCENDING by distance (values increase toward the camera), so
-            // the OPAQUE item at a large NEGATIVE distance runs FIRST and writes depth. Blend
-            // meshes then draw as ONE ITEM EACH, depth-sorted back-to-front (farthest = most
-            // negative = first), each issuing a single indirect record from indirect_blend —
-            // this replaced the whole-scene P2 re-raster AND gave transparency a stable order
-            // (Codex review). Mixed-class meshes draw in both passes; the fragment class-discard
-            // splits them.
+            // the OPAQUE item at a large NEGATIVE distance runs FIRST and writes depth. The blend
+            // work then draws as ONE ITEM PER RUN of consecutive same-pipeline sorted items, each
+            // a single multi_draw over its contiguous slots in indirect_blend_sorted — record
+            // order inside a run is byte-identical to the retired per-mesh items. (Non-map
+            // Transparent3d items — POI markers etc. — now sort against whole runs instead of
+            // interleaving between individual panes; runs are distance-local so the difference is
+            // sub-run-granular.) Mixed-class meshes draw in both passes; the fragment
+            // class-discard splits them.
             phase.add(Transparent3d {
                 entity: (entity, *main_entity),
                 pipeline: opaque_pipeline,
@@ -7438,70 +7583,38 @@ fn queue_gpu_driven(
                 extra_index: PhaseItemExtraIndex::None,
                 indexed: true,
             });
-            for (mesh_idx, centers, pass_mask) in &_buffers.blend_meshes {
-                // Sort key = distance to this mesh's NEAREST instance. It used to be the distance
-                // to its FIRST instance, which is an arbitrary copy that can sit anywhere on the
-                // map, so a mesh sorted as if it were somewhere it is not: on interchange the
-                // pane you look THROUGH (Nikitskaya_2_Outdoor_Glass_04, nearest instance 7.2 m)
-                // carried a 32.2 m key while the pane BEHIND it (…Glass_02, 8.0 m) carried 16.6 m
-                // — so the near glass composited behind the far glass. Worse, both keys track
-                // far-away instances, so ordinary camera movement made them CROSS and the pair
-                // swapped: windows seen through windows flashed between two shadings. Taking the
-                // minimum is O(blend instances) per frame (6,235 on interchange — microseconds).
-                // NOTE this orders MESHES correctly, not instances WITHIN one mesh: two panes of
-                // the SAME mesh still share one indirect record and blend in arbitrary order.
-                let d = centers
-                    .iter()
-                    .map(|c| (cam_pos - Vec3::from_array(*c)).length())
-                    .fold(f32::INFINITY, f32::min);
-                let d = if d.is_finite() { d } else { 0.0 };
-                let item = |pipeline, distance| Transparent3d {
+            for &(kind, key, start, len) in order_cache.runs.iter() {
+                let pipeline = match kind {
+                    DrawPass::Opaque => opaque_pipeline, // unreachable: runs are blend-only
+                    DrawPass::Blend => blend_pipeline,
+                    DrawPass::DecalDepth => decal_depth_pipeline,
+                    DrawPass::DecalColor => decal_color_pipeline,
+                };
+                phase.add(Transparent3d {
                     entity: (entity, *main_entity),
                     pipeline,
                     draw_function: draw_fn,
-                    distance,
+                    distance: key,
                     batch_range: 0..1,
                     extra_index: PhaseItemExtraIndex::IndirectParametersIndex {
-                        range: *mesh_idx..(*mesh_idx + 1),
+                        range: start..(start + len),
                         batch_set_index: None,
                     },
                     indexed: true,
-                };
-                if pass_mask & BLEND_MESH_SOFTCUTOUT != 0 {
-                    // THE road-decal flicker fix. Two coplanar SoftCutout roads at the bus stop
-                    // (Bus_stop_road_01 mat 776 + _02 mat 724) flickered on ANY camera rotate/zoom.
-                    // Root cause was a two-part depth+order interaction, not a simple z-fight:
-                    // the coverage-only depth PREPASS used to draw FIRST and wrote BOTH decals' depth,
-                    // so each decal's COLOR was then GreaterEqual-tested against the OTHER decal's
-                    // prepass depth. Rotating (even in place — view-space z changes) flipped that test
-                    // per-pixel so a decal dropped in/out, and their `-d` distance sort also swapped
-                    // which composited on top. No depth bias / NDC-push could fix it: the interaction
-                    // was decal-vs-decal in the depth buffer.
-                    //
-                    // Fix mirrors Unity's fixed decal render-queue: composite the COLORS FIRST, tested
-                    // ONLY against real opaque scene depth (the prepass has not run yet), in a stable
-                    // camera-INDEPENDENT order — so decals never cull or reorder against each other,
-                    // only against solid geometry. `mesh_idx` is the unique, deterministic, view-
-                    // invariant build index -> a strict total order (base 2e6 keeps idx increments
-                    // f32-distinct; a 1e28 base collapses all to one tie). The +1e-3*w clip push
-                    // (gpu_draw.wgsl) still lifts the color over the coplanar OPAQUE ground.
-                    phase.add(item(decal_color_pipeline, -2.0e6 - (*mesh_idx as f32)));
-                    // Coverage-only depth prepass drawn AFTER the colors: re-asserts the road's raw
-                    // depth so it still occludes the underground ceiling + POIs drawn later (0d95be1),
-                    // but can no longer gate the decal colors above. No NDC push (a depth writer would
-                    // peter-pan). Fixed key, less-negative than the colors (draws after them) and far
-                    // more negative than the -d Overlay/Blend bands (draws before them).
-                    phase.add(item(decal_depth_pipeline, -1.5e6));
-                }
-                if pass_mask & BLEND_MESH_OVERLAY != 0 {
-                    phase.add(item(overlay_pipeline, -d - 0.001));
-                }
-                if pass_mask & BLEND_MESH_TRANSPARENT != 0 {
-                    phase.add(item(blend_pipeline, -d));
-                }
+                });
             }
         }
     }
+}
+
+/// Cached transparent-phase draw order (`queue_gpu_driven`): the sorted item list only changes
+/// when the camera moves, so the O(n log n) sort and the `blend_order` upload happen on movement
+/// and a parked camera pays for neither. Each run is (pipeline kind, first sort key, first slot,
+/// slot count) over `indirect_blend_sorted`.
+#[derive(Default)]
+struct BlendOrderCache {
+    cam: Option<Vec3>,
+    runs: Vec<(DrawPass, f32, u32, u32)>,
 }
 
 /// Which GPU-driven draw specialization a pipeline is. Part of `EftDrawKey`'s
@@ -7510,10 +7623,10 @@ fn queue_gpu_driven(
 enum DrawPass {
     /// P1 OPAQUE: blend None, depth-write ON, no bias, A2C for cutout edges. Discards BLEND frags.
     Opaque,
-    /// True transparency (currently glass): alpha blend, depth-write off, no coplanar bias.
+    /// UNIFIED surface pass — true transparency (glass) AND decal/water overlays: alpha blend,
+    /// depth-write off. The overlay NDC push is per-material in the shader (SURFACE_PUSH), so one
+    /// pipeline serves the whole sorted band and runs never break between the two classes.
     Blend,
-    /// Plain decal and textured-water surface overlays: alpha blend, depth-write off, strong bias.
-    Overlay,
     /// SoftCutout coverage-only depth prepass (A2C); keeps road occlusion without color fighting.
     DecalDepth,
     /// SoftCutout premultiplied color, blended after its depth prepass with a slightly larger bias.
@@ -7588,17 +7701,16 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
                 // strength — the Unity Standard transparent convention. Under the old straight
                 // ALPHA_BLENDING every term was scaled by alpha, so clear glass showed only ~10-30%
                 // of its sky reflection and read as a dark tinted slab (render-audit finding #18).
+                //
+                // UNIFIED with the retired Overlay pass: overlays (decal/water) always ran the
+                // IDENTICAL pipeline state and differed only in the class discard + the NDC push,
+                // both per-material under SURFACE_PUSH now. One pipeline lets the whole sorted
+                // back-to-front band draw as a handful of multi_draw runs instead of ~4,200
+                // pipeline switches per frame on streets (37 ms of encode).
                 Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                 false,
                 DepthBiasState::default(),
-                vec!["BLEND_PASS".into()],
-                ColorWrites::ALL,
-            ),
-            DrawPass::Overlay => (
-                Some(BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                false,
-                DepthBiasState::default(),
-                vec!["BLEND_PASS".into(), "OVERLAY_PASS".into(), "DECAL_NDC_PUSH".into()],
+                vec!["BLEND_PASS".into(), "SURFACE_PUSH".into()],
                 ColorWrites::ALL,
             ),
             DrawPass::DecalDepth => (
@@ -7624,7 +7736,6 @@ impl SpecializedRenderPipeline for EftDrawPipeline {
             label: Some(match key.pass {
                 DrawPass::Opaque => "eft_gpu_draw_opaque".into(),
                 DrawPass::Blend => "eft_gpu_draw_blend".into(),
-                DrawPass::Overlay => "eft_gpu_draw_overlay".into(),
                 DrawPass::DecalDepth => "eft_gpu_draw_decal_depth".into(),
                 DrawPass::DecalColor => "eft_gpu_draw_decal_color".into(),
             }),
@@ -7802,15 +7913,30 @@ impl Node for EftCullNode {
         // Third pass (its own barrier): order each BLEND mesh's survivors back-to-front. cs_cull
         // compacts with atomics, so without this the per-instance draw order inside a transparent
         // mesh reshuffles every frame and overlapping glass flickers with a STILL camera.
-        if let Some(sort_blend) = cache.get_compute_pipeline(pipelines.sort_blend_id) {
+        // cs_blend_gather rides the same pass (disjoint buffers: the sort reorders visible[], the
+        // gather reads indirect_blend — both written by the PREVIOUS pass, barrier at the boundary):
+        // it copies each transparent item's live record into draw order so the phase can issue
+        // whole same-pipeline runs as single multi_draws.
+        {
             let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("eft_cull_sort_blend"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(sort_blend);
-            pass.set_bind_group(0, &**bg, &[]);
-            pass.set_bind_group(1, &hiz.bg, &[]);
-            pass.dispatch_workgroups(blend_groups.0, blend_groups.1, 1);
+            if let Some(sort_blend) = cache.get_compute_pipeline(pipelines.sort_blend_id) {
+                pass.set_pipeline(sort_blend);
+                pass.set_bind_group(0, &**bg, &[]);
+                pass.set_bind_group(1, &hiz.bg, &[]);
+                pass.dispatch_workgroups(blend_groups.0, blend_groups.1, 1);
+            }
+            if buffers.blend_items > 0 {
+                if let Some(gather) = cache.get_compute_pipeline(pipelines.blend_gather_id) {
+                    let g = dispatch_2d(buffers.blend_items.div_ceil(64));
+                    pass.set_pipeline(gather);
+                    pass.set_bind_group(0, &**bg, &[]);
+                    pass.set_bind_group(1, &hiz.bg, &[]);
+                    pass.dispatch_workgroups(g.0, g.1, 1);
+                }
+            }
         }
         span.end(render_context.command_encoder());
         Ok(())
@@ -8331,15 +8457,17 @@ impl<P: PhaseItem> RenderCommand<P> for DrawGpuDrivenInner {
         pass.set_index_buffer(buffers.index.slice(..), 0, buffers.index_format);
 
         // OPAQUE item (extra_index None): ONE multi-draw for ALL meshes from the opaque indirect
-        // buffer (blend-only records are zeroed by cs_reset). BLEND items carry their mesh index
-        // in IndirectParametersIndex and draw exactly ONE record from indirect_blend, already
-        // depth-sorted by the phase. Requires MULTI_DRAW_INDIRECT (guarded at pipeline init).
+        // buffer (blend-only records are zeroed by cs_reset). BLEND items carry a RANGE of slots
+        // in the draw-ordered `indirect_blend_sorted` (cs_blend_gather copied the live records
+        // there this frame), so a whole run of same-pipeline items is ONE multi_draw — the
+        // per-item encode of 11k single-record draws was 48 ms of CPU per frame on streets.
+        // Requires MULTI_DRAW_INDIRECT (guarded at pipeline init).
         match item.extra_index() {
             PhaseItemExtraIndex::IndirectParametersIndex { range, .. } => {
                 pass.multi_draw_indexed_indirect(
-                    &buffers.indirect_blend,
+                    &buffers.indirect_blend_sorted,
                     range.start as u64 * DRAW_ARG_STRIDE,
-                    1,
+                    range.end.saturating_sub(range.start),
                 );
             }
             _ => {

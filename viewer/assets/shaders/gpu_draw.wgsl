@@ -991,6 +991,16 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     // small enough that genuinely-closer geometry (walls, props) still occludes the decal.
     o.clip.z = o.clip.z + 1.0e-3 * o.clip.w;
 #endif
+#ifdef SURFACE_PUSH
+    // Unified glass+overlay build: the coplanar-decal separation (see DECAL_NDC_PUSH above) is
+    // decided per MATERIAL — surface overlays (decal/water) get the push exactly as the retired
+    // Overlay pipeline gave them, true transparency (glass) stays unbiased exactly as the Blend
+    // pipeline did. Vertices of materials the fragment discard will drop are pushed harmlessly.
+    let push_flags = materials[min(v.material_index, arrayLength(&materials) - 1u)].flags;
+    if ((push_flags & (MAT_FLAG_DECAL | MAT_FLAG_WATER)) != 0u) {
+        o.clip.z = o.clip.z + 1.0e-3 * o.clip.w;
+    }
+#endif
     o.world_normal = normalize(cofactor(col0, col1, col2) * oct_decode(v.normal_oct));
     o.uv = v.uv;
     o.material_index = v.material_index;
@@ -1204,13 +1214,12 @@ fn fragment(o: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f3
     if (!is_softcutout) { discard; }
 #else
 #ifdef BLEND_PASS
-    let is_overlay = (m.flags & (MAT_FLAG_DECAL | MAT_FLAG_WATER)) != 0u;
-#ifdef OVERLAY_PASS
-    if (!is_blend || is_softcutout || !is_overlay) { discard; }
-#else
-    // True transparency (glass) has no coplanar bias; surface overlays use OVERLAY_PASS.
-    if (!is_blend || is_softcutout || is_overlay) { discard; }
-#endif
+    // UNIFIED surface pass: glass AND overlays (decal/water) share ONE pipeline — their GPU state
+    // was always identical (premultiplied blend, no depth write, zero rasterizer bias); the only
+    // split was this discard plus the overlay NDC push, and the push is per-MATERIAL now (see
+    // SURFACE_PUSH in the vertex). One pipeline means the whole back-to-front band draws as a
+    // handful of multi_draw runs instead of ~4,200 pipeline switches per frame on streets.
+    if (!is_blend || is_softcutout) { discard; }
 #else
     if (is_blend) { discard; }  // OPAQUE pipeline: keep everything except BLEND (cutout stays)
 #endif
