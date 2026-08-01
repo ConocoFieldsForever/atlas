@@ -124,8 +124,13 @@ def build_weapon_tree(rng, items, bot_mods, presets, weapon_tpl, depth=0, seen=N
                 pick = cands[rng.randrange(len(cands))]
             elif base.get(slot_name) in allowed:
                 pick = base.get(slot_name)          # the factory part
+            # NO ARBITRARY PARTS. Filling a required slot with `sorted(allowed)[0]` picks by
+            # alphabet, which is how a fixed A2 rear sight ended up installed under an HHS-1 --
+            # a build the game would never produce. If neither this bot's table nor BSG's factory
+            # preset names a part, the slot stays empty: an incomplete gun is honest, an invented
+            # one is not.
             elif required and allowed:
-                pick = sorted(allowed)[0]           # a required slot must be filled
+                pick = None
             if pick:
                 chosen[slot_name] = pick
         if chosen:

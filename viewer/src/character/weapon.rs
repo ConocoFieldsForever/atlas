@@ -10,6 +10,7 @@
 //! ships `weapon_holster` for the slung pose), so it follows the animation with no extra work.
 
 use bevy::asset::RenderAssetUsages;
+use bevy::image::{ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
 use serde::Deserialize;
@@ -146,9 +147,24 @@ pub fn load(
         tex_cache
             .entry(format!("{rel}:{srgb}"))
             .or_insert_with(|| {
-                image::open(dir.join(rel))
-                    .ok()
-                    .map(|img| images.add(Image::from_dynamic(img, srgb, RenderAssetUsages::RENDER_WORLD)))
+                image::open(dir.join(rel)).ok().map(|img| {
+                    // Same handling as the character path, which renders correctly. Two
+                    // differences mattered: RENDER_WORLD-only images cannot be sampled the way
+                    // the default usage allows, and with no sampler Bevy's default addressing
+                    // and filtering applied instead of Repeat + linear + anisotropy. The result
+                    // read as a texture mapped wrong rather than as a missing texture.
+                    let mut image = Image::from_dynamic(img, srgb, RenderAssetUsages::default());
+                    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+                        address_mode_u: ImageAddressMode::Repeat,
+                        address_mode_v: ImageAddressMode::Repeat,
+                        mag_filter: ImageFilterMode::Linear,
+                        min_filter: ImageFilterMode::Linear,
+                        mipmap_filter: ImageFilterMode::Linear,
+                        anisotropy_clamp: 16,
+                        ..default()
+                    });
+                    images.add(image)
+                })
             })
             .clone()
     };
