@@ -5850,18 +5850,41 @@ fn match_loot_models(
     if chains.is_empty() {
         return Vec::new();
     }
-    // (lv, folded id) -> container-chain slots that keep it (organization nodes dropped).
-    let mut key_to_chain: std::collections::HashMap<(u32, u32), Vec<u32>> = Default::default();
+    // (lv, folded id) -> (container-chain slot, DEPTH in that chain). Depth 0 is the container's
+    // own transform, 1 its parent, 2 its grandparent — increasingly weak evidence.
+    let mut key_to_chain: std::collections::HashMap<(u32, u32), Vec<(u32, u32)>> = Default::default();
     for (slot, (_, lv, tf)) in chains.iter().enumerate() {
         for (k, &id) in tf.iter().enumerate() {
             if id == 0 || (k > 0 && ancestor_claims.get(&(*lv, id)).copied().unwrap_or(0) > 3) {
                 continue;
             }
-            key_to_chain.entry((*lv, id)).or_default().push(slot as u32);
+            key_to_chain.entry((*lv, id)).or_default().push((slot as u32, k as u32));
         }
     }
-    // One pass over the instances: an instance whose (lv, par) or (lv, par2) is a kept key
-    // belongs to those containers.
+    // MOST SPECIFIC ANCESTOR WINS. Every depth used to count equally, so a container also claimed
+    // whatever else happened to hang off its grandparent — a closed metal barrel two metres from a
+    // toolbox glowed as loot because both sit under one node (streets inst 142930, matched
+    // 'scontainer_toolbox_01_Cup' at depth 2). Take only the SHALLOWEST depth that matches anything
+    // for a given container. Measured on the shipped packs: container coverage is unchanged
+    // (streets 1285/1285, ground_zero 523/523, interchange 906/906) while 802 / 314 / 577 spurious
+    // instance refs disappear — and no container anywhere needs depth 2, so those claims were
+    // never anything but noise.
+    let mut best_depth: Vec<u32> = vec![u32::MAX; chains.len()];
+    for &(par, par2, lv) in inst_ancestry.iter() {
+        for id in [par, par2] {
+            if id == 0 {
+                continue;
+            }
+            if let Some(slots) = key_to_chain.get(&(lv, id)) {
+                for &(s, k) in slots {
+                    let b = &mut best_depth[s as usize];
+                    if k < *b {
+                        *b = k;
+                    }
+                }
+            }
+        }
+    }
     let mut hits: Vec<Vec<u32>> = vec![Vec::new(); chains.len()];
     for (i, &(par, par2, lv)) in inst_ancestry.iter().enumerate() {
         for id in [par, par2] {
@@ -5869,8 +5892,10 @@ fn match_loot_models(
                 continue;
             }
             if let Some(slots) = key_to_chain.get(&(lv, id)) {
-                for &s in slots {
-                    hits[s as usize].push(i as u32);
+                for &(s, k) in slots {
+                    if k == best_depth[s as usize] {
+                        hits[s as usize].push(i as u32);
+                    }
                 }
             }
         }

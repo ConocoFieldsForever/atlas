@@ -111,6 +111,58 @@ def index_game_files(game):
     return idx
 
 
+def refresh_packs(only=None):
+    """Re-link repaired textures into built packs, and independently repair any pack texture that
+    is broken while its source is good.
+
+    assemble_bevy ships textures as HARDLINKS (same inode as the source). The repair above writes a
+    temp file and os.replace()s it, which by design creates a NEW inode - so a source fix leaves
+    every pack that shipped the old one still pointing at the broken bytes. Repairing without this
+    step looks like a fix and changes nothing on screen, which is exactly the failure this tool
+    exists to end. Returns the list of paths it could not fix.
+    """
+    import shutil
+    sources = {}
+    for fp in glob.glob(os.path.join(REPO, "eft_assets", "*", "tex", "*.png")):
+        sources.setdefault(os.path.basename(fp), fp)
+    bad = []
+    relinked = recopied = 0
+    for pack_tex in sorted(glob.glob(os.path.join(REPO, "packs", "*.eftpack", "tex"))):
+        n_before = 0
+        for dst in glob.glob(os.path.join(pack_tex, "*.png")):
+            name = os.path.basename(dst)
+            if only is not None and name not in only and png_complete(dst):
+                continue
+            if png_complete(dst) and only is not None and name not in only:
+                continue
+            if png_complete(dst) and (only is None or name not in only):
+                continue
+            src = sources.get(name)
+            if not src or not png_complete(src):
+                if not png_complete(dst):
+                    bad.append(dst)
+                continue
+            n_before += 1
+            try:
+                os.remove(dst)
+                os.link(src, dst)
+                relinked += 1
+            except OSError:
+                try:
+                    shutil.copy2(src, dst)
+                    recopied += 1
+                except OSError as e:
+                    print(f"[fail] could not refresh {dst}: {e}")
+                    bad.append(dst)
+        if n_before:
+            print(f"[packs] {os.path.basename(os.path.dirname(pack_tex))}: refreshed {n_before}")
+    if relinked or recopied:
+        print(f"[packs] {relinked} relinked, {recopied} copied")
+    if bad:
+        print(f"[packs] {len(bad)} pack texture(s) still broken with no good source")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -123,7 +175,8 @@ def main():
             broken.append(fp)
     print(f"[scan] {len(broken)} broken PNGs across eft_assets/*/tex")
     if not broken:
-        return 0
+        # The sources are fine, but a pack shipped BEFORE a repair still carries the old inode.
+        return 1 if refresh_packs() else 0
     for fp in broken:
         print("   ", os.path.relpath(fp, REPO))
     if args.dry_run:
@@ -187,6 +240,9 @@ def main():
         print(f"[ok]   {base}  <- {os.path.basename(src_fp)} pid {pid}  ({kind}, {img.size[0]}x{img.size[1]})")
 
     print(f"[done] repaired {len(broken) - len(failed)}/{len(broken)}")
+
+    repaired = {os.path.basename(fp) for fp in broken if fp not in failed}
+    failed += refresh_packs(repaired)
     return 1 if failed else 0
 
 
