@@ -17,7 +17,7 @@
 //! pattern `walk_ground` already uses for head bob — `tf.translation.y -= ws.last_bob` at the top of
 //! the frame — and needs no changes to `walk_move` itself.
 
-use super::anim::{accumulate_clip, eval_tree, PoseAccumulator, WeightedClip};
+use super::anim::{accumulate_additive, accumulate_clip, eval_tree, PoseAccumulator, WeightedClip};
 use super::pack::CharacterPack;
 use super::rig::{CharacterRoot, CharacterMesh};
 use super::{ActiveCharacter, CharacterSettings};
@@ -45,6 +45,15 @@ pub(crate) mod states {
     pub const LAND_IDLE: &str = "Base Layer.JUMP.Land_Idle";
     pub const LAND_MOVE: &str = "Base Layer.JUMP.Land_Move";
 }
+
+/// The additive layer that brings the SIGHT to the eye, and the transition on it that does the
+/// bringing. `ISaim` is the controller's own name for iron-sight aim; `idle_aim_AimIn` is the
+/// aim-in transition, which is scrubbed by the aim blend rather than played on a clock.
+///
+/// NOT `Additive_Aiming`: that layer's clips are `SideStep_*_Aim_*` — locomotion variants that
+/// carry the body's own movement, so standing still their frame-0 delta is nothing.
+pub(crate) const AIM_LAYER: &str = "Additive_ISaim";
+pub(crate) const AIM_STATE: &str = "Additive_ISaim.idle_aim_AimIn";
 
 /// Speed below which the character is considered standing still (m/s).
 const MOVE_EPSILON: f32 = 0.15;
@@ -392,6 +401,8 @@ pub fn drive_character(
     // ---- accumulate (incoming and outgoing together = the cross-fade) ----
     let acc = acc.get_or_insert_with(|| PoseAccumulator::new(pack.bones.len()));
     acc.clear();
+    let aim_w = aim_blend.0.clamp(0.0, 1.0);
+    let root_state_time = root.state_time;
     // Smoothstep so the fade eases in and out rather than moving at constant angular rate.
     let t = root.fade.clamp(0.0, 1.0);
     let w_in = if fading { t * t * (3.0 - 2.0 * t) } else { 1.0 };
@@ -414,6 +425,29 @@ pub fn drive_character(
     // loop below needs both at once.
     let CharacterRoot { bones, locals, .. } = &mut *root;
     acc.resolve(pack, locals);
+
+    // ---- additive aim layer -------------------------------------------------------------
+    // How EFT actually aims: `Additive_Aiming.Aiming` is a DELTA pose that brings the weapon up
+    // to the eye on top of whatever the legs are doing, which is why one aim clip works over
+    // idle, walk and strafe alike. Blended in by `AimBlend`, so the weapon rises and lowers
+    // rather than snapping. The clock is the base state's, keeping the aim in step with the gait.
+    if aim_w > 1e-3 {
+        let layer_w = pack
+            .controller
+            .as_ref()
+            .and_then(|c| c.layers.iter().find(|l| l.name == AIM_LAYER))
+            .map(|l| if l.default_weight > 0.0 { l.default_weight } else { 1.0 })
+            .unwrap_or(1.0);
+        let mut aim_leaves: Vec<WeightedClip> = Vec::new();
+        gather(pack, AIM_STATE, &params, &mut aim_leaves);
+        for l in &aim_leaves {
+            if let Some(clip) = pack.clip_by_controller_id(l.clip_id) {
+                // The blend fraction IS the position along the aim-in transition: 0 leaves the clip at its
+                // neutral first frame, 1 holds it fully shouldered.
+                accumulate_additive(clip, aim_w * clip.duration, l.weight * layer_w, locals);
+            }
+        }
+    }
 
     // ---- write bone transforms ----
     // No root-motion special case here: the emitter STRIPS root motion out of the bone tracks into
@@ -457,6 +491,9 @@ pub fn drive_character(
 #[derive(Resource)]
 pub struct PlayerAim {
     pub bone: Entity,
+    /// The node between the socket bone and the weapon meshes. Driven while aiming so the sight
+    /// anchor lands on the eye; identity otherwise.
+    pub offset: Entity,
     pub local: Transform,
     pub fov_deg: Option<f32>,
 }
@@ -484,7 +521,8 @@ pub fn aim_down_sights(
     aim: Option<Res<PlayerAim>>,
     mut blend: ResMut<AimBlend>,
     bones: Query<&GlobalTransform, With<super::rig::CharacterBone>>,
-    mut cam: Query<(&mut Transform, &mut Projection), With<crate::CullCamera>>,
+    mut cam: Query<(&Transform, &mut Projection), With<crate::CullCamera>>,
+    mut offsets: Query<&mut Transform, (Without<crate::CullCamera>, Without<super::rig::CharacterBone>)>,
 ) {
     let Some(aim) = aim else { return };
     // `EFT_ADS=1` holds the sight up without a mouse, so a headless capture can frame it.
@@ -498,17 +536,28 @@ pub fn aim_down_sights(
     let target = if want { 1.0 } else { 0.0 };
     blend.0 += (target - blend.0) * (1.0 - (-rate * time.delta_secs()).exp());
     if blend.0 <= 0.001 {
-        return;
-    }
-    if !std::env::var("EFT_ADS_EYE").map(|v| v.trim() == "1").unwrap_or(false) {
+        // Rest the weapon back in the hand exactly, not merely close to it.
+        if let Ok(mut off) = offsets.get_mut(aim.offset) {
+            *off = Transform::IDENTITY;
+        }
         return;
     }
     let Ok(bone_gt) = bones.get(aim.bone) else { return };
-    let Ok((mut cam_tf, mut proj)) = cam.single_mut() else { return };
-    let world = bone_gt.mul_transform(aim.local);
-    let (_, want_rot, want_pos) = world.to_scale_rotation_translation();
-    cam_tf.translation = cam_tf.translation.lerp(want_pos, blend.0);
-    cam_tf.rotation = cam_tf.rotation.slerp(want_rot, blend.0);
+    let Ok((cam_tf, mut proj)) = cam.single_mut() else { return };
+    // Put the sight ON the eye by moving the WEAPON, not the view: the offset that satisfies
+    //     bone_world * offset * anchor == camera
+    // is `offset = bone_world^-1 * camera * anchor^-1`. Eased from identity by the blend, so the
+    // gun rises into the sight picture instead of teleporting.
+    let cam_world = Transform::from_translation(cam_tf.translation).with_rotation(cam_tf.rotation);
+    let want = Transform::from_matrix(
+        bone_gt.to_matrix().inverse()
+            * cam_world.to_matrix()
+            * aim.local.to_matrix().inverse(),
+    );
+    if let Ok(mut off) = offsets.get_mut(aim.offset) {
+        off.translation = Vec3::ZERO.lerp(want.translation, blend.0);
+        off.rotation = Quat::IDENTITY.slerp(want.rotation, blend.0);
+    }
     // MAGNIFICATION IS NOT A SCREEN ZOOM. `ScopeCameraData.FieldOfView` (5.03 deg on the G33)
     // drives the optic's own camera, whose image the game renders INTO the lens circle -- the
     // rest of the screen keeps its normal field of view. Applying it to the main camera would be

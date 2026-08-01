@@ -187,6 +187,15 @@ fn attach_weapon(
     };
     let Some(dir) = dir else { return };
     let Some(wp) = weapon::load(&dir, meshes, materials, images) else { return };
+    // The weapon hangs off the socket through an OFFSET node. At rest that node is identity, so
+    // the gun sits exactly where the hand puts it; aiming drives it so the sight's own anchor
+    // lands on the eye. This is how EFT aims in first person -- the camera holds still and the
+    // WEAPON comes up to it, which is what `OpticSight.ScopeTransform` (`mod_aim_camera`) exists
+    // to specify.
+    let offset = commands
+        .spawn((Transform::IDENTITY, Visibility::default(), Name::new("weapon_offset")))
+        .id();
+    commands.entity(bone).add_child(offset);
     // Remember where the sight's eye anchor sits, in the weapon's own space. The weapon is a
     // child of the socket bone, so bone_world * anchor is where the eye goes when aiming.
     if let Some(a) = &wp.aim {
@@ -195,6 +204,7 @@ fn attach_weapon(
         if fwd.length_squared() > 0.5 {
             commands.insert_resource(drive::PlayerAim {
                 bone,
+                offset,
                 local: Transform::from_translation(Vec3::from_array(a.position))
                     .looking_to(fwd, if up.length_squared() > 0.5 { up } else { Vec3::Y }),
                 fov_deg: a.fov,
@@ -209,7 +219,7 @@ fn attach_weapon(
         let child = commands
             .spawn((Mesh3d(mesh.clone()), MeshMaterial3d(mat.clone()), Transform::IDENTITY))
             .id();
-        commands.entity(bone).add_child(child);
+        commands.entity(offset).add_child(child);
     }
     info!("player weapon: {} part(s) from {}", wp.parts.len(), dir.display());
 }

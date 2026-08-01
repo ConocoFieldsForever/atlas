@@ -2069,7 +2069,14 @@ fn walk_move(
                 let target = g + EYE_HEIGHT;
                 ws.last_ground_y = g;
                 ws.has_ground = true;
-                if ws.vy <= 0.0 && new_y <= target {
+                // A step you can walk UP is one you can walk DOWN. `ground_height` already probes
+                // `STEP_UP` for the surface underfoot, so a drop within that same tolerance is a
+                // curb, not a ledge — stay grounded and glide down it. Requiring `new_y <= target`
+                // instead made every downward step read as airborne until gravity caught up, which
+                // is ~0.17 s of the FALLING animation for a 15 cm kerb.
+                let drop = tf.translation.y - target;
+                let stepping_down = ws.vy <= 0.0 && drop > 0.0 && drop <= STEP_UP;
+                if ws.vy <= 0.0 && (new_y <= target || stepping_down) {
                     // Land / stand: settle exactly, and while grounded exp-smooth toward the
                     // surface so stepping up curbs/treads glides instead of snapping.
                     let follow = 1.0 - (-20.0 * dt).exp();
@@ -2081,7 +2088,7 @@ fn walk_move(
                     ws.vy = 0.0;
                     ws.grounded = true;
                 } else {
-                    ws.grounded = false; // airborne (rising, or above target)
+                    ws.grounded = false; // airborne (rising, or off a real ledge)
                 }
             }
             None => {

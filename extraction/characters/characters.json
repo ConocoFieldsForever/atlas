@@ -48,7 +48,12 @@
    "Base Layer.JUMP.Fall",
    "Base Layer.JUMP.Fall_End",
    "Base Layer.JUMP.Land_Idle",
-   "Base Layer.JUMP.Land_Move"
+   "Base Layer.JUMP.Land_Move",
+   "Additive_Aiming.Aiming",
+   "Additive_Aiming.SideStep_L_Aiming",
+   "Additive_Aiming.SideStep_R_Aiming",
+   "Additive_ISaim.idle_aim_AimIn",
+   "Additive_ISaim.idle_aim_AimOut"
   ],
   "idle": [
    "Base Layer.Stand.Idle_Aim"

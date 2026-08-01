@@ -140,6 +140,58 @@ pub fn accumulate_clip(acc: &mut PoseAccumulator, clip: &ClipData, time: f32, w:
     }
 }
 
+/// Apply an ADDITIVE layer's contribution on top of already-resolved local transforms.
+///
+/// An additive layer contributes a DELTA in each bone's local space, so one aim pose can sit on
+/// top of idle, walk or strafe without re-authoring any of them. This is how EFT aims:
+/// `Additive_Aiming.Aiming` brings the weapon up to the eye over whatever the legs are doing.
+///
+/// THE REFERENCE IS THE CLIP'S FIRST FRAME, which is Unity's own additive default (these clips
+/// carry no `m_AdditiveReferencePose` override — checked). They are aim-IN TRANSITIONS, not held
+/// poses: five frames over 0.133 s carrying up to 132 degrees of rotation, starting at neutral
+/// and ending shouldered. So frame 0 is genuinely the rest reference, and sampling the clip at
+/// the aim fraction walks that transition — which is why the caller passes `blend * duration` as
+/// the time rather than the base state's clock.
+pub fn accumulate_additive(
+    clip: &ClipData,
+    time: f32,
+    w: f32,
+    out: &mut [(Vec3, Quat, Vec3)],
+) {
+    if w <= 1e-5 || clip.frame_count == 0 {
+        return;
+    }
+    let frames = clip.frame_count;
+    let (i0, i1, a) = if frames == 1 || clip.duration <= 1e-6 {
+        (0usize, 0usize, 0.0f32)
+    } else {
+        // CLAMPED, never wrapped: this is a transition being scrubbed, so past its end it holds
+        // the aimed pose instead of snapping back to neutral every 0.133 s.
+        let t = time.clamp(0.0, clip.duration);
+        let f = (t / clip.duration) * (frames - 1) as f32;
+        let i0 = (f.floor() as usize).min(frames - 1);
+        (i0, (i0 + 1).min(frames - 1), f - f.floor())
+    };
+    for track in &clip.tracks {
+        let b = track.bone;
+        if b >= out.len() {
+            continue;
+        }
+        if !track.rotation.is_empty() {
+            let q0 = track.rotation[i0];
+            let q1 = track.rotation[i1];
+            let q = if a <= 0.0 { q0 } else { q0.slerp(q1, a) };
+            // Delta from the clip's reference (first) frame, eased in by the layer weight.
+            let delta = q * track.rotation[0].inverse();
+            out[b].1 = (Quat::IDENTITY.slerp(delta, w) * out[b].1).normalize();
+        }
+        if !track.position.is_empty() {
+            let p = track.position[i0].lerp(track.position[i1], a);
+            out[b].0 += (p - track.position[0]) * w;
+        }
+    }
+}
+
 /// A resolved blend-tree leaf: which controller clip id, and how much of it.
 #[derive(Debug, Clone, Copy)]
 pub struct WeightedClip {

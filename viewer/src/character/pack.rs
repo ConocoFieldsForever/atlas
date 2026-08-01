@@ -246,6 +246,23 @@ pub struct ControllerManifest {
     pub clip_index_by_id: Vec<i64>,
     #[serde(default)]
     pub states: Vec<StateManifest>,
+    /// The controller's LAYERS. EFT stacks eleven of them: a base locomotion layer plus additive
+    /// ones that add aim, breathing and body turn on top. Aiming lives on `Additive_Aiming`.
+    #[serde(default)]
+    pub layers: Vec<LayerManifest>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerManifest {
+    pub index: usize,
+    pub name: String,
+    /// `"override"` or `"additive"` — additive layers contribute a DELTA against their clip's
+    /// first frame rather than an absolute pose.
+    #[serde(default)]
+    pub blending: String,
+    #[serde(default)]
+    pub default_weight: f32,
 }
 
 #[derive(Debug, Deserialize)]

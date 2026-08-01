@@ -530,6 +530,15 @@ def main() -> None:
     ap.add_argument("--bot", help="bot type from the game's own tables (assault, pmcusec, "
                                   "bosskilla, ...) — appearance is ROLLED, not authored")
     ap.add_argument("--seed", type=int, default=0, help="roll seed for --bot (default 0)")
+    ap.add_argument("--controller", help="override the animator bundle (relative to the characters "
+                                         "root). The BOT controllers carry no first-person aim -- "
+                                         "bots have no first-person view -- so a character meant "
+                                         "for the walk camera wants player_anim_controller.")
+    ap.add_argument("--root-motion", help="override the root-motion table to match --controller")
+    ap.add_argument("--controller-name", help="which AnimatorController inside the bundle "
+                                              "(player_anim_controller ships four, of which "
+                                              "Player_anim_controller_CURRENT_REWORK_ACTUAL_USE_THIS "
+                                              "is the live one)")
     args = ap.parse_args()
 
     if args.list:
@@ -545,6 +554,13 @@ def main() -> None:
         reg = load_registry()
         spec = resolve_appearance(args.bot, args.seed, clip_sets=reg.get("clipSets"))
         spec["id"] = f"{args.bot}_{args.seed}"
+        if args.controller:
+            spec["controller"] = args.controller
+            spec.pop("controllerName", None)
+        if args.controller_name:
+            spec["controllerName"] = args.controller_name
+        if args.root_motion:
+            spec["rootMotion"] = args.root_motion
         print(f"[appearance] {args.bot} #{args.seed}: "
               + ", ".join(f"{k}={v['name']}" for k, v in spec["appearance"].items()))
         build(character=spec, clip_set=args.clips, skip_clips=args.skip_clips, lods=args.lod,
