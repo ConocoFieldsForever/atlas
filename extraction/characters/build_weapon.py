@@ -205,6 +205,34 @@ class Bundle:
             self._scope_modes = modes
         return self._scope_modes
 
+    def foldable_sights(self):
+        """Backup iron sights and which of their states is FOLDED.
+
+        `AutoFoldableSight` tags each state node with a `Mode`, and the game's own node names say
+        what the index means -- Mode 1 sits on `..._folded_LOD*`, Mode 0 on `..._unfolded_LOD*`.
+        A backup sight folds down when a scope is mounted over it, which is exactly what "auto
+        foldable" means; drawn unfolded it stands up THROUGH the optic.
+
+        Returns [(nodes, folded)] — the transform pids of one state, and whether it is the folded one.
+        """
+        if getattr(self, "_foldables", None) is None:
+            out = []
+            for o in self.monos:
+                try:
+                    if o.read().m_Script.read().m_Name != "AutoFoldableSight":
+                        continue
+                    d = o.read_typetree()
+                except Exception:
+                    continue
+                gp = (d.get("m_GameObject") or {}).get("m_PathID")
+                t = self.go2tf.get(gp)
+                if t is None:
+                    continue
+                nm = (self.go_name.get(gp) or "").lower()
+                out.append((self.subtree(t), "unfolded" not in nm))
+            self._foldables = out
+        return self._foldables
+
     def _material_name(self, renderer):
         """First material name on a renderer — how the viewer finds this surface in the pack."""
         try:
@@ -403,7 +431,7 @@ class Bundle:
 
 
 def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, props_by_mat=None,
-         out_aim=None):
+         out_aim=None, fold_sights=False):
     """Append every renderer's mesh, transformed by base_M x its local matrix.
 
     LOD: item prefabs ship several detail shells (ak74_..._LOD0/_LOD1/...). Baking them all
@@ -419,6 +447,13 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
     dropped_states = []
     modes = bundle.scope_modes()
     hidden_modes = set()
+    # A backup iron sight folds down when a scope is mounted over it. `fold_sights` is decided by
+    # the BUILD (does anything occupy a scope slot), and which nodes belong to which state comes
+    # from the sight's own AutoFoldableSight components.
+    for nodes, folded in bundle.foldable_sights():
+        if folded != fold_sights:
+            hidden_modes |= nodes
+
     if modes:
         want = int(os.environ.get("EFT_SCOPE_MODE", "0"))
         want = want if 0 <= want < len(modes) else 0
@@ -657,6 +692,13 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
     """Recursively assemble `item_id` and its installed mods into one merged mesh."""
     verts, idxs, subs, mat_names = [], [], [], []
     aim = []
+    # Does this build carry a sight? BSG's own slot naming answers it: anything installed into a
+    # `mod_scope` slot is glass over the top of the backup irons, so the irons fold.
+    has_optic = any(
+        "scope" in str(slot).lower()
+        for slots in (install or {}).values()
+        for slot in (slots or {})
+    )
     tex_by_mat = {}
     props_by_mat = {}
     bundle_cache = bundle_cache if bundle_cache is not None else {}
@@ -676,7 +718,7 @@ def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None,
         if b is None:
             b = bundle_cache[p] = Bundle(p, cabs)
         bake(b, verts, idxs, subs, M, mat_names, tex_by_mat, props_by_mat=props_by_mat,
-             out_aim=aim)
+             out_aim=aim, fold_sights=has_optic)
         # children: for each installed mod, find the slot node with that name and recurse.
         for slot_name, child_id in (install or {}).get(iid, {}).items():
             node = b.slot_node(slot_name)
