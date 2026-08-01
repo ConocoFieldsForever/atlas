@@ -72,7 +72,7 @@ pub fn acquire() -> Option<File> {
             // designed, not a failure — this viewer renders exactly as normal, it just is not the
             // one a bake worker will defer to. Worth one calm line, not an error.
             eprintln!(
-                "[gpu-lease] another Atlas holds the interactive-GPU lease; rendering normally                  (a background bake will use the CPU path while both run)"
+                "[gpu-lease] another Atlas holds the interactive-GPU lease; rendering normally (a background bake will use the CPU path while both run)"
             );
             None
         }
