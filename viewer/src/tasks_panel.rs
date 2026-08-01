@@ -724,6 +724,10 @@ pub struct TasksUiState {
     show_unlinked: bool,
     /// Expand every task's Rewards section (screenshots / "what does this wipe pay" browsing).
     show_rewards: bool,
+    /// Why the last "Route tracked" produced nothing, shown under the route readout. `None` once a
+    /// real route is issued. Without it the button silently did nothing whenever every tracked
+    /// objective was a hand-in / off-map step.
+    route_note: Option<String>,
 }
 #[cfg(feature = "egui")]
 impl Default for TasksUiState {
@@ -740,6 +744,7 @@ impl Default for TasksUiState {
             located_only: has("located"),
             show_unlinked: has("unlinked"),
             show_rewards: has("rewards"),
+            route_note: None,
         }
     }
 }
@@ -981,7 +986,10 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
             return true;
         }
         t.objectives.iter().any(|o| {
-            o.items.iter().any(|i| i.to_lowercase().contains(&q))
+            // The objective TEXT is what a player actually remembers ("mark the first tanker"),
+            // and it was the one field the search never looked at.
+            o.desc.to_lowercase().contains(&q)
+                || o.items.iter().any(|i| i.to_lowercase().contains(&q))
                 || o.quest_item.as_deref().is_some_and(|i| i.to_lowercase().contains(&q))
                 || o.marker_item.as_deref().is_some_and(|i| i.to_lowercase().contains(&q))
                 || o.required_keys.iter().flatten().any(|k| k.name.to_lowercase().contains(&q))
@@ -1105,7 +1113,17 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
                     }
                 }
             }
-            if !dests.is_empty() {
+            // A tracked task whose objectives are all hand-ins / find-items has NO location on
+            // this map, so `dests` comes back empty. Writing nothing and saying nothing made the
+            // button look broken; name the reason instead. (Cleared by the next real route.)
+            if dests.is_empty() {
+                ui_state.route_note = Some(
+                    "Tracked tasks have no located objectives on this map \u{2014} their steps \
+                     are hand-ins or off-map."
+                        .to_string(),
+                );
+            } else {
+                ui_state.route_note = None;
                 route.write(RouteRequest { start: None, dests, optimize_order: true, ..Default::default() });
             }
         }
@@ -1133,12 +1151,21 @@ pub fn tasks_panel_ui(ui: &mut bevy_egui::egui::Ui, p: &mut TasksPanelParams) {
         }
         RouteStatus::Idle => {}
     }
+    if let Some(note) = ui_state.route_note.clone() {
+        ui.label(RichText::new(note.as_str()).size(theme::SIZE_CAPTION).color(theme::WARN));
+    }
     if !pf_running {
+        // Must match the Navigation tab's wording: routing needs a baked nav grid, and the
+        // ordinary menu build does NOT produce one — the old copy sent users off to run a long
+        // rebuild that could not fix it.
         ui.label(
-            RichText::new("no route data for this map \u{2014} rebuild it from the start menu")
-                .size(9.0)
-                .italics()
-                .color(MUTED),
+            RichText::new(
+                "Routing has not been built for this map yet \u{2014} markers and camera flight \
+                 still work.",
+            )
+            .size(9.0)
+            .italics()
+            .color(MUTED),
         );
     }
 

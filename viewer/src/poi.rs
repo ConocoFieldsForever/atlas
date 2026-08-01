@@ -3002,6 +3002,7 @@ fn apply_poi_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
     game_link: Option<Res<crate::game_watch::GameLink>>,
+    side_choice: Option<Res<crate::game_watch::SideChoice>>,
     mut respawned: ResMut<PoiMarkersRespawned>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     mut last_cam: Local<Vec3>,
@@ -3036,7 +3037,42 @@ fn apply_poi_visibility(
     respawned.0 = false;
     *last_cam = camera;
     let mut occupied = std::collections::HashSet::new();
-    let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
+    let raid_side = crate::game_watch::effective_side(game_link.as_deref(), side_choice.as_deref());
+
+    // WHICH marker represents a crowded cell. The pass below keeps the first one that lands in a
+    // cell, and iteration order is arbitrary — so at range a 400k safe could be dropped in favour
+    // of a 0-value crate sharing its cell, and the min-value filter could not bring it back
+    // (the survivor was chosen before value was ever considered). Pre-compute each cell's best
+    // value so the representative is the one worth walking to.
+    let cell_size = |p: Vec3| {
+        let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
+        if distance > 320.0 {
+            40.0
+        } else if distance > 140.0 {
+            18.0
+        } else {
+            0.0
+        }
+    };
+    let cell_key = |l: &PoiLayer, p: Vec3, cell: f32| {
+        (*l as u8, (p.x / cell).floor() as i32, (p.z / cell).floor() as i32)
+    };
+    let mut best: std::collections::HashMap<(u8, i32, i32), i64> = Default::default();
+    if toggles.cluster_dense {
+        for (l, val, _, _, gt, dense, _) in q.iter() {
+            if dense.is_none() {
+                continue;
+            }
+            let p = gt.translation();
+            let cell = cell_size(p);
+            if cell > 0.0 {
+                let v = val.map(|v| v.0).unwrap_or(0);
+                let e = best.entry(cell_key(l, p, cell)).or_insert(i64::MIN);
+                *e = (*e).max(v);
+            }
+        }
+    }
+
     for (l, val, inactive, faction, gt, dense, mut vis) in &mut q {
         let show = match l {
             PoiLayer::PmcSpawn => toggles.pmc_spawns,
@@ -3072,10 +3108,13 @@ fn apply_poi_visibility(
         }
         if show && toggles.cluster_dense && dense.is_some() {
             let p = gt.translation();
-            let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
-            let cell = if distance > 320.0 { 40.0 } else if distance > 140.0 { 18.0 } else { 0.0 };
+            let cell = cell_size(p);
             if cell > 0.0 {
-                show = occupied.insert((*l as u8, (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
+                let key = cell_key(l, p, cell);
+                // Only the cell's most valuable marker may claim it; `occupied` still breaks ties
+                // between equal-valued neighbours (and keeps exactly one survivor per cell).
+                let v = val.map(|v| v.0).unwrap_or(0);
+                show = best.get(&key).is_none_or(|bv| v >= *bv) && occupied.insert(key);
             }
         }
         // Write ONLY on a real flip: an unconditional `*vis = ...` marks the component changed
@@ -3402,6 +3441,7 @@ fn draw_gamedata_outlines(
     zones: Res<GameDataZones>,
     toggles: Res<LayerToggles>,
     game_link: Option<Res<crate::game_watch::GameLink>>,
+    side_choice: Option<Res<crate::game_watch::SideChoice>>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     nav: Option<Res<crate::pathfind::Nav>>,
     epoch: Res<crate::render::MapEpoch>,
@@ -3427,7 +3467,7 @@ fn draw_gamedata_outlines(
         );
     };
     if toggles.extracts {
-        let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
+        let raid_side = crate::game_watch::effective_side(game_link.as_deref(), side_choice.as_deref());
         for (fac, outline, active) in &zones.exfils {
             if hide_inactive && !active {
                 continue;

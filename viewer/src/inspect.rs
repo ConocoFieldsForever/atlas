@@ -169,7 +169,7 @@ impl Plugin for InspectPlugin {
         app.init_resource::<OpenCards>()
             .init_resource::<PointerOnUi>()
             .init_resource::<UiWantsKeyboard>()
-            .add_systems(Update, (pick_markers, draw_open_card_radii))
+            .add_systems(Update, (pick_markers, draw_open_card_radii, close_cards_on_esc))
             // In-place map swap: drop open cards (their Entity ids point at despawned old-map
             // markers; a recycled id would bind a card to the wrong new marker).
             .add_systems(
@@ -196,6 +196,30 @@ impl Plugin for InspectPlugin {
     }
 }
 
+/// Esc closes EVERY open card at once. Cards are sticky by design, so a browsing session leaves
+/// the map littered with billboards that each needed their own tiny \u{00D7}; there was no bulk
+/// dismiss and Esc did nothing. Ignored while a text field has focus (Esc belongs to the field
+/// then) and while the overlay's own Esc-to-hide binding is what the user means.
+fn close_cards_on_esc(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut cards: ResMut<OpenCards>,
+    ui_kb: Res<UiWantsKeyboard>,
+    cfg: Option<Res<crate::overlay::OverlayConfig>>,
+    state: Option<Res<crate::overlay::OverlayState>>,
+) {
+    if cards.0.is_empty() || ui_kb.0 || !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+    // If Esc is the overlay's dismiss key and the overlay is up, that meaning wins.
+    let esc_dismisses_overlay = cfg
+        .map(|c| c.exit_hotkey == crate::overlay::OverlayExitHotkey::Escape)
+        .unwrap_or(false)
+        && state.map(|s| s.shown).unwrap_or(false);
+    if esc_dismisses_overlay {
+        return;
+    }
+    cards.0.clear();
+}
 /// In-place map swap: forget the open-card entity ids (old-map markers are despawned).
 fn teardown_cards(mut cards: ResMut<OpenCards>) {
     cards.0.clear();
@@ -292,6 +316,10 @@ fn draw_cards(
     mut plan: ResMut<crate::ui::PlanList>,
     mut icons: ResMut<IconCache>,
     pack: Option<Res<crate::render::LoadedPack>>,
+    // Routing needs the nav grid resident. Without this the card's "route here" wrote a request
+    // that died in RouteResult.status — a string only the Navigate tab renders — so clicking it
+    // from the Layers tab did nothing at all, with nothing on screen saying why.
+    server: Res<crate::pathfind::PathfindServer>,
 ) {
     use bevy_egui::egui::{self, Align, Align2, Button, Layout, RichText};
 
@@ -367,11 +395,27 @@ fn draw_cards(
                             .color(crate::ui_theme::MUTED)
                             .size(crate::ui_theme::SIZE_SMALL),
                     );
-                    // Detail lines (bright bone, small).
+                    // Detail lines (bright bone, small). "Value"/"Expected"/"Spawn"/"Search" are
+                    // the numbers a looting decision turns on, and nothing in the UI said what
+                    // they meant or how they relate — so each carries its definition on hover.
                     for d in &info.detail {
-                        ui.label(
+                        let label = ui.label(
                             RichText::new(d).color(crate::ui_theme::TEXT_BRIGHT).size(crate::ui_theme::SIZE_LABEL),
                         );
+                        let tip = if d.starts_with("Value") {
+                            Some("What the contents are worth at current tarkov.dev prices, IF this container spawns loot.")
+                        } else if d.starts_with("Expected") {
+                            Some("Value x spawn chance - what one visit is worth on average. This is what route planning ranks by.")
+                        } else if d.starts_with("Spawn") {
+                            Some("Chance this container holds anything. \"(this area)\" = the game's own odds for this spot; without it, the average for this container type.")
+                        } else if d.starts_with("Search") {
+                            Some("Rough time to search it, from the container's size class.")
+                        } else {
+                            None
+                        };
+                        if let Some(tip) = tip {
+                            label.on_hover_text(tip);
+                        }
                     }
                     // One-click route from your position to this marker (in-process CPU A*), plus
                     // pin/unpin into the raid plan (the panel's "Raid plan" section lists the
@@ -379,7 +423,18 @@ fn draw_cards(
                     // the same marker toggles rather than duplicating.
                     ui.add_space(2.0);
                     ui.horizontal(|ui| {
-                        if ui.small_button("route here").clicked() {
+                        // Same gate as the Raid-plan "Route plan" button (ui.rs): a map with no
+                        // baked nav grid cannot route, and a dead-looking button that explains
+                        // itself on hover beats one that silently swallows the click.
+                        let pf_running =
+                            server.status == crate::pathfind::ServerStatus::Running;
+                        let route_btn = ui
+                            .add_enabled(pf_running, Button::new("route here").small())
+                            .on_disabled_hover_text(
+                                "routing needs baked nav data for this map \u{2014} \
+                                 run `atlas bake-nav <pack>` to enable it",
+                            );
+                        if route_btn.clicked() {
                             route.write(crate::pathfind::RouteRequest {
                                 start: None,
                                 dests: vec![tf.translation()],

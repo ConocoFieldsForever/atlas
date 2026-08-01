@@ -196,6 +196,7 @@ fn dispatch_plan(
     >,
     zones: Res<crate::poi::GameDataZones>,
     game_link: Option<Res<crate::game_watch::GameLink>>,
+    side_choice: Option<Res<crate::game_watch::SideChoice>>,
     mut task: ResMut<PlanTask>,
     mut plan: ResMut<PlanResult>,
     mut route_result: ResMut<RouteResult>,
@@ -258,7 +259,7 @@ fn dispatch_plan(
 
     // ---- extract candidates (active only) — the run must END somewhere safe.
     let want: std::collections::HashSet<&str> = req.extracts.iter().map(String::as_str).collect();
-    let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
+    let raid_side = crate::game_watch::effective_side(game_link.as_deref(), side_choice.as_deref());
     let extracts: Vec<(String, Vec3)> = all_marks
         .iter()
         .filter(|(l, _, _, inactive, _, faction)| {

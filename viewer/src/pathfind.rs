@@ -177,6 +177,10 @@ pub enum ServerCmd {
 #[derive(Resource, Default)]
 pub struct PathfindServer {
     pub status: ServerStatus,
+    /// The loaded grid was baked by a different `baker_version`: routing WORKS but the paths may
+    /// clip walls and floors. The panels render an amber caution on this; without it the only
+    /// notice was an error!() line no GUI user ever sees.
+    pub stale: bool,
 }
 impl PathfindServer {
     /// No external process to reap anymore (routing is in-process) — kept so existing callers (the
@@ -277,11 +281,13 @@ fn teardown_nav(
 fn load_nav(root: &std::path::Path, nav: &mut Nav, server: &mut PathfindServer) {
     match NavGrid::load(root) {
         Some(g) => {
+            server.stale = g.stale;
             nav.0 = Some(Arc::new(g));
             server.status = ServerStatus::Running;
         }
         None => {
             nav.0 = None;
+            server.stale = false;
             server.status = ServerStatus::Stopped;
             info!("nav: no nav grid in this pack — routing unavailable (bake_nav runs in the map build)");
         }

@@ -34,6 +34,9 @@ impl Plugin for ProgressPlugin {
 fn load_progress(
     mut progress: ResMut<PlayerProgress>,
     mut tracker: ResMut<crate::ui::QuestTracker>,
+    // Restoring tracked tasks without their layer is a half-restore: the Tasks tab says "Tracked"
+    // while the map shows nothing, every single launch.
+    mut toggles: ResMut<crate::ui::LayerToggles>,
 ) {
     let path = crate::paths::progress_path();
     if let Ok(text) = std::fs::read_to_string(&path) {
@@ -41,6 +44,17 @@ fn load_progress(
             Ok(mut saved) => {
                 saved.loaded = true;
                 tracker.active = saved.tracked.clone();
+                // Quest markers need the master Quest layer, which defaults OFF and is not
+                // persisted — so a restored tracked set was invisible until the user rediscovered
+                // the toggle. Tracking something is the request to see it; honour it on restore.
+                if !tracker.active.is_empty() && !toggles.quests {
+                    toggles.quests = true;
+                    info!(
+                        "progress: {} tracked task(s) restored - Quest layer switched on so their \
+                         markers show",
+                        tracker.active.len()
+                    );
+                }
                 *progress = saved;
                 info!("progress: loaded {}", path.display());
                 return;

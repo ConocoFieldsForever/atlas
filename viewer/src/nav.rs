@@ -51,6 +51,11 @@ pub struct NavGrid {
     pub nx: usize,
     pub nz: usize,
     pub k: usize,
+    /// This grid was baked by a DIFFERENT `baker_version` than this build expects: it loads and
+    /// routes, but the routes may pass through walls and floors. Carried out of `load` so the UI
+    /// can say so — an error!() line is invisible to every GUI/overlay user, and a wrong route
+    /// that looks authoritative is exactly the silent failure this project refuses to ship.
+    pub stale: bool,
     miss: f32,
     /// Ceiling for an up-move: rises above this are never scaled (players vault ~1.2 m at most).
     climb: f32,
@@ -201,6 +206,7 @@ impl NavGrid {
         let miss = f("miss").unwrap_or(-1.0e9) as f32;
         // Stale-data guard: a grid baked by older code loads perfectly and routes WRONGLY. Only the
         // version distinguishes the two, so report it at error level with the fix in the message.
+        let stale = !matches!(i("baker_version"), Some(v) if v as u32 == BAKER_VERSION);
         match i("baker_version") {
             Some(v) if v as u32 == BAKER_VERSION => {}
             other => error!(
@@ -266,8 +272,8 @@ impl NavGrid {
             dir.display()
         );
         Some(NavGrid {
-            min_x, min_z, res, nx, nz, k, miss, climb, drop_max, vault, step_up, slope_tan, h, door,
-            blk, near_wall, wall_cell,
+            min_x, min_z, res, nx, nz, k, stale, miss, climb, drop_max, vault, step_up, slope_tan,
+            h, door, blk, near_wall, wall_cell,
             comp: std::sync::OnceLock::new(),
         })
     }
@@ -329,6 +335,7 @@ impl NavGrid {
             nx: 1,
             nz: 1,
             k: 1,
+            stale: false,
             miss: -1.0e9,
             climb,
             drop_max: climb,

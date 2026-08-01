@@ -182,6 +182,87 @@ fn game_window_rect() -> Option<TargetRect> {
     None
 }
 
+/// True while a Direct3D EXCLUSIVE-fullscreen application owns the screen.
+///
+/// This is the one state in which the overlay CANNOT work: an exclusive-fullscreen swapchain owns
+/// the display, so no always-on-top window composites over it. Raising anyway is actively harmful —
+/// the game loses keyboard input or minimises outright (the classic exclusive-fullscreen reaction
+/// to losing the foreground) while the user sees nothing appear, mid-raid.
+///
+/// `SHQueryUserNotificationState` is the documented query for exactly this; QUNS_RUNNING_D3D_FULL_SCREEN
+/// (3) is the D3D-exclusive state. Borderless-windowed fullscreen — where the overlay works fine —
+/// reports QUNS_ACCEPTS_NOTIFICATIONS instead, so this does not fire there. Any failure returns
+/// false (assume we may raise): a detection glitch must not silently disable the overlay.
+#[cfg(windows)]
+fn d3d_exclusive_fullscreen() -> bool {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn SHQueryUserNotificationState(state: *mut i32) -> i32;
+    }
+    const QUNS_RUNNING_D3D_FULL_SCREEN: i32 = 3;
+    let mut state = 0i32;
+    // SAFETY: out-param is a valid i32 for the whole call; S_OK (0) means `state` was written.
+    let hr = unsafe { SHQueryUserNotificationState(&mut state) };
+    hr == 0 && state == QUNS_RUNNING_D3D_FULL_SCREEN
+}
+
+#[cfg(not(windows))]
+fn d3d_exclusive_fullscreen() -> bool {
+    false
+}
+
+/// Flash this process's taskbar button — the honest alternative to stealing focus from a game we
+/// cannot draw over. The user sees Atlas asking for attention and alt-tabs when they choose to.
+#[cfg(windows)]
+fn flash_atlas_taskbar() {
+    use std::ffi::c_void;
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: extern "system" fn(*mut c_void, isize) -> i32, param: isize) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
+        fn IsWindowVisible(hwnd: *mut c_void) -> i32;
+        fn FlashWindowEx(info: *mut FlashInfo) -> i32;
+    }
+    #[repr(C)]
+    struct FlashInfo {
+        cb_size: u32,
+        hwnd: *mut c_void,
+        flags: u32,
+        count: u32,
+        timeout: u32,
+    }
+    struct Found(*mut c_void);
+    extern "system" fn cb(hwnd: *mut c_void, param: isize) -> i32 {
+        let found = unsafe { &mut *(param as *mut Found) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == std::process::id() && unsafe { IsWindowVisible(hwnd) } != 0 {
+            found.0 = hwnd;
+            return 0;
+        }
+        1
+    }
+    let mut found = Found(std::ptr::null_mut());
+    unsafe { EnumWindows(cb, &mut found as *mut Found as isize) };
+    if found.0.is_null() {
+        return;
+    }
+    const FLASHW_TRAY: u32 = 0x2;
+    const FLASHW_TIMERNOFG: u32 = 0xC; // flash until the window comes to the foreground
+    let mut info = FlashInfo {
+        cb_size: std::mem::size_of::<FlashInfo>() as u32,
+        hwnd: found.0,
+        flags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+        count: 0,
+        timeout: 0,
+    };
+    // SAFETY: `info` is a correctly sized FLASHWINFO for a window we just enumerated.
+    unsafe { FlashWindowEx(&mut info) };
+}
+
+#[cfg(not(windows))]
+fn flash_atlas_taskbar() {}
+
 /// Bring this process's real top-level window to the foreground and VERIFY that Windows granted
 /// keyboard focus.
 ///
@@ -632,7 +713,10 @@ impl Plugin for OverlayPlugin {
                     .chain(),
             );
         }
-        app.add_systems(bevy_egui::EguiPrimaryContextPass, overlay_return_button);
+        app.add_systems(
+            bevy_egui::EguiPrimaryContextPass,
+            (overlay_return_button, idle_badge),
+        );
     }
 }
 
@@ -707,6 +791,8 @@ fn apply_overlay(
     mut saved: Local<Option<(WindowPosition, UVec2)>>,
     mut overlay_rect: Local<Option<(WindowPosition, UVec2)>>,
     mut view: ResMut<OverlayViewSlice>,
+    // One warning per exclusive-fullscreen episode, not one per retry frame.
+    mut fs_warned: Local<bool>,
 ) {
     // Re-run on a shown/hidden transition, on a settings change, OR on an explicit re-raise
     // request (see `OverlayState::raise_nonce`) -- the last one is what makes a second screenshot
@@ -738,9 +824,33 @@ fn apply_overlay(
     *last_active = Some(active);
     let Ok(mut win) = q.single_mut() else { return };
 
+    // THE ONE STATE WHERE RAISING IS WORSE THAN DOING NOTHING: an exclusive-fullscreen D3D game
+    // owns the display, so the panel cannot composite over it no matter what we do — but taking
+    // the foreground still costs the player their keyboard (or minimises the game) mid-raid, with
+    // nothing visible in return. Ask for attention instead of seizing it, and say so once.
+    let fs_blocked = active && d3d_exclusive_fullscreen();
+    if fs_blocked {
+        *raise_retries = 0;
+        if !*fs_warned {
+            *fs_warned = true;
+            flash_atlas_taskbar();
+            warn!(
+                "overlay: the game is in EXCLUSIVE fullscreen \u{2014} the panel cannot draw over \
+                 it, so Atlas is NOT taking focus (that would cost you keyboard input mid-raid). \
+                 Atlas is flashing in the taskbar; switch EFT to Borderless/Windowed in its video \
+                 settings for the overlay to appear over the game."
+            );
+        }
+    } else if !active {
+        *fs_warned = false;
+    }
+
     // Follow-up raises after the full transition. Re-applying size/position/window level every
     // frame would churn the swapchain — exactly the surface path we are trying to keep stable.
     if active && !active_changed && !config_changed {
+        if fs_blocked {
+            return; // exclusive fullscreen: never raise, never re-ask for focus
+        }
         win.visible = true;
         win.set_minimized(false);
         // `win.focused = true` is not a native-focus guarantee: it mutates Bevy's event-fed cache,
@@ -777,7 +887,11 @@ fn apply_overlay(
         win.set_minimized(false); // we may have minimised ourselves to hand the game focus back
         // The native request may be one frame early (before Winit applies visible/unminimized), so
         // the retry branch above keeps asking until Windows confirms Atlas is the foreground HWND.
-        if request_atlas_focus() {
+        // Skipped entirely under exclusive fullscreen (see fs_blocked): geometry is still applied
+        // so the panel is correct the moment the player alt-tabs, but we never seize the keyboard.
+        if fs_blocked {
+            // nothing: the taskbar flash above is the whole notification
+        } else if request_atlas_focus() {
             *raise_retries = 0;
             if !*focus_confirmed {
                 info!("overlay: Atlas foreground focus confirmed");
@@ -1053,7 +1167,66 @@ fn overlay_return_button(
                     .size(9.0)
                     .color(theme::MUTED),
                 );
+                // `~` also dismisses, and it was documented only in a menu tooltip — on a
+                // tenkeyless/laptop keyboard the NumpadEnter default does not exist at all, so
+                // the overlay itself has to name a key the user definitely has.
+                ui.label(
+                    RichText::new("~ also hides the overlay").size(9.0).color(theme::MUTED),
+                );
             });
+        });
+}
+
+/// "Atlas is idling on purpose" badge.
+///
+/// With the overlay armed but dismissed, an UNFOCUSED Atlas is deliberately throttled to a 500 ms
+/// reactive tick so it costs the game nothing — including when the window is fully visible on a
+/// second monitor. Measured user reaction to an unannounced 2 fps window: "it's frozen/broken".
+/// The reactive mode still redraws on window events, so this badge paints; it disappears the
+/// moment the window is focused (and therefore no longer throttled).
+#[cfg(feature = "egui")]
+fn idle_badge(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    cfg: Res<OverlayConfig>,
+    state: Res<OverlayState>,
+    windows: Query<&Window>,
+) {
+    use crate::ui_theme as theme;
+    use bevy_egui::egui::{self, RichText};
+
+    // Only the exact state that throttles: overlay armed, dismissed, pause-when-hidden on, and
+    // the window not focused. Anything else redraws normally and needs no explanation.
+    if menu.is_some() || state.shown || state.windowed || !cfg.enabled || !cfg.pause_when_hidden {
+        return;
+    }
+    let Ok(win) = windows.single() else { return };
+    if win.focused || !win.visible {
+        return; // focused = full speed; invisible = nothing to explain
+    }
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    egui::Area::new(egui::Id::new("atlas_idle_badge"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(12.0, -12.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("idling to leave the game its frame rate")
+                            .size(11.0)
+                            .color(theme::TEXT_BRIGHT),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "click this window (or take a screenshot in raid) to resume",
+                        )
+                        .size(9.0)
+                        .color(theme::MUTED),
+                    );
+                });
         });
 }
 

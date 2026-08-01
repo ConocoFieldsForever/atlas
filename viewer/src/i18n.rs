@@ -100,6 +100,19 @@ pub enum K {
     FirstRunBanner,
     FirstBuildHint,
     PlayNeedsSync,
+    RebuildPack,
+    DeleteConfirmTip,
+    ConfigSaveFailed,
+    OverlayFpsCap,
+    OverlayFpsCapTip,
+    LinkHealth,
+    LinkWatcher,
+    LinkGameDir,
+    LinkLogsDir,
+    LinkAppLog,
+    LinkShotsDir,
+    LinkEvents,
+    LinkNoEventsHint,
     PlayBusyBuilding,
     LanguageTip,
     ProcessInBackground,
@@ -250,7 +263,7 @@ fn pair(k: K) -> [&'static str; 2] {
         SelectLocation => ["SELECT LOCATION", "ВЫБОР ЛОКАЦИИ"],
         PacksOnDisk => ["PACKS ON DISK", "ПАКЕТЫ НА ДИСКЕ"],
         Intel => ["INTEL", "ДАННЫЕ"],
-        SyncNow => ["SYNC NOW", "ОБНОВИТЬ"],
+        SyncNow => ["SYNC NOW", "СИНХРОНИЗАЦИЯ"],
         Synced => ["tarkov.dev synced", "tarkov.dev обновлён"],
         TasksLabel => ["tasks", "задачи"],
         Icons => ["icons", "иконок"],
@@ -265,7 +278,35 @@ fn pair(k: K) -> [&'static str; 2] {
         Play => ["PLAY", "ИГРАТЬ"],
         Delete => ["DELETE", "УДАЛИТЬ"],
         Update => ["UPDATE", "ОБНОВИТЬ"],
+        // The MAP-ROW action: re-run this pack's build against newer game files.
+        // Distinct from K::Update (new Atlas version) and K::SyncNow (tarkov.dev data)
+        // — all three used to read "ОБНОВИТЬ" in RU.
+        RebuildPack => ["REBUILD", "ПЕРЕСОБРАТЬ"],
         Confirm => ["CONFIRM", "ПОДТВЕРДИТЬ"],
+        LinkHealth => ["LIVE LINK STATUS", "СОСТОЯНИЕ СВЯЗИ"],
+        LinkWatcher => ["watcher running", "наблюдатель работает"],
+        LinkGameDir => ["game install found", "установка игры найдена"],
+        LinkLogsDir => ["log folder found", "папка логов найдена"],
+        LinkAppLog => ["reading the game log", "читаем лог игры"],
+        LinkShotsDir => ["screenshots folder found", "папка скриншотов найдена"],
+        LinkEvents => ["recognized log events:", "распознано событий:"],
+        LinkNoEventsHint => [
+            "Reading the log but recognizing nothing - if you have played a raid since Atlas started, the game log format may have changed. Please report it.",
+            "Лог читается, но ничего не распознано - если вы играли рейд после запуска Atlas, формат лога мог измениться. Сообщите об этом.",
+        ],
+        ConfigSaveFailed => [
+            "Settings could not be saved (read-only folder?) - this change will not survive a restart.",
+            "Не удалось сохранить настройки (папка только для чтения?) - изменение не сохранится после перезапуска.",
+        ],
+        OverlayFpsCap => ["fps cap (0 = uncapped)", "лимит fps (0 = без лимита)"],
+        OverlayFpsCapTip => [
+            "Frame-rate ceiling while the overlay is up, so Atlas leaves the game headroom on the shared GPU. 0 removes the cap.",
+            "Ограничение частоты кадров, пока оверлей открыт, чтобы оставить ресурс GPU игре. 0 - без ограничения.",
+        ],
+        DeleteConfirmTip => [
+            "Deletes this map's built pack from disk. Rebuilding it takes the full processing time again.",
+            "Удаляет собранный пакет этой карты с диска. Повторная сборка займёт всё время обработки заново.",
+        ],
         TickLight => ["light", "свет"],
         TickGrass => ["grass", "трава"],
         TickZones => ["zones", "зоны"],
@@ -293,8 +334,8 @@ fn pair(k: K) -> [&'static str; 2] {
             "Первая СБОРКА карты запускает однократную распаковку ~1-6 ГБ - сначала закройте игру.",
         ],
         PlayNeedsSync => [
-            "Sync tarkov.dev before playing (SYNC NOW, top) - loot/spawns/intel come from it.",
-            "Синхронизируйте tarkov.dev перед игрой (SYNC NOW, сверху) - оттуда лут/спавны/данные.",
+            "No tarkov.dev data yet - maps open, but loot prices and task intel stay empty. Use SYNC NOW (top) when you are online.",
+            "Данных tarkov.dev пока нет - карты откроются, но цены лута и данные квестов будут пустыми. Нажмите SYNC NOW (сверху), когда будете онлайн.",
         ],
         PlayBusyBuilding => [
             "A map is building - the lighting bake needs the GPU. PLAY unlocks when it finishes.",
@@ -324,7 +365,7 @@ fn pair(k: K) -> [&'static str; 2] {
 Check Settings > Controls in Tarkov for your screenshot key. You may need to REBIND it: the default can collide with the Windows Snipping Tool or another screenshot app, which grabs the key first so EFT never writes the file.",
             "Сделайте скриншот в рейде, и Atlas переместит камеру точно туда, где вы стоите, и в ту же сторону - EFT записывает позицию и угол обзора в имя файла скриншота.
 
-Проверьте клавишу скриншота в Настройки > Управление вТарков. Возможно, её придётся ПЕРЕНАЗНАЧИТЬ: стандартная клавиша может конфликтовать с «Ножницами» Windows или другой программой скриншотов, которая перехватывает нажатие, и EFT не создаёт файл.",
+Проверьте клавишу скриншота в Настройках > Управление в Таркове. Возможно, её придётся ПЕРЕНАЗНАЧИТЬ: стандартная клавиша может конфликтовать с «Ножницами» Windows или другой программой скриншотов, которая перехватывает нажатие, и EFT не создаёт файл.",
         ],
         OverlayEnable => [
             "Overlay mode (your screenshot key opens the map over the game)",
@@ -430,21 +471,25 @@ Atlas читает только файлы, которые игра уже за�
             "Sets the options that actually cost performance, measured on this build. Chosen here rather than in-raid because texture quality is applied while a map loads.",
             "Задаёт параметры, которые действительно влияют на производительность. Выбирается здесь, так как качество текстур применяется при загрузке карты.",
         ],
+        // EN MUST stay byte-identical to `QualityPreset::summary()` — these copies had drifted
+        // until Ultra advertised "~2% slower" for a preset measured at ~30%, i.e. off by ~15x, and
+        // the menu is where the choice is actually made. `quality_summaries_match_render_source`
+        // (below) fails the build if they part again.
         QualityLowSum => [
             "~30% faster • ~1.6 GB VRAM — no foliage, shadows or bloom",
             "~30% быстрее • ~1.6 ГБ — без травы, теней и свечения",
         ],
         QualityMediumSum => [
-            "~20% faster • ~2.2 GB VRAM — thinned foliage, no shadows",
-            "~20% быстрее • ~2.2 ГБ — меньше травы, без теней",
+            "~25% faster • ~2.2 GB VRAM — thinned foliage to 150 m, no shadows",
+            "~25% быстрее • ~2.2 ГБ — трава прорежена до 150 м, без теней",
         ],
         QualityHighSum => [
-            "baseline • ~2.2 GB VRAM — the shipped look",
-            "базовый • ~2.2 ГБ — стандартный вид",
+            "baseline • ~2.3 GB VRAM — the shipped look",
+            "базовый • ~2.3 ГБ — стандартный вид",
         ],
         QualityUltraSum => [
-            "~2% slower • ~4.4 GB VRAM — full-res textures + SSAO",
-            "~2% медленнее • ~4.4 ГБ — текстуры полного разрешения + SSAO",
+            "~30% slower • ~4.5 GB VRAM — full-res textures, SSAO + volumetric sun shafts",
+            "~30% медленнее • ~4.5 ГБ — текстуры полного разрешения, SSAO и объёмные лучи солнца",
         ],
         QualityCustomSum => [
             "your own mix — tune it in-raid under Graphics",
@@ -542,5 +587,33 @@ pub fn t(lang: Lang, k: K) -> &'static str {
     match lang {
         Lang::En => en,
         Lang::Ru => ru,
+    }
+}
+
+#[cfg(test)]
+mod quality_summary_tests {
+    use super::*;
+
+    /// The menu's quality tooltips and `QualityPreset::summary()` are two copies of the SAME
+    /// measured numbers, and they silently drifted: the menu advertised Ultra as "~2% slower"
+    /// long after volumetric shafts made it ~30%, so the one place users actually choose a preset
+    /// was off by a factor of ~15. Nothing detected it because nothing compared them. This does.
+    #[test]
+    fn quality_summaries_match_render_source() {
+        for p in crate::render::QualityPreset::ALL {
+            let key = match p {
+                crate::render::QualityPreset::Low => K::QualityLowSum,
+                crate::render::QualityPreset::Medium => K::QualityMediumSum,
+                crate::render::QualityPreset::High => K::QualityHighSum,
+                crate::render::QualityPreset::Ultra => K::QualityUltraSum,
+                crate::render::QualityPreset::Custom => continue, // free-form copy, no numbers
+            };
+            assert_eq!(
+                t(Lang::En, key),
+                p.summary(),
+                "menu tooltip for {:?} has drifted from QualityPreset::summary()",
+                p
+            );
+        }
     }
 }

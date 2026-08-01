@@ -42,6 +42,10 @@ enum GameEvent {
     /// The local profile's side for the upcoming/current raid. This comes only from
     /// GroupMatchRaidSettings; uppercase `Side` fields elsewhere describe other profiles.
     RaidSide(RaidSide),
+    /// Atlas consumed a screenshot AND deleted it (delete_processed_shots). Reported so the app
+    /// can tell the user ONCE that their file was removed: deleting someone's screenshots is not
+    /// something a settings-tooltip they never opened counts as consent for.
+    ShotDeleted(String),
 }
 
 /// Scene-preset bundle name -> our pack id. GAME-DERIVED via the embedded manifest
@@ -119,6 +123,46 @@ impl RaidSide {
     }
 }
 
+/// MANUAL raid-side choice, for planning when the game is not running.
+///
+/// Side filtering used to exist ONLY when the live link had parsed `GroupMatchRaidSettings`, i.e.
+/// only while a raid was actually loading. At the desk — the primary planning case — a PMC saw
+/// Scav-only extracts in "nearest extract" and in loot plans, and could be routed to an exit they
+/// cannot use. The live value stays AUTHORITATIVE; this only fills the gap when it is absent.
+#[derive(Resource, Default)]
+pub struct SideChoice(pub Option<RaidSide>);
+
+impl SideChoice {
+    pub fn load() -> Self {
+        Self(match crate::menu::config_str_pub("raidSide").as_deref() {
+            Some("pmc") => Some(RaidSide::Pmc),
+            Some("scav") => Some(RaidSide::Scav),
+            _ => None,
+        })
+    }
+
+    /// Persist; returns false if the config could not be written (caller surfaces it).
+    pub fn save(&self) -> bool {
+        crate::menu::save_config_str_pub(
+            "raidSide",
+            match self.0 {
+                Some(RaidSide::Pmc) => "pmc",
+                Some(RaidSide::Scav) => "scav",
+                None => "",
+            },
+        )
+    }
+}
+
+/// The side to filter by: the LIVE raid side when the logs know it, else the user's manual choice,
+/// else None (show everything — never guess).
+pub fn effective_side(
+    link: Option<&GameLink>,
+    choice: Option<&SideChoice>,
+) -> Option<RaidSide> {
+    link.and_then(|l| l.raid_side).or_else(|| choice.and_then(|c| c.0))
+}
+
 #[derive(Resource)]
 pub struct GameLink {
     rx: Mutex<Receiver<GameEvent>>,
@@ -134,6 +178,16 @@ pub struct GameLink {
     /// Authoritative when present. None means this session did not log GroupMatchRaidSettings;
     /// consumers must keep both factions visible instead of guessing.
     pub raid_side: Option<RaidSide>,
+    /// The FIRST screenshot this session that Atlas consumed and deleted, until the user
+    /// acknowledges it. Deleting a player's files is disclosed in a settings tooltip they have
+    /// probably never opened, so say it once, on screen, with the way to turn it off.
+    pub deleted_notice: Option<String>,
+    /// Set once the notice has been shown+dismissed, so it never nags again this session.
+    pub deleted_notice_done: bool,
+    /// The raid is on a map whose pack is missing AND the user dismissed the full banner. A
+    /// compact pill keeps saying so (ui::wrong_map_pill) — dismissing must not restore the silent
+    /// wrong-map state the banner exists to break. Cleared when the raid ends.
+    pub wrong_map: Option<String>,
 }
 
 pub struct GameWatchPlugin;
@@ -163,12 +217,16 @@ impl Plugin for GameWatchPlugin {
             .name("eft-game-watch".into())
             .spawn(move || watcher_thread(tx))
             .ok();
+        app.insert_resource(SideChoice::load());
         app.insert_resource(GameLink {
             rx: Mutex::new(rx),
             player: None,
             pending_map: None,
             unbuilt_map: None,
             raid_side: None,
+            deleted_notice: None,
+            deleted_notice_done: false,
+            wrong_map: None,
         })
             .add_systems(
                 Update,
@@ -356,11 +414,23 @@ with the overlay up"
                 link.unbuilt_map = None;
                 link.player = None;
                 link.raid_side = None;
+                // The deferred swap target dies with the raid too. Leaving it set meant a `~`
+                // press or any parseable screenshot HOURS later still loaded that raid's map as
+                // if it were live — and at the start menu it relaunched the whole process into
+                // it. "Pending" only ever meant "the raid the logs say you are in right now".
+                link.pending_map = None;
+                link.wrong_map = None;
             }
             GameEvent::RaidSide(side) => {
                 if link.raid_side != Some(side) {
                     info!("game link: raid side is {} (GroupMatchRaidSettings)", side.label());
                     link.raid_side = Some(side);
+                }
+            }
+            GameEvent::ShotDeleted(name) => {
+                // Once per session, and only until acknowledged.
+                if !link.deleted_notice_done && link.deleted_notice.is_none() {
+                    link.deleted_notice = Some(name);
                 }
             }
         }
@@ -469,6 +539,42 @@ mod tests {
 // Watcher thread (std only): tail the two logs + scan the screenshots folder.
 // ---------------------------------------------------------------------------------------------
 
+/// LIVE-LINK HEALTH, published by the watcher thread for the settings UI.
+///
+/// Every failure in the watcher is non-fatal by design (it just keeps looping), which meant a dead
+/// link — no game dir, no Logs folder, a BSG log-format change — was indistinguishable from a
+/// healthy one that simply had nothing to report. The user only ever noticed as "the overlay
+/// stopped following my raid". These counters make the state observable.
+#[derive(Default)]
+pub struct LinkHealth {
+    /// Game install resolved (`detect_game_dir` returned something).
+    pub game_dir: std::sync::atomic::AtomicBool,
+    /// A `log_*` folder was found under the install.
+    pub logs_dir: std::sync::atomic::AtomicBool,
+    /// An `application_*.log` is being tailed right now.
+    pub app_log: std::sync::atomic::AtomicBool,
+    /// The screenshots folder was found.
+    pub shots_dir: std::sync::atomic::AtomicBool,
+    /// Watcher poll ticks completed — proves the thread is alive at all.
+    pub ticks: std::sync::atomic::AtomicU64,
+    /// Log lines the parsers have RECOGNIZED (map/fov/side/task). Zero after a long session with
+    /// the game running is the signature of a log-format change.
+    pub events: std::sync::atomic::AtomicU64,
+}
+
+pub static LINK_HEALTH: LinkHealth = LinkHealth {
+    game_dir: std::sync::atomic::AtomicBool::new(false),
+    logs_dir: std::sync::atomic::AtomicBool::new(false),
+    app_log: std::sync::atomic::AtomicBool::new(false),
+    shots_dir: std::sync::atomic::AtomicBool::new(false),
+    ticks: std::sync::atomic::AtomicU64::new(0),
+    events: std::sync::atomic::AtomicU64::new(0),
+};
+
+fn health_set(f: &std::sync::atomic::AtomicBool, v: bool) {
+    f.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Tail state for one log file: byte offset consumed + partial-line/JSON carry-over.
 #[derive(Default)]
 struct Tail {
@@ -495,9 +601,14 @@ fn watcher_thread(tx: Sender<GameEvent>) {
             }
         }
         tick += 1;
+        LINK_HEALTH.ticks.store(tick, std::sync::atomic::Ordering::Relaxed);
+        health_set(&LINK_HEALTH.game_dir, !game_dir.is_empty());
+        health_set(&LINK_HEALTH.shots_dir, shots_dir.is_some());
 
         if !game_dir.is_empty() {
-            if let Some(folder) = latest_log_folder(Path::new(&game_dir)) {
+            let folder = latest_log_folder(Path::new(&game_dir));
+            health_set(&LINK_HEALTH.logs_dir, folder.is_some());
+            if let Some(folder) = folder {
                 // Match the log CHANNEL, not a full filename: EFT writes
                 // "<stamp> application_000.log" and "<stamp> push-notifications_000.log", so the
                 // old needles ("application.log" / "notifications.log") never matched and the
@@ -506,6 +617,7 @@ fn watcher_thread(tx: Sender<GameEvent>) {
                 // _000/_001 rotation for free.
                 retarget(&mut app_tail, &folder, "application");
                 retarget(&mut notif_tail, &folder, "notifications");
+                health_set(&LINK_HEALTH.app_log, app_tail.path.is_some());
                 if let Some(chunk) = read_new(&mut app_tail) {
                     parse_application(&mut app_tail.pending, &chunk, &tx);
                 }
@@ -639,9 +751,11 @@ fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) 
     }
     if let Some(id) = latest {
         let _ = tx.send(GameEvent::MapLoading(id.to_string()));
+        LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(v) = latest_fov {
         let _ = tx.send(GameEvent::Fov(v));
+        LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     pending.drain(..upto);
     cap(pending);
@@ -688,6 +802,7 @@ fn parse_notifications(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>
                             let id = tpl.split(' ').next().unwrap_or(tpl).to_string();
                             if !id.is_empty() {
                                 let _ = tx.send(GameEvent::Task { id, status: ty });
+                            LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                     }
@@ -700,10 +815,12 @@ fn parse_notifications(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>
                     };
                     if let Some(side) = side {
                         let _ = tx.send(GameEvent::RaidSide(side));
+                            LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 "UserMatchOver" => {
                     let _ = tx.send(GameEvent::RaidEnd);
+                            LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 _ => {}
             }
@@ -786,7 +903,10 @@ fn scan_screenshots(dir: &Path, last: &mut std::time::SystemTime, tx: &Sender<Ga
     if DELETE_SHOTS.load(std::sync::atomic::Ordering::Relaxed) {
         let p = dir.join(&name);
         match std::fs::remove_file(&p) {
-            Ok(()) => info!("game link: consumed + deleted screenshot '{name}'"),
+            Ok(()) => {
+                info!("game link: consumed + deleted screenshot '{name}'");
+                let _ = tx.send(GameEvent::ShotDeleted(name.clone()));
+            }
             Err(e) => warn!("game link: could not delete '{name}': {e}"),
         }
     }

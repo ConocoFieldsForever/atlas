@@ -254,6 +254,8 @@ impl Plugin for UiPlugin {
                 crate::navigate_panel::navigate_tab,
                 pos_hud,
                 unbuilt_map_banner,
+                wrong_map_pill,
+                shot_deleted_notice,
                 // NOTE: the in-raid EN/RU toggle is intentionally NOT registered (finding 8). It
                 // flipped the shared Lang but the raid panels (navigate/tasks) are hardcoded
                 // English, so it changed only the badge and misrepresented that RU took effect.
@@ -396,7 +398,105 @@ fn unbuilt_map_banner(
         info!("game link: user asked to process '{id}' from the in-raid prompt");
         link.unbuilt_map = None;
     } else if dismiss {
-        link.unbuilt_map = None;
+        // Dismissing must NOT restore the silence this banner exists to break: the overlay would
+        // go back to confidently showing a map the player is not on. Remember the mismatch and
+        // keep a compact pill up (see `wrong_map_pill`) until the raid ends.
+        link.wrong_map = link.unbuilt_map.take();
+    }
+}
+
+/// Persistent, unobtrusive reminder that the loaded map is NOT the raid's map, after the user
+/// dismissed the full banner. Clears when the raid ends (`GameLink::wrong_map` is reset there).
+#[cfg(feature = "egui")]
+fn wrong_map_pill(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    link: Option<Res<crate::game_watch::GameLink>>,
+) {
+    use bevy_egui::egui::{self, RichText};
+    use crate::ui_theme as theme;
+    if menu.is_some() {
+        return;
+    }
+    let Some(link) = link else { return };
+    let Some(map) = link.wrong_map.as_ref() else { return };
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let pretty = crate::inspect::prettify(map);
+    egui::Area::new(egui::Id::new("wrong_map_pill"))
+        .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 8.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, theme::WARN))
+                .inner_margin(egui::Margin::symmetric(10, 4))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("raid is on {pretty} \u{2014} not this map"))
+                            .size(11.0)
+                            .color(theme::WARN),
+                    );
+                });
+        });
+}
+
+/// ONE-TIME disclosure that Atlas consumed and DELETED a screenshot. The setting is opt-out and
+/// documented only in a tooltip, so the first time it actually removes one of the player's files
+/// we say so on screen and point at the switch that stops it.
+#[cfg(feature = "egui")]
+fn shot_deleted_notice(
+    mut contexts: bevy_egui::EguiContexts,
+    menu: Option<Res<crate::menu::MenuState>>,
+    mut link: Option<ResMut<crate::game_watch::GameLink>>,
+) {
+    use bevy_egui::egui::{self, RichText};
+    use crate::ui_theme as theme;
+    if menu.is_some() {
+        return;
+    }
+    let Some(link) = link.as_mut() else { return };
+    let Some(name) = link.deleted_notice.clone() else { return };
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let mut ack = false;
+    egui::Area::new(egui::Id::new("shot_deleted_notice"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.set_max_width(360.0);
+                    ui.label(
+                        RichText::new("Screenshot used for your position \u{2014} and deleted")
+                            .size(12.0)
+                            .strong()
+                            .color(theme::TEXT_BRIGHT),
+                    );
+                    ui.label(
+                        RichText::new(format!("\u{201C}{name}\u{201D}"))
+                            .size(10.0)
+                            .color(theme::MUTED),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "EFT never cleans these up, so Atlas removes the ones it reads. Turn \
+                             this off in Settings \u{203A} Live link \u{203A} \u{201C}Delete \
+                             processed screenshots\u{201D}.",
+                        )
+                        .size(10.0)
+                        .color(theme::TEXT_BRIGHT),
+                    );
+                    ui.add_space(4.0);
+                    if ui.button(RichText::new("Got it").size(11.0)).clicked() {
+                        ack = true;
+                    }
+                });
+        });
+    if ack {
+        link.deleted_notice = None;
+        link.deleted_notice_done = true;
     }
 }
 
@@ -691,8 +791,11 @@ struct GfxUiParams<'w, 's> {
     /// Present only in start-menu mode (bare launch) — the panel stands down entirely.
     menu: Option<Res<'w, crate::menu::MenuState>>,
     pack: Option<Res<'w, crate::render::LoadedPack>>,
-    /// (display name, pack path) list, scanned once from the packs/ dir beside the current pack.
+    /// (pack id, pack path) list, scanned from the packs/ dir beside the current pack. Refreshed
+    /// each time the map combo is opened so a mid-session build appears without a relaunch.
     pack_list: bevy::ecs::system::Local<'s, Option<Vec<(String, String)>>>,
+    /// Last observed open/closed state of the map combo — the rising edge triggers the rescan.
+    pack_list_open: bevy::ecs::system::Local<'s, bool>,
     /// Raid plan pins (inspect-card "pin" button fills it; the panel section lists/prunes it).
     plan: ResMut<'w, PlanList>,
     /// Saved camera views (persisted per pack to bookmarks.json).
@@ -716,6 +819,18 @@ struct GfxUiParams<'w, 's> {
             bevy::prelude::Without<crate::poi::ZoneWall>,
         ),
     >,
+}
+
+/// Display name for a pack id: the GAME-DERIVED English title from the roster when the id is a
+/// known map, else the prettified directory name. The dropdown used to show the raw pack dir
+/// ("factory_rework") while the start menu showed the real name for the same map.
+#[cfg(feature = "egui")]
+fn pack_display_name(id: &str) -> String {
+    crate::maps::known_pairs()
+        .iter()
+        .find(|(k, _)| *k == id)
+        .map(|(_, en)| (*en).to_string())
+        .unwrap_or_else(|| crate::inspect::prettify(id))
 }
 
 #[cfg(feature = "egui")]
@@ -748,6 +863,7 @@ fn layers_panel(
     mut route_writer: MessageWriter<crate::pathfind::RouteRequest>,
     server: Res<crate::pathfind::PathfindServer>,
     game_link: Option<Res<crate::game_watch::GameLink>>,
+    side_choice: Option<Res<crate::game_watch::SideChoice>>,
 ) {
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
     use crate::pathfind::{RouteRequest, ServerStatus};
@@ -782,7 +898,7 @@ fn layers_panel(
     // Per-layer marker counts (cheap: a few thousand markers, once per focused frame). Shown as a
     // dim number after each row so the planner can gauge density without enabling the layer.
     let mut poi_counts = [0usize; 20];
-    let raid_side = game_link.as_ref().and_then(|link| link.raid_side);
+    let raid_side = crate::game_watch::effective_side(game_link.as_deref(), side_choice.as_deref());
     for (l, faction) in &poi_q {
         if matches!(l, PoiLayer::Extract)
             && raid_side.is_some_and(|side| {
@@ -827,8 +943,19 @@ fn layers_panel(
                 .pack
                 .as_ref()
                 .map(|p| p.0.root.to_string_lossy().replace('\\', "/"));
+            // Rescan whenever the combo is OPENED rather than once per session: a map built
+            // mid-session (including via the in-raid PROCESS button) never appeared in this list
+            // until the app was relaunched, with no refresh affordance anywhere.
+            let combo_id = egui::Id::new("map_select");
+            let combo_open = egui::ComboBox::is_open(ui.ctx(), combo_id);
+            if combo_open != *gfx_ui.pack_list_open {
+                *gfx_ui.pack_list_open = combo_open;
+                if combo_open {
+                    *gfx_ui.pack_list = None; // force the scan below
+                }
+            }
             let packs = gfx_ui.pack_list.get_or_insert_with(|| {
-                // Scan the packs/ dir next to the loaded pack (or ./packs as fallback), once.
+                // Scan the packs/ dir next to the loaded pack (or ./packs as fallback).
                 let dir = cur_pack_root
                     .as_deref()
                     .and_then(|r| std::path::Path::new(r).parent().map(|p| p.to_path_buf()))
@@ -857,12 +984,20 @@ fn layers_panel(
             ui.horizontal(|ui| {
                 ui.label(RichText::new("map").color(MUTED).size(11.0));
                 egui::ComboBox::from_id_salt("map_select")
-                    .selected_text(RichText::new(&cur_name).color(ACCENT).size(12.0))
+                    // Show the map's real name, not its pack directory ("factory_rework").
+                    .selected_text(
+                        RichText::new(pack_display_name(&cur_name))
+                            .color(ACCENT)
+                            .size(12.0),
+                    )
                     .width(170.0)
                     .show_ui(ui, |ui| {
                         for (name, path) in packs.iter() {
                             if ui
-                                .selectable_label(*name == cur_name, name)
+                                .selectable_label(
+                                    *name == cur_name,
+                                    pack_display_name(name),
+                                )
                                 .on_hover_text("switch to this map in place (no relaunch)")
                                 .clicked()
                                 && *name != cur_name
@@ -873,9 +1008,11 @@ fn layers_panel(
                     });
             });
             // ---- CAMERA BOOKMARKS (per map, persisted to <pack>/bookmarks.json). "save view"
-            // snapshots the fly-cam; clicking a row flies to the stored TARGET via the standard
-            // `CameraCommand` framing (fly_to is the only camera command — the exact saved pose
-            // isn't restorable without touching main.rs, so pos is stored but unused for now).
+            // snapshots the fly-cam; clicking a row restores that EXACT pose via
+            // `CameraCommand::eye` (the same exact-pose path the screenshot fix stands in).
+            // It used to `fly_to` the stored target instead, which re-framed with a fixed
+            // (+6,+11,+18) m offset — so a restored view sat ~20 m away in a hardcoded compass
+            // direction, and indoors the +11 m usually put the camera through the ceiling.
             ui.horizontal(|ui| {
                 ui.label(RichText::new("views").color(MUTED).size(11.0));
                 if ui
@@ -904,10 +1041,19 @@ fn layers_panel(
                     ui.add_space(10.0);
                     if ui
                         .selectable_label(false, RichText::new(&b.name).size(12.0))
-                        .on_hover_text("fly to this view")
+                        .on_hover_text("restore this exact camera pose")
                         .clicked()
                     {
-                        cam_cmd.fly_to = Some(Vec3::from(b.target));
+                        // `target` was saved as pos + forward * 20, so the look direction comes
+                        // back out of the stored pair — no bookmarks.json schema change, and
+                        // views saved by older builds restore correctly too. A degenerate pair
+                        // (pos == target) falls back to the old framing rather than NaN.
+                        let pos = Vec3::from(b.pos);
+                        let d = Vec3::from(b.target) - pos;
+                        match d.try_normalize() {
+                            Some(fwd) => cam_cmd.eye = Some((pos, fwd)),
+                            None => cam_cmd.fly_to = Some(Vec3::from(b.target)),
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button(RichText::new("\u{00D7}").size(12.0)).clicked() {
@@ -920,11 +1066,21 @@ fn layers_panel(
                 bm.views.remove(i);
             }
             ui.add_space(4.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut search.query)
+            // The field had no clear affordance and no statement of scope: an active query
+            // permanently displaced the panel sections until the text was manually deleted.
+            ui.horizontal(|ui| {
+                let te = egui::TextEdit::singleline(&mut search.query)
                     .desired_width(f32::INFINITY)
-                    .hint_text("Search markers\u{2026}"),
-            );
+                    .hint_text("Search markers\u{2026}");
+                ui.add(te).on_hover_text("Searches every marker's name, type and detail lines \u{2014} loot, spawns, extracts, doors, keys and quest objectives.");
+            });
+            if !search.query.is_empty() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("clear search").clicked() {
+                        search.query.clear();
+                    }
+                });
+            }
             let q = search.query.trim().to_lowercase();
             if !q.is_empty() {
                 // (rank, info, position, poi layer, loot class, quest task, value) — the
@@ -1997,7 +2153,7 @@ fn level_panel(
                     }
                 });
                 ui.label(
-                    RichText::new("Maps spawn un-powered (dark). Flip a switch to light its bank \u{2014} or click the switch in the world.")
+                    RichText::new("Maps spawn un-powered (dark). Flip a switch to light its bank \u{2014} or DOUBLE-click the switch in the world.")
                         .color(DIM)
                         .size(10.0),
                 );

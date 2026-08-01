@@ -86,6 +86,8 @@ struct Row {
 pub(crate) struct NavLive<'w> {
     epoch: Res<'w, crate::render::MapEpoch>,
     game_link: Option<Res<'w, crate::game_watch::GameLink>>,
+    /// Manual PMC/Scav choice for desk planning; the live raid side still wins when known.
+    side_choice: Option<ResMut<'w, crate::game_watch::SideChoice>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -114,7 +116,7 @@ pub fn navigate_tab(
         Without<ZoneWall>,
     >,
     cams: Query<&Transform, With<CullCamera>>,
-    live: NavLive,
+    mut live: NavLive,
     mut ui_state: Local<NavUiState>,
 ) {
     if menu.is_some() {
@@ -143,7 +145,11 @@ pub fn navigate_tab(
     // fallback we sort by name so rows don't reshuffle while flying.
     let cam_pos = cams.single().map(|t| t.translation).unwrap_or(Vec3::ZERO);
     let ref_pos = start_pt.0.unwrap_or(cam_pos);
-    let raid_side = live.game_link.as_ref().and_then(|link| link.raid_side);
+    // Live side wins; the manual choice covers desk planning with the game closed.
+    let raid_side = crate::game_watch::effective_side(
+        live.game_link.as_deref(),
+        live.side_choice.as_deref().map(|v| &*v),
+    );
 
     let mut rows: Vec<Row> = extracts
         .iter()
@@ -204,6 +210,27 @@ pub fn navigate_tab(
                         RichText::new("Routing has not been built for this map yet \u{2014} extract, POI browsing and camera flight still work.")
                             .size(theme::SIZE_CAPTION)
                             .color(theme::MUTED),
+                    );
+                });
+                ui.add_space(theme::SP_SM);
+            } else if server.stale {
+                // Loads and routes, but was baked by another baker_version: the paths can clip
+                // walls and floors. Routing that LOOKS authoritative while being wrong is worse
+                // than routing that is plainly unavailable, so say it where the user routes.
+                theme::card(ui, theme::WARN, |ui| {
+                    ui.label(
+                        RichText::new("Route data is outdated")
+                            .size(theme::SIZE_LABEL)
+                            .strong()
+                            .color(theme::WARN),
+                    );
+                    ui.label(
+                        RichText::new(
+                            "This map's nav grid was baked by an older build \u{2014} routes may \
+                             pass through walls and floors. Re-bake it to trust them.",
+                        )
+                        .size(theme::SIZE_CAPTION)
+                        .color(theme::MUTED),
                     );
                 });
                 ui.add_space(theme::SP_SM);
@@ -509,6 +536,53 @@ pub fn navigate_tab(
                 .plan_extracts
                 .retain(|t| rows.iter().any(|r| !r.inactive && &r.title == t));
             let sel_n = ui_state.plan_extracts.len();
+            // WHICH SIDE ARE YOU? The live link answers this only while a raid is loading; at
+            // the desk (the main planning case) it is unknown, and an unknown side used to mean
+            // "show every extract", so a PMC could plan a run that ends at a Scav-only exit.
+            // Persisted, and overridden by the live value whenever the logs actually know.
+            {
+                let live_known =
+                    live.game_link.as_ref().and_then(|l| l.raid_side).is_some();
+                let mut changed = None;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("side").size(theme::SIZE_CAPTION).color(theme::MUTED),
+                    );
+                    let cur = live.side_choice.as_deref().and_then(|c| c.0);
+                    let mut chip = |ui: &mut egui::Ui, label: &str, val: Option<crate::game_watch::RaidSide>| {
+                        if ui
+                            .selectable_label(cur == val && !live_known, label)
+                            .clicked()
+                        {
+                            changed = Some(val);
+                        }
+                    };
+                    ui.add_enabled_ui(!live_known, |ui| {
+                        chip(ui, "PMC", Some(crate::game_watch::RaidSide::Pmc));
+                        chip(ui, "Scav", Some(crate::game_watch::RaidSide::Scav));
+                        chip(ui, "both", None);
+                    });
+                    if live_known {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} (from the raid)",
+                                raid_side.map(|s| s.label()).unwrap_or("")
+                            ))
+                            .size(theme::SIZE_TINY)
+                            .color(theme::OK),
+                        );
+                    }
+                });
+                if let Some(v) = changed {
+                    if let Some(c) = live.side_choice.as_deref_mut() {
+                        c.0 = v;
+                        if !c.save() {
+                            warn!("navigate: could not persist the raid-side choice");
+                        }
+                    }
+                }
+                ui.add_space(theme::SP_XS);
+            }
             ui.horizontal(|ui| {
                 ui.label(theme::section_header("EXTRACTS", rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

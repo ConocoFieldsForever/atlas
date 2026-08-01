@@ -469,6 +469,15 @@ pub(crate) fn spawn_loot(
             .unwrap_or(gc.pos + Vec3::Y * half.y);
         if glow.is_some() {
             n_model += 1;
+        } else {
+            // A box is an HONEST fallback, but an unexplained one reads as a broken model: the
+            // card was identical to a glowing container's, so "this PMC body is still a cube" had
+            // no answer on screen. Say which of the two states this marker is in, and that the
+            // anchor is then the container's own pivot (which can sit off the visible prop).
+            detail.push(
+                "shown as a box \u{2014} this pack has no model link; position approximate"
+                    .to_string(),
+            );
         }
         let pick_r = ((half * 2.0).length() * 0.5).max(0.9);
         let mut e = commands.spawn((

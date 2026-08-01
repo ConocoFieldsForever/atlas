@@ -2020,7 +2020,7 @@ pub fn menu_ui(
                 {
                     state.process_in_background = bg;
                     state.config_err = (!save_config_process_in_background(bg))
-                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                        .then(|| t(lg, K::ConfigSaveFailed).to_string());
                 }
             });
             // "Screenshot to locate current position" (default ON): poll the EFT screenshot folder
@@ -2039,7 +2039,7 @@ pub fn menu_ui(
                     state.screenshot_locate = loc;
                     crate::game_watch::set_screenshot_locate(loc);
                     state.config_err = (!save_config_screenshot_locate(loc))
-                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                        .then(|| t(lg, K::ConfigSaveFailed).to_string());
                 }
                 ui.label(RichText::new("\u{2139}").color(DIM).size(12.0))
                     .on_hover_text(t(lg, K::ScreenshotLocateTip));
@@ -2063,7 +2063,7 @@ pub fn menu_ui(
                         *overlay_cfg = state.overlay.clone(); // live, no relaunch needed
                         crate::game_watch::set_delete_processed_shots(del);
                         state.config_err = (!state.overlay.save())
-                            .then(|| "settings could not be saved (read-only folder?)".to_string());
+                            .then(|| t(lg, K::ConfigSaveFailed).to_string());
                     }
                 });
             });
@@ -2081,7 +2081,7 @@ pub fn menu_ui(
                     state.overlay.enabled = ov;
                     *overlay_cfg = state.overlay.clone(); // live, no relaunch needed
                     state.config_err = (!state.overlay.save())
-                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                        .then(|| t(lg, K::ConfigSaveFailed).to_string());
                 }
                 ui.label(RichText::new("\u{2139}").color(DIM).size(12.0))
                     .on_hover_text(t(lg, K::OverlayEnableTip));
@@ -2132,13 +2132,20 @@ pub fn menu_ui(
                     if valid_game_dir(&state.game_dir_edit) {
                         state.game_dir = state.game_dir_edit.clone();
                         state.config_err = (!save_config_game_dir(&state.game_dir))
-                            .then(|| "settings could not be saved (read-only folder?)".to_string());
+                            .then(|| t(lg, K::ConfigSaveFailed).to_string());
                         state.game_fp = game_fingerprint(&state.game_dir);
                         let (entries, total) = scan(&state.game_fp);
                         state.entries = entries;
                         state.total_bytes = total;
                     } else {
+                        // An error!() line is invisible in a GUI: the button simply looked dead.
+                        // Reuse the same warning strip every other settings failure uses.
                         error!("menu: '{}' does not look like EscapeFromTarkov_Data", state.game_dir_edit);
+                        state.config_err = Some(
+                            "That folder is not EscapeFromTarkov_Data \u{2014} pick the folder \
+                             that contains globalgamemanagers."
+                                .to_string(),
+                        );
                     }
                 }
                 match &state.game_fp {
@@ -2175,7 +2182,7 @@ pub fn menu_ui(
                         state.assets_dir = dir.clone();
                         state.assets_dir_edit = dir.clone();
                         state.config_err = (!save_config_assets_dir(&dir))
-                            .then(|| "settings could not be saved (read-only folder?)".to_string());
+                            .then(|| t(lg, K::ConfigSaveFailed).to_string());
                         state.assets_ok = true;
                     }
                 }
@@ -2193,7 +2200,7 @@ pub fn menu_ui(
                 {
                     state.assets_dir = state.assets_dir_edit.clone();
                     state.config_err = (!save_config_assets_dir(&state.assets_dir))
-                        .then(|| "settings could not be saved (read-only folder?)".to_string());
+                        .then(|| t(lg, K::ConfigSaveFailed).to_string());
                     state.assets_ok = true;
                 }
                 if state.assets_ok {
@@ -2393,7 +2400,11 @@ pub fn menu_ui(
                             ui.add_space(8.0);
                             ui.label(RichText::new(t(lg, K::OverlayPerf)).size(10.0).color(DIM));
                             let mut cap = cfg.fps_cap as f32;
-                            if ui.add(egui::Slider::new(&mut cap, 0.0..=144.0).text("fps cap")).changed() {
+                            if ui
+                                .add(egui::Slider::new(&mut cap, 0.0..=360.0).text(t(lg, K::OverlayFpsCap)))
+                                .on_hover_text(t(lg, K::OverlayFpsCapTip))
+                                .changed()
+                            {
                                 cfg.fps_cap = cap.round() as u32;
                                 dirty = true;
                             }
@@ -2441,6 +2452,46 @@ pub fn menu_ui(
                         });
                     }
                     1 => {
+                        // LINK HEALTH, first: every watcher failure is non-fatal, so a dead link
+                        // (no game dir, no Logs folder, a changed log format) used to look exactly
+                        // like a healthy idle one. Show what the watcher actually resolved.
+                        {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            let h = &crate::game_watch::LINK_HEALTH;
+                            let row = |ui: &mut egui::Ui, ok: bool, label: &str| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new(if ok { "\u{2713}" } else { "\u{2717}" })
+                                            .color(if ok { OK } else { WARN })
+                                            .size(11.0),
+                                    );
+                                    ui.label(RichText::new(label).size(11.0).color(DIM));
+                                });
+                            };
+                            let alive = h.ticks.load(Relaxed) > 0;
+                            egui::Frame::new().fill(theme::INSET).inner_margin(8.0).show(ui, |ui| {
+                                ui.label(RichText::new(t(lg, K::LinkHealth)).size(11.0).color(BONE));
+                                row(ui, alive, t(lg, K::LinkWatcher));
+                                row(ui, h.game_dir.load(Relaxed), t(lg, K::LinkGameDir));
+                                row(ui, h.logs_dir.load(Relaxed), t(lg, K::LinkLogsDir));
+                                row(ui, h.app_log.load(Relaxed), t(lg, K::LinkAppLog));
+                                row(ui, h.shots_dir.load(Relaxed), t(lg, K::LinkShotsDir));
+                                let ev = h.events.load(Relaxed);
+                                ui.label(
+                                    RichText::new(format!("{} {ev}", t(lg, K::LinkEvents)))
+                                        .size(10.0)
+                                        .color(if ev > 0 { DIM } else { WARN }),
+                                );
+                                if h.app_log.load(Relaxed) && ev == 0 {
+                                    ui.label(
+                                        RichText::new(t(lg, K::LinkNoEventsHint))
+                                            .size(10.0)
+                                            .color(WARN),
+                                    );
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
                         let loc_now = {
                             let mut loc = state.screenshot_locate;
                             if ui
@@ -2450,7 +2501,10 @@ pub fn menu_ui(
                             {
                                 state.screenshot_locate = loc;
                                 crate::game_watch::set_screenshot_locate(loc);
-                                let _ = save_config_screenshot_locate(loc);
+                                // Was `let _ =`: on a read-only folder the toggle silently
+                                // reverted next launch. Surface it like every other save does.
+                                state.config_err = (!save_config_screenshot_locate(loc))
+                                    .then(|| t(lg, K::ConfigSaveFailed).to_string());
                             }
                             loc
                         };
@@ -2480,7 +2534,8 @@ pub fn menu_ui(
                             .changed()
                         {
                             state.process_in_background = bg;
-                            let _ = save_config_process_in_background(bg);
+                            state.config_err = (!save_config_process_in_background(bg))
+                                .then(|| t(lg, K::ConfigSaveFailed).to_string());
                         }
                         ui.add_space(6.0);
                         // FORCE CPU PROCESSING — bake lighting/terrain on the CPU (EFT_BAKE_CPU=1
@@ -2495,7 +2550,7 @@ pub fn menu_ui(
                             state.force_cpu_process = cpu;
                             if !save_config_force_cpu_process(cpu) {
                                 state.config_err = Some(
-                                    "settings could not be saved (read-only folder?)".to_string(),
+                                    t(lg, K::ConfigSaveFailed).to_string(),
                                 );
                             }
                         }
@@ -2533,7 +2588,7 @@ pub fn menu_ui(
                                     }
                                     if !save_quality_preset_pub(p) {
                                         state.config_err = Some(
-                                            "settings could not be saved (read-only folder?)".to_string(),
+                                            t(lg, K::ConfigSaveFailed).to_string(),
                                         );
                                     }
                                 }
@@ -2617,7 +2672,7 @@ pub fn menu_ui(
     if *settings_save_pending && !ctx.input(|i| i.pointer.any_down()) {
         *settings_save_pending = false;
         state.config_err = (!state.overlay.save())
-            .then(|| "settings could not be saved (read-only folder?)".to_string());
+            .then(|| t(lg, K::ConfigSaveFailed).to_string());
     }
 
     egui::CentralPanel::default()
@@ -2634,6 +2689,9 @@ pub fn menu_ui(
             let mut delete_now: Option<usize> = None;
             let mut rescan = false;
             let mut set_confirm: Option<usize> = None;
+            // Explicit disarm for the delete confirm. Without it an accidentally armed row
+            // stayed armed indefinitely: the flag was only ever cleared BY deleting.
+            let mut clear_confirm = false;
             let mut set_rebuild: Option<usize> = None;
             // (map key, force): BUILD -> force=false (incremental), UPDATE -> force=true.
             let mut start_build: Option<(String, bool)> = None;
@@ -2788,20 +2846,29 @@ pub fn menu_ui(
                                                 // the process. The lease already prevents the
                                                 // crash; this stops the user walking into either.
                                                 let play = theme::primary_button(t(lg, K::Play));
-                                                let playable = intel_synced && !any_building;
+                                                // A missing tarkov.dev sync costs LAYERS (loot
+                                                // prices, task metadata), not the map — gating
+                                                // PLAY on it meant a user who built a map offline
+                                                // could never open it, with no override anywhere.
+                                                // The inline banner above already explains the
+                                                // degraded state; let them in.
+                                                let playable = !any_building;
                                                 let resp = ui
                                                     .add_enabled_ui(playable, |ui| {
                                                         ui.add_sized([84.0, 30.0], play)
                                                     })
                                                     .inner;
                                                 if playable {
+                                                    let resp = if intel_synced {
+                                                        resp
+                                                    } else {
+                                                        resp.on_hover_text(t(lg, K::PlayNeedsSync))
+                                                    };
                                                     if resp.clicked() {
                                                         switch.0 = e.pack_dir.clone();
                                                     }
-                                                } else if any_building {
-                                                    resp.on_disabled_hover_text(t(lg, K::PlayBusyBuilding));
                                                 } else {
-                                                    resp.on_disabled_hover_text(t(lg, K::PlayNeedsSync));
+                                                    resp.on_disabled_hover_text(t(lg, K::PlayBusyBuilding));
                                                 }
                                             } else {
                                                 let reb = theme::warn_button(if this_building {
@@ -2831,7 +2898,7 @@ pub fn menu_ui(
                                                 let upd = theme::warn_button(if this_building {
                                                     "..."
                                                 } else {
-                                                    t(lg, K::Update)
+                                                    t(lg, K::RebuildPack)
                                                 });
                                                 // UPDATE needs the kit+deps just like BUILD
                                                 // (finding 11) and re-extracts stale data via
@@ -2853,8 +2920,24 @@ pub fn menu_ui(
                                             // Tarkov-style destructive button: red fill, black text.
                                             let del_btn = |s: &str| theme::danger_button(s);
                                             if confirm_idx == Some(i) {
+                                                // CONFIRM used to replace DELETE in the same slot
+                                                // under the same cursor, so the second click of a
+                                                // habitual double-click deleted the pack outright.
+                                                // A cancel sits where CONFIRM now is, and CONFIRM
+                                                // moves right — the armed row is also escapable,
+                                                // which it never was (the flag only cleared by
+                                                // deleting).
+                                                if ui
+                                                    .add_sized([84.0, 30.0], egui::Button::new(
+                                                        RichText::new(t(lg, K::Cancel)).color(BONE),
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    clear_confirm = true;
+                                                }
                                                 if ui
                                                     .add_sized([120.0, 30.0], del_btn(t(lg, K::Confirm)))
+                                                    .on_hover_text(t(lg, K::DeleteConfirmTip))
                                                     .clicked()
                                                 {
                                                     delete_now = Some(i);
@@ -2893,6 +2976,9 @@ pub fn menu_ui(
                 }
             });
 
+            if clear_confirm {
+                state.confirm_delete = None;
+            }
             if let Some(i) = set_confirm {
                 state.confirm_delete = Some(i);
             }
