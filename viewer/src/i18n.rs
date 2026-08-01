@@ -102,6 +102,10 @@ pub enum K {
     PlayNeedsSync,
     RebuildPack,
     DeleteConfirmTip,
+    TickGrassTip,
+    TickLightTip,
+    TickZonesTip,
+    TickIconsTip,
     ConfigSaveFailed,
     OverlayFpsCap,
     OverlayFpsCapTip,
@@ -294,6 +298,22 @@ fn pair(k: K) -> [&'static str; 2] {
             "Reading the log but recognizing nothing - if you have played a raid since Atlas started, the game log format may have changed. Please report it.",
             "Лог читается, но ничего не распознано - если вы играли рейд после запуска Atlas, формат лога мог измениться. Сообщите об этом.",
         ],
+        TickGrassTip => [
+            "Procedural grass field (grass.bin). The map's own bushes and foliage are scene geometry and render regardless of this.",
+            "Процедурное поле травы (grass.bin). Собственная растительность карты - это геометрия сцены и рисуется в любом случае.",
+        ],
+        TickLightTip => [
+            "Baked SH irradiance volume. Without it the map falls back to flat realtime lighting.",
+            "Запечённый SH-объём освещения. Без него карта использует плоское освещение.",
+        ],
+        TickZonesTip => [
+            "Game-file gamedata.json: extracts, spawns, doors, loot containers and quest zones.",
+            "gamedata.json из файлов игры: выходы, спавны, двери, контейнеры и квестовые зоны.",
+        ],
+        TickIconsTip => [
+            "Cached item icons for the loot cards.",
+            "Кэш иконок предметов для карточек лута.",
+        ],
         ConfigSaveFailed => [
             "Settings could not be saved (read-only folder?) - this change will not survive a restart.",
             "Не удалось сохранить настройки (папка только для чтения?) - изменение не сохранится после перезапуска.",
@@ -308,7 +328,11 @@ fn pair(k: K) -> [&'static str; 2] {
             "Удаляет собранный пакет этой карты с диска. Повторная сборка займёт всё время обработки заново.",
         ],
         TickLight => ["light", "свет"],
-        TickGrass => ["grass", "трава"],
+        // NOT "does this map show grass": the map's own foliage is ordinary scene geometry and
+        // always renders. This flag is the PROCEDURAL grass field (grass.bin density grids), which
+        // only some packs carry - the old bare "grass" label read as a missing-vegetation warning
+        // on maps that visibly have plenty.
+        TickGrass => ["grass sim", "трава (симуляция)"],
         TickZones => ["zones", "зоны"],
         TickIcons => ["icons", "иконки"],
         GameInstall => ["GAME INSTALL", "ПАПКА ИГРЫ"],

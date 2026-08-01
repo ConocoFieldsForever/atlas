@@ -2810,11 +2810,19 @@ pub fn menu_ui(
                                             .color(DIM)
                                             .size(11.0),
                                     );
+                                    // Each flag says what the PACK carries, which is not always
+                                    // what the player sees on screen (a greyed "grass sim" on a
+                                    // visibly grassy map read as a bug) - so each one explains
+                                    // itself on hover.
                                     let tick = |on: bool, s: &str| theme::tick(on, s);
-                                    ui.label(tick(e.has_volume, t(lg, K::TickLight)));
-                                    ui.label(tick(e.has_grass, t(lg, K::TickGrass)));
-                                    ui.label(tick(e.has_gamedata, t(lg, K::TickZones)));
-                                    ui.label(tick(e.has_icons, t(lg, K::TickIcons)));
+                                    ui.label(tick(e.has_volume, t(lg, K::TickLight)))
+                                        .on_hover_text(t(lg, K::TickLightTip));
+                                    ui.label(tick(e.has_grass, t(lg, K::TickGrass)))
+                                        .on_hover_text(t(lg, K::TickGrassTip));
+                                    ui.label(tick(e.has_gamedata, t(lg, K::TickZones)))
+                                        .on_hover_text(t(lg, K::TickZonesTip));
+                                    ui.label(tick(e.has_icons, t(lg, K::TickIcons)))
+                                        .on_hover_text(t(lg, K::TickIconsTip));
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
