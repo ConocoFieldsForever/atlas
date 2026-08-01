@@ -802,6 +802,8 @@ struct GfxUiParams<'w, 's> {
     bookmarks: ResMut<'w, Bookmarks>,
     /// Position-HUD on/off (footer checkbox).
     hud: ResMut<'w, PosHud>,
+    /// "show disabled geometry" — the GEOMETRY sibling of the marker-level `hide inactive` filter.
+    show_disabled_geom: ResMut<'w, crate::ShowDisabledGeom>,
     /// The fly-cam transform (root-level entity, so `Transform` IS world space) for "save view".
     cam: Query<'w, 's, &'static Transform, With<crate::render::CullCamera>>,
     /// Typed gamedata.json zone state — the footer credits the game files when it's live.
@@ -1392,6 +1394,24 @@ fn layers_panel(
                                          (inactive exfils, low-power minefields, \u{2026})",
                                     );
                                 theme::count_tag(ui, gfx_ui.inactive.iter().count());
+                            });
+                            // ---- SHOW DISABLED GEOMETRY — the GEOMETRY sibling of the filter
+                            // above, and deliberately worded to keep them apart: that one hides
+                            // MARKERS whose gamedata record is disabled; this one draws MESHES
+                            // Unity has switched off (eftpack::flags::INACTIVE). Off by default so
+                            // the view matches what the game renders.
+                            ui.horizontal(|ui| {
+                                ui.add_space(10.0);
+                                ui.checkbox(
+                                    &mut gfx_ui.show_disabled_geom.0,
+                                    "show disabled geometry",
+                                )
+                                .on_hover_text(
+                                    "draw scenery and rooms Unity has switched off \
+                                     (unreleased interiors, parked props). The game does not \
+                                     render these \u{2014} this is geometry, not the marker \
+                                     filter above.",
+                                );
                             });
                         });
 

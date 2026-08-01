@@ -193,6 +193,20 @@ def _obj_complete(fp):
         return False
 
 
+def _vcol_usable(fp):
+    """True only for a vertex-colour sidecar that carries actual paint. Missing, unreadable, empty or
+    ALL-ZERO -> False (re-derive it). All-zero is not a harmless value here: it is the vert-paint blend
+    weight set, and the shader reads it as unpainted, so a failed decode renders as the base layer and
+    looks like a deliberately plain surface."""
+    if not os.path.exists(fp):
+        return False
+    try:
+        a = np.load(fp)
+        return bool(a.size) and bool(a.any())
+    except Exception:
+        return False
+
+
 def _drop_incomplete(fp):
     """Remove a half-written casualty so os.link / skip guards can never resurrect it."""
     try:
@@ -776,6 +790,7 @@ def main():
 
     exported = {}        # (lv,fid,pid) mesh -> obj filename
     _repaired = []       # OBJs that existed but held no geometry (NUL-filled/truncated) -> dropped + re-exported
+    _repaired_vcol = []  # vertex-colour sidecars that were missing or all-zero -> re-derived from the bundle
     tex_done = set()     # (fid,pid) textures already written
     mat_cache = {}       # (fid,pid) material -> (alb,nrm,sh,tile)
     instances = []
@@ -1226,13 +1241,28 @@ def main():
                 # carries a Colour channel (vertex-data channel 3) decode it via MeshHandler -> <mesh>.vcol.npy.
                 if exported.get(key):
                     vc_fp = fp[:-4] + ".vcol.npy"
-                    if not os.path.exists(vc_fp):
+                    # An ALL-ZERO decode is never kept. These are the vert-paint blend weights, and the
+                    # shader reads all-zero as "unpainted" and falls back to layer 0 alone -- which is
+                    # exactly what an undecoded mesh looks like, so a bad read was indistinguishable from
+                    # authored intent and the exists() check then pinned it forever. Streets carried 472 of
+                    # them, 67x concentrated in the same 35 levels the killed run damaged; re-derived from
+                    # the bundle, City_construction_site_terrain_LOD0 comes back painted (mean 74/152/153)
+                    # instead of zero, so its construction-site mud rendered as bare road base. Writing NO
+                    # file is visually identical for a genuinely unpainted mesh (load_vcol -> None ->
+                    # assemble's (1,0,0,1) -> layer 0, the same branch) and leaves the next run free to retry.
+                    if not _vcol_usable(vc_fp):
                         try:
                             chs = mesh.m_VertexData.m_Channels
                             if len(chs) > 3 and getattr(chs[3], "dimension", 0):
                                 from UnityPy.helpers.MeshHelper import MeshHandler
                                 mh = MeshHandler(mesh); mh.process(); _c = getattr(mh, "m_Colors", None)
-                                if _c is not None: _atomic_write(vc_fp, lambda t: _save_npy(t, np.asarray(_c, np.float32).reshape(-1, 4)))
+                                if _c is not None:
+                                    _vc = np.asarray(_c, np.float32).reshape(-1, 4)
+                                    if _vc.any():
+                                        _atomic_write(vc_fp, lambda t: _save_npy(t, _vc))
+                                        if os.path.exists(vc_fp): _repaired_vcol.append(os.path.basename(vc_fp))
+                                    elif os.path.exists(vc_fp):
+                                        _drop_incomplete(vc_fp)          # stop a zeroed sidecar surviving another run
                         except Exception: pass
             except Exception:
                 exported[key] = None
@@ -1780,6 +1810,39 @@ def main():
                 levels = sorted(set(old.get("levels") or []) | set(levels))
         except Exception as e:
             print(f"  terrain-only: scene merge failed ({e}) - writing this run's scene as-is", flush=True)
+    elif os.path.exists(scene_path):
+        # PARTIAL-RUN GUARD -- the rule above, generalised to EVERY mode. --terrain-only got this
+        # treatment when a 3 s touch-up nuked a 110k-instance graph; every other partial run kept the
+        # unconditional overwrite, so re-extracting a few levels to repair their meshes still destroyed
+        # the other 200. That is not hypothetical: `--levels 325` on streets cut a 459 MB, 654,748-instance
+        # scene.json down to 2,223 instances, and the only way back was a full 245-level re-extraction.
+        # A run OWNS the levels it was asked for and nothing else, so keep every instance from a level this
+        # run did not touch. lod.g is a per-run cumulative index, so the new instances are offset past the
+        # old table exactly as extract_parallel._merge does it -- old instances keep indexing the old
+        # entries, which stay put. A full run (or a chunk dir holding only its own levels) keeps nothing,
+        # so this is a no-op there and the write is byte-identical to before.
+        try:
+            old = json.load(open(scene_path, encoding="utf-8"))
+        except Exception as e:
+            raise SystemExit(f"[extract] FATAL: {scene_path} exists but could not be read ({e}). Refusing to "
+                             f"overwrite it with this run's {len(levels)} level(s) -- that would discard a "
+                             f"scene graph we cannot even inspect. Move it aside deliberately to rebuild.")
+        run_lvs = set(levels)
+        kept = [it for it in (old.get("instances") or []) if it.get("lv") not in run_lvs]
+        if kept:
+            old_lg = old.get("lodGroups") or []
+            base = len(old_lg)
+            for it in instances:
+                L = it.get("lod")
+                if L and "g" in L:
+                    L["g"] = int(L["g"]) + base
+            print(f"  partial run: merged {len(instances):,} instance(s) from {len(run_lvs)} re-extracted "
+                  f"level(s) into the existing scene.json ({len(kept):,} kept from {len(set(old.get('levels') or [])-run_lvs)} "
+                  f"untouched level(s)); lod.g offset by {base:,}", flush=True)
+            instances = kept + instances
+            lodgroups = old_lg + lodgroups
+            waterbodies = (old.get("waterBodies") or []) + waterbodies
+            levels = sorted(set(old.get("levels") or []) | run_lvs)
     json.dump({"instances": instances, "up": "unity", "levels": levels, "lodGroups": lodgroups, "lod_schema": 1,
                "waterBodies": waterbodies,
                "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"},
@@ -1790,6 +1853,9 @@ def main():
     if _repaired:
         print(f"  REPAIRED {len(_repaired)} OBJ(s) that existed but held no geometry (NUL-filled/truncated by a "
               f"killed run) - re-exported from the bundles. e.g. {_repaired[:3]}", flush=True)
+    if _repaired_vcol:
+        print(f"  REPAIRED {len(_repaired_vcol)} vertex-colour sidecar(s) that were missing or all-zero - "
+              f"re-derived from the bundles. e.g. {_repaired_vcol[:3]}", flush=True)
     print(f"\nDONE {len(instances)} instances, {len([v for v in exported.values() if v])} meshes, "
           f"{len(tex_done)} textures in {time.time()-T0:.0f}s -> {out}", flush=True)
 

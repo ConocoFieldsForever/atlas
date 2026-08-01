@@ -265,6 +265,21 @@ pub struct MapSwitch(pub Option<String>);
 /// group's max available level). Only meaningful on `--alllod` packs that carry multiple LODs; a
 /// no-op on lean LOD0-only packs. Changing it bumps `MapEpoch` so `build_cpu_data` rebuilds the
 /// instance set for the new level.
+/// Draw the geometry Unity has SWITCHED OFF (`eftpack::flags::INACTIVE`) — parked scenery and the
+/// interiors of unreleased rooms, which the build ships flagged but the renderer hides so the view
+/// matches what the game draws. OFF by default. Entirely separate from `LayerToggles::hide_inactive`,
+/// which filters gamedata MARKERS; this one is about geometry.
+#[derive(Resource)]
+pub struct ShowDisabledGeom(pub bool);
+impl Default for ShowDisabledGeom {
+    /// `EFT_SHOW_DISABLED=1` starts with it on, matching the `EFT_LOD` / `EFT_LAYERS=showinactive`
+    /// debug-override style. Without this the toggle is only reachable by clicking, so a headless
+    /// capture cannot exercise it and the flag's end-to-end behaviour could not be verified.
+    fn default() -> Self {
+        ShowDisabledGeom(std::env::var("EFT_SHOW_DISABLED").map(|v| v.trim() == "1").unwrap_or(false))
+    }
+}
+
 #[derive(Resource)]
 pub struct ForcedLod(pub i32);
 impl Default for ForcedLod {
@@ -283,6 +298,40 @@ impl Default for ForcedLod {
 /// bump would nuke all that state for no visual change. Only bump when the pack ACTUALLY carries
 /// multiple LODs (an `--alllod` pack), so the selector is a true no-op on standard packs and never
 /// touches camera/nav/POI/plan state there. (Reset-to-defaults also resets `ForcedLod`, in ui.rs.)
+/// Same re-trigger as `bump_epoch_on_lod_change`, for the disabled-geometry toggle. Guarded the
+/// same way: a `MapEpoch` bump is destructive (reframes the camera, clears nav/pins/routes), so only
+/// bump when the pack ACTUALLY ships flagged geometry — on every pack built before this flag existed
+/// the toggle is a true no-op and must not nuke that state.
+///
+/// Compares the VALUE, never `is_changed()`. egui draws the checkbox with
+/// `ui.checkbox(&mut res.0, ..)`, and `ResMut`'s `deref_mut` sets the changed flag on every frame
+/// the panel is open whether or not the bool moved — so an `is_changed()` guard here bumped the
+/// epoch every frame and rebuilt the 4.6 s CPU blob in a loop (39 rebuilds in one session; the map
+/// never finished loading). A `Local` copy of the last applied value is the only reliable edge.
+fn bump_epoch_on_disabled_geom_change(
+    show: Res<ShowDisabledGeom>,
+    pack: Option<Res<LoadedPack>>,
+    mut epoch: ResMut<render::MapEpoch>,
+    mut last: Local<Option<bool>>,
+) {
+    let cur = show.0;
+    if last.is_none() {
+        *last = Some(cur); // first observation: adopt, never bump
+        return;
+    }
+    if *last == Some(cur) {
+        return; // no real edge — the flag was just touched by the UI's &mut
+    }
+    *last = Some(cur);
+    let has_any = pack
+        .as_ref()
+        .map(|p| p.0.instances.iter().any(|i| i.is_inactive()))
+        .unwrap_or(false);
+    if has_any {
+        epoch.0 = epoch.0.wrapping_add(1);
+    }
+}
+
 fn bump_epoch_on_lod_change(
     lod: Res<ForcedLod>,
     pack: Option<Res<LoadedPack>>,
@@ -1177,6 +1226,7 @@ fn main() {
         .init_resource::<PendingMapLoad>() // async in-place pack load (no frame freeze on switch)
         .init_resource::<MapLoadError>() // async load failure -> UI error + back-to-menu (finding 4)
         .init_resource::<ForcedLod>() // graphics-panel LOD selector (meaningful on --alllod packs)
+        .init_resource::<ShowDisabledGeom>() // "show disabled geometry" toggle (Unity-inactive scenery)
         .init_resource::<agent_link::AgentLinkCtl>() // drone agent link (TCP lockstep sim control)
         // DoorClick is CONSUMED only by the gpu-driven render path, but pick_system (always-on)
         // WRITES it unconditionally — on the M0/std paths EftGpuDrivenPlugin (its only init site)
@@ -1206,7 +1256,7 @@ fn main() {
                 .run_if(not(resource_exists::<menu::MenuState>)),
         )
         .init_resource::<BenchSampleStart>()
-        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change, bench_stats, arm_auto_exposure))
+        .add_systems(Update, (apply_camera_command, auto_screenshot, debug_switch, return_to_menu, bump_epoch_on_lod_change, bump_epoch_on_disabled_geom_change, bench_stats, arm_auto_exposure))
         // Bench cameras override the fly-cam AFTER Update, before transforms propagate.
         .add_systems(
             PostUpdate,

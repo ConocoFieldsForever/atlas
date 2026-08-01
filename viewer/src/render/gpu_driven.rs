@@ -1756,7 +1756,7 @@ fn softcutout_params(vp: &Option<crate::eftpack::VertPaint>) -> Option<[f32; 4]>
 /// the caller (`poll_cpu_build`) clears the loading flag in that case. The heavy work here — the
 /// fused geometry encode, the material table, grass, SH/light-grid load — is exactly what used to
 /// stall the main thread for ~0.6–1.3 s per map load.
-fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
+fn compute_cpu_blob(pack: &Pack, lod: i32, show_disabled: bool) -> Option<CpuData> {
     let build_t0 = std::time::Instant::now(); // STALL INSTRUMENTATION (off-thread now)
     // DISTANCE-LOD: a pack that ships more than one shell per group ("multi-LOD") packs EVERY shell
     // and lets the GPU cull select per-frame (ids.w window + ids.z bits); a lean pack keeps the old
@@ -1767,6 +1767,16 @@ fn compute_cpu_blob(pack: &Pack, lod: i32) -> Option<CpuData> {
     } else {
         pack.instances_by_mesh_for_lod(lod) // lean: one shell per group (unchanged)
     };
+    // DISABLED GEOMETRY: drop the Unity-switched-off instances unless the viewer asks for them.
+    // Filtered HERE rather than in `Pack::instances_by_mesh` so nav-bake and the M0 instancing path
+    // keep seeing the full set (collision//baking want the walls even when they are not drawn).
+    let mut by_mesh = by_mesh;
+    if !show_disabled {
+        for v in by_mesh.iter_mut() {
+            v.retain(|&i| !pack.instances[i as usize].is_inactive());
+        }
+    }
+    let by_mesh = by_mesh;
     let t_bymesh = build_t0.elapsed(); // phase: instance-by-mesh grouping
     // Per-instance LOD encode (multi-LOD only): (ids.z extra bits, ids.w f16 window). `ids.z` bit8 =
     // is-default-shell, bits9..12 = lod_index (clamped 0..15); `ids.w` = pack_f16(near', far') where the
@@ -3625,6 +3635,7 @@ fn kick_cpu_build(
     epoch: Res<super::MapEpoch>,
     tags: Query<(), With<GpuDrivenTag>>,
     lod: Res<crate::ForcedLod>,
+    show_disabled: Res<crate::ShowDisabledGeom>,
     load_signal: Option<Res<GpuLoadSignal>>,
 ) {
     let Some(pack) = pack else {
@@ -3639,6 +3650,7 @@ fn kick_cpu_build(
     }
     let pack_arc = pack.0.clone(); // Arc clone (cheap); shares meshes.bin with the worker
     let lod = lod.0;
+    let show_disabled = show_disabled.0;
     let ep = epoch.0;
 
     // Escape hatch: build synchronously in this frame and apply immediately (old behavior).
@@ -3647,7 +3659,7 @@ fn kick_cpu_build(
         .unwrap_or(false);
     if sync_load {
         commands.remove_resource::<PendingCpuBuild>();
-        match compute_cpu_blob(&pack_arc, lod) {
+        match compute_cpu_blob(&pack_arc, lod, show_disabled) {
             Some(cpu) => {
                 // Slim persistent copy for loot.rs: the blob itself is dropped after upload.
                 commands.insert_resource(crate::loot::LootModelIndex {
@@ -3668,7 +3680,7 @@ fn kick_cpu_build(
     }
 
     let task = bevy::tasks::AsyncComputeTaskPool::get()
-        .spawn(async move { compute_cpu_blob(&pack_arc, lod) });
+        .spawn(async move { compute_cpu_blob(&pack_arc, lod, show_disabled) });
     // Inserting replaces (and thus cancels) any previous in-flight build for a superseded epoch.
     commands.insert_resource(PendingCpuBuild { task, epoch: ep });
 }

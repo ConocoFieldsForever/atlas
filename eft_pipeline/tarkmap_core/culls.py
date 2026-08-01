@@ -71,6 +71,16 @@ class Culls:
         # world bounding DIAMETER exceeds this keeps only via TARKMAP_KEEP_HIDDEN=1. The caller supplies
         # the mesh-size lookup (filter(..., mesh_diam=...)); without one the gate is inert (old behavior).
         self.inactive_keep_max_m = float(c.get("inactive_keep_max_m", 10.0))
+        # ...but "oversized + inactive" is a HEURISTIC for parked scenery, and it misreads disabled
+        # ROOM INTERIORS: streets' Chekannaya_13_indoor_flat_02_Walls (a 15.2 m shell in the unreleased
+        # DAMA_SERDCA room) is exactly the shape this gate was built to reject, and dropping it left the
+        # room's props floating inside an invisible box. Rather than widen the gate -- the parked
+        # Lighthouse_Mountain case it exists for is real -- the instance is now KEPT and MARKED
+        # (`oversize_inactive`), so the pack can flag it and the viewer can hide it by default and offer
+        # it behind a toggle. Safe to default ON now that the viewer hides FLAG_INACTIVE unless its
+        # "show disabled geometry" checkbox is ticked, so the default view still matches the game and
+        # the parked Lighthouse_Mountain case stays invisible until asked for.
+        self.keep_oversize_inactive = c.get("keep_oversize_inactive", True)
         self._mesh_diam = None
         self._n_oversize = 0
         # OFF-MAP BACKDROP cull: EFT scenes carry a distant city-skyline cluster (e.g. Interchange's build03_part*/
@@ -108,7 +118,9 @@ class Culls:
                     d = self._mesh_diam(it)
                     if d is not None and d > self.inactive_keep_max_m:
                         self._n_oversize += 1
-                        return False
+                        if not self.keep_oversize_inactive:
+                            return False
+                        it["oversize_inactive"] = True   # kept, but MARKED: the pack flags it, the viewer hides it
         # WATER LAYER OVERRIDE. `wlayer` is set by eft_extract_v2 for geometry on Unity's built-in
         # Water layer (4) — the layer EFT's own ballistics reads. It must outrank the root denylist
         # below, because BSG parks woods' `WATER_LEVEL` surface under a `BLOCKERS` scene root, and

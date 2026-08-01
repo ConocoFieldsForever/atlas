@@ -125,6 +125,9 @@ def _fold32(x):
 FLAG_MIRROR  = 1 << 0   # det3(affine) < 0 -> renderer flips front-face / winding for this instance
 FLAG_TERRAIN = 1 << 1   # MicroSplat terrain tile (drive with the terrain splat shader)
 FLAG_BAKED   = 1 << 2   # identity-affine, geometry PRE-BAKED to world (degenerate fallback); no normal-matrix
+FLAG_INACTIVE= 1 << 3   # Unity-DISABLED geometry the size gate would have dropped (parked scenery / unreleased
+                        # rooms). Shipped so the viewer can OFFER it; hidden by default because the game does
+                        # not draw it either. Distinct from the marker-level 'hide inactive' POI filter.
 
 # ---- PHYSICS COLLIDERS (colliders.bin + collider_meshes.bin) -------------------------------------------------
 # The render pack is built from MeshRenderers, so it only holds geometry you can SEE. The world the
@@ -695,8 +698,14 @@ def main():
           f"Unity-hidden {rep.get('hidden_unity', 0):,}); top dropped roots "
           f"{[r for r, _ in rep['top_dropped_roots'][:5]]}")
     if rep.get('inactive_oversize'):
-        print(f"[bevy] oversized-inactive cull: dropped {rep['inactive_oversize']} parked/disabled "
-              f"scenery instance(s) (> {CULLS.inactive_keep_max_m:.0f} m, aih=False)")
+        # Say what actually happened. The gate no longer always drops: with keep_oversize_inactive it
+        # KEEPS and FLAGS these (FLAG_INACTIVE), and the viewer hides them behind "show disabled
+        # geometry". Reporting a drop that did not occur is the same failure as reporting a bake that
+        # did not run -- the number was right and the verb was wrong.
+        _verb = ("kept + flagged INACTIVE (viewer hides them unless 'show disabled geometry' is on)"
+                 if CULLS.keep_oversize_inactive else "dropped")
+        print(f"[bevy] oversized-inactive gate: {rep['inactive_oversize']} parked/disabled scenery "
+              f"instance(s) (> {CULLS.inactive_keep_max_m:.0f} m, aih=False) -> {_verb}")
     if rep.get('offmap_backdrop'):
         print(f"[bevy] off-map backdrop cull: dropped {rep['offmap_backdrop']} distant-skyline instances")
     if rep['kept'] == 0 or rep['kept'] < rep['raw'] * 0.005:
@@ -1005,6 +1014,7 @@ def main():
             flags = 0
             if det3(mg) < 0.0: flags |= FLAG_MIRROR         # renderer flips winding; we do NOT bake
             if is_terrain: flags |= FLAG_TERRAIN
+            if it.get('oversize_inactive'): flags |= FLAG_INACTIVE
             L = it.get('lod'); lg, li = (L['g'], L['i']) if L else (-1, -1)
             inst_records.append((list(mg[:12]), meshId, int(lg), int(li), rid(it.get('root') or ''), flags,
                                  _fold32(it.get('par')), _fold32(it.get('par2')), int(it.get('lv') or 0)))
@@ -1260,7 +1270,8 @@ def main():
         "lodGroups": lod_groups,
         "flagsLegend": {"0x1": "MIRROR (det<0: flip front-face/winding)",
                         "0x2": "TERRAIN (MicroSplat splat shader)",
-                        "0x4": "BAKED_WORLD (identity affine, geometry pre-baked)"},
+                        "0x4": "BAKED_WORLD (identity affine, geometry pre-baked)",
+                        "0x8": "INACTIVE (Unity-disabled scenery/rooms; viewer hides unless 'show disabled geometry' is on)"},
         "conventions": {
             "affine": "ROW-MAJOR world 3x4 incl shear (glam Affine3A / raw instance buffer is shear+mirror correct)",
             "normals": "LOCAL smooth normals; renderer applies per-instance inverse-transpose of the 3x3 (shear-correct)",

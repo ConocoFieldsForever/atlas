@@ -43,6 +43,12 @@ pub mod flags {
     /// Identity affine; geometry PRE-BAKED to world (degenerate/rank-deficient
     /// fallback). No per-instance normal matrix.
     pub const BAKED: u32 = 1 << 2;
+    /// Geometry Unity has SWITCHED OFF (activeInHierarchy == false) and which the build's
+    /// oversized-inactive gate would otherwise have dropped: parked scenery and the interiors of
+    /// unreleased rooms. Shipped so the viewer can offer it, HIDDEN by default because the game
+    /// does not draw it either. Nothing to do with `LayerToggles::hide_inactive`, which filters
+    /// gamedata MARKERS (disabled exfils/minefields), not geometry.
+    pub const INACTIVE: u32 = 1 << 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +552,11 @@ impl GpuInstance {
     #[inline]
     pub fn is_mirror(&self) -> bool {
         self.flags & flags::MIRROR != 0
+    }
+
+    /// Unity-disabled scenery/room geometry (see `flags::INACTIVE`).
+    pub fn is_inactive(&self) -> bool {
+        self.flags & flags::INACTIVE != 0
     }
 }
 
