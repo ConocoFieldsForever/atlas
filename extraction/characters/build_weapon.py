@@ -585,6 +585,12 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
             UV = np.asarray(uv, np.float64)
             UV = UV.reshape(-1, 2) if UV.ndim == 1 else UV[:, :2]
             UV = UV[:n] if UV.shape[0] >= n else np.zeros((n, 2))
+            # FLIP V. Unity's UV origin is bottom-left, Bevy/wgpu's is top-left. The map pack
+            # declares `uvVFlipBaked: true` and the character pack bakes it the same way through
+            # coords.uvs(); weapons never did, so every gun sampled its texture upside down --
+            # which reads as a subtle wrong-placement rather than an obvious break.
+            UV = UV.copy()
+            UV[:, 1] = 1.0 - UV[:, 1]
         else:
             UV = np.zeros((n, 2))
         if os.environ.get("EFT_WEAPON_DEBUG"):
