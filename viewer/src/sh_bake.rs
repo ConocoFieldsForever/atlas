@@ -642,50 +642,30 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
     // even interchange/streets-scale giants on-GPU) when available + it fits; else the rayon CPU pass
     // below. Kept in f32 (NOT packed yet) so the M3 diffuse bounce can trilinearly gather irradiance.
     let t_bake = Instant::now();
-    // The GPU pass computes probe positions from (gmin, spacing) internally, so it cannot honour
-    // virtual offset. When probes have been relocated the CPU pass is the correct one.
-    let gpu_a = if n_moved == 0 && matches!(backend, Backend::Gpu | Backend::Auto) {
-        crate::sh_bake_gpu::pass_a_gpu(
-            &bvh, lights, gmin, spacing, dims, n_dir, sky_scale, light_scale, indirect_only,
-        )
-    } else {
-        None
-    };
-    let (sh_a, inside_solid): (Vec<[Vec3; 4]>, usize) = if let Some(v) = gpu_a {
-        (v, 0) // inside-solid is a CPU-pass diagnostic only (never serialized); GPU path skips the count
-    } else {
-        if backend == Backend::Gpu {
-            eprintln!("  sh-bake: --backend gpu unavailable — falling back to the CPU pass A");
-        }
-        let inside = std::sync::atomic::AtomicUsize::new(0);
-        let mut sh_a: Vec<[Vec3; 4]> = vec![[Vec3::ZERO; 4]; n_probe];
-        sh_a.par_iter_mut().enumerate().for_each_init(
-        || Vec::<u32>::with_capacity(64),
-        |stack, (pi, out)| {
-            let o = probe_pos(pi);
-            // --- M1: sky-visibility (each escaping Fibonacci ray sees a neutral sky gradient) ---
-            let mut sh = [Vec3::ZERO; 4];
-            let mut n_sky = 0u32;
-            for (d, basis) in &dirs {
-                if ray_occluded(&bvh, o, *d, f32::INFINITY, stack) {
-                    continue; // occluded -> sees no sky
-                }
-                n_sky += 1;
-                let l = sky(*d, sky_scale);
-                for c in 0..4 {
-                    sh[c] += l * basis[c];
-                }
+    // PER-PROBE pass A, shared by the full CPU path and the relocated-probe fixup below.
+    // Returns (sh, saw_no_sky) — the second is the inside-solid diagnostic.
+    let pass_a_probe = |pi: usize, stack: &mut Vec<u32>| -> ([Vec3; 4], bool) {
+        let o = probe_pos(pi);
+        // --- M1: sky-visibility (each escaping Fibonacci ray sees a neutral sky gradient) ---
+        let mut sh = [Vec3::ZERO; 4];
+        let mut n_sky = 0u32;
+        for (d, basis) in &dirs {
+            if ray_occluded(&bvh, o, *d, f32::INFINITY, stack) {
+                continue; // occluded -> sees no sky
             }
+            n_sky += 1;
+            let l = sky(*d, sky_scale);
             for c in 0..4 {
-                sh[c] *= norm; // sky is a hemisphere integral -> weight by the ray solid angle dw
+                sh[c] += l * basis[c];
             }
-            if n_sky == 0 {
-                inside.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            // --- M2: live practicals (delta lights; added AFTER the sky*norm scale, NOT weighted by
-            //     norm — a point light is a single direction, not a solid-angle sample). SKIPPED under
-            //     --indirect-only (they render as real-time direct lights instead). ---
-            if !indirect_only {
+        }
+        for c in 0..4 {
+            sh[c] *= norm; // sky is a hemisphere integral -> weight by the ray solid angle dw
+        }
+        // --- M2: live practicals (delta lights; added AFTER the sky*norm scale, NOT weighted by
+        //     norm — a point light is a single direction, not a solid-angle sample). SKIPPED under
+        //     --indirect-only (they render as real-time direct lights instead). ---
+        if !indirect_only {
             for lgt in lights {
                 let tol = lgt.pos - o;
                 let dist = tol.length();
@@ -716,16 +696,72 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
                     sh[c] += rad * basis[c];
                 }
             }
-            } // end if !indirect_only (M2 practicals)
-            *out = sh;
-        },
+        }
+        (sh, n_sky == 0)
+    };
+
+    // The GPU pass computes probe positions from (gmin, spacing) internally, so it cannot honour
+    // virtual offset. It used to be skipped ENTIRELY whenever a single probe had been relocated —
+    // on streets that is 101,801 of 774,144 probes (13%), which sent the other 87% to the CPU too
+    // and cost ~87 s on a machine with a perfectly good GPU. Run the GPU over the whole grid, then
+    // recompute JUST the relocated probes on the CPU below (same code, so their result is
+    // bit-identical to the all-CPU bake).
+    let gpu_a = if matches!(backend, Backend::Gpu | Backend::Auto) {
+        crate::sh_bake_gpu::pass_a_gpu(
+            &bvh, lights, gmin, spacing, dims, n_dir, sky_scale, light_scale, indirect_only,
+        )
+    } else {
+        None
+    };
+    let used_gpu = gpu_a.is_some();
+    let (mut sh_a, inside_solid): (Vec<[Vec3; 4]>, usize) = if let Some(v) = gpu_a {
+        (v, 0) // inside-solid is a CPU-pass diagnostic only (never serialized); GPU path skips the count
+    } else {
+        if backend == Backend::Gpu {
+            eprintln!("  sh-bake: --backend gpu unavailable — falling back to the CPU pass A");
+        }
+        let inside = std::sync::atomic::AtomicUsize::new(0);
+        let mut sh_a: Vec<[Vec3; 4]> = vec![[Vec3::ZERO; 4]; n_probe];
+        sh_a.par_iter_mut().enumerate().for_each_init(
+            || Vec::<u32>::with_capacity(64),
+            |stack, (pi, out)| {
+                let (sh, no_sky) = pass_a_probe(pi, stack);
+                if no_sky {
+                    inside.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                *out = sh;
+            },
         );
         (sh_a, inside.into_inner())
     };
+    // RELOCATED-PROBE FIXUP (GPU path only). The GPU computed every probe at its GRID position;
+    // probes that virtual-offset moved out of geometry must be re-lit from where they actually sit,
+    // or they keep the occluded-in-a-wall result the relocation existed to escape. Same closure as
+    // the CPU pass, so these probes are bit-identical to an all-CPU bake.
+    if used_gpu && n_moved > 0 && !positions.is_empty() {
+        let t_fix = Instant::now();
+        let fixed: Vec<(usize, [Vec3; 4])> = (0..n_probe)
+            .into_par_iter()
+            .filter(|&pi| positions[pi] != probe_o(pi, nx, ny, gmin, spacing))
+            .map_init(
+                || Vec::<u32>::with_capacity(64),
+                |stack, pi| (pi, pass_a_probe(pi, stack).0),
+            )
+            .collect();
+        let n_fixed = fixed.len();
+        for (pi, sh) in fixed {
+            sh_a[pi] = sh;
+        }
+        eprintln!(
+            "  sh-bake: pass A relocated-probe fixup {n_fixed} probes on CPU in {:.2}s",
+            t_fix.elapsed().as_secs_f32()
+        );
+    }
     eprintln!(
-        "  sh-bake: pass A (direct) {n_probe} probes in {:.2}s ({} fully-occluded/inside-solid)",
+        "  sh-bake: pass A (direct) {n_probe} probes in {:.2}s ({} fully-occluded/inside-solid){}",
         t_bake.elapsed().as_secs_f32(),
-        inside_solid
+        inside_solid,
+        if used_gpu { " [GPU]" } else { " [CPU]" }
     );
 
     // ================= PASS B — one diffuse bounce (M3) =============================================

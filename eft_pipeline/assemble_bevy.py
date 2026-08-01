@@ -497,6 +497,7 @@ class _PackShipper:
 
     def __init__(self, out_dir):
         self.out = out_dir; self.files = 0; self.bytes = 0; self.missing = []
+        self.linked = 0; self.copied = 0   # hardlinked vs byte-copied (see ship)
         self._by_src = {}    # normalized source path -> pack-relative path (copy dedup)
         self._by_base = {}   # claimed tex/ basename  -> owning source path (collision check)
         self._sha = {}       # source path -> short content hash (lazy, for collisions only)
@@ -513,15 +514,35 @@ class _PackShipper:
         return h
 
     def ship(self, src, rel):
-        """Copy src -> <pack>/<rel> (rel = pack-relative, posix slashes). None if src missing."""
+        """Materialize src at <pack>/<rel> (rel = pack-relative, posix slashes). None if src missing.
+
+        HARDLINK first, copy as fallback. A self-contained streets pack ships ~6.4 GB of textures
+        that already exist, byte-identical and read-only, in the extraction dir — copying them cost
+        ~56 s per build AND a second 6.4 GB on disk per pack. A hardlink is the same inode: no
+        bytes moved, no extra space. It only works on the same volume (os.link raises OSError
+        otherwise, e.g. assets on D: and packs on C:) and needs the source to stay put, which it
+        does — the extraction dir IS the pipeline's durable input.
+
+        NOTE the link is to a file the pipeline treats as immutable. Anything that later rewrites a
+        texture must replace it (write temp + os.replace), never edit in place, or it would mutate
+        every pack sharing the inode. extraction/unity/eft_extract_v2.py already writes that way
+        (_atomic_write), and tools/repair_broken_tex.py follows the same rule."""
         if not src or not os.path.exists(src):
             return None
         dst = os.path.join(self.out, rel.replace('/', os.sep))
         d = os.path.dirname(dst)
         if d:
             os.makedirs(d, exist_ok=True)
-        shutil.copy2(src, dst)
-        self.files += 1; self.bytes += os.path.getsize(src)
+        sz = os.path.getsize(src)
+        if os.path.exists(dst):
+            os.remove(dst)
+        try:
+            os.link(src, dst)
+            self.linked += 1
+        except OSError:
+            shutil.copy2(src, dst)   # cross-volume / FS without hardlinks -> the old behaviour
+            self.copied += 1
+        self.files += 1; self.bytes += sz
         return rel
 
     def ship_tex(self, src):
@@ -1196,8 +1217,8 @@ def main():
     print(f"  materials.json= {len(MF.records):,} materials   roots={len(root_names):,}   "
           f"bounds={manifest['bounds']}")
     if shipper:
-        print(f"[bevy] SELF-CONTAINED: copied {shipper.files} files (+{shipper.bytes/1e6:.1f} MB) into the pack "
-              f"(tex/ + sidecars); {len(shipper.missing)} referenced textures missing")
+        print(f"[bevy] SELF-CONTAINED: {shipper.files} files (+{shipper.bytes/1e6:.1f} MB) into the pack "
+              f"({shipper.linked} hardlinked, {shipper.copied} copied); {len(shipper.missing)} referenced textures missing")
     # ---- atomic swap: migrate per-map sidecars the build doesn't regenerate (semantics.json,
     #      grass.bin/grass_sidecar.json, and any loot/tasks/grade already in the live pack), then
     #      retire the old dir and move the staging dir into place. ----
