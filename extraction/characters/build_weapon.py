@@ -381,6 +381,8 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
     # `ScopePrefabCache._scopeModeInfos`. Only the selected mode's geometry exists at any moment;
     # baking them all stacked the HHS-1's magnifier onto its own flipped-aside copy. `EFT_SCOPE_MODE`
     # picks which, defaulting to the game's first entry.
+    seen_state_nodes = {}
+    dropped_states = []
     modes = bundle.scope_modes()
     hidden_modes = set()
     if modes:
@@ -566,12 +568,42 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
                 pass
             if mat_name not in mat_names:
                 mat_names.append(mat_name)
+            # MUTUALLY EXCLUSIVE STATE NODES. A mod prefab ships every state of a moving part and
+            # the game shows one: the LA-5 carries `switch_000..switch_004`, its selector drawn in
+            # all five positions at once (its template says `ModesCount: 4`), and the MBUS front
+            # sight ships folded AND deployed, tagged by `AutoFoldableSight.Mode`. Baking them all
+            # stacked identical geometry on itself.
+            #
+            # The test is MEASURED, not named: two pieces sharing a material whose bounds centre on
+            # the same point are one part drawn twice. Genuinely different parts that merely overlap
+            # -- the barrel inside its handguard, the G33's lens against its backing disc -- carry
+            # different materials and are untouched.
+            tri = idx[first:first + cnt]
+            if len(tri):
+                u = np.unique(np.asarray(tri, np.int64))
+                u = u[u < P.shape[0]]
+                if u.size:
+                    pts = P[u]
+                    ctr = (pts.max(0) + pts.min(0)) / 2
+                    # Same material AND the same triangle count AND centred within 2 cm: the same
+                    # part drawn in another of its states. The switch positions differ by only a
+                    # few millimetres, so this is a distance test, not an exact key.
+                    key = (mat_name, int(cnt))
+                    prev = seen_state_nodes.setdefault(key, [])
+                    if any(float(np.linalg.norm(ctr - c)) < 0.02 for c in prev):
+                        dropped_states.append(nm)
+                        continue
+                    prev.append(ctr)
             start = len(out_i)
             # X-flip mirrors the winding — swap to keep faces outward.
-            tri = idx[first:first + cnt]
             for k in range(0, len(tri) - 2, 3):
                 out_i.extend((base + tri[k], base + tri[k + 2], base + tri[k + 1]))
             out_sub.append((mat_names.index(mat_name), start, len(out_i) - start))
+    if dropped_states:
+        from collections import Counter
+        for nm_, k in Counter(dropped_states).most_common():
+            print(f"  [state] {os.path.basename(bundle.path)}: {nm_} drawn {k + 1}x at one place "
+                  f"-- kept 1 (alternate states of a moving part)")
 
 
 def build(item_id, templates, out_dir, install=None, depth=0, bundle_cache=None, cabs=None):

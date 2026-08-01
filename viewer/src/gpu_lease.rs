@@ -67,6 +67,15 @@ pub fn acquire() -> Option<File> {
             eprintln!("[gpu-lease] ACQUIRED {}", p.display());
             Some(f)
         }
+        Err(e) if e.raw_os_error() == Some(32) => {
+            // Sharing violation: ANOTHER ATLAS ALREADY HOLDS IT. That is the lease working as
+            // designed, not a failure — this viewer renders exactly as normal, it just is not the
+            // one a bake worker will defer to. Worth one calm line, not an error.
+            eprintln!(
+                "[gpu-lease] another Atlas holds the interactive-GPU lease; rendering normally                  (a background bake will use the CPU path while both run)"
+            );
+            None
+        }
         Err(e) => {
             // Not fatal (we still render), but it means a bake worker won't see us and may
             // contend for the adapter -- so say so loudly rather than failing silently.
