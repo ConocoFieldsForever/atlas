@@ -854,9 +854,7 @@ fn main() {
     // escape hatch for a custom finite harness.
     let hidden_requested =
         std::env::var("EFT_HIDDEN").map(|v| v.trim() == "1").unwrap_or(false);
-    let finite_hidden_job = std::env::var_os("EFT_SHOT").is_some()
-        || std::env::var_os("EFT_BENCH").is_some()
-        || std::env::var("EFT_HIDDEN_ALLOW").map(|v| v.trim() == "1").unwrap_or(false);
+    let finite_hidden_job = automated_finite_job();
     let hidden = hidden_requested && finite_hidden_job;
     if hidden_requested && !finite_hidden_job {
         eprintln!(
@@ -1273,6 +1271,19 @@ fn main() {
     install_panic_log_hook();
 
     app.run();
+}
+
+/// True when this process is a finite automated job (an `EFT_SHOT` capture, an `EFT_BENCH` run, or
+/// a custom `EFT_HIDDEN_ALLOW` harness) rather than an interactive desk session. Automated runs
+/// must be deterministic, so the desk-tool conveniences stand down: the overlay is forced off (its
+/// hidden-idle throttle is a 500 ms reactive frame clock — a wall-clock bench that inherits it
+/// measures exactly 2 fps regardless of the map) and the game link never starts (it consumes +
+/// deletes the player's screenshots and commits a deferred map swap, either of which corrupts a
+/// scripted run when the game happens to be live).
+pub fn automated_finite_job() -> bool {
+    std::env::var_os("EFT_SHOT").is_some()
+        || std::env::var_os("EFT_BENCH").is_some()
+        || std::env::var("EFT_HIDDEN_ALLOW").map(|v| v.trim() == "1").unwrap_or(false)
 }
 
 /// Startup echo of the resolved render path INTO the file log: the capability probe (incl. the

@@ -596,14 +596,32 @@ impl Plugin for OverlayPlugin {
                 std::env::remove_var("EFT_GAME_FOV");
             });
         }
-        app.insert_resource(OverlayConfig::load().sanitized())
+        // A finite EFT_SHOT/EFT_BENCH job measures or captures — the desk-tool overlay must not
+        // shape its frame clock. The persisted overlayEnabled=true would otherwise apply the
+        // hidden-idle throttle (Reactive 500 ms) to the unfocused scripted window, and every
+        // wall-clock number comes out as exactly 2 fps no matter the map. Resources still exist
+        // (menu-mode consumers take them by value), the config is just forced off; the startup
+        // focus grab is skipped for the same reason — a script must not yank the foreground.
+        let automated = crate::automated_finite_job();
+        let mut cfg = OverlayConfig::load().sanitized();
+        if automated && cfg.enabled {
+            info!("overlay: disabled for this finite EFT_SHOT/EFT_BENCH job (config untouched)");
+            cfg.enabled = false;
+        }
+        app.insert_resource(cfg)
             .insert_resource(OverlayState {
-                shown: summon,
+                shown: summon && !automated,
                 windowed: false,
                 raise_nonce: 0,
             })
-            .init_resource::<OverlayViewSlice>()
-            .add_systems(
+            .init_resource::<OverlayViewSlice>();
+        if automated {
+            app.add_systems(
+                Update,
+                (toggle_overlay, apply_overlay, apply_overlay_view_slice).chain(),
+            );
+        } else {
+            app.add_systems(
                 Update,
                 (
                     focus_atlas_on_startup,
@@ -613,6 +631,7 @@ impl Plugin for OverlayPlugin {
                 )
                     .chain(),
             );
+        }
         app.add_systems(bevy_egui::EguiPrimaryContextPass, overlay_return_button);
     }
 }

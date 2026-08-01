@@ -144,6 +144,14 @@ impl Plugin for GameWatchPlugin {
             info!("game link: disabled (EFT_GAME_LINK=0)");
             return;
         }
+        // A scripted EFT_SHOT/EFT_BENCH run must not race the player's own session: the watcher
+        // consumes + deletes their screenshots, and a live raid would queue a map swap into a run
+        // that was told exactly which pack to measure. No watcher thread, no GameLink resource —
+        // every consumer takes Option<GameLink> and stands down.
+        if crate::automated_finite_job() {
+            info!("game link: disabled (finite EFT_SHOT/EFT_BENCH job)");
+            return;
+        }
         // Seed the shared flag from the persisted menu setting before the thread starts, so a
         // user who turned screenshot-locate OFF never gets a single poll of the folder.
         set_screenshot_locate(crate::menu::config_screenshot_locate());
