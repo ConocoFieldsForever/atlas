@@ -148,6 +148,8 @@ class Bundle:
                         continue
                     optic = self.deref(o, m.get("OpticSight") or {})
                     aim = fov = lens = None
+                    lens_mat = decor_mat = None
+                    eye_relief = near = None
                     if optic is not None:
                         try:
                             od = optic.read_typetree()
@@ -159,6 +161,22 @@ class Bundle:
                             if lr is not None:
                                 lg = (lr.read_typetree().get("m_GameObject") or {}).get("m_PathID")
                                 lens = self.go2tf.get(lg)
+                                lens_mat = self._material_name(lr)
+                            dr = self.deref(optic, od.get("DecorLensRenderer") or {})
+                            if dr is not None:
+                                decor_mat = self._material_name(dr)
+                            # EYE RELIEF. The game's own distance from the eye to the sight; the
+                            # optic is placed this far IN FRONT of the camera, not on it.
+                            if od.get("DistanceToCamera") is not None:
+                                eye_relief = float(od["DistanceToCamera"])
+                            sd2 = self.deref(optic, od.get("ScopeData") or {})
+                            for cand in (sd2, optic):
+                                if cand is None:
+                                    continue
+                                cdt = cand.read_typetree()
+                                if "NearClipPlane" in cdt:
+                                    near = float(cdt["NearClipPlane"])
+                                    break
                             sd = self.deref(optic, od.get("ScopeData") or {})
                             # The optic's camera data is what magnification MEANS: a field of
                             # view in degrees, straight from the game.
@@ -173,11 +191,27 @@ class Bundle:
                             pass
                     if fov is None:
                         fov = self._camera_fov_near(go)
-                    modes.append({"tf": tfp, "nodes": self.subtree(tfp),
+                    mode_mats = set()
+                    for gp2, ro, _k in self.renderers:
+                        if self.go2tf.get(gp2) in self.subtree(tfp):
+                            mn = self._material_name(ro)
+                            if mn:
+                                mode_mats.add(mn)
+                    modes.append({"materials": mode_mats, "tf": tfp, "nodes": self.subtree(tfp),
                                   "optic": optic is not None, "aim": aim, "fov": fov,
-                                  "lens": lens})
+                                  "lens": lens, "lensMaterial": lens_mat,
+                                  "decorMaterial": decor_mat, "eyeRelief": eye_relief,
+                                  "near": near})
             self._scope_modes = modes
         return self._scope_modes
+
+    def _material_name(self, renderer):
+        """First material name on a renderer — how the viewer finds this surface in the pack."""
+        try:
+            mats = renderer.read().m_Materials or []
+            return str(mats[0].read().m_Name) if mats else None
+        except Exception:
+            return None
 
     def _camera_fov_near(self, mode_go):
         """`ScopeCameraData.FieldOfView` on any node inside this mode (the optic camera)."""
@@ -423,6 +457,19 @@ def bake(bundle, out_v, out_i, out_sub, base_M, mat_names, tex_by_mat, lod=0, pr
                 "forward": [float(v) for v in fwd],
                 "up": [float(v) for v in basis[:, 1]],
                 "fov": float(sel["fov"]) if sel.get("fov") else None,
+                # How far in FRONT of the eye the sight sits. Placing it AT the eye put the optic
+                # inside the near plane, where it was clipped away.
+                "eyeRelief": sel.get("eyeRelief"),
+                "nearClip": sel.get("near"),
+                # The surfaces the optic renders THROUGH: the lens carries the scope image, the
+                # decor lens its glass. Named by material so the viewer can find the submesh.
+                "lensMaterial": sel.get("lensMaterial"),
+                "decorMaterial": sel.get("decorMaterial"),
+                # EVERY surface inside the optic's own mode subtree. These are what you look
+                # THROUGH: the lens, its decor glass, and the backing disc the game renders the
+                # magnified image onto (`back_linza`, authored opaque black — it is a render
+                # target, not paint, so drawn as-is it blocks the sight picture completely).
+                "opticMaterials": sorted(sel.get("materials") or []),
                 "source": "OpticSight.ScopeTransform",
             })
     for gp, obj, kind in bundle.renderers:

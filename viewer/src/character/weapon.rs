@@ -53,6 +53,17 @@ pub struct AimAnchor {
     pub up: [f32; 3],
     #[serde(default)]
     pub fov: Option<f32>,
+    /// `OpticSight.DistanceToCamera` — the game's own eye relief, metres.
+    #[serde(default)]
+    pub eye_relief: Option<f32>,
+    /// `OpticSight.LensRenderer` / `DecorLensRenderer`, by material name.
+    #[serde(default)]
+    pub lens_material: Option<String>,
+    #[serde(default)]
+    pub decor_material: Option<String>,
+    /// Every material inside the optic's own mode subtree.
+    #[serde(default)]
+    pub optic_materials: Vec<String>,
 }
 
 /// A material's raw properties, straight from the game.
@@ -195,10 +206,31 @@ pub fn load(
         // probe (`_EnvTex`/`_Cube`) — the fresnel lens family, whose opacity is the reflection
         // blend in `_ReflectColor.a`.
         let has_env = slots.is_some_and(|s| s.contains_key("_EnvTex") || s.contains_key("_Cube"));
+        // WHAT YOU LOOK THROUGH. The optic's own components name its surfaces: `LensRenderer`
+        // carries the sight picture and `DecorLensRenderer` its glass. The third one is the
+        // BACKING (`back_linza`) — authored opaque black with no textures at all, because in the
+        // game it is the surface the optic's camera renders the magnified image onto. Drawn as
+        // authored it is simply a black disc that blocks the sight completely, which is why the
+        // magnifier could not be seen through. A material inside the optic that carries no
+        // texture is a render target, not paint.
+        let is_optic_glass = man.aim.as_ref().is_some_and(|a| {
+            Some(&mat_name) == a.lens_material.as_ref()
+                || Some(&mat_name) == a.decor_material.as_ref()
+                || (a.optic_materials.iter().any(|m| *m == mat_name)
+                    && slots.is_none_or(|s| s.is_empty()))
+        });
         let refl = c("_ReflectColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
         let stated_alpha = color[3];
-        let is_glass = !is_reticle && (stated_alpha < 0.999 || (base.is_none() && has_env));
-        let alpha = if stated_alpha < 0.999 { stated_alpha } else { refl[3] };
+        let is_glass = !is_reticle && (is_optic_glass || stated_alpha < 0.999 || (base.is_none() && has_env));
+        // An optic surface you look through keeps only a faint tint; its authored alpha describes
+        // a lens with the scope image behind it, which we do not render yet.
+        let alpha = if is_optic_glass {
+            0.12
+        } else if stated_alpha < 0.999 {
+            stated_alpha
+        } else {
+            refl[3]
+        };
 
         // The lens TINT is `_MainColor` where the fresnel family provides it (the G33's blue-grey),
         // otherwise `_Color`. Falling back to white here is what made every untextured lens — and

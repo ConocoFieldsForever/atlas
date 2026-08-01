@@ -204,6 +204,7 @@ fn attach_weapon(
         if fwd.length_squared() > 0.5 {
             commands.insert_resource(drive::PlayerAim {
                 bone,
+                eye_relief: a.eye_relief.unwrap_or(0.11),
                 offset,
                 local: Transform::from_translation(Vec3::from_array(a.position))
                     .looking_to(fwd, if up.length_squared() > 0.5 { up } else { Vec3::Y }),

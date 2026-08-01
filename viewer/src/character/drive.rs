@@ -491,6 +491,8 @@ pub fn drive_character(
 #[derive(Resource)]
 pub struct PlayerAim {
     pub bone: Entity,
+    /// Eye relief and near clip, from the optic itself.
+    pub eye_relief: f32,
     /// The node between the socket bone and the weapon meshes. Driven while aiming so the sight
     /// anchor lands on the eye; identity otherwise.
     pub offset: Entity,
@@ -563,11 +565,23 @@ pub fn aim_down_sights(
     // rest of the screen keeps its normal field of view. Applying it to the main camera would be
     // a ~12x zoom of everything, which is not what aiming looks like. The value is carried in the
     // pack for a future scope-camera pass; `EFT_ADS_ZOOM=1` opts the whole screen in meanwhile.
-    if std::env::var("EFT_ADS_ZOOM").map(|v| v.trim() == "1").unwrap_or(false) {
-        if let (Some(fov), Projection::Perspective(p)) = (aim.fov_deg, &mut *proj) {
+    if let Projection::Perspective(p) = &mut *proj {
+        // MAGNIFICATION. `ScopeCameraData.FieldOfView` is the optic's own field of view — 5.03 deg
+        // for this G33, which is its 3x magnification expressed the way the game stores it. In EFT
+        // that camera renders INTO the lens; here it drives the whole view, which is the honest
+        // approximation until the optic renders to its own texture. `EFT_ADS_ZOOM=0` opts out.
+        // OFF by default, and measured: at 5.03 deg the reticle plane — 11 cm from the eye —
+        // fills the entire screen, because this FOV describes the image the optic renders INTO
+        // its lens, not the view of the world around it.  to see it anyway.
+        let zoom_on = std::env::var("EFT_ADS_ZOOM").map(|v| v.trim() == "1").unwrap_or(false);
+        if let (Some(fov), true) = (aim.fov_deg, zoom_on) {
             let hip = settings.fov_deg.to_radians();
             p.fov = hip + (fov.to_radians().max(0.02) - hip) * blend.0;
         }
+        // The sight sits about eye relief from the eye — 11 cm — which the default near plane
+        // clips straight through. Pull it in while aiming so the optic survives.
+        let near_aim = (aim.eye_relief * 0.15).clamp(0.005, 0.05);
+        p.near = 0.1f32 + (near_aim - 0.1) * blend.0;
     }
 }
 
