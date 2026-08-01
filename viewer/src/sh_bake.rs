@@ -701,12 +701,20 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
     };
 
     // The GPU pass computes probe positions from (gmin, spacing) internally, so it cannot honour
-    // virtual offset. It used to be skipped ENTIRELY whenever a single probe had been relocated —
-    // on streets that is 101,801 of 774,144 probes (13%), which sent the other 87% to the CPU too
-    // and cost ~87 s on a machine with a perfectly good GPU. Run the GPU over the whole grid, then
-    // recompute JUST the relocated probes on the CPU below (same code, so their result is
-    // bit-identical to the all-CPU bake).
-    let gpu_a = if matches!(backend, Backend::Gpu | Backend::Auto) {
+    // virtual offset, and the relocated probes are fixed up on the CPU below.
+    //
+    // WHY THE `n_moved == 0` GATE IS BACK. Dropping it to win the other 87% of probes looked free
+    // and was not: on streets (123 M occluder tris / 67 M BVH nodes / 769,104 probes) the GPU pass
+    // LOST THE DEVICE mid-bake — "Error in Device::poll: Parent device is lost" — and because this
+    // binary is built with `panic = "abort"`, wgpu's internal poll panic killed the bake process
+    // outright (rc 0xC0000409). Neither guard helped: the adaptive batching never got to measure a
+    // safe size, and the all-zero watchdog net only catches a reset that still RETURNS. The build
+    // then continued (bake-sh is optional) and silently shipped the PREVIOUS pack's volume.
+    //
+    // The gate is therefore load-bearing, not incidental: heavy relocation and a watchdog-blowing
+    // scene are the same maps. A future attempt needs the GPU pass to honour virtual offset itself
+    // (probe positions uploaded, not derived) AND a recoverable device-loss path — not a wider gate.
+    let gpu_a = if n_moved == 0 && matches!(backend, Backend::Gpu | Backend::Auto) {
         crate::sh_bake_gpu::pass_a_gpu(
             &bvh, lights, gmin, spacing, dims, n_dir, sky_scale, light_scale, indirect_only,
         )

@@ -878,6 +878,7 @@ def main():
     #    in warp mode (the CUDA volume is already in the pack) UNLESS that bake produced nothing, in
     #    which case this is the fallback so the pack still ships lighting. Skipped only when no built
     #    viewer exe can be found (a kit without a compiled binary).
+    _stage3_started = time.time()
     if bake_mode != "warp" or not os.path.isfile(os.path.join(pack, "volume.bin")):
         atlas_exe = find_atlas_exe()
         if atlas_exe:
@@ -887,8 +888,21 @@ def main():
             print(f"[STAGE 3/{total}] lighting: skipped - viewer exe not found. Build it "
                   f"(`cargo build --release`) or set EFT_ATLAS_EXE, then rebuild to bake lighting.",
                   flush=True)
-    if os.path.isfile(os.path.join(pack, "volume.bin")):
-        print("  lighting: SH irradiance volume baked into pack", flush=True)
+    # "A volume.bin exists" is NOT "this build baked one". The sidecar migration carries the
+    # PREVIOUS pack's volume across a rebuild, so when bake-sh failed (it is optional) this line
+    # cheerfully reported success over a volume baked for the OLD geometry — a grid whose very
+    # dimensions no longer match the pack. Report what actually happened, and say plainly when the
+    # lighting on disk is stale.
+    _vol = os.path.join(pack, "volume.bin")
+    if os.path.isfile(_vol):
+        _fresh = os.path.getmtime(_vol) >= _stage3_started
+        if _fresh:
+            print("  lighting: SH irradiance volume baked into pack", flush=True)
+        else:
+            print("  lighting: WARNING - the bake did NOT produce a volume; the pack is carrying "
+                  "the PREVIOUS build's volume.bin, which was baked for different geometry. "
+                  "Re-run `atlas bake-sh <pack> --indirect-only` (add EFT_BAKE_CPU=1 if the GPU "
+                  "bake keeps losing the device) before trusting this map's lighting.", flush=True)
         # The manifest is reconciled against the pack's real contents by finalize_pack_manifest()
         # at the end of the build — one place, covering the volume AND the light sidecars. (This
         # used to be an inline volume-only patch here, which is why a light sidecar that appeared
