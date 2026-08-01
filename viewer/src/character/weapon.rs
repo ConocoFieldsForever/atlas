@@ -47,6 +47,10 @@ struct WeapManifest {
 /// magnification as a field of view in degrees (`ScopeCameraData.FieldOfView`); it describes the
 /// image rendered THROUGH the lens, not the whole screen.
 #[derive(Debug, Deserialize, Clone)]
+// The manifest is camelCase like every other block in it. Without this the multi-word fields
+// silently deserialize to their defaults -- which is how the optic's own surface names went
+// missing and every lens fell back to being half-opaque.
+#[serde(rename_all = "camelCase")]
 pub struct AimAnchor {
     pub position: [f32; 3],
     pub forward: [f32; 3],
