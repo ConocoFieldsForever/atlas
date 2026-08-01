@@ -149,10 +149,42 @@ def _link_or_copy(src, dst):
         except Exception: pass
 
 
+def _png_complete(fp):
+    """True only for a fully-written PNG (tail carries IEND). Runs killed before texpool gained
+    atomic writes left files that are a valid IHDR + IDAT header followed by megabytes of NTFS
+    preallocation zeros; PIL's lazy open() reads only the header, so they passed every casual
+    check, and the old skip-if-EXISTS guard then preserved them through every rebuild — the
+    viewer draws them as its magenta failed-decode placeholder (streets shipped 38 of these).
+    Missing/unreadable/short -> False (extract it)."""
+    try:
+        with open(fp, "rb") as f:
+            f.seek(0, 2)
+            if f.tell() < 60:
+                return False
+            f.seek(-16, 2)
+            return b"IEND" in f.read()
+    except OSError:
+        return False
+
+
+def _drop_incomplete(fp):
+    """Remove a half-written casualty so os.link / skip guards can never resurrect it."""
+    try:
+        os.remove(fp)
+    except OSError:
+        pass
+
+
 def _publish_cache(out_fp, cache_fp):
-    """After writing out_fp, hardlink it into the cache (first writer wins; identical dup is a no-op)."""
-    if not cache_fp or os.path.exists(cache_fp):
+    """After writing out_fp, hardlink it into the cache (first writer wins; identical dup is a no-op).
+    A cache entry that exists but is INCOMPLETE is replaced — a corrupt cache would otherwise
+    hand the corruption to every later dataset via the hardlink fast path."""
+    if not cache_fp:
         return
+    if os.path.exists(cache_fp):
+        if _png_complete(cache_fp):
+            return
+        _drop_incomplete(cache_fp)
     _link_or_copy(out_fp, cache_fp)
 
 
@@ -850,9 +882,12 @@ def main():
                 if key not in tex_done:
                     tex_done.add(key)
                     out_fp = os.path.join(td, nm + ".png")
-                    if not os.path.exists(out_fp):          # skip if already on disk (this dataset, prior run)
+                    # Skip only a COMPLETE file from a prior run. exists() alone kept half-written
+                    # zero-padded PNGs (killed pre-atomic-write run) alive through every rebuild.
+                    if not _png_complete(out_fp):
+                        _drop_incomplete(out_fp)
                         cache_fp = _texcache_key_path(to, is_normal) if _TEXCACHE_ENABLED else None
-                        if cache_fp and os.path.exists(cache_fp):
+                        if cache_fp and _png_complete(cache_fp):
                             _link_or_copy(cache_fp, out_fp)  # cache HIT: skip decode + PNG encode entirely
                             _texstats["hit"] += 1
                         else:
