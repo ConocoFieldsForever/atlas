@@ -14,8 +14,9 @@ load_vcol, matsig.sub_sig) and DIVERGES only where the target engine differs:
     (flattened billboard/decal planes) -- the pinv fallback -- exactly per the
     tarkov-unity-extraction skill's #1 rule: NEVER TRS-decompose.
 
-  * a NEW (lv, lod.g) -> keep-min(lod.i) LOD-shell dedup replaces the web payload
-    split. (No-op on an already-LOD0-resolved scene; ~47% cut on an --alllod scene.)
+  * a NEW (lv, lod.g) LOD-shell dedup replaces the web payload split: a coarse shell
+    is removed only when the shells KEPT in its group are shown to render and to
+    enclose it. (No-op on an already-LOD0-resolved scene; ~39% cut on an --alllod one.)
 
   * the ENTIRE web-lossy tail is DROPPED: no build_textures 512 downscale, no
     gltf-transform quantize/etc1s/uastc/meshopt/fix-texcoords/deinstance, no
@@ -718,26 +719,120 @@ def main():
     inst = [it for it in inst if any(not sb.get('drop_nm_decal') for sb in it['subs'])]
     if ndrop: print(f"[bevy] dropped {ndrop} normal-map-albedo decal submeshes (would paint edges blue)")
 
-    # ---- STEP 3: LOD-SHELL DEDUP -- group by (lv, lod.g), keep only lod.i == group-min -----------------------
-    # (Replaces the web payload split. Untagged instances -- terrain, ungrouped meshes -- are ALWAYS kept.
-    #  lod.g is a global/cumulative index so (lv,g) == g, but keying on (lv,g) is redundant-but-safe. This is a
-    #  NO-OP on an already-LOD0-resolved scene.json and yields the ~47% cut only on an --alllod extraction.)
+    _integrity = None                                       # -> <pack>/lod_integrity.json when anything drew nothing
+
+    # ---- STEP 3: LOD-SHELL DEDUP -- a coarse shell may go ONLY if a KEPT one stands in for it -----------------
+    # Group by (lv, lod.g). Untagged instances -- terrain, ungrouped meshes -- are ALWAYS kept. lod.g is a
+    # global/cumulative index so (lv,g) == g, but keying on (lv,g) is redundant-but-safe. NO-OP on an already
+    # LOD0-resolved scene.json; only an --alllod extraction has coarser shells to remove at all.
+    #
+    # The rule USED to be "keep min(lod.i)", which ASSUMED the finest shell is always there to replace the
+    # coarser ones it deletes. That assumption is not free, and on streets it was false: a crashed extraction
+    # left 8,962 of the dataset's mesh OBJs zero-filled and 1,230 missing (47,235 instance references), so the
+    # group-minimum shell `Klimova_A_Road_02_part_02_LOD0` is 51,488 bytes of NUL -> load_obj yields 0 faces
+    # -> STEP 6 silently `continue`s past it. This step had already thrown away the LOD1 shell carrying the
+    # actual 128 x 62 m road slab, so nothing drew at all and the clear colour showed through the Primorskiy
+    # boulevard -- a see-through hole over 16% of the frame.
+    #
+    # So PROVE the premise rather than assume it. A shell is dropped only when the shells surviving in its own
+    # group actually RENDER and their world volume ENCLOSES it; anything else stays. Renderability is decided
+    # by load_obj + Culls.keep_submesh -- the same two calls STEP 6 makes -- so "renders nothing" here and
+    # "silently skipped there" are one verdict that cannot drift. A shell kept by the fallback also joins the
+    # covering set, so it can in turn stand in for still-coarser levels.
+    # Over-keeping costs frame time; over-dropping puts holes in the world, and only one of those is recoverable.
     if not KEEP_LODS:
-        gmin = {}
-        for it in inst:
+        n0 = len(inst); t3 = time.time()
+        bucket = {}
+        for i, it in enumerate(inst):
             L = it.get('lod')
-            if not L: continue
-            k = (it['lv'], L['g'])
-            gmin[k] = min(gmin.get(k, 1 << 30), L['i'])
-        n0 = len(inst)
-        kept = []
-        for it in inst:
-            L = it.get('lod')
-            if not L or L['i'] == gmin[(it['lv'], L['g'])]:
-                kept.append(it)
-        inst = kept
-        print(f"[bevy] LOD-shell dedup: {len(inst):,}/{n0:,} instances kept "
-              f"({n0 - len(inst):,} coarser LOD shells removed)")
+            if L: bucket.setdefault((it['lv'], L['g']), []).append(i)
+        live = [v for v in bucket.values() if len({inst[i]['lod']['i'] for i in v}) > 1]
+
+        _mesh_box = {}                                      # mesh -> (lo,hi) local AABB, or None if it draws nothing
+        def _local_box(mesh):
+            if mesh not in _mesh_box:
+                lo = load_obj(DS, mesh)
+                _mesh_box[mesh] = (None if (lo is None or len(lo[0]) == 0 or len(lo[2]) == 0)
+                                   else (lo[0].min(0).astype(np.float64), lo[0].max(0).astype(np.float64)))
+            return _mesh_box[mesh]
+
+        def _world_box(it):
+            """World AABB of an instance, or None when it draws NOTHING -- either its mesh is missing/empty
+            (STEP 6's `if not lo` / `len(F)==0`) or every submesh is a shadow/billboard/fog/proxy that
+            STEP 6 skips (`if not pending`). A thing that draws nothing can never stand in for anything."""
+            if not any((not sb.get('drop_nm_decal')) and CULLS.keep_submesh(sb) for sb in it['subs']):
+                return None
+            box = _local_box(it['mesh'])
+            if box is None: return None
+            M3, T = _M3T(it['m'])
+            W = _corners(*box) @ M3.T + T
+            return W.min(0), W.max(0)
+
+        # Containment tolerance = the data's own precision, not a world-model constant: scene.json rounds each
+        # transform element to 5 decimals and OBJ verts are float32, so anything under ~1e-5 relative is noise.
+        # Deliberately far below the sub-metre overhangs real coarse shells have -- those must be KEPT.
+        _EPS = 1e-5
+        drop = bytearray(len(inst))
+        n_dead_finer = n_uncovered = n_level_mates = 0
+        for idxs in live:
+            at = {}
+            for i in idxs: at.setdefault(inst[i]['lod']['i'], []).append(i)
+            levels = sorted(at)
+            cover = [w for w in (_world_box(inst[i]) for i in at[levels[0]]) if w is not None]
+            for li in levels[1:]:
+                boxes = [(i, _world_box(inst[i])) for i in at[li]]
+                if not cover:
+                    # Nothing finer in this group draws anything -> this level IS the group's geometry. KEEP it,
+                    # and let it cover the coarser levels above. (The boulevard road slab lives here.)
+                    n_dead_finer += len(at[li])
+                    cover += [w for _, w in boxes if w is not None]
+                    continue
+                clo = np.min([c[0] for c in cover], 0); chi = np.max([c[1] for c in cover], 0)
+                unc = []
+                for i, w in boxes:
+                    if w is None: continue                   # draws nothing: never blocks its level's removal
+                    eps = _EPS * (1.0 + np.maximum(np.abs(w[0]), np.abs(w[1])))
+                    if (w[0] < clo - eps).any() or (w[1] > chi + eps).any():
+                        unc.append(i)
+                # ALL-OR-NOTHING PER LEVEL. The viewer selects a shell per GROUP, not per instance: a level that
+                # is PRESENT at all gets its own exclusive distance band (gpu_driven::lod_encode gives each
+                # present level a window ending where the next present level begins). Keeping one instance of a
+                # level while dropping its level-mates therefore leaves that band drawing a PARTIAL object --
+                # streets' trailer group 47505 kept door_back_lod1 (92 tris) but dropped prizep_shalanda_lod1
+                # (5,402 tris), so the trailer BODY vanished between ~7.4 and ~24.7 and came back beyond it.
+                # So a level may only go when EVERY instance on it is covered; otherwise the whole level stays.
+                if unc:
+                    n_uncovered += len(unc); n_level_mates += len(at[li]) - len(unc)
+                    cover += [w for _, w in boxes if w is not None]
+                else:
+                    for i in at[li]: drop[i] = 1
+        inst = [it for i, it in enumerate(inst) if not drop[i]]
+
+        n_probed = len(_mesh_box); n_dead_mesh = sum(1 for b in _mesh_box.values() if b is None)
+        print(f"[bevy] LOD-shell dedup: {len(inst):,}/{n0:,} instances kept ({n0 - len(inst):,} coarser LOD "
+              f"shells removed) -- {len(live):,} multi-level groups, {n_probed:,} meshes probed ({time.time()-t3:.0f}s)")
+        print(f"[bevy] LOD-shell dedup fallback KEPT {n_dead_finer + n_uncovered + n_level_mates:,} shells that "
+              f"the keep-min rule deleted: {n_dead_finer:,} whose finer shells render NOTHING, {n_uncovered:,} "
+              f"reaching outside the kept shells' world volume, {n_level_mates:,} level-mates held back so no "
+              f"LOD level is left PARTIALLY populated (the viewer draws a present level alone in its own band)")
+        # A probe that finds NO geometry anywhere cannot establish the premise for anything, so every drop it
+        # authorised would be a guess. That is a wrong mesh_dir / unreadable dataset, not a LOD decision -- fail
+        # loudly rather than ship a pack whose holes are indistinguishable from correct culling.
+        if n_probed and n_dead_mesh == n_probed:
+            raise SystemExit(f"[bevy] FATAL: all {n_probed:,} LOD meshes probed as unreadable/empty under "
+                             f"{os.path.join(DS, cfg.get('source.mesh_dir', 'meshes'))} -- the dedup cannot show "
+                             f"that anything it drops has a replacement. Fix the dataset/mesh_dir and re-run.")
+        if n_dead_mesh:
+            # NEVER swallowed: these instances draw nothing no matter what the LOD rule does. The fallback
+            # recovered a coarser shell wherever the group had one; the rest need a targeted re-extraction.
+            dead = sorted(m for m, b in _mesh_box.items() if b is None)
+            print(f"[bevy] DATA INTEGRITY: {n_dead_mesh:,}/{n_probed:,} probed mesh files render nothing "
+                  f"(missing, or zero-filled by a crashed extraction). Full list -> lod_integrity.json. "
+                  f"First: {dead[:3]}")
+            _integrity = {"map": MAP, "dataset": DS, "probedMeshes": n_probed, "deadMeshes": dead,
+                          "shellsKeptByFallback": n_dead_finer + n_uncovered,
+                          "keptDeadFinerShell": n_dead_finer, "keptNotCovered": n_uncovered,
+                          "deadMeshNote": "missing or zero-filled OBJ; re-extract these meshes"}
     else:
         print(f"[bevy] --keep-lods: kept all {len(inst):,} LOD shells for the viewer LOD selector")
 
@@ -777,14 +872,27 @@ def main():
             wmin = np.minimum(wmin, pts.min(0)); wmax = np.maximum(wmax, pts.max(0))
 
     utris = 0
+    # These three `continue`s used to be the pipeline's quietest failure: an instance whose mesh is missing,
+    # empty or entirely un-drawable vanished from the pack with nothing said, which is exactly how a
+    # zero-filled OBJ turned into a see-through hole (see STEP 3). Still skipped -- there is nothing to
+    # emit -- but now COUNTED and reported, so "this did not draw" can never again look like "nothing to draw".
+    skip_missing = skip_nofaces = skip_nosubs = 0
+    skip_inst = 0
+    skipped_examples = []
     for gi, mkey in enumerate(groups):
         mname = mkey[0]
         if mname not in obj_cache:
             obj_cache[mname] = (load_obj(DS, mname), load_vcol(DS, mname))
         lo, vcol = obj_cache[mname]
-        if not lo: continue
+        if not lo:
+            skip_missing += 1; skip_inst += len(by_mesh[mkey])
+            if len(skipped_examples) < 5: skipped_examples.append(f"{mname} (missing)")
+            continue
         V, VT, F = lo
-        if len(F) == 0: continue
+        if len(F) == 0:
+            skip_nofaces += 1; skip_inst += len(by_mesh[mkey])
+            if len(skipped_examples) < 5: skipped_examples.append(f"{mname} (0 faces)")
+            continue
         subs = by_mesh[mkey][0]['subs']                    # consistent across the group (same material signature)
 
         # WATER recovery (correctness, map-agnostic): material-less+untextured lake/pond/river/ocean meshes -> water;
@@ -852,7 +960,10 @@ def main():
             matId = MF.get(sb)
             pending.append({"mat": matId, "pos": pos[idx0].astype(np.float32), "nrm": nrm,
                             "uv": uvr[idx0].astype(np.float32), "inv": inv.astype(np.uint32), "col": col8})
-        if not pending: continue
+        if not pending:
+            skip_nosubs += 1; skip_inst += len(by_mesh[mkey])
+            if len(skipped_examples) < 5: skipped_examples.append(f"{mname} (no drawable submesh)")
+            continue
 
         # pack this mesh's vertices + local indices; assign a meshId
         va_parts, idx_parts, submeshes = [], [], []
@@ -902,6 +1013,15 @@ def main():
         if gi % 2000 == 0:
             print(f"[bevy]   {gi}/{len(groups)} groups  utris={utris/1e6:.1f}M  "
                   f"vbuf={len(vbuf)/1e6:.0f}MB ({time.time()-t0:.0f}s)")
+
+    if skip_missing or skip_nofaces or skip_nosubs:
+        print(f"[bevy] DREW NOTHING: {skip_inst:,} instance(s) over {skip_missing + skip_nofaces + skip_nosubs:,} "
+              f"(mesh,material) groups emitted no geometry -- {skip_missing:,} mesh file missing, "
+              f"{skip_nofaces:,} mesh empty/zero-filled, {skip_nosubs:,} no drawable submesh. "
+              f"e.g. {skipped_examples}")
+        if _integrity is None: _integrity = {"map": MAP, "dataset": DS}
+        _integrity.update({"drewNothingInstances": skip_inst, "drewNothingMissing": skip_missing,
+                           "drewNothingEmpty": skip_nofaces, "drewNothingNoSubmesh": skip_nosubs})
 
     # ---- STEP 8: degenerate baked-world geometry -> one mesh + one identity instance -------------------------
     if baked:
@@ -1188,6 +1308,11 @@ def main():
         print(f"[bevy] WARNING: sanitized {len(_nonfinite)} non-finite float(s) in the manifest -> 0.0: "
               + ", ".join(_nonfinite[:8]) + (" ..." if len(_nonfinite) > 8 else ""), flush=True)
     json.dump(manifest, open(os.path.join(OUT, 'manifest.json'), 'w'), indent=1, allow_nan=False)
+
+    # Dataset damage the LOD fallback had to work around, written beside the pack as an exact work list
+    # for a targeted re-extraction. NOT referenced by the manifest -- the loader neither needs nor reads it.
+    if _integrity is not None:
+        json.dump(_integrity, open(os.path.join(OUT, 'lod_integrity.json'), 'w'), indent=1)
 
     # ---- GLOBAL sidecars: the all-maps catalogs (tarkov.dev loot/tasks) + the game grade LUT are
     #      map-AGNOSTIC, so they live ONCE in packs/shared/ (above the packs; the viewer resolves

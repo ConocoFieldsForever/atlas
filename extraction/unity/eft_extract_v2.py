@@ -167,6 +167,32 @@ def _png_complete(fp):
         return False
 
 
+def _obj_complete(fp):
+    """True only for a fully-written mesh OBJ. Same failure as _png_complete, same cause, and it
+    bit harder: a run killed mid-write leaves NTFS preallocation -- the directory entry carries the
+    final SIZE while the data was never flushed -- so the file is megabytes of NUL. The old guard
+    (`not exists or getsize == 0`) sees a plausible non-zero size and REUSES it forever, which is
+    why a full re-extraction could not repair these: streets carried 8,962 zero-filled OBJs (968
+    MiB) plus 1,230 missing, 47,235 instance references. When one of those was a LOD group's finest
+    shell, assemble_bevy's dedup dropped the coarser shells that still had geometry and the map got
+    a see-through hole (Klimova_A_Road_02_part_02_LOD0 -> the Primorskiy boulevard road slab).
+    mesh.export() writes `g <name>` first and ends every face line with a newline, so head+tail is
+    enough to catch NUL-fill and truncation alike at two small reads -- no full parse on the reuse
+    path. Missing/unreadable/short -> False (re-export it)."""
+    try:
+        with open(fp, "rb") as f:
+            f.seek(0, 2)
+            if f.tell() < 8:
+                return False
+            f.seek(0)
+            if f.read(2) not in (b"g ", b"v "):     # NUL-filled / garbage head
+                return False
+            f.seek(-1, 2)
+            return f.read(1) in b"\r\n"            # truncated mid-line -> incomplete
+    except OSError:
+        return False
+
+
 def _drop_incomplete(fp):
     """Remove a half-written casualty so os.link / skip guards can never resurrect it."""
     try:
@@ -749,6 +775,7 @@ def main():
     os.makedirs(md, exist_ok=True); os.makedirs(td, exist_ok=True)
 
     exported = {}        # (lv,fid,pid) mesh -> obj filename
+    _repaired = []       # OBJs that existed but held no geometry (NUL-filled/truncated) -> dropped + re-exported
     tex_done = set()     # (fid,pid) textures already written
     mat_cache = {}       # (fid,pid) material -> (alb,nrm,sh,tile)
     instances = []
@@ -1174,7 +1201,12 @@ def main():
                 # on VertexCount<=0, and the old `open(fp,"w").write(mesh.export())` truncated the file to 0 bytes
                 # BEFORE the write(False) raised -> a permanent empty stub that the exists() check never repaired
                 # (dropped real geometry like hair_shop / upboard3 whose streamed .resS wasn't resolved that run).
-                if (not os.path.exists(fp)) or os.path.getsize(fp) == 0:
+                # ...and re-export a file that EXISTS at full size but holds no geometry: _obj_complete catches the
+                # NUL-filled/truncated casualties of a killed run, which a size check cannot see and which the old
+                # guard therefore preserved through every rebuild. Drop it first so nothing can resurrect it.
+                if not _obj_complete(fp):
+                    if os.path.exists(fp):
+                        _drop_incomplete(fp); _repaired.append(obj_fn)
                     data = mesh.export()
                     if isinstance(data, str) and data:
                         # encoding='utf-8' is CRITICAL: OBJ data embeds the mesh's `g <name>` line, and EFT has many
@@ -1753,6 +1785,11 @@ def main():
                "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"},
               open(os.path.join(out, "scene.json"), "w"))
     print(f"  LOD: {len(lodgroups)} LODGroups, {sum(1 for it in instances if it.get('lod'))} tagged instances", flush=True)
+    # Surfaced, never swallowed: a non-empty list means the dataset on disk was carrying dead meshes that
+    # every previous run silently reused (see _obj_complete). They are repaired now; say how many.
+    if _repaired:
+        print(f"  REPAIRED {len(_repaired)} OBJ(s) that existed but held no geometry (NUL-filled/truncated by a "
+              f"killed run) - re-exported from the bundles. e.g. {_repaired[:3]}", flush=True)
     print(f"\nDONE {len(instances)} instances, {len([v for v in exported.values() if v])} meshes, "
           f"{len(tex_done)} textures in {time.time()-T0:.0f}s -> {out}", flush=True)
 
