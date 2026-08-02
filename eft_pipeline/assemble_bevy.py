@@ -242,9 +242,22 @@ class _TexTest:
                     between = w0 * w1 * (m0 - m1) ** 2
                     t = int(np.argmax(between))
                     w_lo = float(wc[t])
+                    # ...and the kept class must contain actual SOLID texels. Authored coverage art
+                    # has hard opaque interiors - a leaf is solid inside, only its silhouette is cut.
+                    # A smooth mask (fire, AO, water, gloss) can still clear the three tests above on
+                    # the strength of a long tail while never reaching full alpha, and promoting one
+                    # alpha-tests a solid object into nothing: ground_zero's barrel_metal_fire took
+                    # `cutout` at Otsu 0.22, then the material's authored _Cutoff of 0.5 discarded
+                    # 98.6% of the surface and the burning motorcycle rendered see-through.
+                    # Measured over all 109 cutout textures in that pack, the separation is not close:
+                    # every genuine mask holds 1.06%-99.6% of its texels above alpha 0.95 (foliage
+                    # atlases 3.1-5.7%, painted props 99%+), while both false positives - the fire
+                    # mask and bag_sport_dif - sit at 0.01%. 0.5% splits a hundred-fold gap.
+                    op = float(w[int(0.95 * 256):].sum())
                     if (between[t] / total_var >= 0.5     # bimodal
                             and m0[t] <= 0.1              # low mode = true holes
                             and m1[t] >= 0.3              # solid mode = meaningfully opaque
+                            and op >= 0.005               # ...and some of it is FULLY opaque
                             and 0.005 <= w_lo <= 0.995):  # both classes non-trivial (Codex: one
                         res = float(lv[t])                # stray texel must not flip a texture)
             except Exception:
