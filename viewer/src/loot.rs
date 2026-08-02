@@ -179,6 +179,40 @@ pub struct LootTime(pub f32);
 #[derive(Component, Clone, Copy)]
 pub struct SpawnChance(pub f32);
 
+/// WHERE a `SpawnChance` came from. Carried alongside the number because the three sources are not
+/// equally trustworthy and the difference has to survive all the way to the panel: a route whose
+/// value is mostly `Unknown` is a raw opportunity estimate, NOT an expected value, and saying
+/// otherwise would be inventing a probability model out of missing data.
+///
+/// Loose loot currently has no per-location spawn probability anywhere in the pack — `poi.rs`
+/// carries price, trend and search time, but nothing about odds — so it is `Unknown` and scores at
+/// p = 1.0. That is deliberately an over-estimate, and it must be LABELLED as one rather than
+/// quietly averaged in with container odds the game actually gives us.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnChanceSource {
+    /// The game's own LootableContainersGroup odds (`grp_p`) — location-specific, the good case.
+    GameGroup,
+    /// loot.json's per-TYPE average fill rate. Real data, but location-blind.
+    LootTypeAverage,
+    /// No rate exists for this marker; scored at p = 1.0 and reported as unadjusted.
+    Unknown,
+}
+
+impl SpawnChanceSource {
+    /// True when the odds are location-specific rather than a type average or a guess.
+    pub fn is_exact(self) -> bool {
+        self == SpawnChanceSource::GameGroup
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SpawnChanceSource::GameGroup => "game group odds",
+            SpawnChanceSource::LootTypeAverage => "type average",
+            SpawnChanceSource::Unknown => "no rate - unadjusted",
+        }
+    }
+}
+
 /// One LootableContainer as the GAME ships it (gamedata.json — the authoritative overlay
 /// driver). `idx` is its position in the file's containers array: the same index
 /// `LootModelIndex` keys its ancestry-matched model instances on.
@@ -442,7 +476,13 @@ pub(crate) fn spawn_loot(
         };
         let (color, half) = class_look(&cls);
         // The game's own per-area odds beat every estimate; type average is the fallback.
-        let spawn_p = gc.grp_p.unwrap_or(if spawn_avg > 0.0 { spawn_avg } else { 1.0 }).clamp(0.0, 1.0);
+        // Record WHICH of the three sources answered, not just the number (see SpawnChanceSource).
+        let (spawn_p, spawn_src) = match gc.grp_p {
+            Some(p) => (p, SpawnChanceSource::GameGroup),
+            None if spawn_avg > 0.0 => (spawn_avg, SpawnChanceSource::LootTypeAverage),
+            None => (1.0, SpawnChanceSource::Unknown),
+        };
+        let spawn_p = spawn_p.clamp(0.0, 1.0);
         if gc.grp_p.is_some() {
             n_grouped += 1;
         }
@@ -489,6 +529,7 @@ pub(crate) fn spawn_loot(
             // an active filter).
             MarkerValue(ev),
             SpawnChance(spawn_p),
+            spawn_src,
             LootTime(search_s),
             crate::poi::DenseMarker,
             PickRadius(pick_r),
