@@ -1670,14 +1670,28 @@ fn build_frac(stage: &str, sub: Option<f32>, fresh: bool) -> f32 {
         // Measured sub-pass shares of stage 1 (streets: 2899s / 6s / 2673s). Colliders is
         // nearly HALF the stage — it runs serial while the dataset extract runs one process
         // per core, which is also why parallelizing it is the biggest first-build win left.
+        // A pass that EMITS [SUBPROGRESS] starts at the bottom of its slice, not the middle:
+        // `base`'s 0.5 fallback is a guess made before the first reading arrives, and on the
+        // colliders pass that guess (48.65%) lands just ABOVE the real first reading (48.63%),
+        // so `max_frac` latches it and the pass's own signal is clamped away for its whole run.
+        // The grass pass emits nothing, so it keeps the midpoint guess inside its 1% slice.
+        let signalled = if done { 1.0 } else { sub.unwrap_or(0.0).clamp(0.0, 1.0) };
         if stage.contains("extract dataset") {
-            0.52 * base
+            0.52 * signalled
         } else if stage.contains("grass density") {
             0.52 + 0.01 * base
         } else if stage.contains("physics colliders") {
-            0.53 + 0.47 * base
+            0.53 + 0.47 * signalled
         } else {
-            base
+            // Unmatched stage-1 names (check dataset, nav agent settings) are BOOKENDS, not a
+            // pass with a duration -- they must sit at the START of the span, not the middle of
+            // it. With `base` here the first marker of a fresh build ("check dataset", no
+            // [SUBPROGRESS] yet, so base falls to the 0.5 default) claimed 0.5 * 0.636 = 31.8%,
+            // and `max_frac` latched it: the dataset pass's own readings (3.3%, 17.8%, 32.4%)
+            // were then all discarded, so the bar did not move until the extract was ~96% done.
+            // On streets that is ~45 min parked at 31.8% at the very start of a first build --
+            // the same "reads as a hang" this table exists to remove. `done` still ends the span.
+            if done { 1.0 } else { 0.0 }
         }
     } else {
         base
@@ -1770,7 +1784,17 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
     // markers can't drop the bar. The sub-fraction moves the bar WITHIN the long extraction stage via
     // the parallel extractor's `[SUBPROGRESS] <done>/<total>` marker.
     let sub = if stage.starts_with("[STAGE 1/") {
-        tail.iter().rev().find_map(|l| subprogress_frac(l))
+        // Take the newest [SUBPROGRESS] FROM THE PASS THAT IS RUNNING. Stage 1 is three serial
+        // passes with three independent denominators, so an unfiltered search hands the colliders
+        // marker the dataset pass's trailing ~1.0: 0.53 + 0.47*0.98 = 0.99 of the span, which
+        // `max_frac` latches at 63%. Every later colliders reading is lower and gets clamped away,
+        // freezing the bar for the whole (~45 min) pass. The emitters already tag their lines, so
+        // match on the tag; anything untagged (older logs' plain `extract <d>/<t>`) still parses.
+        let tag = if stage.contains("physics colliders") { "colliders" } else { "extract" };
+        tail.iter()
+            .rev()
+            .filter(|l| l.contains(tag))
+            .find_map(|l| subprogress_frac(l))
     } else {
         None
     };
@@ -3316,6 +3340,89 @@ mod tests {
     // The byte-weighted emitters (extract_parallel / eft_extract_colliders) put the machine
     // token LAST precisely so an already-shipped viewer keeps working — this is that contract.
 
+    /// Replay a whole marker stream through `build_frac` + the `max_frac` clamp exactly as
+    /// `build_view` drives them, and assert the property the bar actually has to have: it never
+    /// goes backwards, and it never sits at one value across a pass boundary. The parser tests
+    /// above check that a LINE is read correctly; this checks that the CURVE is usable, which is
+    /// where both of the freezes this table was written to remove actually lived.
+    fn replay(stream: &[&str]) -> Vec<f32> {
+        let (mut tail, mut stage, mut mx, mut out) = (Vec::new(), String::new(), 0.0f32, Vec::new());
+        let mut fresh = false;
+        for line in stream {
+            tail.push(line.to_string());
+            if line.starts_with("[STAGE") || line.starts_with("[BUILD") {
+                stage = line.to_string();
+            }
+            if stage.is_empty() {
+                continue;
+            }
+            if stage.starts_with("[STAGE 1/") && stage.contains("extract dataset") {
+                fresh = true;
+            }
+            let sub = if stage.starts_with("[STAGE 1/") {
+                let tag = if stage.contains("physics colliders") { "colliders" } else { "extract" };
+                tail.iter().rev().filter(|l| l.contains(tag)).find_map(|l| subprogress_frac(l))
+            } else {
+                None
+            };
+            mx = mx.max(build_frac(&stage, sub, fresh));
+            out.push(mx);
+        }
+        out
+    }
+
+    /// The exact stream `tools/build_map.py --dry-run` emits on the fresh path.
+    const DRY_RUN_FRESH: &[&str] = &[
+        "[STAGE 1/9] check dataset",
+        "[STAGE 1/9] extract dataset (geometry + textures)",
+        "[SUBPROGRESS] extract levels 3/217 bytes 536870912/5463154688",
+        "[SUBPROGRESS] extract levels 120/217 bytes 2936012800/5463154688",
+        "[SUBPROGRESS] extract levels 210/217 bytes 5348024320/5463154688",
+        "[STAGE 1/9] extract dataset (geometry + textures): done (0s)",
+        "[STAGE 1/9] extract grass density",
+        "[STAGE 1/9] extract grass density: done (0s)",
+        "[STAGE 1/9] extract physics colliders",
+        "[SUBPROGRESS] colliders levels 100/217 bytes 2726297600/5463154688",
+        "[STAGE 1/9] extract physics colliders: done (0s)",
+        "[STAGE 1/9] check dataset: done",
+        "[STAGE 2/9] extract lights",
+        "[STAGE 2/9] extract lights: done (0s)",
+    ];
+
+    #[test]
+    fn bar_never_goes_backwards() {
+        let f = replay(DRY_RUN_FRESH);
+        for w in f.windows(2) {
+            assert!(w[1] >= w[0] - 1e-6, "bar regressed: {:?}", f);
+        }
+    }
+
+    #[test]
+    fn first_build_does_not_open_a_third_full() {
+        // "check dataset" is a bookend, not a pass: a fresh build must START near zero.
+        let f = replay(DRY_RUN_FRESH);
+        assert!(f[0] < 0.02, "fresh build opened at {:.3}", f[0]);
+    }
+
+    #[test]
+    fn dataset_progress_is_not_discarded() {
+        // The three dataset [SUBPROGRESS] lines must each move the bar. Before the bookend fix
+        // they computed 3.3% / 17.8% / 32.4% against a latched 31.8% and were clamped away.
+        let f = replay(DRY_RUN_FRESH);
+        assert!(f[2] < f[3] && f[3] < f[4], "dataset readings did not advance: {:?}", &f[..5]);
+    }
+
+    #[test]
+    fn colliders_pass_moves_the_bar() {
+        // The regression this fix targets: the colliders marker must not inherit the dataset
+        // pass's trailing ~1.0 and latch the top of the stage-1 span.
+        let f = replay(DRY_RUN_FRESH);
+        let at_marker = f[8]; // "[STAGE 1/9] extract physics colliders"
+        let at_reading = f[9]; // its first own [SUBPROGRESS]
+        assert!(at_marker < 0.60, "colliders marker jumped to {at_marker:.3} on stale sub");
+        assert!(at_reading > at_marker, "colliders reading did not advance the bar");
+    }
+
     #[test]
     fn subprogress_parses_legacy_level_count() {
         let f = subprogress_frac("[SUBPROGRESS] extract 12/217").unwrap();
@@ -3357,11 +3464,18 @@ mod tests {
     }
 
     #[test]
-    fn stage1_colliders_without_signal_sits_in_its_window() {
-        // the frozen-"28%" repro: colliders running, no SUBPROGRESS in the tail. The window
-        // puts it at 0.55 * (0.53 + 0.47*0.5) instead of the old 0.55 * 0.5.
+    fn stage1_colliders_without_signal_sits_at_the_START_of_its_window() {
+        // the frozen-"28%" repro: colliders running, no SUBPROGRESS in the tail yet.
+        //
+        // This assertion CHANGED from 0.55 * (0.53 + 0.47*0.5) to the start of the slice, and the
+        // midpoint it used to pin is why the pass still froze. The colliders pass emits progress
+        // now (this PR added it), so "no signal" only ever means "the first line has not arrived
+        // yet" -- a few seconds. Guessing the midpoint during those seconds puts the bar at
+        // 48.65%, the first real reading is 48.63%, and `max_frac` keeps the guess: the pass then
+        // reports for ~45 min with every reading clamped away. A pass that will report starts at
+        // the bottom of its slice; only the signal moves it.
         let f = build_frac("[STAGE 1/9] extract physics colliders", None, false);
-        assert!((f - 0.55 * 0.765).abs() < 1e-4);
+        assert!((f - 0.55 * 0.53).abs() < 1e-4);
     }
 
     #[test]
