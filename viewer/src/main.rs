@@ -10,6 +10,7 @@
 //! designed in `render::gpu_driven` (M1).
 
 mod agent_link;
+mod assets;
 mod character;
 mod drone;
 mod eftpack;
@@ -22,6 +23,7 @@ mod inspect;
 mod jobs;
 mod fx;
 mod loot;
+mod loot_volume;
 mod npc;
 mod maps;
 mod menu;
@@ -1209,6 +1211,7 @@ fn main() {
         .add_plugins(npc::NpcPlugin) // scavs walking the game's own patrol_ways
         .add_plugins(overlay::OverlayPlugin) // in-game screenshot summons the map over the game (same window)
         .add_plugins(insights::InsightsPlugin) // netcode position breadcrumbs mined from the logs
+        .add_plugins(assets::AssetsPlugin) // browse the game's Unity bundles, joined to the pick
         .add_plugins(poi::PoiPlugin) // PMC/scav/boss spawns + extracts/doors/interactables
         .add_plugins(inspect::InspectPlugin) // left-click a marker -> floating info card (\u{2715} to close)
         .add_plugins(ui::UiPlugin) // right-hand layer-toggle panel
@@ -1227,6 +1230,7 @@ fn main() {
         .init_resource::<MapLoadError>() // async load failure -> UI error + back-to-menu (finding 4)
         .init_resource::<ForcedLod>() // graphics-panel LOD selector (meaningful on --alllod packs)
         .init_resource::<ShowDisabledGeom>() // "show disabled geometry" toggle (Unity-inactive scenery)
+        .add_plugins(loot_volume::LootVolumePlugin) // Analysis tab: loot-VALUE grid over the pack bounds
         .init_resource::<agent_link::AgentLinkCtl>() // drone agent link (TCP lockstep sim control)
         // DoorClick is CONSUMED only by the gpu-driven render path, but pick_system (always-on)
         // WRITES it unconditionally — on the M0/std paths EftGpuDrivenPlugin (its only init site)

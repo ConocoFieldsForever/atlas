@@ -201,8 +201,13 @@ pub enum RightPanelTab {
     Navigate,
     /// Level controls: power switches (toggle the lights each one drives).
     Level,
+    /// Spatial analysis of the map's own data — currently the loot-value volume.
+    Analysis,
     /// Netcode position breadcrumbs mined from the game's logs (insights module).
     Insights,
+    /// The game's own Unity bundles: GameObjects, components and scripts, joined to the picked
+    /// geometry (assets module).
+    Assets,
 }
 
 pub struct UiPlugin;
@@ -221,6 +226,8 @@ impl Plugin for UiPlugin {
                 Ok("nav") | Ok("route") => RightPanelTab::Navigate,
                 Ok("level") => RightPanelTab::Level,
                 Ok("insights") => RightPanelTab::Insights,
+                Ok("analysis") => RightPanelTab::Analysis,
+                Ok("assets") => RightPanelTab::Assets,
                 _ => RightPanelTab::Visibility,
             })
             // apply_loot_visibility ordered AFTER spawn_loot so a swap-respawn's fresh markers are
@@ -2028,6 +2035,12 @@ fn toolbar_panel(
             // (this used to reuse the house icon and read as a second "home" button).
             if theme::rail_button(ui, cur == RightPanelTab::Level, 6, "Map", "Map \u{00B7} level & power controls") {
                 *tab = RightPanelTab::Level;
+            }
+            if theme::rail_button(ui, cur == RightPanelTab::Analysis, 4, "Value", "Analysis \u{00B7} loot-value volume") {
+                *tab = RightPanelTab::Analysis;
+            }
+            if theme::rail_button(ui, cur == RightPanelTab::Assets, 7, "Assets", "Assets \u{00B7} the game's Unity bundles, joined to the picked geometry") {
+                *tab = RightPanelTab::Assets;
             }
             if theme::rail_button(ui, cur == RightPanelTab::Insights, 5, "Trail", "Insights \u{00B7} netcode position trail from the game's logs") {
                 *tab = RightPanelTab::Insights;

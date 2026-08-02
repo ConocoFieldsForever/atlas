@@ -66,6 +66,7 @@ impl Plugin for PickPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PickState>()
             .init_resource::<PickSpheres>()
+            .init_resource::<LastPick>()
             .add_systems(Startup, spawn_pick_ui)
             .add_systems(Update, (pick_system, sync_pick_ui_visibility))
             // In-place map swap: clear the lazy per-mesh bounding-sphere cache — it's indexed by the
@@ -138,6 +139,27 @@ struct Hit {
     material_id: u32,
 }
 
+/// The most recent identify-pick, published for the ASSETS tab's "reveal source object" join.
+///
+/// `par`/`par2` are the folded parent/grandparent Transform ids the pack already ships per instance
+/// (`_fold32` in assemble_bevy.py). Together with `lv` they address the exact GameObject in the
+/// level bundle — no name matching, which is why the join is 1:1 rather than a best guess. Written
+/// on every identify pick; `assets.rs` reads it and never writes it.
+#[derive(Resource, Default)]
+pub struct LastPick(pub Option<PickedSource>);
+
+/// One picked instance, reduced to what identifies its SOURCE object in the bundle.
+#[derive(Clone)]
+pub struct PickedSource {
+    pub mesh: String,
+    pub inst: usize,
+    pub lv: u32,
+    pub par: u32,
+    pub par2: u32,
+    pub root: String,
+    pub world: Vec3,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pick_system(
     mouse: Res<ButtonInput<MouseButton>>,
@@ -155,6 +177,7 @@ fn pick_system(
     mut readout: Query<&mut Text, With<PickReadout>>,
     mut gfx: ResMut<crate::render::GfxSettings>,
     mut door_click: ResMut<crate::render::gpu_driven::DoorClick>,
+    mut last_pick: ResMut<LastPick>,
 ) {
     // Esc cancels an armed place-position mode (checked before the click gate so it works without
     // any click) — unless a text field has focus, where Esc means "defocus the field".
@@ -349,6 +372,64 @@ fn pick_system(
     };
 
     // ---- resolve + report --------------------------------------------------
+    // PROVENANCE: level, scene root and LOD standing for the picked instance, from fields the pack
+    // already ships (lv / rootId / lodGroup / lodIndex). Every diagnosis this session started by
+    // asking exactly these questions of an instance and answering them with a throwaway script:
+    // which level owns it, which LOD group it belongs to, and which shells of that group survived
+    // the dedup. "shells 0,1,2 / this=1" is the vanishing-trailer bug legible on one line.
+    let provenance = |inst_idx: usize| -> String {
+        let Some(i) = pack.instances.get(inst_idx) else {
+            return String::new();
+        };
+        let root = pack
+            .manifest
+            .roots
+            .get(i.root_id as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?");
+        if i.lod_group < 0 {
+            return format!("  | lv {} {root}  (ungrouped)", i.lv);
+        }
+        // Which shells of this group actually reached the pack — the dedup's outcome, per group.
+        let mut shells: Vec<i32> = pack
+            .instances
+            .iter()
+            .filter(|o| o.lod_group == i.lod_group)
+            .map(|o| o.lod_index)
+            .collect();
+        shells.sort_unstable();
+        shells.dedup();
+        let list = shells
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "  | lv {} {root}  | group {} shells {list} this={}",
+            i.lv, i.lod_group, i.lod_index
+        )
+    };
+
+    // The same instance fields `provenance` prints, kept as DATA for the Assets tab rather than
+    // re-parsed out of the readout string.
+    let source_of = |inst_idx: usize, mesh: &str, world: Vec3| -> Option<PickedSource> {
+        let i = pack.instances.get(inst_idx)?;
+        Some(PickedSource {
+            mesh: mesh.to_string(),
+            inst: inst_idx,
+            lv: i.lv,
+            par: i.par,
+            par2: i.par2,
+            root: pack
+                .manifest
+                .roots
+                .get(i.root_id as usize)
+                .cloned()
+                .unwrap_or_default(),
+            world,
+        })
+    };
+
     let material_role = |mid: u32| -> String {
         pack.materials
             .iter()
@@ -408,8 +489,9 @@ fn pick_system(
         // A door within range swings; anywhere else it's a no-op. Also still shows the pick readout.
         door_click.point = Some(wp);
         door_click.gen = door_click.gen.wrapping_add(1);
+        last_pick.0 = source_of(h.inst, mesh_name, wp);
         let line = format!(
-            "PICK  {mesh}  #{id}  inst {inst}  mat {mat} {role}  d={dist:.1}m  ({x:.1}, {y:.1}, {z:.1})",
+            "PICK  {mesh}  #{id}  inst {inst}  mat {mat} {role}  d={dist:.1}m  ({x:.1}, {y:.1}, {z:.1}){prov}",
             mesh = mesh_name,
             id = h.mesh_id,
             inst = h.inst,
@@ -419,6 +501,7 @@ fn pick_system(
             x = wp.x,
             y = wp.y,
             z = wp.z,
+            prov = provenance(h.inst),
         );
         info!("{line}  | candidates: {cand_str}");
         set_text(&mut readout, line);
@@ -449,6 +532,9 @@ fn pick_system(
             .unwrap_or(0);
         let role = material_role(mat0);
         let wp = ro + rd * t_near;
+        // A sphere-only near-miss still names a real instance, so it still resolves to a source
+        // object — the Assets tab labels it as such rather than pretending it was a triangle hit.
+        last_pick.0 = source_of(inst_idx, mesh_name, wp);
         let line = format!(
             "PICK  {mesh}  #{id}  inst {inst}  mat {mat} {role}  d={dist:.1}m  ({x:.1}, {y:.1}, {z:.1})  (sphere-only)",
             mesh = mesh_name,

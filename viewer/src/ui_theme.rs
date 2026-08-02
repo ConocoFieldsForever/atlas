@@ -425,7 +425,8 @@ pub fn rail_button(ui: &mut egui::Ui, active: bool, kind: u8, label: &str, tip: 
 
 /// Vector icon inside `rect`: 0 = eye, 1 = camera, 2 = tasks/checklist, 3 = navigation (a location
 /// pin with a dashed route leading to it), 4 = house (back-to-menu — the ONLY house on the rail),
-/// 5 = breadcrumb trail (insights), 6 = folded map (level/power controls). Painter primitives only
+/// 5 = breadcrumb trail (insights), 6 = folded map (level/power controls), 7 = stacked plates
+/// (assets — the bundle's contents). Painter primitives only
 /// (no image assets — keeps the shippable exe free of game-derived art).
 pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: Color32) {
     let ctr = rect.center();
@@ -458,6 +459,24 @@ pub fn paint_tool_icon(painter: &egui::Painter, rect: egui::Rect, kind: u8, c: C
             painter.line_segment([p(3.0, top + 1.5), p(3.0, bot)], s);
             // A marked spot on the middle panel.
             painter.circle_filled(p(0.0, 0.5), 1.6, c);
+            return;
+        }
+        7 => {
+            // assets: a stack of three plates (the bundle's layers) seen in slight perspective —
+            // reads as "what this is built out of" rather than a folder, which would suggest a
+            // plain file browser.
+            let p = |x: f32, y: f32| egui::pos2(ctr.x + x, ctr.y + y);
+            for (i, dy) in [5.5f32, 0.5, -4.5].iter().enumerate() {
+                let plate = vec![
+                    p(0.0, dy - 4.0),
+                    p(9.5, *dy),
+                    p(0.0, dy + 4.0),
+                    p(-9.5, *dy),
+                ];
+                // Top plate solid, the two under it lighter: depth without a fill colour.
+                let w = if i == 2 { 1.7 } else { 1.2 };
+                painter.add(egui::Shape::closed_line(plate, Stroke::new(w, c)));
+            }
             return;
         }
         3 => {
