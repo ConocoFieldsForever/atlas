@@ -889,7 +889,11 @@ def main():
             if os.path.isfile(s):
                 shutil.copyfile(s, os.path.join(out_dir, dst))
     else:
-        print(f"[STAGE 3/{total}] bake lighting: portable SH (GPU if available, else CPU; runs post-assemble)", flush=True)
+        # NOT a [STAGE] marker: this announces work that has not started (the portable SH bake runs
+        # AFTER assemble). Emitted as one it moved the loader bar into stage 3's window before stage 4
+        # had begun, and `max_frac` then clamped the whole 1205s assemble at that value - the bar sat
+        # at 74.9% for two thirds of a rebuild. The real marker is printed below when the bake runs.
+        print("  lighting: portable SH bake (GPU auto, CPU fallback) runs after assemble", flush=True)
 
     # 4: assemble the pack (atomic; auto-ships loot/tasks/grade sidecars)
     run(4, total, "assemble pack",

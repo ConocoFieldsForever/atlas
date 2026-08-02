@@ -1712,18 +1712,31 @@ fn build_frac(stage: &str, sub: Option<f32>, fresh: bool) -> f32 {
             (0.999, 1.000), // 9 stamp
         ]
     } else if (n - 9.0).abs() < 0.5 {
-        // full build: extract, lights, bake(GPU), assemble, grass, zones, icons, nav(GPU),
-        // stamp — the original codex-ranked cumulative table, expressed as windows verbatim.
+        // REBUILD (dataset already extracted) — the case every build after the first one takes.
+        // The table this replaces was ranked for a FRESH build and gave stage 1 the 0..0.55 span
+        // because extraction dominates one. On a rebuild extraction does not run at all: stage 1
+        // is `check dataset`, about a second, so the bar leapt to 55% immediately and, with the
+        // stage-2/3/4 windows on top, read 84% after 57s of a 31-minute build. The ETA
+        // (elapsed/frac) said ~68s with half an hour to go, and only became truthful in the last
+        // four minutes.
+        //
+        // MEASURED on a real streets rebuild (2026-08-02, total 1878s): check 1s, lights+intel
+        // 56s, assemble 1205s, SH bake 289s, grass 2s, zones 75s, icons 1s, nav 247s, stamp 2s.
+        // Windows are cumulative in WALL-CLOCK order (1,2,4,3,5..9) for the same reason the fresh
+        // table is: the portable pipeline bakes AFTER assembling, and a table ordered by stage
+        // NUMBER put the bake's window behind the bar, freezing it at 88% for the whole 289s bake
+        // while `max_frac` hid the contradiction. Same defect the fresh table fixed, left behind
+        // on the path that runs far more often.
         &[
-            (0.00, 0.55),
-            (0.55, 0.58),
-            (0.58, 0.80),
-            (0.80, 0.88),
-            (0.88, 0.92),
-            (0.92, 0.95),
-            (0.95, 0.96),
-            (0.96, 0.99),
-            (0.99, 1.00),
+            (0.000, 0.001), // 1 check dataset (no extraction on a rebuild)
+            (0.001, 0.030), // 2 lights + interactables + LUT
+            (0.672, 0.826), // 3 SH bake — runs post-assemble
+            (0.030, 0.672), // 4 assemble
+            (0.826, 0.827), // 5 grass
+            (0.827, 0.867), // 6 zones
+            (0.867, 0.868), // 7 icons
+            (0.868, 0.999), // 8 nav
+            (0.999, 1.000), // 9 stamp
         ]
     } else if (n - 3.0).abs() < 0.5 {
         &[(0.00, 0.05), (0.05, 0.98), (0.98, 1.00)] // deps install: venv, pip, verify
@@ -3424,6 +3437,28 @@ mod tests {
     }
 
     #[test]
+    fn both_tables_order_the_bake_after_the_assemble() {
+        // The portable pipeline runs stage 3 (SH bake) AFTER stage 4 (assemble). A table ordered
+        // by stage NUMBER puts the bake's window behind the bar and `max_frac` freezes it there
+        // for the whole bake. Assert the ordering directly in both tables so neither regresses.
+        for fresh in [true, false] {
+            let assemble_end = build_frac("[STAGE 4/9] assemble pack: done (0s)", None, fresh);
+            let bake_start = build_frac("[STAGE 3/9] bake lighting", Some(0.0), fresh);
+            assert!(
+                bake_start >= assemble_end - 1e-6,
+                "fresh={fresh}: bake starts at {bake_start:.3} but assemble ended at {assemble_end:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebuild_does_not_jump_to_half_on_the_first_marker() {
+        // A rebuild skips extraction entirely, so stage 1 must not claim the extraction span.
+        let f = build_frac("[STAGE 1/9] check dataset: done", None, false);
+        assert!(f < 0.01, "rebuild opened at {f:.3}");
+    }
+
+    #[test]
     fn subprogress_parses_legacy_level_count() {
         let f = subprogress_frac("[SUBPROGRESS] extract 12/217").unwrap();
         assert!((f - 12.0 / 217.0).abs() < 1e-6);
@@ -3459,8 +3494,11 @@ mod tests {
     fn stage1_extract_window_standard_table() {
         // extraction sub-pass owns [0, 0.52] of stage 1's 0.55 span (measured: colliders is
         // nearly half the stage)
-        let f = build_frac("[STAGE 1/9] extract dataset (geometry + textures)", Some(1.0), false);
-        assert!((f - 0.55 * 0.52).abs() < 1e-4);
+        // fresh=true: these three sub-passes only ever run during the ONE-TIME extraction, so the
+        // fresh window (0..0.636) is the only table they can be reached under. Pinning them against
+        // the rebuild table asserted a state the pipeline cannot produce.
+        let f = build_frac("[STAGE 1/9] extract dataset (geometry + textures)", Some(1.0), true);
+        assert!((f - 0.636 * 0.52).abs() < 1e-4);
     }
 
     #[test]
@@ -3474,8 +3512,8 @@ mod tests {
         // 48.65%, the first real reading is 48.63%, and `max_frac` keeps the guess: the pass then
         // reports for ~45 min with every reading clamped away. A pass that will report starts at
         // the bottom of its slice; only the signal moves it.
-        let f = build_frac("[STAGE 1/9] extract physics colliders", None, false);
-        assert!((f - 0.55 * 0.53).abs() < 1e-4);
+        let f = build_frac("[STAGE 1/9] extract physics colliders", None, true);
+        assert!((f - 0.636 * 0.53).abs() < 1e-4);
     }
 
     #[test]
