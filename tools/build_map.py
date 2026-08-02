@@ -704,11 +704,36 @@ def main():
         dry_lights = light_levels_for(m)
         light_note = (f" (levels {dry_lights})" if dry_lights
                       else " (none known -> sky-only bake)")
+        # Mirror the REAL stage-1 plan: a missing dataset means the build would run the ONE-TIME
+        # extraction's three sub-passes, so the dry run rehearses their exact markers — stage
+        # names AND sample byte-weighted [SUBPROGRESS] lines. This is what makes the viewer's
+        # whole first-build progress path (fresh weight table, sub-stage windows, ETA) testable
+        # in seconds; without it that path only ever ran on a real multi-hour extraction, which
+        # is why its regressions went unnoticed. Same fidelity rationale as dry_lights above.
+        fresh_sim = force or not os.path.isfile(os.path.join(dataset, "scene.json"))
+        def _dry_pass(name, subs=()):
+            print(f"[STAGE 1/{total}] {name}", flush=True)
+            for s in subs:
+                time.sleep(0.3)
+                print(s, flush=True)
+            time.sleep(0.6)
+            print(f"[STAGE 1/{total}] {name}: done (0s)", flush=True)
         for i, name in enumerate(
             ["check dataset", "extract lights" + light_note, "bake lighting (GPU)",
              "assemble pack" + sc_note, "grass" + sc_note,
              "gameplay zones", "item icons", "bake nav grid (CPU)",
              "stamp fingerprint"], 1):
+            if i == 1 and fresh_sim:
+                print(f"[STAGE 1/{total}] check dataset", flush=True)
+                _dry_pass("extract dataset (geometry + textures)",
+                          ["[SUBPROGRESS] extract levels 3/217 bytes 536870912/5463154688",
+                           "[SUBPROGRESS] extract levels 120/217 bytes 2936012800/5463154688",
+                           "[SUBPROGRESS] extract levels 210/217 bytes 5348024320/5463154688"])
+                _dry_pass("extract grass density")
+                _dry_pass("extract physics colliders",
+                          ["[SUBPROGRESS] colliders levels 100/217 bytes 2726297600/5463154688"])
+                print(f"[STAGE 1/{total}] check dataset: done", flush=True)
+                continue
             print(f"[STAGE {i}/{total}] {name}", flush=True)
             time.sleep(0.6)
             print(f"[STAGE {i}/{total}] {name}: done (0s)", flush=True)

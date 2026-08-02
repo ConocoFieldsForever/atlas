@@ -48,6 +48,8 @@ fn scale_rgb(c: Color32, f: f32) -> Color32 {
 /// * `stage_text` — "LOADING OBJECTS..." style line, drawn upper-left with the percent under it.
 /// * `elapsed_secs` — build wall time; drives the ESTIMATED TIME readout upper-right
 ///   (naive `elapsed/frac - elapsed`, shown as "--:--" until `frac` is meaningful).
+///   Estimates past an hour render as "1h42m" — the old mm:ss clamp pinned any long
+///   first-build extraction at a frozen "99:59", which read as a hang, not a duration.
 /// * `failed` — recolors filled segments the menu red and freezes the pulse.
 pub fn eft_loading_bar(
     ui: &mut egui::Ui,
@@ -71,8 +73,17 @@ pub fn eft_loading_bar(
     } else if frac >= 1.0 {
         "00:00".to_string()
     } else {
-        let est = (elapsed_secs / frac - elapsed_secs).clamp(0.0, 99.0 * 60.0 + 59.0);
-        format!("{:02}:{:02}", (est / 60.0) as u32, (est % 60.0) as u32)
+        // A first-build extraction can legitimately estimate hours; clamping to a mm:ss
+        // ceiling froze the readout at "99:59" (a display artifact users read as a hang).
+        // Switch to h/m past the hour instead — coarser is fine, the minute noise doesn't
+        // matter at that horizon. Cap at 99h59m: beyond that the linear extrapolation is
+        // noise, not information.
+        let est = (elapsed_secs / frac - elapsed_secs).clamp(0.0, 99.0 * 3600.0 + 59.0 * 60.0);
+        if est >= 3600.0 {
+            format!("{}h{:02}m", (est / 3600.0) as u32, ((est % 3600.0) / 60.0) as u32)
+        } else {
+            format!("{:02}:{:02}", (est / 60.0) as u32, (est % 60.0) as u32)
+        }
     };
 
     // Header row: stage + percent upper-left, ESTIMATED TIME + mm:ss upper-right.
