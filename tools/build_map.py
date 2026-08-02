@@ -998,12 +998,36 @@ def main():
     gd_cmd = [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_gamedata.py"), m]
     if geom_levels:                                   # already derived for stage 2; don't re-shell
         gd_cmd.append("--levels=" + ",".join(str(lv) for lv in geom_levels))
-    if run(6, total, "gameplay zones", gd_cmd, VIEWER, optional=True):
+    _stage6_started = time.time()
+    _gd_ok = run(6, total, "gameplay zones", gd_cmd, VIEWER, optional=True)
+    if _gd_ok:
         gd = os.path.join(out_dir, "gamedata.json")
         if os.path.isfile(gd):
             merge_gamedata_interactables(gd, dataset, switch_levels)
             shutil.copyfile(gd, os.path.join(pack, "gamedata.json"))
             print("  gamedata.json -> pack", flush=True)
+    # "A gamedata.json exists" is NOT "this build produced one" — the same hole the SH volume had
+    # at stage 3, one stage later. This stage is optional, and on failure the whole copy block above
+    # is skipped, so the sidecar migration carries the PREVIOUS build's doors/exfils/zones/loot
+    # points across the atomic swap and the build still prints [BUILD OK] with nothing said. Seen
+    # for real: extract_gamedata died rc=3221225477 (0xC0000005) 53 s in, and the shipped pack kept
+    # gamedata from an earlier extraction — harmless while the dataset is unchanged, silently wrong
+    # after a game update. Compare against the stage start and say plainly which one is on disk.
+    _gd_pack = os.path.join(pack, "gamedata.json")
+    if os.path.isfile(_gd_pack):
+        if os.path.getmtime(_gd_pack) < _stage6_started:
+            print("  gamedata: WARNING - this build did NOT produce gameplay data; the pack is "
+                  "carrying the PREVIOUS build's gamedata.json (doors, exfils, zones, loot points). "
+                  "It matches the older extraction, not this one. Re-run "
+                  f"`extraction/intel/extract_gamedata.py {m}` before trusting this map's intel.",
+                  flush=True)
+        elif not _gd_ok:
+            print("  gamedata: WARNING - the stage reported failure but left a fresh "
+                  "gamedata.json; treat this map's intel as incomplete.", flush=True)
+    elif not _gd_ok:
+        print("  gamedata: WARNING - no gameplay data in the pack (the stage failed and there was "
+              "no previous build to carry across); doors/exfils/zones/loot will be missing.",
+              flush=True)
 
     # 7: item icons (network; cached into the pack)
     run(7, total, "item icons",
