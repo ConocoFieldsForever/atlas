@@ -34,8 +34,26 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Global level-completion counter -> a single [SUBPROGRESS] extract <done>/<total> stream the viewer
 # reads to move the loader bar DURING the (long) extraction, across all chunk processes.
+#
+# BYTE-WEIGHTED, not level-counted: the LPT plan schedules the BIGGEST levels first, so counting
+# levels made the bar (and the naive ETA extrapolated from it) systematically undershoot for the
+# first hours of a fresh extraction — few levels finish while most of the bytes are being chewed.
+# The plan already sizes every level for bin packing (`_level_size`); weighting completions by those
+# same bytes makes done/total track wall-clock instead. `_SIZES` (lv -> size+1, the LPT's own +1 so
+# zero-size levels still advance) is filled once in main() before any chunk thread starts, then only
+# read — no lock needed beyond the counter's own.
 _prog_lock = threading.Lock()
-_prog = {"done": 0, "total": 0}
+_prog = {"done": 0, "total": 0, "done_lv": 0, "total_lv": 0}
+_SIZES = {}
+
+
+def _prog_line():
+    """The [SUBPROGRESS] line: human-readable level count first, machine-read byte ratio LAST
+    (the viewer parses the last whitespace token as <done>/<total>, unit-agnostic). RAW bytes,
+    not a rounded MB — a %.1f MB collapses small totals to the degenerate 0.0/0.0 the parser
+    rightly rejects."""
+    return (f"[SUBPROGRESS] extract levels {_prog['done_lv']}/{_prog['total_lv']} "
+            f"bytes {_prog['done']}/{_prog['total']}")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXTRACT = os.path.join(HERE, "eft_extract_v2.py")
@@ -158,14 +176,20 @@ def _run_chunk(idx, chunk_levels, name, passthrough):
     )
     for line in p.stdout:
         print(f"  [p{idx}] {line.rstrip()}", flush=True)
-        # eft_extract_v2 prints "level<lv>: +N mesh ... (<t>s)" once per finished level -> global bar.
+        # eft_extract_v2 prints "level<lv>: +N mesh ... (<t>s)" once per finished level -> global bar,
+        # weighted by that level's on-disk bytes (an unparseable id still nudges the bar by 1 byte
+        # rather than stalling it).
         s = line.strip()
         if s.startswith("level") and " mesh" in s and s.endswith("s)"):
+            lv_id = s[len("level"):].split(":", 1)[0]
+            w = _SIZES.get(int(lv_id), 1) if lv_id.isdigit() else 1
             with _prog_lock:
-                _prog["done"] += 1
-                d, t = _prog["done"], _prog["total"]
-            if t:
-                print(f"[SUBPROGRESS] extract {d}/{t}", flush=True)
+                _prog["done"] += w
+                _prog["done_lv"] += 1
+                emit = _prog["total"] > 0
+                msg = _prog_line()
+            if emit:
+                print(msg, flush=True)
     rc = p.wait()
     print(f"[CHUNK {idx}] done rc={rc}", flush=True)
     return idx, rc
@@ -341,7 +365,10 @@ def main():
         _clean_staging(args.name)
 
     print(f"[PARALLEL] {len(levels)} levels across {n} chunks (jobs={jobs})", flush=True)
-    _prog["total"] = len(levels)  # denominator for the [SUBPROGRESS] extraction bar
+    # Denominators for the [SUBPROGRESS] bar: byte-weighted (the LPT plan's own sizes) + level count.
+    _SIZES.update({lv: sz + 1 for lv, sz in sized})
+    _prog["total"] = sum(_SIZES.values())
+    _prog["total_lv"] = len(levels)
     T0 = time.time()
 
     # Record the plan BEFORE any chunk runs (atomic temp+rename) so a kill leaves a resumable signal on disk.
@@ -358,10 +385,10 @@ def main():
                 if resume and not merge_interrupted and _chunk_scene_ok(args.name, i):
                     print(f"[RESUME] chunk {i} already complete ({len(ch)} levels) -> skipping", flush=True)
                     with _prog_lock:
-                        _prog["done"] += len(ch)
-                        d, t = _prog["done"], _prog["total"]
-                    if t:
-                        print(f"[SUBPROGRESS] extract {d}/{t}", flush=True)   # keep the loader bar honest on resume
+                        _prog["done"] += sum(_SIZES.get(lv, 1) for lv in ch)
+                        _prog["done_lv"] += len(ch)
+                        msg = _prog_line()
+                    print(msg, flush=True)   # keep the loader bar honest on resume
                     results.append((i, 0))
                     continue
                 futs.append(pool.submit(_run_chunk, i, ch, args.name, passthrough))

@@ -74,6 +74,15 @@ pub struct BuildJob {
     /// jumps. Clamping to this max fixes it. AtomicU32 = interior mutability through the `&BuildJob`
     /// the menu polls; a new build is a new BuildJob (starts at 0), so nothing leaks across builds.
     max_frac: std::sync::atomic::AtomicU32,
+    /// Sticky "this build ran the ONE-TIME full extraction" latch, set by `build_view` the first
+    /// time the stage marker names a fresh-extraction-only stage ("extract dataset ..."). It picks
+    /// the first-build weight table in `build_frac`: on a fresh build stage 1 alone measured
+    /// ~64% of wall-clock (streets, 2026-08-02) and the SH bake another ~19% — under the
+    /// standard table the ETA overestimated all through a first build, then collapsed. Sticky so
+    /// the table stays consistent AFTER stage 1 hands off (the marker text moves on). A reattach
+    /// that lands post-extraction misses the latch and falls back to the standard table — today's
+    /// behavior, and by then the bar is past 0.55 anyway.
+    fresh_extract: std::sync::atomic::AtomicBool,
 }
 
 /// Best-effort per-platform spawn tweaks applied before `.spawn()`.
@@ -236,6 +245,7 @@ impl BuildJob {
                 result: None,
                 started: std::time::Instant::now(),
                 max_frac: std::sync::atomic::AtomicU32::new(0),
+                fresh_extract: std::sync::atomic::AtomicBool::new(false),
             });
         }
 
@@ -274,6 +284,7 @@ impl BuildJob {
             result: None,
             started: std::time::Instant::now(),
             max_frac: std::sync::atomic::AtomicU32::new(0),
+            fresh_extract: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -315,6 +326,7 @@ impl BuildJob {
             result: None,
             started,
             max_frac: std::sync::atomic::AtomicU32::new(0),
+            fresh_extract: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -342,6 +354,7 @@ impl BuildJob {
             result: Some(ok),
             started: std::time::Instant::now(),
             max_frac: std::sync::atomic::AtomicU32::new(0),
+            fresh_extract: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1603,7 +1616,33 @@ fn fmt_age(days: Option<f64>) -> String {
 /// equal-stage assumption is what pinned the ESTIMATED TIME at 99:59 (extraction counted as 1/9).
 /// `stage` is the latest `[STAGE i/N]` / `[BUILD OK]` marker; `sub` is an optional in-stage fraction
 /// (0..1) from a `[SUBPROGRESS]` marker, so the bar moves DURING the long extraction.
-fn build_frac(stage: &str, sub: Option<f32>) -> f32 {
+///
+/// In-stage fraction from a `[SUBPROGRESS] ...` line: the LAST whitespace token is `<done>/<total>`,
+/// unit-agnostic — the emitters put the human-readable level count first and the machine-read
+/// byte ratio last, and older logs' plain `extract <d>/<t>` parses identically. `None` for
+/// non-SUBPROGRESS lines and degenerate totals.
+fn subprogress_frac(line: &str) -> Option<f32> {
+    let rest = line.split("[SUBPROGRESS]").nth(1)?;
+    let tok = rest.split_whitespace().last()?; // "<d>/<t>"
+    let (d, t) = tok.split_once('/')?;
+    let (d, t) = (d.trim().parse::<f32>().ok()?, t.trim().parse::<f32>().ok()?);
+    (t > 0.0).then(|| (d / t).clamp(0.0, 1.0))
+}
+
+/// `fresh` = this build is running the ONE-TIME full extraction (the `fresh_extract` latch). The
+/// standard 55% extraction weight was ranked on builds whose dataset already exists; on a fresh
+/// build stage 1 alone is ~64% of wall-clock and the SH bake another ~19%, so the same table
+/// made `elapsed/frac` overestimate the whole way through (the naive ETA then saturated its old
+/// mm:ss ceiling at 99:59). The fresh table is MEASURED — `[TIMING]` lines of a real streets
+/// first build (2026-08-02, 6C/12T, total 2h26m): stage 1 5578s (dataset 2899 / grass 6 /
+/// colliders 2673), lights 114s, assemble 724s, SH bake 1625s, grass 11s, zones 196s, icons
+/// 129s, nav 387s, stamp 5s. One sample, one map, one machine — but a measurement, not a guess.
+///
+/// Weights are per-stage WINDOWS rather than a cumulative array because the portable pipeline
+/// runs stage 3 (SH bake) AFTER stage 4 (assemble): wall-clock order is 1,2,4,3,5..9, which a
+/// cumulative-by-stage-number table cannot express — it froze the bar (and pinned the ETA)
+/// through the whole 27-minute bake while the `max_frac` guard absorbed the regression.
+fn build_frac(stage: &str, sub: Option<f32>, fresh: bool) -> f32 {
     if stage.starts_with("[BUILD OK]") {
         return 1.0;
     }
@@ -1618,18 +1657,81 @@ fn build_frac(stage: &str, sub: Option<f32>) -> f32 {
         return 0.0;
     };
     let done = stage.contains(": done") || stage.contains(": skipped");
-    let in_frac = if done { 1.0 } else { sub.unwrap_or(0.5).clamp(0.0, 1.0) };
-    // Cumulative fraction AT THE END of each 1-based stage, per pipeline length.
-    let cum: &[f32] = if (n - 9.0).abs() < 0.5 {
-        // full build: extract, lights, bake(GPU), assemble, grass, zones, icons, nav(GPU), stamp
-        &[0.0, 0.55, 0.58, 0.80, 0.88, 0.92, 0.95, 0.96, 0.99, 1.0]
+    let base = if done { 1.0 } else { sub.unwrap_or(0.5).clamp(0.0, 1.0) };
+    // Stage 1 of a map build is THREE serial passes over the game files (dataset -> grass ->
+    // colliders), each re-emitting "[STAGE 1/N]" with its own name. Treating them as one pool
+    // meant the bar finished stage 1's span with the dataset pass and then sat frozen through
+    // grass + colliders (on streets, up to an hour of "28%" / "55%" with a live build behind
+    // it). Give each pass its slice of the stage-1 span; the `sub` signal moves the bar WITHIN
+    // the slice. Splits are duration estimates on a fresh streets build (the dominant case —
+    // these sub-stages only run on a fresh extraction). Unmatched stage-1 names (check dataset,
+    // nav agent settings) keep the whole-span behavior; `max_frac` already absorbs any regress.
+    let in_frac = if (n - 9.0).abs() < 0.5 && (i - 1.0).abs() < 0.5 {
+        // Measured sub-pass shares of stage 1 (streets: 2899s / 6s / 2673s). Colliders is
+        // nearly HALF the stage — it runs serial while the dataset extract runs one process
+        // per core, which is also why parallelizing it is the biggest first-build win left.
+        // A pass that EMITS [SUBPROGRESS] starts at the bottom of its slice, not the middle:
+        // `base`'s 0.5 fallback is a guess made before the first reading arrives, and on the
+        // colliders pass that guess (48.65%) lands just ABOVE the real first reading (48.63%),
+        // so `max_frac` latches it and the pass's own signal is clamped away for its whole run.
+        // The grass pass emits nothing, so it keeps the midpoint guess inside its 1% slice.
+        let signalled = if done { 1.0 } else { sub.unwrap_or(0.0).clamp(0.0, 1.0) };
+        if stage.contains("extract dataset") {
+            0.52 * signalled
+        } else if stage.contains("grass density") {
+            0.52 + 0.01 * base
+        } else if stage.contains("physics colliders") {
+            0.53 + 0.47 * signalled
+        } else {
+            // Unmatched stage-1 names (check dataset, nav agent settings) are BOOKENDS, not a
+            // pass with a duration -- they must sit at the START of the span, not the middle of
+            // it. With `base` here the first marker of a fresh build ("check dataset", no
+            // [SUBPROGRESS] yet, so base falls to the 0.5 default) claimed 0.5 * 0.636 = 31.8%,
+            // and `max_frac` latched it: the dataset pass's own readings (3.3%, 17.8%, 32.4%)
+            // were then all discarded, so the bar did not move until the extract was ~96% done.
+            // On streets that is ~45 min parked at 31.8% at the very start of a first build --
+            // the same "reads as a hang" this table exists to remove. `done` still ends the span.
+            if done { 1.0 } else { 0.0 }
+        }
+    } else {
+        base
+    };
+    // Per-stage (start, end) windows of the overall bar, indexed by stage NUMBER (1-based).
+    let windows: &[(f32, f32)] = if (n - 9.0).abs() < 0.5 && fresh {
+        // FIRST build, measured (see the doc comment). Stage 3's window sits AFTER stage 4's
+        // because that is the wall-clock order the portable pipeline actually runs them in.
+        &[
+            (0.000, 0.636), // 1 extract (dataset + grass + colliders)
+            (0.636, 0.649), // 2 lights + interactables + LUT
+            (0.732, 0.917), // 3 SH bake — runs post-assemble
+            (0.649, 0.732), // 4 assemble
+            (0.917, 0.918), // 5 grass pack
+            (0.918, 0.941), // 6 zones
+            (0.941, 0.955), // 7 icons
+            (0.955, 0.999), // 8 nav
+            (0.999, 1.000), // 9 stamp
+        ]
+    } else if (n - 9.0).abs() < 0.5 {
+        // full build: extract, lights, bake(GPU), assemble, grass, zones, icons, nav(GPU),
+        // stamp — the original codex-ranked cumulative table, expressed as windows verbatim.
+        &[
+            (0.00, 0.55),
+            (0.55, 0.58),
+            (0.58, 0.80),
+            (0.80, 0.88),
+            (0.88, 0.92),
+            (0.92, 0.95),
+            (0.95, 0.96),
+            (0.96, 0.99),
+            (0.99, 1.00),
+        ]
     } else if (n - 3.0).abs() < 0.5 {
-        &[0.0, 0.05, 0.98, 1.0] // deps install: venv, pip, verify
+        &[(0.00, 0.05), (0.05, 0.98), (0.98, 1.00)] // deps install: venv, pip, verify
     } else {
         return ((i - 1.0 + in_frac) / n).clamp(0.0, 1.0); // unknown pipeline: linear
     };
-    let idx = (i as usize).clamp(1, cum.len() - 1);
-    (cum[idx - 1] + (cum[idx] - cum[idx - 1]) * in_frac).clamp(0.0, 1.0)
+    let (lo, hi) = windows[(i as usize).clamp(1, windows.len()) - 1];
+    (lo + (hi - lo) * in_frac).clamp(0.0, 1.0)
 }
 
 /// Localized age ("today" / "3 d ago") for the map-row cards.
@@ -1682,17 +1784,35 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
     // markers can't drop the bar. The sub-fraction moves the bar WITHIN the long extraction stage via
     // the parallel extractor's `[SUBPROGRESS] <done>/<total>` marker.
     let sub = if stage.starts_with("[STAGE 1/") {
-        tail.iter().rev().find_map(|l| {
-            let rest = l.split("[SUBPROGRESS]").nth(1)?;
-            let tok = rest.split_whitespace().last()?; // "<d>/<t>"
-            let (d, t) = tok.split_once('/')?;
-            let (d, t) = (d.trim().parse::<f32>().ok()?, t.trim().parse::<f32>().ok()?);
-            (t > 0.0).then(|| (d / t).clamp(0.0, 1.0))
-        })
+        // Take the newest [SUBPROGRESS] FROM THE PASS THAT IS RUNNING. Stage 1 is three serial
+        // passes with three independent denominators, so an unfiltered search hands the colliders
+        // marker the dataset pass's trailing ~1.0: 0.53 + 0.47*0.98 = 0.99 of the span, which
+        // `max_frac` latches at 63%. Every later colliders reading is lower and gets clamped away,
+        // freezing the bar for the whole (~45 min) pass. The emitters already tag their lines, so
+        // match on the tag; anything untagged (older logs' plain `extract <d>/<t>`) still parses.
+        let tag = if stage.contains("physics colliders") { "colliders" } else { "extract" };
+        tail.iter()
+            .rev()
+            .filter(|l| l.contains(tag))
+            .find_map(|l| subprogress_frac(l))
     } else {
         None
     };
-    let raw = if finished && ok { 1.0 } else { build_frac(&stage, sub) };
+    // Latch the fresh-extraction flag off the stage marker itself: "extract dataset" is a stage
+    // name only the ONE-TIME full extraction path emits (a cached dataset skips straight through
+    // "check dataset"). Sticky on the job so the first-build weight table keeps applying after
+    // stage 1 hands off to the tail stages.
+    let fresh = {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !job.fresh_extract.load(Relaxed)
+            && stage.starts_with("[STAGE 1/")
+            && stage.contains("extract dataset")
+        {
+            job.fresh_extract.store(true, Relaxed);
+        }
+        job.fresh_extract.load(Relaxed)
+    };
+    let raw = if finished && ok { 1.0 } else { build_frac(&stage, sub, fresh) };
     let frac = {
         use std::sync::atomic::Ordering::Relaxed;
         let prev = f32::from_bits(job.max_frac.load(Relaxed));
@@ -3209,5 +3329,205 @@ pub fn menu_ui(
     }
     if dismiss_build {
         worker.dismiss_last();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_frac, subprogress_frac};
+
+    // ---- subprogress_frac: BOTH marker generations must parse to the same ratio semantics.
+    // The byte-weighted emitters (extract_parallel / eft_extract_colliders) put the machine
+    // token LAST precisely so an already-shipped viewer keeps working — this is that contract.
+
+    /// Replay a whole marker stream through `build_frac` + the `max_frac` clamp exactly as
+    /// `build_view` drives them, and assert the property the bar actually has to have: it never
+    /// goes backwards, and it never sits at one value across a pass boundary. The parser tests
+    /// above check that a LINE is read correctly; this checks that the CURVE is usable, which is
+    /// where both of the freezes this table was written to remove actually lived.
+    fn replay(stream: &[&str]) -> Vec<f32> {
+        let (mut tail, mut stage, mut mx, mut out) = (Vec::new(), String::new(), 0.0f32, Vec::new());
+        let mut fresh = false;
+        for line in stream {
+            tail.push(line.to_string());
+            if line.starts_with("[STAGE") || line.starts_with("[BUILD") {
+                stage = line.to_string();
+            }
+            if stage.is_empty() {
+                continue;
+            }
+            if stage.starts_with("[STAGE 1/") && stage.contains("extract dataset") {
+                fresh = true;
+            }
+            let sub = if stage.starts_with("[STAGE 1/") {
+                let tag = if stage.contains("physics colliders") { "colliders" } else { "extract" };
+                tail.iter().rev().filter(|l| l.contains(tag)).find_map(|l| subprogress_frac(l))
+            } else {
+                None
+            };
+            mx = mx.max(build_frac(&stage, sub, fresh));
+            out.push(mx);
+        }
+        out
+    }
+
+    /// The exact stream `tools/build_map.py --dry-run` emits on the fresh path.
+    const DRY_RUN_FRESH: &[&str] = &[
+        "[STAGE 1/9] check dataset",
+        "[STAGE 1/9] extract dataset (geometry + textures)",
+        "[SUBPROGRESS] extract levels 3/217 bytes 536870912/5463154688",
+        "[SUBPROGRESS] extract levels 120/217 bytes 2936012800/5463154688",
+        "[SUBPROGRESS] extract levels 210/217 bytes 5348024320/5463154688",
+        "[STAGE 1/9] extract dataset (geometry + textures): done (0s)",
+        "[STAGE 1/9] extract grass density",
+        "[STAGE 1/9] extract grass density: done (0s)",
+        "[STAGE 1/9] extract physics colliders",
+        "[SUBPROGRESS] colliders levels 100/217 bytes 2726297600/5463154688",
+        "[STAGE 1/9] extract physics colliders: done (0s)",
+        "[STAGE 1/9] check dataset: done",
+        "[STAGE 2/9] extract lights",
+        "[STAGE 2/9] extract lights: done (0s)",
+    ];
+
+    #[test]
+    fn bar_never_goes_backwards() {
+        let f = replay(DRY_RUN_FRESH);
+        for w in f.windows(2) {
+            assert!(w[1] >= w[0] - 1e-6, "bar regressed: {:?}", f);
+        }
+    }
+
+    #[test]
+    fn first_build_does_not_open_a_third_full() {
+        // "check dataset" is a bookend, not a pass: a fresh build must START near zero.
+        let f = replay(DRY_RUN_FRESH);
+        assert!(f[0] < 0.02, "fresh build opened at {:.3}", f[0]);
+    }
+
+    #[test]
+    fn dataset_progress_is_not_discarded() {
+        // The three dataset [SUBPROGRESS] lines must each move the bar. Before the bookend fix
+        // they computed 3.3% / 17.8% / 32.4% against a latched 31.8% and were clamped away.
+        let f = replay(DRY_RUN_FRESH);
+        assert!(f[2] < f[3] && f[3] < f[4], "dataset readings did not advance: {:?}", &f[..5]);
+    }
+
+    #[test]
+    fn colliders_pass_moves_the_bar() {
+        // The regression this fix targets: the colliders marker must not inherit the dataset
+        // pass's trailing ~1.0 and latch the top of the stage-1 span.
+        let f = replay(DRY_RUN_FRESH);
+        let at_marker = f[8]; // "[STAGE 1/9] extract physics colliders"
+        let at_reading = f[9]; // its first own [SUBPROGRESS]
+        assert!(at_marker < 0.60, "colliders marker jumped to {at_marker:.3} on stale sub");
+        assert!(at_reading > at_marker, "colliders reading did not advance the bar");
+    }
+
+    #[test]
+    fn subprogress_parses_legacy_level_count() {
+        let f = subprogress_frac("[SUBPROGRESS] extract 12/217").unwrap();
+        assert!((f - 12.0 / 217.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn subprogress_parses_byte_weighted_lines() {
+        // the emitters' real shape: raw-byte ratio last
+        let f = subprogress_frac("[SUBPROGRESS] extract levels 12/217 bytes 884998144/5463154688")
+            .unwrap();
+        assert!((f - 884998144.0 / 5463154688.0).abs() < 1e-6);
+        // the token is unit-agnostic — floats parse identically
+        let f = subprogress_frac("[SUBPROGRESS] colliders levels 3/200 bytes 50.0/4000.0").unwrap();
+        assert!((f - 0.0125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn subprogress_rejects_noise_and_degenerate_totals() {
+        assert_eq!(subprogress_frac("  [p3] level410: 7765 colliders in 60.0s"), None);
+        assert_eq!(subprogress_frac("[SUBPROGRESS] extract levels 0/0 bytes 0/0"), None);
+        assert_eq!(subprogress_frac("[SUBPROGRESS] extract garbage"), None);
+    }
+
+    // ---- build_frac: weight tables + the stage-1 sub-pass windows.
+
+    #[test]
+    fn build_ok_is_full() {
+        assert_eq!(build_frac("[BUILD OK] pack ready", None, false), 1.0);
+        assert_eq!(build_frac("[BUILD OK] pack ready", None, true), 1.0);
+    }
+
+    #[test]
+    fn stage1_extract_window_standard_table() {
+        // extraction sub-pass owns [0, 0.52] of stage 1's 0.55 span (measured: colliders is
+        // nearly half the stage)
+        let f = build_frac("[STAGE 1/9] extract dataset (geometry + textures)", Some(1.0), false);
+        assert!((f - 0.55 * 0.52).abs() < 1e-4);
+    }
+
+    #[test]
+    fn stage1_colliders_without_signal_sits_at_the_START_of_its_window() {
+        // the frozen-"28%" repro: colliders running, no SUBPROGRESS in the tail yet.
+        //
+        // This assertion CHANGED from 0.55 * (0.53 + 0.47*0.5) to the start of the slice, and the
+        // midpoint it used to pin is why the pass still froze. The colliders pass emits progress
+        // now (this PR added it), so "no signal" only ever means "the first line has not arrived
+        // yet" -- a few seconds. Guessing the midpoint during those seconds puts the bar at
+        // 48.65%, the first real reading is 48.63%, and `max_frac` keeps the guess: the pass then
+        // reports for ~45 min with every reading clamped away. A pass that will report starts at
+        // the bottom of its slice; only the signal moves it.
+        let f = build_frac("[STAGE 1/9] extract physics colliders", None, false);
+        assert!((f - 0.55 * 0.53).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fresh_table_dominates_extraction() {
+        let f = build_frac("[STAGE 1/9] extract dataset (geometry + textures)", Some(0.5), true);
+        assert!((f - 0.636 * 0.52 * 0.5).abs() < 1e-4);
+        // stage-1 fully done on the fresh (measured) table = 0.636, not 0.55
+        let f = build_frac("[STAGE 1/9] extract physics colliders: done (2673s)", None, true);
+        assert!((f - 0.636).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fresh_windows_follow_wall_clock_order_through_the_bake() {
+        // the portable pipeline runs stage 3 (SH bake) AFTER stage 4 (assemble); the fresh
+        // windows encode that, so the raw frac no longer regresses (and the bar no longer
+        // freezes) through the 27-minute bake.
+        let assemble_done = build_frac("[STAGE 4/9] assemble pack: done (724s)", None, true);
+        let bake_running = build_frac("[STAGE 3/9] bake lighting (portable SH)", None, true);
+        let bake_done = build_frac("[STAGE 3/9] bake lighting (portable SH): done (1625s)", None, true);
+        assert!((assemble_done - 0.732).abs() < 1e-4);
+        assert!(bake_running > assemble_done);
+        assert!((bake_done - 0.917).abs() < 1e-4);
+    }
+
+    #[test]
+    fn fresh_sequence_is_monotonic_through_stage1() {
+        // raw frac (before the max_frac guard) must never regress across the stage-1 handoffs;
+        // the guard only needs to absorb the out-of-order stage-3/4 bake markers, not stage 1.
+        let seq: &[(&str, Option<f32>)] = &[
+            ("[STAGE 1/9] extract dataset (geometry + textures)", Some(0.1)),
+            ("[STAGE 1/9] extract dataset (geometry + textures)", Some(0.9)),
+            ("[STAGE 1/9] extract dataset (geometry + textures): done (7200s)", None),
+            ("[STAGE 1/9] extract grass density", None),
+            ("[STAGE 1/9] extract grass density: done (300s)", None),
+            ("[STAGE 1/9] extract physics colliders", Some(0.2)),
+            ("[STAGE 1/9] extract physics colliders", Some(0.9)),
+            ("[STAGE 1/9] extract physics colliders: done (2400s)", None),
+            ("[STAGE 4/9] assemble pack", None),
+        ];
+        let mut prev = 0.0;
+        for (stage, sub) in seq {
+            let f = build_frac(stage, *sub, true);
+            assert!(f >= prev, "regressed at {stage}: {f} < {prev}");
+            prev = f;
+        }
+    }
+
+    #[test]
+    fn deps_and_unknown_pipelines_unchanged() {
+        let f = build_frac("[STAGE 2/3] pip install: done (30s)", None, false);
+        assert!((f - 0.98).abs() < 1e-4);
+        let f = build_frac("[STAGE 2/5] some future pipeline", None, false);
+        assert!((f - 0.3).abs() < 1e-4); // linear fallback
     }
 }

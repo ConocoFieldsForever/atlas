@@ -106,7 +106,21 @@ def main():
     exported = {}
     t_all = time.time()
 
-    for lv in [int(x) for x in args.levels.split(",")]:
+    # [SUBPROGRESS] denominators, byte-weighted like the parallel extractor's: streets' heavy
+    # levels take 30-60s each while most take <1s, so a level COUNT would misrepresent the pass
+    # exactly the way it did for extraction. Without this the whole (up to ~1h on streets) pass
+    # was silent to the loader bar, which parked on the stage-1 "no sub-signal" fallback — the
+    # frozen "28%" a first-time builder reads as a hang.
+    _levels = [int(x) for x in args.levels.split(",")]
+    _lv_w = {}
+    for _lv in _levels:
+        try:
+            _lv_w[_lv] = os.path.getsize(os.path.join(EFTDATA, f"level{_lv}")) + 1
+        except OSError:
+            _lv_w[_lv] = 1
+    _w_total, _w_done, _n_done = sum(_lv_w.values()), 0, 0
+
+    for lv in _levels:
         path = os.path.join(EFTDATA, f"level{lv}")
         if not os.path.exists(path):
             print(f"level{lv} missing", flush=True)
@@ -361,6 +375,12 @@ def main():
             n_lv += 1
 
         print(f"  level{lv}: {n_lv} colliders in {time.time()-t0:.1f}s  skipped={skipped}", flush=True)
+        # Machine-readable ratio LAST on the line (the viewer parses the final whitespace token).
+        # RAW bytes — a rounded MB collapses small totals to a degenerate 0.0/0.0.
+        _w_done += _lv_w.get(lv, 1)
+        _n_done += 1
+        print(f"[SUBPROGRESS] colliders levels {_n_done}/{len(_levels)} "
+              f"bytes {_w_done}/{_w_total}", flush=True)
 
     # Unity layer names come from TagManager (an engine type -> readable despite the encrypted
     # il2cpp metadata). Shipped alongside the colliders so the consumer never hardcodes indices.
