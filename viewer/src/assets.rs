@@ -308,8 +308,12 @@ pub enum Mode {
 
 enum Msg {
     Catalog(Result<Box<(Catalog, Vec<Entry>)>, String>),
-    Level(u32, Result<Box<LevelIndex>, String>),
-    Dump(Result<Box<Dump>, String>),
+    /// (request generation, level). The generation is what makes a reply stale — clearing
+    /// `pending_level` on the first arrival would let an OLDER reply through afterwards, because
+    /// "nothing pending" cannot be distinguished from "this is the one I want".
+    Level(u64, u32, Result<Box<LevelIndex>, String>),
+    /// The path_id it answers, so a slow dump cannot overwrite a newer selection's.
+    Dump(i64, Result<Box<Dump>, String>),
     /// Carries the request it answers so an out-of-order reply can be dropped rather than shown
     /// against whatever is selected now.
     Asset(AssetRef, Result<Box<AssetView>, String>),
@@ -356,6 +360,10 @@ pub struct AssetBrowser {
     pub level: Option<Box<LevelIndex>>,
     pub level_state: Load,
     pending_level: Option<u32>,
+    /// Bumped per level request; only the newest generation's reply is installed.
+    level_req: u64,
+    /// The object the in-flight dump was requested for.
+    dump_for: Option<i64>,
 
     pub expanded: HashSet<u32>,
     pub selected: Option<u32>,
@@ -391,6 +399,11 @@ pub struct AssetBrowser {
     /// Height of the inspector pane (draggable split).
     pub split: f32,
 
+    /// (level, fold) -> how many pack instances that source object produced. Built ONCE per pack:
+    /// a result row needs this number, and recomputing it per row per frame meant scanning all
+    /// 186,724 instances several times a frame while results were on screen.
+    inst_counts: HashMap<(u32, u32), u32>,
+
     pub near: Vec<NearRow>,
     near_at: Option<Vec3>,
     /// Show the full near list rather than the first handful. Collapsed by default so the catalog
@@ -420,6 +433,8 @@ impl Default for AssetBrowser {
             level: None,
             level_state: Load::Missing,
             pending_level: None,
+            level_req: 0,
+            dump_for: None,
             expanded: HashSet::new(),
             selected: None,
             dump: None,
@@ -443,6 +458,7 @@ impl Default for AssetBrowser {
             // Tall enough that a mesh preview plus its stats and skin line fit without scrolling;
             // draggable from there.
             split: 380.0,
+            inst_counts: HashMap::new(),
             near: Vec::new(),
             near_at: None,
             near_all: false,
@@ -470,6 +486,13 @@ fn tool_path(args: &[String]) -> Result<String, String> {
     let py = crate::paths::python_exe(root);
     let mut cmd = std::process::Command::new(&py);
     cmd.arg("tools/asset_index.py").args(args).current_dir(root);
+    // The indexer resolves bundles from EFT_GAME_DATA. Without it an install anywhere but the
+    // hard-coded default silently reads the wrong path and every build fails — so pass the same
+    // menu-selected/auto-detected directory the rest of the pipeline runs on.
+    let game = crate::menu::detect_game_dir();
+    if !game.is_empty() {
+        cmd.env("EFT_GAME_DATA", game);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -599,6 +622,8 @@ impl AssetBrowser {
             return;
         }
         self.pending_level = Some(lv);
+        self.level_req = self.level_req.wrapping_add(1);
+        let gen = self.level_req;
         self.level_state = Load::Running(format!("reading level{lv}"));
         self.send(move |tx| {
             let fp = pack.join("assets").join(format!("lv{lv}.json"));
@@ -613,13 +638,14 @@ impl AssetBrowser {
                         .map_err(|e| format!("parsing lv{lv}.json: {e}"))
                 })
                 .map(|li| Box::new(finish_level(li)));
-            let _ = tx.send(Msg::Level(lv, res));
+            let _ = tx.send(Msg::Level(gen, lv, res));
         });
     }
 
     fn load_dump(&mut self, pack: PathBuf, lv: u32, path_id: i64) {
         self.dump_state = Load::Running("reading object".into());
         self.dump = None;
+        self.dump_for = Some(path_id);
         self.dump_text.clear();
         self.send(move |tx| {
             let res = run_tool(&[
@@ -630,7 +656,7 @@ impl AssetBrowser {
             ])
             .and_then(|t| serde_json::from_str::<Dump>(&t).map_err(|e| format!("parsing the dump: {e}")))
             .map(Box::new);
-            let _ = tx.send(Msg::Dump(res));
+            let _ = tx.send(Msg::Dump(path_id, res));
         });
     }
 
@@ -656,6 +682,22 @@ impl AssetBrowser {
             .map(Box::new);
             let _ = tx.send(Msg::Asset(r, res));
         });
+    }
+
+    /// Instances per source object, built once. Both `par` and `par2` are counted because a pick
+    /// resolves against either, so the count must match what "fly to geometry" would find.
+    fn ensure_inst_counts(&mut self, pack: &crate::eftpack::Pack) {
+        if !self.inst_counts.is_empty() {
+            return;
+        }
+        for i in &pack.instances {
+            if i.par != 0 {
+                *self.inst_counts.entry((i.lv, i.par)).or_insert(0) += 1;
+            }
+            if i.par2 != 0 && i.par2 != i.par {
+                *self.inst_counts.entry((i.lv, i.par2)).or_insert(0) += 1;
+            }
+        }
     }
 
     /// Resolve one GameObject's base-colour texture so the mesh thumbnail can be skinned with it.
@@ -744,11 +786,10 @@ fn poll_assets(mut ab: ResMut<AssetBrowser>) {
                 ab.near_at = None;
             }
             Msg::Catalog(Err(e)) => ab.catalog_state = Load::Failed(e),
-            Msg::Level(lv, res) => {
-                // Ignore a reply the user has already navigated away from. Opening level A then B
-                // before A finished would otherwise install A over B AND consume B's pending
-                // reveal (the lv check inside would fail), so B would arrive with nothing revealed.
-                if ab.pending_level.map(|p| p != lv).unwrap_or(false) {
+            Msg::Level(gen, lv, res) => {
+                // Only the newest request may land. Opening level A then B would otherwise let a
+                // late A reply replace B's hierarchy and consume B's pending reveal.
+                if gen != ab.level_req {
                     continue;
                 }
                 ab.pending_level = None;
@@ -783,7 +824,8 @@ fn poll_assets(mut ab: ResMut<AssetBrowser>) {
                     Err(e) => ab.level_state = Load::Failed(e),
                 }
             }
-            Msg::Dump(Ok(d)) => {
+            Msg::Dump(pid, _) if ab.dump_for != Some(pid) => {}
+            Msg::Dump(_, Ok(d)) => {
                 ab.dump_text = d
                     .fields
                     .as_ref()
@@ -792,7 +834,7 @@ fn poll_assets(mut ab: ResMut<AssetBrowser>) {
                 ab.dump = Some(d);
                 ab.dump_state = Load::Ready;
             }
-            Msg::Dump(Err(e)) => ab.dump_state = Load::Failed(e),
+            Msg::Dump(_, Err(e)) => ab.dump_state = Load::Failed(e),
             // Drop a reply for a request the inspector has moved on from (selection changed, or a
             // texture slot was followed) — subprocesses can finish out of order.
             Msg::Asset(r, _) if ab.asset_for.as_ref() != Some(&r) => {}
@@ -1180,18 +1222,19 @@ fn recompute_hits(ab: &mut AssetBrowser, c: &Ctx) {
     if !has_query && ab.filter_script.is_none() && ab.filter_comp.is_none() {
         return;
     }
-    // Folds that actually produced geometry in this pack, for the "in this pack" filter.
-    let geom: Option<HashSet<(u32, u32)>> = if ab.only_geometry {
-        c.pack.map(|p| p.instances.iter().map(|i| (i.lv, i.par)).collect())
-    } else {
-        None
-    };
+    // Folds that actually produced geometry in this pack, for the "in this pack" filter — the same
+    // table the row counts come from, so the filter and the "xN in map" badge cannot disagree.
+    if let Some(p) = c.pack {
+        ab.ensure_inst_counts(p);
+    }
+    let geom = ab.only_geometry.then(|| std::mem::take(&mut ab.inst_counts));
     // The index holds one record per (object, script), so an object with two scripts would appear
     // twice in a plain text query. A script filter already selects a single record per object, so
     // the de-dup is only needed when no script filter is active.
     let mut seen: HashSet<(u32, i64)> = HashSet::new();
     let dedup = ab.filter_script.is_none();
-    let mut scored: Vec<(u32, u32)> = Vec::new(); // (score, index)
+    // [0] exact, [1] prefix, [2] substring — drained in that order.
+    let mut buckets: [Vec<u32>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     for (i, e) in ab.entries.iter().enumerate() {
         if let Some(s) = ab.filter_script {
             if e.script != s {
@@ -1204,7 +1247,7 @@ fn recompute_hits(ab: &mut AssetBrowser, c: &Ctx) {
             }
         }
         if let Some(g) = geom.as_ref() {
-            if e.fold == 0 || !g.contains(&(e.lv, e.fold)) {
+            if e.fold == 0 || !g.contains_key(&(e.lv, e.fold)) {
                 continue;
             }
         }
@@ -1221,13 +1264,32 @@ fn recompute_hits(ab: &mut AssetBrowser, c: &Ctx) {
         if dedup && !seen.insert((e.lv, e.path_id)) {
             continue;
         }
-        scored.push((score, i as u32));
-        if scored.len() > MAX_HITS * 40 {
-            break; // enough to rank from; a query this broad is being refined anyway
+        // Bucket by rank instead of collecting-then-sorting with a cutoff. The old early exit
+        // stopped scanning once enough of ANY rank had been seen, so an exact match late in the
+        // index could be dropped while weak substring hits from early on were shown — the opposite
+        // of what the ranking promises. Scanning can only stop once the BEST bucket is full.
+        let b = &mut buckets[score as usize];
+        if b.len() < MAX_HITS {
+            b.push(i as u32);
+        }
+        if buckets[0].len() >= MAX_HITS {
+            break; // exact matches alone already fill the list; nothing later can outrank them
         }
     }
-    scored.sort_by_key(|&(s, i)| (s, ab.entries[i as usize].name.len(), i));
-    ab.hits = scored.into_iter().take(MAX_HITS).map(|(_, i)| i).collect();
+    let mut hits: Vec<u32> = Vec::with_capacity(MAX_HITS);
+    for b in buckets.iter_mut() {
+        b.sort_by_key(|&i| (ab.entries[i as usize].name.len(), i));
+        for &i in b.iter() {
+            if hits.len() >= MAX_HITS {
+                break;
+            }
+            hits.push(i);
+        }
+    }
+    ab.hits = hits;
+    if let Some(g) = geom {
+        ab.inst_counts = g; // put the shared table back
+    }
 }
 
 /// The picked-geometry card — the tab's primary context. Always the first thing under the search.
@@ -1469,9 +1531,12 @@ fn draw_results(ui: &mut bevy_egui::egui::Ui, ab: &mut AssetBrowser, c: &Ctx) {
         ui.label(RichText::new("nothing matched").size(10.0).color(DIM));
         return;
     }
-    // Instance counts per (lv, fold) so a row can say "x12" without a scan per row.
+    if let Some(p) = c.pack {
+        ab.ensure_inst_counts(p);
+    }
     let mut open: Option<u32> = None;
     let hits = ab.hits.clone();
+    let counts = std::mem::take(&mut ab.inst_counts);
     egui::ScrollArea::vertical()
         .id_salt("assets_results")
         .auto_shrink([false, false])
@@ -1480,15 +1545,7 @@ fn draw_results(ui: &mut bevy_egui::egui::Ui, ab: &mut AssetBrowser, c: &Ctx) {
                 let Some(e) = ab.entries.get(hits[r] as usize) else {
                     continue;
                 };
-                let ninst = c
-                    .pack
-                    .map(|p| {
-                        p.instances
-                            .iter()
-                            .filter(|i| i.lv == e.lv && (i.par == e.fold || i.par2 == e.fold))
-                            .count()
-                    })
-                    .unwrap_or(0);
+                let ninst = counts.get(&(e.lv, e.fold)).copied().unwrap_or(0);
                 let script = ab
                     .catalog
                     .as_ref()
@@ -1543,6 +1600,7 @@ fn draw_results(ui: &mut bevy_egui::egui::Ui, ab: &mut AssetBrowser, c: &Ctx) {
                 }
             }
         });
+    ab.inst_counts = counts; // taken above only to satisfy the borrow inside the row closure
     if let Some(i) = open {
         if let Some(e) = ab.entries.get(i as usize) {
             let (lv, pid, fold) = (e.lv, e.path_id, e.fold);

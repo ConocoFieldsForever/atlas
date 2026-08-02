@@ -79,9 +79,14 @@ impl Plugin for PickPlugin {
 }
 
 /// In-place map swap: drop the stale bounding-sphere cache so `pick_system` rebuilds it from the new
-/// pack's mesh table on the next click.
-fn teardown_pick(mut spheres: ResMut<PickSpheres>) {
+/// pack's mesh table on the next click, and forget the last pick.
+///
+/// The pick is dropped for the same reason as the cache: its instance index, level and folded
+/// ancestry all describe the OLD pack. Left in place, the Assets tab would offer to reveal a source
+/// object from the previous map and fly to coordinates that no longer mean anything.
+fn teardown_pick(mut spheres: ResMut<PickSpheres>, mut last: ResMut<LastPick>) {
     spheres.0.clear();
+    last.0 = None;
 }
 
 /// Top-left, dark, semi-transparent readout. Spawned once; the pick system just
