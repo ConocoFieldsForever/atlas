@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tarkov Data"
+  short_description: "EFT extraction and data quirks"
+  default_prompt: "Use $tarkov-data to change the Atlas EFT extraction pipeline safely."
