@@ -3301,6 +3301,12 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         let stride = (starts.len() / want).max(1);
         println!("\n=== loot plans ({want} start(s), {} candidate stop(s)) ===", cands.len());
         let (mut solved, mut refused) = (0usize, 0usize);
+        // Bucketed by CAUSE. "7 refused" on its own reads as a routing failure, and on interchange
+        // it is not one: every refusal there is this harness's own budget (1800 s, 12 stops, every
+        // candidate flat-valued) failing to fit a tour from a start far from the loot mass, while
+        // the field reached the map fine. A count that cannot tell those apart sends you looking
+        // in the router for a tuning artifact.
+        let mut why: std::collections::BTreeMap<&'static str, usize> = Default::default();
         let (mut lg_n, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
         let (mut fs_n, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
         let (mut selfx, mut walked, mut straight) = (0usize, 0.0f32, 0.0f32);
@@ -3337,6 +3343,16 @@ pub fn run_check_cli(args: &[String]) -> i32 {
                 }
                 Err(e) => {
                     refused += 1;
+                    *why.entry(if e.contains("off the walkable mesh") {
+                        "start is not on the nav mesh (ROUTING)"
+                    } else if e.contains("budget") {
+                        "no tour fits the time budget (TUNING, not routing)"
+                    } else if e.contains("extract") {
+                        "no extract reachable within the budget"
+                    } else {
+                        "no loot above the value filter"
+                    })
+                    .or_default() += 1;
                     println!(
                         "  none [{:>7.1},{:>6.1},{:>7.1}]  {e}",
                         start.x, start.y, start.z
@@ -3352,6 +3368,9 @@ pub fn run_check_cli(args: &[String]) -> i32 {
             "  {solved}/{want} solved ({refused} refused); ledge {lg_bad}/{lg_n} worst {lg_worst:.2} m; \
              floor {fs_bad}/{fs_n} worst {fs_worst:.2} m"
         );
+        for (cause, n) in &why {
+            println!("    {n:>3} refused: {cause}");
+        }
         println!(
             "  {selfx} self-crossing leg pair(s); walked {:.2}x the straight line through the same stops",
             walked / straight.max(1.0)

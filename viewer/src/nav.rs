@@ -1176,6 +1176,47 @@ impl NavGrid {
         let Some((sc, sl)) = self.snap_start(from.x, from.y, from.z, self.rings(START_SNAP_M)) else {
             return false;
         };
+        // ISLAND RESCUE, the one-to-many form. `path` steps a pocketed start into the
+        // DESTINATION's component; a field has no destination, so it steps into the largest
+        // component within rescue reach instead. Without this the field is the planner's only
+        // reachability gate and it silently inherits every sealed pocket: a player standing in one
+        // presses PLAN and is told "no reachable loot above the value filter within the budget",
+        // which blames their filter for a snap. Measured on interchange before this: 7 of 12
+        // player spawns refused a plan while `path` routed from all of them.
+        //
+        // A small component here really is sealed, not merely small: `comps` expands through doors
+        // and honours the same blk mask the router does, so a room reachable through a doorway is
+        // already the SAME component. Counting is confined to the rescue window, so this costs one
+        // local scan and never a second full pass.
+        // Off with `EFT_NAV_FIELD_RESCUE=0` for A/B, same convention as EFT_NAV_CLEARANCE.
+        let (sc, sl) = if std::env::var("EFT_NAV_FIELD_RESCUE").as_deref() == Ok("0") {
+            (sc, sl)
+        } else {
+            let comps = self.comps();
+            let start_comp = comps[sc * self.k + sl];
+            let (cx, cz) = self.cell_of_xz(from.x, from.z);
+            let r = self.rings(RESCUE_SNAP_M);
+            let mut count: std::collections::HashMap<u32, u32> = Default::default();
+            for jz in (cz - r).max(0)..=(cz + r).min(self.nz as i64 - 1) {
+                for jx in (cx - r).max(0)..=(cx + r).min(self.nx as i64 - 1) {
+                    let c = (jz * self.nx as i64 + jx) as usize;
+                    for l in 0..self.k {
+                        if self.h[c * self.k + l] <= self.miss * 0.5 {
+                            break;
+                        }
+                        *count.entry(comps[c * self.k + l]).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mine = count.get(&start_comp).copied().unwrap_or(0);
+            let best = count.iter().max_by_key(|(_, n)| **n).map(|(c, n)| (*c, *n));
+            match best {
+                Some((bc, bn)) if bc != start_comp && bn > mine => self
+                    .snap_start_in(from.x, from.y, from.z, r, Some(bc))
+                    .unwrap_or((sc, sl)),
+                _ => (sc, sl),
+            }
+        };
         let k = self.k;
         let nx = self.nx as i64;
         let nz = self.nz as i64;
