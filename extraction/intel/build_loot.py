@@ -25,15 +25,10 @@ _OUT_DIR = os.environ.get("EFT_INTEL_OUT_DIR") or (
     os.path.join(_TK, "out") if _TK else os.path.join(REPO, "packs", "shared")
 )
 OUT = os.path.join(_OUT_DIR, 'loot.json')
-DEV_TO_ID = {
-    'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
-    # The shipped roster's "Factory" is the 1.0 rework (id factory_rework). tarkov.dev still calls
-    # it factory / night-factory, so both map to factory_rework or the pack loads with no POI.
-    'factory': 'factory_rework', 'night-factory': 'factory_rework', 'woods': 'woods', 'customs': 'customs',
-    'shoreline': 'shoreline', 'streets-of-tarkov': 'streets', 'reserve': 'reserve',
-    'the-lab': 'labs', 'the-labs': 'labs', 'lighthouse': 'lighthouse',
-    'the-labyrinth': 'labyrinth', 'labyrinth': 'labyrinth',
-}
+# ONE table, shared with the sibling builder. See mapslugs.py for why the two copies diverged.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from mapslugs import DEV_TO_ID, map_id as _shared_map_id
 
 # Per container TYPE: ev = roubles WHEN it spawns loot; spawn = P(worthwhile loot this raid = "fill rate"); t = seconds
 # to open+search; cls = class (for include/exclude filtering). EFFECTIVE value the optimiser uses = ev * spawn -- so a

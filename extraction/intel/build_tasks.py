@@ -30,22 +30,20 @@ _OUT_DIR = os.environ.get("EFT_INTEL_OUT_DIR") or (
 )
 OUT = os.path.join(_OUT_DIR, 'tasks.json')
 # tarkov.dev map normalizedName -> our map id (matches tarkmap/maps/<id>). Extend as maps are added.
-DEV_TO_ID = {
-    'interchange': 'interchange', 'ground-zero': 'ground_zero', 'ground-zero-21': 'ground_zero',
-    # Shipped "Factory" is the 1.0 rework (id factory_rework); tarkov.dev still names it
-    # factory / night-factory, so map both to factory_rework or the quest layer is empty there.
-    'factory': 'factory_rework', 'night-factory': 'factory_rework', 'woods': 'woods', 'customs': 'customs',
-    'shoreline': 'shoreline', 'streets-of-tarkov': 'streets', 'reserve': 'reserve',
-    'the-lab': 'labs', 'the-labs': 'labs', 'lighthouse': 'lighthouse',
-    'the-labyrinth': 'labyrinth', 'labyrinth': 'labyrinth',
-}
+# ONE table, shared with the sibling builder. See mapslugs.py for why the two copies diverged.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from mapslugs import DEV_TO_ID, map_id as _shared_map_id
 G3 = (-1.0, 1.0, 1.0)   # Unity world -> viewer world (X-flip), read logically from coordinates.global_matrix
 
 def bridge(p):
     return None if p is None else [round(G3[0] * p['x'], 2), round(G3[1] * p['y'], 2), round(G3[2] * p['z'], 2)]
 
 def map_id(nn):
-    return DEV_TO_ID.get(nn, nn)
+    # Was `DEV_TO_ID.get(nn, nn)`. A passthrough emits a key no pack matches (the-lab-dark,
+    # ground-zero-tutorial), which reads as data and behaves as a silent drop; the sibling builder
+    # skipped the same maps outright. Both now resolve through one table and miss the same way.
+    return _shared_map_id(nn)
 
 
 def zclean(z):
