@@ -561,7 +561,20 @@ pub(crate) fn solve(
 
     // ---- phase 3: real legs (A* threading) + budget repair ----
     let mut s = crate::nav::pooled_scratch(grid.nodes());
-    for _repair in 0..6 {
+    // The repair loop drops exactly ONE stop per iteration, so a fixed 6 could never reduce a
+    // 12-stop tour to a 2-stop one: it ran out of repairs and reported "couldn't fit a run into
+    // the budget" while still holding 6 stops it had never tried removing. That got WORSE as
+    // routing improved, which is the opposite of what you would expect and is why it went
+    // unnoticed: better reachability means phase 0 keeps more candidates, phase 1 packs a fuller
+    // tour, and a fuller tour needs more shedding than the budget allowed. Measured on streets,
+    // 6 of 12 starts solved before this session's routing fixes and 3 of 12 after, with 8 of the
+    // 9 refusals landing on the budget message.
+    //
+    // Allow one repair per stop plus slack, so the loop can always shrink a tour to nothing and
+    // the terminal error means what it says.
+    let repair_budget = (max_stops + 2).max(8);
+    let mut last_reason = "no tour fits the walking budget";
+    for _repair in 0..repair_budget {
         if tour.is_empty() {
             return Err("no reachable loot within the budget".into());
         }
@@ -609,6 +622,7 @@ pub(crate) fn solve(
             }
         }
         if let Some(k) = unreachable {
+            last_reason = "a stop could not be threaded (off-mesh, or its leg did not join)";
             tour.remove(k); // off-mesh stop (shelf/roof glitch) — drop and re-thread
             continue;
         }
@@ -620,6 +634,7 @@ pub(crate) fn solve(
         // is a line through a building.
         if exp[0].distance(cur) > JOIN_TOL {
             if tour.len() > 1 {
+                last_reason = "the exit leg did not join the tour";
                 tour.pop();
                 continue;
             }
@@ -636,6 +651,7 @@ pub(crate) fn solve(
                         .total_cmp(&(cands[tour[b]].score_value / (legs[b] / WALK_MPS + cands[tour[b]].loot_s).max(1.0)))
                 })
                 .unwrap();
+            last_reason = "no tour fits the walking budget";
             tour.remove(worst);
             continue;
         }
@@ -693,7 +709,11 @@ pub(crate) fn solve(
             total_value,
         });
     }
-    Err("couldn't fit a run into the budget (try fewer stops / larger budget)".into())
+    // Name the reason the loop actually ran out on. This used to say "budget" unconditionally,
+    // which is right for one of the three exits and misleading for the other two.
+    Err(format!(
+        "gave up after {repair_budget} repair(s): {last_reason} (try fewer stops / larger budget)"
+    ))
 }
 
 /// Publish the finished plan: the stop list into `PlanResult`, the tour polyline into
