@@ -37,6 +37,40 @@ const VERT: f32 = 6.0;
 /// so it steers toward a clearer route when one exists but never blocks a genuinely narrow passage.
 const WALL_CLEARANCE: f32 = 0.35;
 
+/// Snap reaches, in METRES. They used to be raw cell literals passed at each call site, which
+/// silently rescaled when the default bake resolution went 1.0 -> 0.5 m: `snap_start`'s reach
+/// halved from 16 m to 8 m on every pack, reintroducing the exact failure its own comment says it
+/// fixed. On streets, 10 of 509 spawns then snapped to a different node and six landed on a sealed
+/// roof plate (that column has NO ground floor; real ground is 9-10.5 m away, inside the old reach
+/// and outside the new one). Every other metre->cell conversion in this file divides by `self.res`;
+/// these are now no exception.
+const START_SNAP_M: f32 = 16.0;
+/// Island-rescue reach: far enough to step out of a sealed pocket, near enough that a start never
+/// teleports across the map. The comment on the old literal said "24 cells ~ 24 m at 1 m res".
+const RESCUE_SNAP_M: f32 = 24.0;
+/// Destination reach. Shared by `snap_dest` (which moves the routed endpoint) and `field_dist`
+/// (which decides whether the planner keeps the candidate at all). They must agree: a point the
+/// planner prunes as unreachable is one `path` would have routed to, and a point it keeps that
+/// `path` cannot reach costs a full failed A*.
+const DEST_SNAP_M: f32 = 12.0;
+
+/// How far a STRAIGHTENED chord may sag BELOW the real floor beneath it.
+///
+/// This is bounded by the baker's lowest capsule sample (`nav_bake::CAP_H[0]`, 0.55 m above the
+/// route point), and the bound is not cosmetic: the wall test casts its lowest ray at
+/// `chord_y + 0.55`, so a chord sagging further than that puts the ray UNDERGROUND, where it hits
+/// the ground shell and reports a wall crossing no player could ever walk into. The tolerance used
+/// to be `self.step_up`; when the free step went from 0.45 to `res*tan(55 deg)` (0.714 at res 0.5)
+/// to stop stairs sealing, that silently loosened the sag by 59% and pushed the lowest ray under
+/// the floor — the simplifier alone then accounted for 40 of 52 reported crossings.
+const CHORD_SAG_MAX: f32 = 0.40;
+/// How far a straightened chord may ride ABOVE the floor. Riding high is how a legitimate
+/// step-over/stair reads, so this one tracks the free step; it is the sag that must stay pinned.
+#[inline]
+pub(crate) fn chord_rise_max(step_up: f32) -> f32 {
+    step_up.max(CHORD_SAG_MAX)
+}
+
 /// Per-CELL soft-avoidance cost (extra metres-equivalent added when the path enters the cell).
 /// XZ-only (a danger zone spans all floors above it). Built by [`NavGrid::build_avoid`] from
 /// danger points (boss/PMC/scav spawns); the A* takes it as an optional penalty layer, so paths
@@ -67,6 +101,11 @@ pub struct NavGrid {
     vault: f32,
     /// Free step-up height (stairs / curbs auto-stepped without a slope check) — Unity stepHeight.
     step_up: f32,
+    /// A* node-expansion ceiling. The old hard-coded 2,000,000 sat BELOW streets' 2,628,964
+    /// walkable nodes, so any search that had to sweep most of the map aborted and reported "no
+    /// route" for a pair that was merely far apart. Worse, it inverted A/B tests: relaxing an edge
+    /// rule ADDED reachable nodes, so the wavefront hit the cap sooner and scored WORSE.
+    expand_cap: u64,
     /// tan(max walkable incline). An up-move's rise/run above this is too STEEP to scale — the
     /// player would slide (Unity NavMesh maxSlope). Separates "walk a hill" from "scale a wall": a
     /// 1.2 m rise over a 1 m cell is 50° and now rejected, while a curb (<= step_up) still passes.
@@ -191,7 +230,15 @@ impl Scratch {
 ///     footprint erosion checked for floor beside a cell but never for a WALL next to it), and a
 ///     default bake resolution of 0.5 m. Zero wall crossings and zero illegal steps on the
 ///     self-check, against 14 and 1013 before.
-pub const BAKER_VERSION: u32 = 2;
+/// 3 = the free step became resolution-dependent (`free_step(res)` = res*tan(55 deg), 0.714 at the
+///     default 0.5 m) so stairs stop sealing; the clearance band starts above it instead of at the
+///     floor, which changes nav.bin's HEIGHTS; the capsule fan casts a sloped ray and is re-run
+///     after region pruning; `tri_box_overlap` stopped reporting false separations (it projected
+///     one fixed vertex pair for all three edges), which changes both the clearance deletions and
+///     `wall_cell`; the prune flood now applies the router's vault cap and diagonal rule; and
+///     `resolve_column` keeps the LOWEST k floors instead of the top k, which is the difference
+///     between having a street under a tall building and not.
+pub const BAKER_VERSION: u32 = 3;
 
 impl NavGrid {
     /// Load the nav grid from a directory holding nav.json + nav.bin (+ optional door/blk). Returns
@@ -206,7 +253,23 @@ impl NavGrid {
         let miss = f("miss").unwrap_or(-1.0e9) as f32;
         // Stale-data guard: a grid baked by older code loads perfectly and routes WRONGLY. Only the
         // version distinguishes the two, so report it at error level with the fix in the message.
-        let stale = !matches!(i("baker_version"), Some(v) if v as u32 == BAKER_VERSION);
+        // TWO discriminators, because the first one is only as good as the human who remembers
+        // to bump it. `step_up` is emitted by every baker from v3 on; a grid claiming v3 without it
+        // was written by a baker that predates the key, whatever its stamp says. This is not
+        // hypothetical: packs on disk carried v2 under two incompatible contracts (drop_max 0.38
+        // with no step_up, versus 0.714 with it) because the constant was never bumped while the
+        // output changed twice, and `step_up` then fell through to the pre-fix 0.45 default over a
+        // height field the new baker produced.
+        let version_ok = matches!(i("baker_version"), Some(v) if v as u32 == BAKER_VERSION);
+        let keys_ok = meta.get("step_up").is_some();
+        let stale = !version_ok || !keys_ok;
+        if version_ok && !keys_ok {
+            error!(
+                "nav data in {} claims baker_version {BAKER_VERSION} but omits `step_up` — it was                  written by an older baker. Re-bake with `atlas bake-nav {}`",
+                dir.display(),
+                dir.display()
+            );
+        }
         match i("baker_version") {
             Some(v) if v as u32 == BAKER_VERSION => {}
             other => error!(
@@ -224,6 +287,11 @@ impl NavGrid {
         // surface-recording slope (nav.json slope_max_deg, ~60). Env-overridable for A/B tuning.
         let step_up = env_f32("EFT_NAV_STEP").or_else(|| f("step_up").map(|v| v as f32)).unwrap_or(0.45);
         let slope_deg = env_f32("EFT_NAV_SLOPE").or_else(|| f("walk_slope_deg").map(|v| v as f32)).unwrap_or(45.0);
+        // Scale the ceiling to the grid so it bounds runaway searches without ever bounding a real
+        // one: 4x the node count leaves ample room for the multi-layer revisits A* makes.
+        let expand_cap = env_f32("EFT_NAV_EXPAND")
+            .map(|v| v as u64)
+            .unwrap_or_else(|| ((nx * nz * k) as u64).saturating_mul(4).max(8_000_000));
         let slope_tan = slope_deg.clamp(20.0, 70.0).to_radians().tan();
         let m = nx * nz * k;
 
@@ -273,7 +341,7 @@ impl NavGrid {
         );
         Some(NavGrid {
             min_x, min_z, res, nx, nz, k, stale, miss, climb, drop_max, vault, step_up, slope_tan,
-            h, door, blk, near_wall, wall_cell,
+            h, door, blk, near_wall, wall_cell, expand_cap,
             comp: std::sync::OnceLock::new(),
         })
     }
@@ -327,7 +395,11 @@ impl NavGrid {
     /// Test-only grid carrying just the walkability parameters, seeded exactly as `bake` writes
     /// them into nav.json (drop_max = climb, walk_slope_deg = agentSlope, vault = VAULT).
     #[cfg(test)]
-    pub fn test_grid(climb: f32, slope_deg: f32, vault: f32) -> NavGrid {
+    /// `step` is the router's free step-up AND its drop allowance — the pair that must match the
+    /// baker's `free_step(res)`. It is a PARAMETER rather than the old hardcoded 0.45 because that
+    /// constant is precisely what let the baker and the router diverge in production while this
+    /// grid's agreement test stayed green.
+    pub fn test_grid(climb: f32, slope_deg: f32, vault: f32, step: f32) -> NavGrid {
         NavGrid {
             min_x: 0.0,
             min_z: 0.0,
@@ -338,9 +410,10 @@ impl NavGrid {
             stale: false,
             miss: -1.0e9,
             climb,
-            drop_max: climb,
+            drop_max: step,
             vault,
-            step_up: 0.45,
+            step_up: step,
+            expand_cap: 8_000_000,
             slope_tan: slope_deg.clamp(20.0, 70.0).to_radians().tan(),
             h: vec![-1.0e9],
             door: vec![0],
@@ -395,6 +468,14 @@ impl NavGrid {
     /// Node count (nx*nz*K) — the size a `Scratch` must match.
     pub fn nodes(&self) -> usize {
         self.nx * self.nz * self.k
+    }
+
+    /// A reach in metres as a ring count for this grid's resolution. The snap radii are physical
+    /// distances ("how far away may the floor I am standing on be"), not grid counts, so they must
+    /// survive a change of `res`.
+    #[inline]
+    fn rings(&self, metres: f32) -> i64 {
+        (metres / self.res).ceil().max(1.0) as i64
     }
 
     /// Build a soft-avoidance cost field from danger points `(pos, radius_m)`. Cost per entered
@@ -682,8 +763,21 @@ impl NavGrid {
         let mut ciz = ((z - self.min_z) / self.res).round() as i64;
         cix = cix.clamp(0, self.nx as i64 - 1);
         ciz = ciz.clamp(0, self.nz as i64 - 1);
+        // Scored across ALL rings, not per-ring. This used to return the moment a ring held any
+        // floor, which made the `rad * 0.5` term in the score dead weight: a start whose own cell
+        // holds only a ramp/roof surface snapped THERE, however far above it, instead of stepping
+        // one ring out to the ground it was actually standing on. On streets that put player
+        // spawns at y = 0.6 onto a rooftop island 21 m up (cell 677,628 holds one floor, 21.79,
+        // while the cell two along holds 0.55), which read as "the spawn cannot reach anything".
+        let (mut bc, mut bl, mut bd) = (-1i64, -1i64, f64::MAX);
         for rad in 0..=max_cells {
-            let (mut bc, mut bl, mut bd) = (-1i64, -1i64, f64::MAX);
+            // Every candidate in this ring or beyond scores at least `rad * 0.5` (the height term
+            // cannot be negative), so once the best is already better than that, nothing further
+            // out can win and the spiral can stop. Keeps the old early exit's cost in the common
+            // case where the start is standing on the right floor.
+            if bc >= 0 && bd <= rad as f64 * 0.5 {
+                break;
+            }
             for dz in -rad..=rad {
                 for dx in -rad..=rad {
                     if rad > 0 && dx.abs().max(dz.abs()) != rad {
@@ -708,15 +802,84 @@ impl NavGrid {
                     }
                 }
             }
-            if bc >= 0 {
-                return Some((bc as usize, bl as usize));
+        }
+        (bc >= 0).then(|| (bc as usize, bl as usize))
+    }
+
+    /// Snap a DESTINATION onto the nearest walkable cell+layer, preferring one that shares
+    /// `want_comp` (the start's component) so the route ends somewhere actually reachable.
+    ///
+    /// The start has had a spiral snap + island rescue for a long time; the destination had none —
+    /// `cell_of` took the single authored cell and gave up. That is fine for a point a human just
+    /// clicked on visible floor, and wrong for every authored destination in the game, because an
+    /// exfil is a TRIGGER VOLUME whose recorded `pos` is the volume centre. On streets that centre
+    /// lands: on no floor at all (E5, Exit_E10_coop — 0 walkable layers in the cell), or on a
+    /// 166-node ledge island beside the real doorway (E4). Both were unroutable from EVERY spawn on
+    /// the map, and read as "the pathfinder is broken" rather than "the target is a volume".
+    ///
+    /// Two passes on purpose: take the best cell in the start's own component if one exists within
+    /// the radius, and only fall back to nearest-walkable-anything if it does not. Preferring
+    /// proximity alone would keep choosing the same unreachable ledge.
+    fn snap_dest(
+        &self,
+        b: Vec3,
+        want_comp: Option<u32>,
+        max_cells: i64,
+    ) -> Option<(usize, usize)> {
+        let cix = (((b.x - self.min_x) / self.res).round() as i64).clamp(0, self.nx as i64 - 1);
+        let ciz = (((b.z - self.min_z) / self.res).round() as i64).clamp(0, self.nz as i64 - 1);
+        let comps = want_comp.map(|_| self.comps());
+        let mut fallback: Option<(usize, usize)> = None;
+        // Global best across rings, for the same reason as `snap_start` — an exfil volume's centre
+        // routinely sits over a ledge or a roof slab, and taking the first ring that holds any
+        // floor picks that slab over the doorway one ring further out.
+        let (mut bc, mut bl, mut bd) = (-1i64, -1i64, f64::MAX);
+        for rad in 0..=max_cells {
+            if bc >= 0 && bd <= rad as f64 * 0.25 {
+                break;
+            }
+            for dz in -rad..=rad {
+                for dx in -rad..=rad {
+                    if rad > 0 && dx.abs().max(dz.abs()) != rad {
+                        continue; // ring only
+                    }
+                    let (jx, jz) = (cix + dx, ciz + dz);
+                    if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                        continue;
+                    }
+                    let c = (jz * self.nx as i64 + jx) as usize;
+                    for l in 0..self.k {
+                        let hh = self.h[c * self.k + l];
+                        if hh <= self.miss * 0.5 {
+                            break;
+                        }
+                        // Rank by vertical error first, ring distance second — an exfil volume is
+                        // wide and shallow, so the right floor matters more than the right cell.
+                        let d = (hh - b.y).abs() as f64 + rad as f64 * 0.25;
+                        let in_comp = match (&comps, want_comp) {
+                            (Some(cm), Some(w)) => cm[c * self.k + l] == w,
+                            _ => true,
+                        };
+                        if in_comp && d < bd {
+                            bd = d;
+                            bc = c as i64;
+                            bl = l as i64;
+                        }
+                        if fallback.is_none() {
+                            fallback = Some((c, l));
+                        }
+                    }
+                }
             }
         }
-        None
+        if bc >= 0 {
+            return Some((bc as usize, bl as usize));
+        }
+        fallback
     }
 
     #[inline]
-    fn node_pos(&self, node: usize) -> Vec3 {
+    pub fn node_pos(&self, node: usize) -> Vec3 {
         let c = node / self.k;
         let l = node % self.k;
         Vec3::new(
@@ -828,8 +991,21 @@ impl NavGrid {
         let mut ciz = ((z - self.min_z) / self.res).round() as i64;
         cix = cix.clamp(0, self.nx as i64 - 1);
         ciz = ciz.clamp(0, self.nz as i64 - 1);
+        // Scored across ALL rings, exactly like `snap_start` and `snap_dest`. This was the THIRD
+        // copy of the same defect and the one that got missed when the other two were fixed: with
+        // the accumulator declared inside `for rad`, the `+ rad * 0.5` term added an identical
+        // constant to every candidate it actually compared, so it was provably dead and the
+        // function returned the first ring holding ANY node of `want` rather than the nearest one
+        // by height. Measured on shipped data: streets 406 of 3,114 rescued starts (13%) picked a
+        // different node, 319 of them more than a storey off; interchange 737 of 3,852 (19%).
+        // That never turns a route into a failure, but it plants the polyline's first vertex a
+        // storey above the player, under-reports the leg, and opens a >JOIN_TOL gap that makes
+        // `chain` break and the planner drop the stop as unreachable.
+        let (mut bc, mut bl, mut bd) = (-1i64, -1i64, f64::MAX);
         for rad in 0..=max_cells {
-            let (mut bc, mut bl, mut bd) = (-1i64, -1i64, f64::MAX);
+            if bc >= 0 && bd <= rad as f64 * 0.5 {
+                break; // nothing further out can beat this
+            }
             for dz in -rad..=rad {
                 for dx in -rad..=rad {
                     if rad > 0 && dx.abs().max(dz.abs()) != rad {
@@ -857,11 +1033,8 @@ impl NavGrid {
                     }
                 }
             }
-            if bc >= 0 {
-                return Some((bc as usize, bl as usize));
-            }
         }
-        None
+        (bc >= 0).then(|| (bc as usize, bl as usize))
     }
 
     fn astar(
@@ -916,8 +1089,12 @@ impl NavGrid {
                 tr.push((self.node_pos(cur), s.g[cur])); // record the wavefront for the live search viz
             }
             expanded += 1;
-            if expanded > 2_000_000 {
-                warn!("nav: A* expansion cap hit");
+            if expanded > self.expand_cap {
+                warn!(
+                    "nav: A* expansion cap hit ({} nodes) — reporting NO ROUTE for a pair that may \
+                     well be connected; raise EFT_NAV_EXPAND if this fires on a real map",
+                    self.expand_cap
+                );
                 break;
             }
             let c = cur / k;
@@ -996,7 +1173,7 @@ impl NavGrid {
     /// One bounded flood lets a planner test reachability/distance of MANY points without ever
     /// paying an exhaustive failed A* per unreachable point. Returns false if the start won't snap.
     pub fn dijkstra_field(&self, from: Vec3, g_limit: f32, s: &mut Scratch) -> bool {
-        let Some((sc, sl)) = self.snap_start(from.x, from.y, from.z, 16) else {
+        let Some((sc, sl)) = self.snap_start(from.x, from.y, from.z, self.rings(START_SNAP_M)) else {
             return false;
         };
         let k = self.k;
@@ -1066,26 +1243,213 @@ impl NavGrid {
         true
     }
 
+    /// Label every walkable node with a connected-component id, using EXACTLY the router's own
+    /// expansion rule (`blk` mask, `walkable_step`, strict `diag_ok`, forced door edges). Returns
+    /// `(label_per_node, size_per_component)`; nodes with no floor get `-1`.
+    ///
+    /// This is the diagnostic reachability actually needs. "Spawn cannot reach extract" has two
+    /// completely different causes — the spawn never snapped onto the mesh, or it snapped into a
+    /// SEALED ISLAND — and only a component map tells them apart. Guessing between them is what
+    /// made earlier passes at this chase the wrong knob.
+    pub fn components(&self) -> (Vec<i32>, Vec<u32>) {
+        let k = self.k;
+        let (nx, nz) = (self.nx as i64, self.nz as i64);
+        let mut label = vec![-1i32; self.h.len()];
+        let mut sizes: Vec<u32> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        for c in 0..(self.nx * self.nz) {
+            for l in 0..k {
+                let n = c * k + l;
+                if self.h[n] <= self.miss * 0.5 || label[n] >= 0 {
+                    continue;
+                }
+                let id = sizes.len() as i32;
+                let mut count = 0u32;
+                label[n] = id;
+                stack.push(n);
+                while let Some(cur) = stack.pop() {
+                    count += 1;
+                    let (cc, cl) = (cur / k, cur % k);
+                    let (ix, iz) = ((cc % self.nx) as i64, (cc / self.nx) as i64);
+                    let h_cur = self.h_lay(cc, cl);
+                    let blk_c = self.blk[cur];
+                    for d in 0..8 {
+                        let (dx, dz) = (NB[d].0 as i64, NB[d].1 as i64);
+                        let (jx, jz) = (ix + dx, iz + dz);
+                        if jx < 0 || jz < 0 || jx >= nx || jz >= nz {
+                            continue;
+                        }
+                        let nc = (jz * nx + jx) as usize;
+                        let nl = self.best_layer(nc, h_cur);
+                        if nl < 0 {
+                            continue;
+                        }
+                        let nl = nl as usize;
+                        let up = self.h_lay(nc, nl) - h_cur;
+                        let forced = self.door[cc] == 1 || self.door[nc] == 1;
+                        if !forced && (blk_c >> d) & 1 != 0 {
+                            continue;
+                        }
+                        let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                        if !self.walkable_step(up, horiz, forced) {
+                            continue;
+                        }
+                        if dx != 0 && dz != 0 && !forced && !self.diag_ok(ix, iz, h_cur, blk_c, d) {
+                            continue;
+                        }
+                        let nn = nc * k + nl;
+                        if label[nn] < 0 {
+                            label[nn] = id;
+                            stack.push(nn);
+                        }
+                    }
+                }
+                sizes.push(count);
+            }
+        }
+        (label, sizes)
+    }
+
+}
+
+/// Why an island's boundary edges were refused, and where. An island is only actionable once you
+/// know what seals it: a wall mask bit, a height the agent cannot take, or a diagonal corner rule.
+#[derive(Default)]
+pub struct BoundaryReport {
+    /// Edge refused by the baked capsule mask (`blk`) — geometry the player cannot pass.
+    pub wall: usize,
+    /// Edge refused by the step rule — too tall to climb or too far to drop.
+    pub step: usize,
+    /// Edge refused by the strict diagonal corner-cut rule.
+    pub diag: usize,
+    /// Smallest rise among the STEP refusals, i.e. how much extra climb would open this island.
+    pub min_up: f32,
+    /// Smallest drop among the STEP refusals.
+    pub min_down: f32,
+    /// (from, to, reason, rise) samples for eyeballing in the viewer.
+    pub examples: Vec<(Vec3, Vec3, &'static str, f32)>,
+}
+
+impl NavGrid {
+    /// Classify every edge leaving component `id` that lands on a floor in a DIFFERENT component.
+    ///
+    /// This is the question "why is this island sealed" asked of the grid itself rather than
+    /// inferred from a failed route, and it distinguishes the three causes that need three
+    /// different fixes: `wall` means the capsule pass found real geometry (correct, leave it),
+    /// `step` means the island is a climb away (an agent-limit or resolution problem), `diag`
+    /// means only the corner rule stands between them.
+    pub fn island_boundary(&self, label: &[i32], id: i32, max_examples: usize) -> BoundaryReport {
+        let mut r = BoundaryReport {
+            min_up: f32::MAX,
+            min_down: f32::MAX,
+            ..Default::default()
+        };
+        let k = self.k;
+        let (nx, nz) = (self.nx as i64, self.nz as i64);
+        for (n, &lb) in label.iter().enumerate() {
+            if lb != id {
+                continue;
+            }
+            let (c, l) = (n / k, n % k);
+            let (ix, iz) = ((c % self.nx) as i64, (c / self.nx) as i64);
+            let h_cur = self.h_lay(c, l);
+            let blk_c = self.blk[n];
+            for d in 0..8 {
+                let (dx, dz) = (NB[d].0 as i64, NB[d].1 as i64);
+                let (jx, jz) = (ix + dx, iz + dz);
+                if jx < 0 || jz < 0 || jx >= nx || jz >= nz {
+                    continue;
+                }
+                let nc = (jz * nx + jx) as usize;
+                let nl = self.best_layer(nc, h_cur);
+                if nl < 0 {
+                    continue; // no floor next door: an edge of the world, not a seal
+                }
+                let nl = nl as usize;
+                let nn = nc * k + nl;
+                if label[nn] == id || label[nn] < 0 {
+                    continue; // same island, or not walkable
+                }
+                let up = self.h_lay(nc, nl) - h_cur;
+                let forced = self.door[c] == 1 || self.door[nc] == 1;
+                let horiz = ((dx * dx + dz * dz) as f32).sqrt() * self.res;
+                let reason = if !forced && (blk_c >> d) & 1 != 0 {
+                    r.wall += 1;
+                    "wall"
+                } else if !self.walkable_step(up, horiz, forced) {
+                    r.step += 1;
+                    if up >= 0.0 {
+                        r.min_up = r.min_up.min(up);
+                    } else {
+                        r.min_down = r.min_down.min(-up);
+                    }
+                    "step"
+                } else if dx != 0 && dz != 0 && !forced && !self.diag_ok(ix, iz, h_cur, blk_c, d) {
+                    r.diag += 1;
+                    "diag"
+                } else {
+                    continue; // passable, so the two are the same component after all
+                };
+                if r.examples.len() < max_examples {
+                    r.examples.push((self.node_pos(n), self.node_pos(nn), reason, up));
+                }
+            }
+        }
+        if r.min_up == f32::MAX {
+            r.min_up = 0.0;
+        }
+        if r.min_down == f32::MAX {
+            r.min_down = 0.0;
+        }
+        r
+    }
+}
+
+impl NavGrid {
+    /// Component id under a world point, using the same spiral snap the router starts with, so a
+    /// report about a spawn describes the node the router would ACTUALLY have used.
+    pub fn component_at(&self, label: &[i32], p: Vec3) -> Option<i32> {
+        let (c, l) = self.snap_start(p.x, p.y, p.z, self.rings(START_SNAP_M))?;
+        label.get(c * self.k + l).copied().filter(|&v| v >= 0)
+    }
+
     /// Walkable distance to `pos` read from a [`Self::dijkstra_field`] in `s` — None if `pos`
-    /// wasn't reached (unreachable, or beyond the flood's g_limit). Checks every layer of the
-    /// cell and its 3x3 ring (seam/shelf tolerance), keeping the best stamped g.
+    /// wasn't reached (unreachable, or beyond the flood's g_limit).
+    ///
+    /// The search radius must match what `path` would accept as a destination, because this is the
+    /// planner's ONLY reachability gate: a candidate this returns None for is deleted before any
+    /// A* runs. It used to probe a hard-coded 3x3 ring — at res 0.5 that is ±0.5 m, against the
+    /// 24-cell (12 m) spiral `snap_dest` uses — so the planner discarded points `path` routes to
+    /// perfectly well. On streets that is ~10% of containers and two exfils whose recorded centre
+    /// is a trigger volume with no floor in its own cell.
     pub fn field_dist(&self, s: &Scratch, pos: Vec3) -> Option<f32> {
         let gen = s.gen;
         let (cx, cz) = self.cell_of_xz(pos.x, pos.z);
         let mut best: Option<f32> = None;
-        for dz in -1..=1i64 {
-            for dx in -1..=1i64 {
-                let (jx, jz) = (cx + dx, cz + dz);
-                if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
-                    continue;
-                }
-                let c = (jz * self.nx as i64 + jx) as usize;
-                for l in 0..self.k {
-                    let n = c * self.k + l;
-                    if s.open_gen[n] == gen && best.is_none_or(|b| s.g[n] < b) {
-                        best = Some(s.g[n]);
+        // Same reach as `snap_dest`'s spiral. Widening rings, stopping at the first that yields a
+        // stamped node: nearest-reached wins, and an unreachable point still costs only the empty
+        // rings rather than a full scan.
+        for rad in 0..=self.rings(DEST_SNAP_M) {
+            for dz in -rad..=rad {
+                for dx in -rad..=rad {
+                    if rad > 0 && dx.abs().max(dz.abs()) != rad {
+                        continue; // ring only
+                    }
+                    let (jx, jz) = (cx + dx, cz + dz);
+                    if jx < 0 || jz < 0 || jx >= self.nx as i64 || jz >= self.nz as i64 {
+                        continue;
+                    }
+                    let c = (jz * self.nx as i64 + jx) as usize;
+                    for l in 0..self.k {
+                        let n = c * self.k + l;
+                        if s.open_gen[n] == gen && best.is_none_or(|b| s.g[n] < b) {
+                            best = Some(s.g[n]);
+                        }
                     }
                 }
+            }
+            if best.is_some() {
+                return best;
             }
         }
         best
@@ -1159,10 +1523,12 @@ impl NavGrid {
         };
         let dy = b.y - a.y;
         // How far the drawn chord may sit off the real floor before it's "floating". Kept TIGHT
-        // (a free step) so the chord hugs the ground: a straight span is only accepted where it
-        // tracks the floor within a step, which also keeps stairs from flattening into a ramp that
-        // floats up past the wall_cell body band and clips a ledge/rail the mask can't see.
-        let float_tol = self.step_up;
+        // so the chord hugs the ground: a straight span is only accepted where it tracks the floor,
+        // which also keeps stairs from flattening into a ramp that floats up past the wall_cell
+        // body band and clips a ledge/rail the mask can't see. See CHORD_SAG_MAX for why the two
+        // directions do NOT share a tolerance.
+        let sag_tol = CHORD_SAG_MAX;
+        let rise_tol = chord_rise_max(self.step_up);
         let max_steps = (du.abs() + dw.abs()) as usize + 4;
         let mut guard = 0usize;
         loop {
@@ -1248,8 +1614,13 @@ impl NavGrid {
                 return false; // a true riser/drop across this edge — can't straighten through it
             }
             let y_interp = a.y + dy * t_at.clamp(0.0, 1.0);
-            if (new_floor - y_interp).abs() > float_tol {
-                return false; // the chord would float off the floor here
+            // ASYMMETRIC on purpose. `new_floor - y_interp > 0` means the floor is above the drawn
+            // line, i.e. the chord SAGS into the ground — that is the direction that puts the
+            // acceptance ray underground, so it is held to CHORD_SAG_MAX regardless of step_up.
+            // The other direction (riding above the floor) is what a real step-over looks like.
+            let off = new_floor - y_interp;
+            if off > sag_tol || -off > rise_tol {
+                return false; // the chord would sink into / float off the floor here
             }
             cur_cell = new_cell;
             cur_layer = nnl;
@@ -1288,21 +1659,15 @@ impl NavGrid {
     /// simplification for a->b (or None). Lets the machine proof attribute wall-crossings to the
     /// A* connectivity (raw) vs the simplifier (simplified).
     pub fn route_debug(&self, a: Vec3, b: Vec3, s: &mut Scratch) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
-        let (sc, sl) = self.snap_start(a.x, a.y, a.z, 16)?;
-        let mut dc = self.cell_of(b.x, b.z);
-        if dc < 0 {
-            let cix = (((b.x - self.min_x) / self.res).round() as i64).clamp(0, self.nx as i64 - 1);
-            let ciz = (((b.z - self.min_z) / self.res).round() as i64).clamp(0, self.nz as i64 - 1);
-            dc = ciz * self.nx as i64 + cix;
-        }
-        let dc = dc as usize;
-        for dl in self.layers_by_height(dc, b.y) {
-            if let Some(path) = self.astar(sc, sl, dc, dl, s, None, &mut None) {
-                let simp = self.simplify_route(&path);
-                return Some((path, simp));
-            }
-        }
-        None
+        // A WRAPPER, not a third copy. This was the same defect as `path_traced`: snap the start,
+        // try the destination's layers, give up — none of `path_inner`'s island rescue or
+        // destination re-snap. It matters more here than it looks, because this function is what
+        // the bake self-check routes its AFTER legs with, while the BEFORE legs go through the
+        // full `path`. The headline "routed AFTER n / BEFORE m" was therefore comparing two
+        // different routers and understating the shipped one (measured: interchange 182 vs 247 of
+        // 256), and the wall/floor/ledge assertions were being taken over a strict subset of the
+        // routes the viewer actually draws.
+        self.path_inner(a, b, s, None, &mut None).map(|(raw, simp, _, _)| (raw, simp))
     }
 
     /// Test/bake-only: zero the wall block mask + clearance + wall-cell fields to reproduce OLD
@@ -1328,52 +1693,7 @@ impl NavGrid {
         s: &mut Scratch,
         avoid: Option<&AvoidMap>,
     ) -> Option<(Vec<Vec3>, f32)> {
-        let (sc, sl) = self.snap_start(a.x, a.y, a.z, 16)?;
-        let mut dc = self.cell_of(b.x, b.z);
-        if dc < 0 {
-            // dest off-grid: clamp XZ into the grid
-            let cix = (((b.x - self.min_x) / self.res).round() as i64).clamp(0, self.nx as i64 - 1);
-            let ciz = (((b.z - self.min_z) / self.res).round() as i64).clamp(0, self.nz as i64 - 1);
-            dc = ciz * self.nx as i64 + cix;
-        }
-        let dc = dc as usize;
-        // ISLAND RESCUE: the 1 m grid over-blocks (a capsule fan seals every edge within a player
-        // radius of a wall), so a start can land in a sealed pocket from which NOTHING is
-        // reachable -- the user sees "no walkable path found" for every destination at once. If the
-        // plain start cannot reach a dest layer, re-snap the start to the nearest cell that is
-        // actually in that layer's component and retry, rather than reporting failure.
-        let dls = self.layers_by_height(dc, b.y);
-        for &dl in &dls {
-            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, &mut None) {
-                // Report the length of the SIMPLIFIED polyline (what actually gets drawn + walked),
-                // not the raw 8-connected staircase: the staircase over-measures a diagonal-ish leg
-                // by the grid metrication error (~up to 8%). Simplifying first makes the displayed
-                // metres match the drawn line and the true walked distance. The wall-aware pull
-                // guarantees the drawn chords never cut through a wall the cell path avoided.
-                let simp = self.simplify_route(&path);
-                let dist = polyline_len(&simp);
-                return Some((simp, dist));
-            }
-        }
-        // Second pass: step the start out of its island into the destination's component.
-        let comps = self.comps();
-        for &dl in &dls {
-            let want = comps[dc * self.k + dl];
-            if want == comps[sc * self.k + sl] {
-                continue; // same component and A* already failed -- genuinely blocked
-            }
-            // 24 cells ~ 24 m at 1 m res: enough to leave a pocket, small enough that the start
-            // never teleports across the map.
-            let Some((sc2, sl2)) = self.snap_start_in(a.x, a.y, a.z, 24, Some(want)) else {
-                continue;
-            };
-            if let Some(path) = self.astar(sc2, sl2, dc, dl, s, avoid, &mut None) {
-                let simp = self.simplify_route(&path);
-                let dist = polyline_len(&simp);
-                return Some((simp, dist));
-            }
-        }
-        None
+        self.path_inner(a, b, s, avoid, &mut None).map(|(_, poly, d, _)| (poly, d))
     }
 
     /// Like `path`, but ALSO records the A* wavefront (every closed node's position + g-distance),
@@ -1387,26 +1707,98 @@ impl NavGrid {
         avoid: Option<&AvoidMap>,
         max_trace: usize,
     ) -> Option<(Vec<Vec3>, f32, Vec<(Vec3, f32)>)> {
-        let (sc, sl) = self.snap_start(a.x, a.y, a.z, 16)?;
+        let (_, poly, dist, mut tr) = self.path_inner(a, b, s, avoid, &mut Some(Vec::new()))?;
+        // Down-sample the wavefront (keeps g-order) so the animated draw stays cheap.
+        if max_trace > 0 && tr.len() > max_trace {
+            let stride = tr.len() / max_trace + 1;
+            tr = tr.into_iter().step_by(stride).collect();
+        }
+        Some((poly, dist, tr))
+    }
+
+    /// The ONE routing implementation. `path` and `path_traced` are thin wrappers over it.
+    ///
+    /// They used to be two near-copies, and the copy drifted: `path` grew an island rescue and a
+    /// destination re-snap while `path_traced` kept only the first pass. Turning "visualize search"
+    /// on therefore silently downgraded the router, and any exfil whose recorded point is a trigger
+    /// VOLUME centre rather than a spot on the floor became unreachable — on interchange, Railway
+    /// Exfil failed from a roof that Saferoom routed from fine. The visualization is a drawing
+    /// option; it has no business changing which routes exist, so there is now nothing to keep in
+    /// sync.
+    fn path_inner(
+        &self,
+        a: Vec3,
+        b: Vec3,
+        s: &mut Scratch,
+        avoid: Option<&AvoidMap>,
+        trace: &mut Option<Vec<(Vec3, f32)>>,
+    ) -> Option<(Vec<Vec3>, Vec<Vec3>, f32, Vec<(Vec3, f32)>)> {
+        // Each pass re-floods from scratch, so the recorded wavefront must be reset before every
+        // attempt: otherwise a failed first pass leaves its dead-end flood stitched in front of the
+        // successful one and the animation shows a search that never happened.
+        let mut fresh = |t: &mut Option<Vec<(Vec3, f32)>>| {
+            if let Some(v) = t.as_mut() {
+                v.clear();
+            }
+        };
+        let (sc, sl) = self.snap_start(a.x, a.y, a.z, self.rings(START_SNAP_M))?;
         let mut dc = self.cell_of(b.x, b.z);
         if dc < 0 {
+            // dest off-grid: clamp XZ into the grid
             let cix = (((b.x - self.min_x) / self.res).round() as i64).clamp(0, self.nx as i64 - 1);
             let ciz = (((b.z - self.min_z) / self.res).round() as i64).clamp(0, self.nz as i64 - 1);
             dc = ciz * self.nx as i64 + cix;
         }
         let dc = dc as usize;
-        for dl in self.layers_by_height(dc, b.y) {
-            let mut trace: Option<Vec<(Vec3, f32)>> = Some(Vec::new());
-            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, &mut trace) {
-                let simp = self.simplify_route(&path);
-                let dist = polyline_len(&simp);
-                let mut tr = trace.unwrap_or_default();
-                // Down-sample the wavefront (keeps g-order) so the animated draw stays cheap.
-                if max_trace > 0 && tr.len() > max_trace {
-                    let stride = tr.len() / max_trace + 1;
-                    tr = tr.into_iter().step_by(stride).collect();
+        // Report the length of the SIMPLIFIED polyline (what actually gets drawn + walked), not the
+        // raw 8-connected staircase: the staircase over-measures a diagonal-ish leg by the grid
+        // metrication error (~up to 8%). Simplifying first makes the displayed metres match the
+        // drawn line and the true walked distance. The wall-aware pull guarantees the drawn chords
+        // never cut through a wall the cell path avoided.
+        let done = |me: &Self, path: Vec<Vec3>, t: &mut Option<Vec<(Vec3, f32)>>| {
+            let simp = me.simplify_route(&path);
+            let dist = polyline_len(&simp);
+            (path, simp, dist, t.take().unwrap_or_default())
+        };
+        // ISLAND RESCUE: the 1 m grid over-blocks (a capsule fan seals every edge within a player
+        // radius of a wall), so a start can land in a sealed pocket from which NOTHING is
+        // reachable -- the user sees "no walkable path found" for every destination at once. If the
+        // plain start cannot reach a dest layer, re-snap the start to the nearest cell that is
+        // actually in that layer's component and retry, rather than reporting failure.
+        let dls = self.layers_by_height(dc, b.y);
+        for &dl in &dls {
+            fresh(trace);
+            if let Some(path) = self.astar(sc, sl, dc, dl, s, avoid, trace) {
+                return Some(done(self, path, trace));
+            }
+        }
+        // Second pass: step the start out of its island into the destination's component.
+        let comps = self.comps();
+        for &dl in &dls {
+            let want = comps[dc * self.k + dl];
+            if want == comps[sc * self.k + sl] {
+                continue; // same component and A* already failed -- genuinely blocked
+            }
+            // RESCUE_SNAP_M, converted for this grid's resolution.
+            let Some((sc2, sl2)) = self.snap_start_in(a.x, a.y, a.z, self.rings(RESCUE_SNAP_M), Some(want)) else {
+                continue;
+            };
+            fresh(trace);
+            if let Some(path) = self.astar(sc2, sl2, dc, dl, s, avoid, trace) {
+                return Some(done(self, path, trace));
+            }
+        }
+        // THIRD pass: re-snap the DESTINATION. Everything above assumes the authored point sits on
+        // a floor you can stand on; an exfil is a trigger volume, so its centre routinely does not.
+        // Search outward for a walkable cell in the START's component: that is the difference
+        // between "this exfil is unreachable from all 241 spawns" and "the doorway is 3 m north".
+        let start_comp = comps[sc * self.k + sl];
+        if let Some((dc2, dl2)) = self.snap_dest(b, Some(start_comp), self.rings(DEST_SNAP_M)) {
+            if dc2 * self.k + dl2 != dc * self.k + dls.first().copied().unwrap_or(0) {
+                fresh(trace);
+                if let Some(path) = self.astar(sc, sl, dc2, dl2, s, avoid, trace) {
+                    return Some(done(self, path, trace));
                 }
-                return Some((simp, dist, tr));
             }
         }
         None
