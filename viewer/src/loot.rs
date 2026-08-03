@@ -31,6 +31,7 @@ impl Plugin for LootPlugin {
         // has early-returns): a new pack may have no loot.json, so its markers must clear regardless.
         // Also re-run when the container->model match lands (LootModelIndex arrives AFTER the async
         // geometry build), so markers upgrade from box to model-glow without a map swap.
+        app.init_resource::<LootMarkersRespawned>();
         app.init_resource::<LootGlowState>().add_systems(
             Update,
             (teardown_loot, spawn_loot)
@@ -46,6 +47,20 @@ impl Plugin for LootPlugin {
         );
     }
 }
+
+/// Set by `spawn_loot` whenever markers are (re)created, cleared by `apply_loot_visibility`
+/// once it has actually applied them. The exact analogue of `PoiMarkersRespawned`, which the loot
+/// side was missing.
+///
+/// It cannot be replaced by a gate condition. `loot_needs_rebuild` fires on
+/// `index.is_some_and(|i| i.is_changed())`, and `LootModelIndex` is inserted by the async geometry
+/// build HUNDREDS of frames after the `MapEpoch` bump. On that frame every marker is despawned and
+/// respawned, while `apply_loot_visibility` sees an unchanged epoch, unchanged toggles and (for a
+/// still camera) no movement, so it early-returns and every active filter -- a class you unticked,
+/// a min-value, the master `noloot` -- is silently discarded until you touch a control. Nothing
+/// observable at the gate distinguishes that frame; only a latch set by the spawner does.
+#[derive(Resource, Default)]
+pub struct LootMarkersRespawned(pub bool);
 
 fn loot_needs_rebuild(
     epoch: Res<crate::render::MapEpoch>,
@@ -329,12 +344,16 @@ pub(crate) fn resolve_loot_json(pack_root: Option<&std::path::Path>) -> Option<P
 }
 
 pub(crate) fn spawn_loot(
+    mut respawned: ResMut<LootMarkersRespawned>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     pack: Option<Res<LoadedPack>>,
     model_index: Option<Res<LootModelIndex>>,
 ) {
+    // Tell the visibility pass that markers are new, even though nothing it can observe
+    // changed this frame (see LootMarkersRespawned).
+    respawned.0 = true;
     // AUTHORITATIVE set: the game's own LootableContainers from the pack's gamedata. tarkov.dev
     // (loot.json) is loaded below as optional ENRICHMENT only — it prices and classifies, it
     // never adds or removes a marker (its stale entries both missed real containers and placed

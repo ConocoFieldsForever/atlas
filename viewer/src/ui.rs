@@ -693,6 +693,7 @@ fn teardown_ui(mut plan: ResMut<PlanList>) {
 pub(crate) fn apply_loot_visibility(
     toggles: Res<LayerToggles>,
     epoch: Res<crate::render::MapEpoch>,
+    mut respawned: ResMut<crate::loot::LootMarkersRespawned>,
     cam: Query<&GlobalTransform, With<crate::render::CullCamera>>,
     mut last_cam: Local<Vec3>,
     mut q: Query<(
@@ -703,29 +704,75 @@ pub(crate) fn apply_loot_visibility(
         &mut Visibility,
     )>,
 ) {
-    // Re-apply on a toggle change, a map swap (fresh markers spawn Hidden and the swap didn't
-    // touch the toggles) or — with clustering on — when the camera actually MOVED; a static
-    // camera with stable toggles recomputes an identical result, so skip the whole pass.
+    // Re-apply on a RESPAWN (see LootMarkersRespawned — the markers are new but nothing else
+    // changed, which is the frame the async model index lands on), a toggle change, a map swap, or
+    // — with clustering on — when the camera actually MOVED; a static camera with stable toggles
+    // recomputes an identical result, so skip the whole pass.
+    //
+    // The old comment here said "fresh markers spawn Hidden". That was copied from the POI side and
+    // is false for loot: `spawn_loot` uses `Visibility::default()`, i.e. Inherited, so a discarded
+    // filter shows every marker rather than none.
     let camera = cam.single().ok().map(|t| t.translation()).unwrap_or(Vec3::ZERO);
     let moved = camera.distance_squared(*last_cam) > 0.25;
-    if !toggles.is_changed() && !epoch.is_changed() && !(toggles.cluster_dense && moved) {
+    if !respawned.0
+        && !toggles.is_changed()
+        && !epoch.is_changed()
+        && !(toggles.cluster_dense && moved)
+    {
         return;
     }
+    respawned.0 = false;
     *last_cam = camera;
+
+    // Pre-score each declutter cell by VALUE, so the survivor is the marker worth seeing. This is
+    // the same fix poi.rs got for its own marker set; the loot half kept `occupied.insert(...)`,
+    // which hands the cell to whichever entity the query happened to iterate first. Measured on
+    // interchange: a 26,240 weapon box beaten by a 3,200 ammo box in the same cell, invisible past
+    // 140 m and un-pickable with it (inspect gates on InheritedVisibility). Streets has 211 such
+    // cells. Only same-class markers contend, because the key hashes the class.
+    use std::hash::{Hash, Hasher};
+    let cell_of = |p: Vec3, camera: Vec3| -> f32 {
+        let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
+        if distance > 320.0 {
+            35.0
+        } else if distance > 140.0 {
+            14.0
+        } else {
+            0.0
+        }
+    };
+    let key_of = |cls: &str, p: Vec3, cell: f32| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        cls.hash(&mut h);
+        (h.finish(), (p.x / cell).floor() as i32, (p.z / cell).floor() as i32)
+    };
+    let mut best: std::collections::HashMap<(u64, i32, i32), i64> = Default::default();
+    if toggles.cluster_dense {
+        for (cls, val, gt, dense, _) in q.iter() {
+            if dense.is_none() || vis_for(&toggles, &cls.0, val) != Visibility::Visible {
+                continue;
+            }
+            let p = gt.translation();
+            let cell = cell_of(p, camera);
+            if cell > 0.0 {
+                let v = val.map(|v| v.0).unwrap_or(0);
+                let e = best.entry(key_of(&cls.0, p, cell)).or_insert(i64::MIN);
+                *e = (*e).max(v);
+            }
+        }
+    }
     let mut occupied = std::collections::HashSet::new();
     for (cls, val, gt, dense, mut vis) in &mut q {
         let mut shown = vis_for(&toggles, &cls.0, val) == Visibility::Visible;
         if shown && toggles.cluster_dense && dense.is_some() {
             let p = gt.translation();
-            let distance = Vec2::new(p.x - camera.x, p.z - camera.z).length();
-            let cell = if distance > 320.0 { 35.0 } else if distance > 140.0 { 14.0 } else { 0.0 };
+            let cell = cell_of(p, camera);
             if cell > 0.0 {
-                // Hash the class NAME instead of cloning it — the old `cls.0.clone()` allocated
-                // a String per marker per frame (1.3k/frame on streets) just to key this set.
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                cls.0.hash(&mut h);
-                shown = occupied.insert((h.finish(), (p.x / cell).floor() as i32, (p.z / cell).floor() as i32));
+                // Win the cell only if nothing more valuable wants it. `occupied` still runs, so
+                // ties resolve to one marker rather than showing every equal-valued one.
+                let key = key_of(&cls.0, p, cell);
+                let v = val.map(|x| x.0).unwrap_or(0);
+                shown = best.get(&key).is_none_or(|bv| v >= *bv) && occupied.insert(key);
             }
         }
         // Write only on a real flip — unconditional writes mark every marker changed every
