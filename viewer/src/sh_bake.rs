@@ -667,6 +667,17 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         //     --indirect-only (they render as real-time direct lights instead). ---
         if !indirect_only {
             for lgt in lights {
+                // Switch-controlled lights are OFF in the runtime's default power state (the
+                // renderer builds its records with all groups off, mask 0), so baking them lit
+                // burns a permanently-powered mall into the volume and makes the lever inert:
+                // a volume with "direct": true disables the realtime grid entirely. The extractor
+                // was changed to keep these records, tagged `on:false` with a `group`, precisely so
+                // the viewer could switch them; neither SH baker learned. Interchange ships 109
+                // such records, all intensity > 0, all inside the bake volume. Skip the whole
+                // group, not just the on:false ones, because the default state zeroes all of it.
+                if lgt.group_idx >= 0 {
+                    continue;
+                }
                 let tol = lgt.pos - o;
                 let dist = tol.length();
                 let r = lgt.range.max(LIGHT_RANGE_FLOOR); // floor to match the CUDA reference
@@ -794,7 +805,18 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         // more per-probe-variable than pass A's any-hit occlusion, so a hot batch can exceed the OS GPU
         // watchdog (~2 s) and reset the device; TDR-safe batches for it would be so small that giant-map
         // GPU pass B barely beats the rayon pass anyway. Default is the reliable CPU bounce below.
-        let gpu_b = if matches!(backend, Backend::Gpu | Backend::Auto) && env_usize("EFT_SH_GPU_BOUNCE", 0) > 0 {
+        // `n_moved == 0` for the same reason pass A carries it: the GPU derives every probe
+        // position from (gmin, spacing) and the grid index, so it CANNOT honour a probe that the
+        // virtual-offset pass relocated out of solid geometry. Pass A was gated and given a CPU
+        // fixup; pass B landed first and never received the rule, so with the flag set it cast all
+        // its bounce rays from the buried grid cell for every relocated probe. That is 25.7% of
+        // probes on interchange (405,223 of 1,574,326), and the shipped bakes are --indirect-only,
+        // where the bounce IS essentially the whole signal. The unreachable
+        // `if used_gpu && n_moved > 0` below is the leftover shape of the rule pass B never got.
+        let gpu_b = if n_moved == 0
+            && matches!(backend, Backend::Gpu | Backend::Auto)
+            && env_usize("EFT_SH_GPU_BOUNCE", 0) > 0
+        {
             crate::sh_bake_gpu::pass_b_gpu(
                 &bvh, &sh_a, gmin, spacing, [nx, ny, nz], bounce_rays,
                 &albedo_lut, &emis_lut, inv_pi_boost, emis_gain,

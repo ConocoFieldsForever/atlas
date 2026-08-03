@@ -976,7 +976,12 @@ fn load_intel(
         .exfils
         .into_iter()
         .map(|r| LevelExfil {
-            world_pos: Vec3::new(-r.pos[0], r.pos[1], r.pos[2]),
+            // gamedata exfil `pos` is ALREADY viewer-space, bridged by extract_gamedata, exactly
+            // like the door `pos` the comment below says so about. Negating X here flipped it a
+            // second time, putting every exfil on the wrong side of the map. Latent only because
+            // `Pack::exfils` currently has no readers, which is precisely why it would have been
+            // believed the first time something started using it.
+            world_pos: Vec3::new(r.pos[0], r.pos[1], r.pos[2]),
             name: r.name,
             faction: r.faction,
             active: r.active,
