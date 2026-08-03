@@ -57,6 +57,16 @@ are skipped: those are not in the physics world at all.
     python extraction/unity/eft_extract_colliders.py --levels 54,63 --name interchange_v2
 """
 import os, sys, json, argparse, time, struct
+
+# ONE definition of "is this file actually finished", shared with eft_extract_v2. This exporter
+# used to carry its own `not exists or getsize == 0` copy, which the mesh exporter was fixed away
+# from and this one was not -- so a killed collider pass (it runs about an hour on streets, and the
+# stage is optional so a failure does not stop the build) left NUL-filled OBJs that every later run
+# REUSED. load_obj parses them without raising, assemble_bevy sees len(V) == 0, the MeshCollider
+# never reaches colliders.bin, and the nav bake never learns the wall is there.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+from fileguards import obj_complete as _obj_complete, drop_incomplete as _drop_incomplete,     atomic_write as _atomic_write, write_text_utf8 as _write_text_utf8
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -290,12 +300,13 @@ def main():
                 nm = g(mesh, "m_Name", default=f"m{mesh_pptr.path_id}") or f"m{mesh_pptr.path_id}"
                 fn = f"{san(nm)}__{key[0]}_{key[1]}_{key[2]}.obj"
                 fp = os.path.join(md, fn)
-                if (not os.path.exists(fp)) or os.path.getsize(fp) == 0:
+                if not _obj_complete(fp):
+                    _drop_incomplete(fp)
                     data = mesh.export()
                     if isinstance(data, str) and data:
-                        # utf-8: EFT ships Cyrillic mesh names; cp1252 would truncate the file to 0 B.
-                        with open(fp, "w", encoding="utf-8") as fh:
-                            fh.write(data)
+                        # Atomic, so a kill can never leave the half-written file the guard above
+                        # exists to detect.
+                        _atomic_write(fp, lambda t, _d=data: _write_text_utf8(t, _d))
                     else:
                         fn = None
             except Exception:

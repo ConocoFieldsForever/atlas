@@ -1710,17 +1710,21 @@ def main():
                 # bake albedo whenever the PNG is missing (decoupled from OBJ existence)
                 alb_name = f"terrain_{lv}_{tname}_albedo"
                 alb_path = os.path.join(td, alb_name + ".png")
-                # L18: re-bake if the PNG is missing OR a 0-byte stub from a truncated/failed prior run (mirrors the
-                # mesh-export size guard) so a pre-fix or partially-written albedo is never silently reused.
-                if (not os.path.exists(alb_path)) or os.path.getsize(alb_path) == 0:
+                # `_png_complete`, not a size test. The comment here used to claim it mirrored the
+                # mesh-export size guard -- and it did, but that guard was upgraded to
+                # `_obj_complete` precisely because a size test cannot see a file whose directory
+                # entry carries the final SIZE while the data was never flushed. It REUSES a
+                # NUL-filled albedo forever. The texture path already moved to `_png_complete`;
+                # this one did not. A broken terrain albedo binds the 1x1 magenta placeholder over
+                # a whole tile, and on the 5 of 7 packs whose terrainLayers is null the baked
+                # albedo IS the ground.
+                if not _png_complete(alb_path):
+                    _drop_incomplete(alb_path)
                     prep = _terrain_bake_prepare(tdata)
                     if prep is not None:
                         _tile_jobs.append((tname, alb_path, prep))
                     else:
                         alb_name = None
-                        if os.path.exists(alb_path) and os.path.getsize(alb_path) == 0:
-                            try: os.remove(alb_path)
-                            except OSError: pass
                 # export raw splat layers + control maps so the builder can render a SHARP tiling material
                 # (the flat baked albedo above stays as a fallback). Keyed by tile name (san of m_Name).
                 try: export_terrain_splat(tdata, tname, splat_root, terrain_manifest, _layer_saved)
@@ -1809,7 +1813,18 @@ def main():
                 waterbodies = waterbodies or (old.get("waterBodies") or [])
                 levels = sorted(set(old.get("levels") or []) | set(levels))
         except Exception as e:
-            print(f"  terrain-only: scene merge failed ({e}) - writing this run's scene as-is", flush=True)
+            # NOT "write this run's scene as-is". The generalised guard below is derived from this
+            # branch and its commit claims an unreadable scene.json is "now fatal instead of
+            # silently overwritten" - which was false for the branch it was derived FROM. In
+            # terrain-only mode the renderer pass is skipped entirely, so `instances` holds ~4
+            # terrain records: this handler replaced a 654,748-instance scene graph with 4 and
+            # exited 0. It is a bare `except`, so it also fires on MemoryError parsing a 459 MB
+            # file and on a Windows sharing violation, i.e. cases where the file on disk is
+            # perfectly healthy and gets destroyed anyway.
+            raise SystemExit(f"[extract] FATAL: {scene_path} exists but could not be merged ({e}). "
+                             f"Refusing to overwrite a scene graph with this run's "
+                             f"{len(instances)} terrain instance(s). Move it aside deliberately "
+                             f"to rebuild.")
     elif os.path.exists(scene_path):
         # PARTIAL-RUN GUARD -- the rule above, generalised to EVERY mode. --terrain-only got this
         # treatment when a 3 s touch-up nuked a 110k-instance graph; every other partial run kept the
@@ -1843,10 +1858,15 @@ def main():
             lodgroups = old_lg + lodgroups
             waterbodies = (old.get("waterBodies") or []) + waterbodies
             levels = sorted(set(old.get("levels") or []) | run_lvs)
-    json.dump({"instances": instances, "up": "unity", "levels": levels, "lodGroups": lodgroups, "lod_schema": 1,
-               "waterBodies": waterbodies,
-               "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"},
-              open(os.path.join(out, "scene.json"), "w"))
+    # ATOMIC. scene.json was the one artifact in this module written straight through `open(...,"w")`
+    # while every other output goes via _atomic_write; a kill between truncate and flush left a
+    # half-written scene graph that the guards above then refuse to touch, which is a dataset you
+    # have to re-extract from scratch.
+    _scene_blob = {"instances": instances, "up": "unity", "levels": levels, "lodGroups": lodgroups,
+                   "lod_schema": 1, "waterBodies": waterbodies,
+                   "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"}
+    _atomic_write(os.path.join(out, "scene.json"),
+                  lambda t: _write_text_utf8(t, json.dumps(_scene_blob)))
     print(f"  LOD: {len(lodgroups)} LODGroups, {sum(1 for it in instances if it.get('lod'))} tagged instances", flush=True)
     # Surfaced, never swallowed: a non-empty list means the dataset on disk was carrying dead meshes that
     # every previous run silently reused (see _obj_complete). They are repaired now; say how many.
