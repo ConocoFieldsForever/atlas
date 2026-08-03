@@ -125,9 +125,23 @@ def build_bake_mesh(cfg):
     kept, rep = culls.filter(sc)
     print(f"[mesh] culls kept {rep['kept']:,}/{rep['raw']:,} instances")
     # LOD0 filter -- scene.json is ALL-LOD; the shipped viewer geometry is finest + untagged (assemble --payload lod0)
+    # The extractor keeps a group's finest EXISTING level, because some LODGroups ship an empty
+    # LOD0 slot and a hardcoded `i == 0` made those objects VANISH. This filter kept the literal
+    # and its docstring still claims it applies "the SAME culls + LOD0 filter the viewer geometry
+    # uses". Mirror the extractor: per group, keep the minimum lod.i present.
+    _gmin = {}
+    for _it in kept:
+        _L = _it.get('lod')
+        if _L and _L.get('i', -1) >= 0 and _L.get('g') is not None:
+            _g = _L['g']
+            _gmin[_g] = min(_gmin.get(_g, 1 << 30), _L['i'])
+
     def _lod0(it):
-        L = it.get('lod'); i = L['i'] if (L and L.get('i', -1) >= 0) else None
-        return i is None or i == 0
+        L = it.get('lod')
+        if not L or L.get('i', -1) < 0:
+            return True                      # untagged geometry is always kept
+        g = L.get('g')
+        return L['i'] == _gmin.get(g, 0)
     n0 = len(kept); kept = [it for it in kept if _lod0(it)]
     print(f"[mesh] LOD0 filter -> {len(kept):,}/{n0:,} instances")
 
@@ -258,8 +272,17 @@ def load_lights(G3, DS):
         if len(cand) > 1:
             print(f"[lights] merged {len(cand)} sidecars -> {len(L)} lights total")
     pos, ci, rng_, sf, cono, coni = [], [], [], [], [], []
-    n_spot = n_dir_skipped = 0
+    n_spot = n_dir_skipped = n_group_skipped = 0
     for l in L:
+        # Switch-controlled lights are OFF in the runtime's default power state, so baking them lit
+        # produces a permanently-powered interior and a dead lever. The comment above about
+        # on:false records living only in *_all.json stopped being true when the extractor was
+        # changed to force-keep them in the MAIN sidecar tagged `on:false` + `group`; this filter
+        # never learned, and neither did sh_bake.rs. Skip the whole group: the default state zeroes
+        # all of it, not just the records that happen to be tagged off.
+        if l.get('group'):
+            n_group_skipped += 1
+            continue
         if l.get('type') == 'Directional':
             n_dir_skipped += 1; continue   # authored sun/moon (older maps ship one, e.g. Factory_Day):
                                            # not a positional practical -- the bake supplies its own sky+sun

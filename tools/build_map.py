@@ -685,7 +685,7 @@ def main():
         print(f"[BUILD] forced refresh: invalidating stale game-derived caches for {m}", flush=True)
         stale = [os.path.join(dataset, "scene.json"),
                  os.path.join(out_dir, "volume2.bin"), os.path.join(out_dir, "volume.bin"),
-                 os.path.join(out_dir, "nav.bin"), os.path.join(out_dir, "instanced_raw.glb")]
+                 os.path.join(pack, "nav.bin"), os.path.join(out_dir, "instanced_raw.glb")]
         if os.path.isdir(dataset):
             stale += [os.path.join(dataset, f) for f in os.listdir(dataset)
                       if f.startswith("lights_") and f.endswith(".json")]
@@ -772,6 +772,17 @@ def main():
         run(1, total, "extract physics colliders",
             [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "eft_extract_colliders.py"),
              "--levels", levels, "--name", dsname], VIEWER, optional=True)
+        # `optional=True` above means a FAILED collider pass does not stop the build -- and that is
+        # how streets shipped with no physics world at all. The nav bake then falls back to render
+        # geometry without complaint, so the map looks fine and every route is wrong: 11 of its 17
+        # exfils were unreachable from every player spawn. A missing colliders.json is not a
+        # cosmetic gap, so say so loudly here rather than discovering it in a route months later.
+        cpath = os.path.join(dataset, "colliders.json")
+        if not os.path.isfile(cpath):
+            print(f"[BUILD WARNING] no colliders.json at {cpath} - the nav bake will use RENDER "
+                  f"geometry only. Routes will walk through invisible collision and stand on "
+                  f"surfaces the player cannot reach. Re-run the collider stage before trusting "
+                  f"any pathfinding from this pack.", flush=True)
         if not os.path.isfile(os.path.join(dataset, "scene.json")):
             print(f"[BUILD FAILED] extraction finished but no scene.json at {dataset} - check the "
                   f"log above (is UnityPy installed for EFT_PY_UNITY? is EFT_GAME_DATA correct and "
@@ -1041,15 +1052,35 @@ def main():
     #    pack (same layout the old CUDA bake_nav.py emitted, same tuning constants -> same quality).
     #    Only skipped when no built viewer exe can be found (a kit without a compiled binary).
     atlas_exe = find_atlas_exe()
+    _stage8_started = time.time()
+    _nav_ok = False
     if atlas_exe:
-        run(8, total, "bake nav grid (CPU)",
-            [atlas_exe, "bake-nav", pack], VIEWER, optional=True)
+        _nav_ok = run(8, total, "bake nav grid (CPU)",
+                      [atlas_exe, "bake-nav", pack], VIEWER, optional=True)
     else:
         print(f"[STAGE 8/{total}] nav: skipped - viewer exe not found. Build it "
               f"(`cargo build --release`) or set EFT_ATLAS_EXE, then rebuild to enable routing.",
               flush=True)
-    if os.path.isfile(os.path.join(pack, "nav.bin")):
-        print("  nav grid: baked into pack (in-process CPU routing enabled)", flush=True)
+    # "A nav.bin exists" is NOT "this build baked one" -- the same hole stages 3 and 6 already had
+    # guards for, and the one place it was never added. assemble_bevy stages into <pack>.building
+    # and then moves EVERY file the staging dir lacks out of the live pack, unfiltered; nav.* are
+    # written after assemble, so they ALWAYS migrate across the swap. Already fired on disk:
+    # factory_rework's nav.bin is 2.5 days older than its geometry, woods' is 12 hours older, and
+    # both load silently because they carry a plausible baker_version. The exe-missing branch above
+    # needs no crash at all to reach it -- it printed "skipped" and this line then said "baked".
+    _navbin = os.path.join(pack, "nav.bin")
+    if os.path.isfile(_navbin):
+        if os.path.getmtime(_navbin) < _stage8_started:
+            print("  nav grid: WARNING - this build did NOT bake routing; the pack is carrying the "
+                  "PREVIOUS build's nav.bin. It describes the OLDER geometry, so routes may pass "
+                  "through walls that exist in this build and around walls that no longer do. "
+                  f"Re-run `atlas bake-nav {pack}` before trusting any path on this map.",
+                  flush=True)
+        elif not _nav_ok:
+            print("  nav grid: WARNING - the nav bake reported failure but wrote a grid; treat this "
+                  "map's routing as unverified.", flush=True)
+        else:
+            print("  nav grid: baked into pack (in-process CPU routing enabled)", flush=True)
     else:
         print("  nav grid: none (routing disabled for this map until the baker runs)", flush=True)
 
