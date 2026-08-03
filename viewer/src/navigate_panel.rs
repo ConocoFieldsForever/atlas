@@ -7,15 +7,17 @@
 //!      pin auto-clears any drawn route (it started from the old spot; pathfind.rs).
 //!   2. EXTRACTS — a table of every extract (faction-coloured painter dot — no font glyphs — plus a
 //!      separated faction tag and a `~straight-line` distance). Clicking a row computes the walkable
-//!      route to it; ROUTE NEAREST EXTRACT solves one A* per ACTIVE extract and keeps the shortest
-//!      (true nearest-by-foot, not a tour). Rows work even while the Extracts overlay is hidden.
+//!      route to it. Rows work even while the Extracts overlay is hidden.
 //!
 //!      Each row also carries a TICK BOX — "I can use this extract this raid" — and that is the
-//!      SINGLE place extracts are selected. Both consumers read the same set: the loot plan's
-//!      "ends at" and ROUTE NEAREST EXTRACT. Empty selection means every active extract, so the
-//!      default needs no interaction at all. (This replaced a second checkbox list of the same
-//!      extracts nested inside the loot plan: two controls for one decision, with nothing to say
-//!      they were the same decision.) The tick consumes its own click so selecting never routes.
+//!      SINGLE place extracts are selected. It feeds the loot plan's "ends at", and it is
+//!      REQUIRED: PLAN LOOT RUN stays disabled until at least one is ticked. An empty set used to
+//!      mean "any active extract", which is a guess the viewer is not entitled to make — a real
+//!      raid assigns you a subset, and planning a run that ends at an exit you cannot take is
+//!      worse than not planning one. (This replaced a second checkbox list of the same extracts
+//!      nested inside the loot plan: two controls for one decision, with nothing to say they were
+//!      the same decision.) The tick consumes its own click so selecting never routes. Clicking
+//!      the REST of a row still just routes there, ticked or not.
 //!   3. ROUTE — a labelled result card: WHERE the route goes + walkable metres; the matching row is
 //!      highlighted from `RouteResult::dest_label` (so "nearest" highlights its winner too).
 //!
@@ -43,10 +45,18 @@ pub struct NavUiState {
     plan_min_value: i64,
     plan_stops: usize,
     plan_budget_min: f32,
-    /// Raw extract titles the loot plan may finish at. EMPTY = any active extract. Stale entries
-    /// are dropped each frame against the live list, so a map swap cannot leave a selection that
-    /// silently excludes every real extract.
+    /// Priced loose loot lying in the world is eligible as a plan stop. Off = containers only.
+    /// Same concept and the same label as `LootVolumeSettings::include_loose`.
+    plan_include_loose: bool,
+    /// Raw extract titles the loot plan must finish at. EMPTY = NOTHING CHOSEN YET, never "any":
+    /// the plan is disabled until the player ticks one. Stale entries are dropped each frame
+    /// against the live list, BEFORE any consumer reads it, so a map swap cannot leave a selection
+    /// that silently excludes every real extract.
     plan_extracts: std::collections::HashSet<String>,
+    /// (count, expiry) for the "your ticks were dropped" notice. That per-frame prune is the only
+    /// thing that empties `plan_extracts`, and under the must-tick rule it silently disarms the
+    /// plan with no user action — so it says so for a few seconds instead.
+    plan_drop_notice: Option<(usize, f64)>,
     /// Last MapEpoch we reacted to — on a swap, `pending` (an extract Entity from the OLD map) is
     /// cleared so it can't highlight a wrong row / recycled id on the new map.
     last_epoch: u64,
@@ -58,7 +68,9 @@ impl Default for NavUiState {
             plan_min_value: 100_000,
             plan_stops: 10,
             plan_budget_min: 25.0,
+            plan_include_loose: true,
             plan_extracts: std::collections::HashSet::new(),
+            plan_drop_notice: None,
             last_epoch: 0,
         }
     }
@@ -182,7 +194,20 @@ pub fn navigate_tab(
     } else {
         rows.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.tag.cmp(&b.tag)));
     }
+
+    // Drop titles that no longer exist on this map/side BEFORE anything reads the set. This used
+    // to run inside the panel body, ~120 lines AFTER the "ends at" echo read its length, so the
+    // echo could count extracts that were already gone. Harmless when empty meant "any"; under the
+    // must-tick rule it would arm PLAN LOOT RUN on a set the solver then rejects asynchronously.
+    let before_n = ui_state.plan_extracts.len();
+    ui_state.plan_extracts.retain(|t| rows.iter().any(|r| !r.inactive && &r.title == t));
+    let dropped_n = before_n - ui_state.plan_extracts.len();
+    if dropped_n > 0 {
+        let now = ctx.input(|i| i.time);
+        ui_state.plan_drop_notice = Some((dropped_n, now + 6.0));
+    }
     let active_n = rows.iter().filter(|r| !r.inactive).count();
+    let sel_n = ui_state.plan_extracts.len();
 
     egui::SidePanel::right("map_layers")
         .resizable(false)
@@ -321,64 +346,23 @@ pub fn navigate_tab(
                 &mut route_opts.visualize,
                 RichText::new("visualize search").size(theme::SIZE_SMALL).color(theme::MUTED),
             )
-            .on_hover_text("watch the pathfinder's wavefront expand and converge on the next single-destination route");
-
-            // ---- flagship action: true nearest-by-foot (one A* per ACTIVE extract, keep the
-            // shortest — NOT a tour through all of them). ----
-            let full = egui::vec2(ui.available_width(), 26.0);
-            if ui
-                .add_enabled(
-                    ready && active_n > 0,
-                    egui::Button::new(
-                        RichText::new("ROUTE NEAREST EXTRACT")
-                            .size(theme::SIZE_LABEL)
-                            .strong()
-                            .color(if ready && active_n > 0 { theme::ACCENT } else { theme::FAINT }),
-                    )
-                    .min_size(full)
-                    .corner_radius(0.0),
-                )
-                .on_hover_text(if ui_state.plan_extracts.is_empty() {
-                    "compares the walkable route to every active extract and takes the shortest \
-                     \u{00B7} tick extracts under EXTRACTS to narrow it to the ones you can use"
-                } else {
-                    "compares the walkable route to each extract you ticked under EXTRACTS and \
-                     takes the shortest"
-                })
-                .clicked()
-            {
-                ui_state.pending = None;
-                // Honour the same selection the loot plan uses. Which extracts are open depends on
-                // side, time, keys and the raid's random draw, so "nearest" must mean "nearest of
-                // the ones I can actually use" - routing to an extract the player cannot take is
-                // worse than not routing at all. Empty selection = any active extract.
-                let act: Vec<&Row> = rows
-                    .iter()
-                    .filter(|r| !r.inactive)
-                    .filter(|r| {
-                        ui_state.plan_extracts.is_empty()
-                            || ui_state.plan_extracts.contains(&r.title)
-                    })
-                    .collect();
-                route.write(RouteRequest {
-                    start: None,
-                    dests: act.iter().map(|r| r.pos).collect(),
-                    labels: act.iter().map(|r| r.label.clone()).collect(),
-                    nearest_of: true,
-                    ..Default::default()
-                });
-            }
+            .on_hover_text(
+                "watch the pathfinder's wavefront expand and converge on the next \
+                 single-destination route \u{00B7} loot-run tours do not animate",
+            );
 
             // ===== LOOT PLAN (orienteering: max value under a walking budget, ends at an extract) =====
             ui.add_space(theme::SP_SM);
             egui::CollapsingHeader::new(theme::section_header("LOOT PLAN", plan.stops.len()))
                 .id_salt("nav_lootplan")
-                .default_open(false)
+                .default_open(true)
                 // Auto-open while a plan is computing / live (collapses again on clear).
                 .open((!matches!(plan.status, crate::planner::PlanStatus::Idle)).then_some(true))
                 .show(ui, |ui| {
                     use crate::planner::{PlanRequest, PlanStatus};
                     ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                    // The column is ~210 px; without this the slider eats the numeric readout.
+                    ui.spacing_mut().slider_width = 96.0;
                     // knobs
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("min value").size(theme::SIZE_SMALL).color(theme::MUTED));
@@ -390,14 +374,37 @@ pub fn navigate_tab(
                                 }
                             });
                     });
+                    // Sits with `min value` because the two together answer one question: what
+                    // counts as a stop. Positive phrasing on purpose - ticked reads true, and
+                    // "exclude loose loot" would make the ticked state a double negative.
+                    ui.checkbox(
+                        &mut ui_state.plan_include_loose,
+                        RichText::new("include loose loot").size(theme::SIZE_SMALL).color(theme::MUTED),
+                    )
+                    .on_hover_text(
+                        "loose loot is priced items lying in the world. Untick to plan containers only.",
+                    );
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("stops").size(theme::SIZE_SMALL).color(theme::MUTED));
                         ui.add(egui::Slider::new(&mut ui_state.plan_stops, 4..=18));
                     });
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("budget").size(theme::SIZE_SMALL).color(theme::MUTED));
+                        ui.label(RichText::new("time left").size(theme::SIZE_SMALL).color(theme::MUTED));
                         ui.add(egui::Slider::new(&mut ui_state.plan_budget_min, 5.0..=50.0).suffix(" min").step_by(1.0));
                     });
+                    // Derived from the solver's own constant, not a "2" that can drift from it.
+                    ui.label(
+                        RichText::new(format!(
+                            "+{:.0} min extract reserve",
+                            crate::planner::EXTRACT_BUFFER_S / 60.0
+                        ))
+                        .size(theme::SIZE_TINY)
+                        .color(theme::FAINT),
+                    )
+                    .on_hover_text(
+                        "the plan keeps this much of your time in hand for the extract itself. \
+                         The walk to it is a routed leg and is counted separately.",
+                    );
                     // WHERE the run ends. There used to be a second checkbox list of every extract
                     // right here, duplicating the EXTRACTS table below it — two places to pick the
                     // same thing, and no indication they were the same thing. The selection now
@@ -405,44 +412,68 @@ pub fn navigate_tab(
                     // still says what it will do.
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("ends at").size(theme::SIZE_SMALL).color(theme::MUTED));
-                        let sel = ui_state.plan_extracts.len();
-                        ui.label(
-                            RichText::new(if sel == 0 {
-                                "any extract".to_string()
-                            } else {
-                                format!("{sel} selected")
-                            })
-                            .size(theme::SIZE_SMALL)
-                            .color(if sel == 0 { theme::MUTED } else { theme::ACCENT }),
+                        // Four states, each said plainly. There is no "any" any more: the old
+                        // read-only echo showed "any extract" for an empty set, which was the
+                        // viewer guessing at something only the player knows.
+                        let (txt, col) = if active_n == 0 {
+                            ("no extracts on this map".to_string(), theme::WARN)
+                        } else if sel_n == 0 {
+                            (
+                                // Short enough to survive .truncate() in a ~150 px value column:
+                                // "pick them under EXTRACTS below" was cut mid-word, losing
+                                // exactly the part that says where to go.
+                                "none ticked \u{2014} see EXTRACTS".to_string(),
+                                theme::WARN,
+                            )
+                        } else if sel_n == 1 {
+                            let one = rows
+                                .iter()
+                                .find(|r| ui_state.plan_extracts.contains(&r.title))
+                                .map(|r| r.name.clone())
+                                .unwrap_or_else(|| "1 ticked".to_string());
+                            (one, theme::ACCENT)
+                        } else {
+                            (format!("{sel_n} ticked"), theme::ACCENT)
+                        };
+                        ui.add(
+                            egui::Label::new(RichText::new(txt).size(theme::SIZE_SMALL).color(col))
+                                .truncate(),
                         )
                         .on_hover_text(
                             "which extracts are open depends on your side, the time, keys and the \
                              raid's own random selection \u{2014} none of which the viewer can \
-                             know. Tick the ones you can use under EXTRACTS below; the plan and \
-                             ROUTE NEAREST EXTRACT both honour exactly those.",
+                             know. Tick the ones you can use under EXTRACTS below; the plan ends \
+                             at exactly those.",
                         );
-                        if sel > 0
-                            && ui
-                                .small_button("any")
-                                .on_hover_text("clear the extract selection")
-                                .clicked()
-                        {
-                            ui_state.plan_extracts.clear();
-                        }
                     });
                     let full = egui::vec2(ui.available_width(), 26.0);
+                    // A run has to END somewhere you can actually leave from, so an unticked
+                    // extract set is not a plan waiting to happen - it is a question the player
+                    // has not answered yet. Disabled rather than defaulted, and the reason is on
+                    // the face of the panel (the WARN "ends at" line) as well as in the hover,
+                    // because a disabled control with no stated cause is just a dead button.
+                    let can_plan = ready && active_n > 0 && sel_n > 0;
                     if ui
-                        .add_enabled(ready, egui::Button::new(
+                        .add_enabled(can_plan, egui::Button::new(
                             RichText::new("PLAN LOOT RUN").size(theme::SIZE_LABEL).strong()
-                                .color(if ready { theme::ACCENT } else { theme::FAINT }))
+                                .color(if can_plan { theme::ACCENT } else { theme::FAINT }))
                             .min_size(full).corner_radius(0.0))
                         .on_hover_text("pick the highest-value loot tour that fits the budget, ending at an extract \u{00B7} honors the avoid options")
+                        .on_disabled_hover_text(if !ready {
+                            "routing has not been built for this map"
+                        } else if active_n == 0 {
+                            "no usable extract on this map \u{2014} the run has nowhere to end"
+                        } else {
+                            "tick at least one extract under EXTRACTS below \u{2014} a loot run \
+                             must end somewhere you can actually leave from"
+                        })
                         .clicked()
                     {
                         plan_req.write(PlanRequest {
                             min_value: ui_state.plan_min_value,
                             max_stops: ui_state.plan_stops,
                             budget_s: ui_state.plan_budget_min * 60.0,
+                            include_loose: ui_state.plan_include_loose,
                             extracts: ui_state.plan_extracts.iter().cloned().collect(),
                         });
                     }
@@ -458,11 +489,10 @@ pub fn navigate_tab(
                             ui.horizontal(|ui| {
                                 ui.label(
                                     RichText::new(format!(
-                                        "\u{2248}{}k RUB  \u{00B7}  {:.1} min / {:.0} m  \u{00B7}  exits {}",
+                                        "\u{2248}{}k RUB  \u{00B7}  {:.1} min / {:.0} m",
                                         plan.total_value / 1000,
                                         plan.total_time / 60.0,
-                                        plan.total_dist,
-                                        plan.extract
+                                        plan.total_dist
                                     ))
                                     .size(theme::SIZE_SMALL)
                                     .color(theme::OK),
@@ -473,12 +503,23 @@ pub fn navigate_tab(
                                             min_value: 0,
                                             max_stops: 0,
                                             budget_s: 0.0,
+                                            include_loose: true,
                                             extracts: Vec::new(),
                                         });
                                         route.write(RouteRequest::default());
                                     }
                                 });
                             });
+                            // Own line: an extract name is variable-length and was squeezing the
+                            // numbers off the end of the summary in a 210 px column.
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("exits {}", plan.extract))
+                                        .size(theme::SIZE_SMALL)
+                                        .color(theme::OK),
+                                )
+                                .truncate(),
+                            );
                             for (i, st) in plan.stops.iter().enumerate() {
                                 let row = ui
                                     .horizontal(|ui| {
@@ -527,15 +568,15 @@ pub fn navigate_tab(
 
             // ===== 2 · EXTRACTS =====
             // The ONE place extracts are selected. A row does two independent things: its tick box
-            // says "I can use this one" (feeding the loot plan and ROUTE NEAREST EXTRACT), and the
+            // says "I can use this one" (feeding the loot plan), and the
             // rest of the row routes there. Keeping those on one row is what removed the duplicate
             // list that used to sit inside the loot plan.
-            // Stale titles are dropped against the live rows each frame, so a map swap cannot
-            // leave a selection that silently excludes every real extract.
-            ui_state
-                .plan_extracts
-                .retain(|t| rows.iter().any(|r| !r.inactive && &r.title == t));
-            let sel_n = ui_state.plan_extracts.len();
+            // The staleness prune now runs BEFORE the panel body (see the top of this system) so
+            // the loot-plan gate cannot read a title that no longer exists. `sel_n` from up there
+            // is the gate's value; the header needs its own read, because the per-row ticks below
+            // mutate the set later in this same closure and a stale count would render a click
+            // behind by one frame.
+            let sel_now = ui_state.plan_extracts.len();
             // WHICH SIDE ARE YOU? The live link answers this only while a raid is loading; at
             // the desk (the main planning case) it is unknown, and an unknown side used to mean
             // "show every extract", so a PMC could plan a run that ends at a Scav-only exit.
@@ -586,32 +627,72 @@ pub fn navigate_tab(
             ui.horizontal(|ui| {
                 ui.label(theme::section_header("EXTRACTS", rows.len()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if sel_n > 0 {
+                    // This button was labelled "all" and CLEARED the selection - it was the one
+                    // control whose whole job was to manufacture the state the loot plan now
+                    // forbids, under a label that said the opposite. Inverted so the word means
+                    // what it does, and shown whenever there is anything to tick rather than only
+                    // once something already is (it was unreachable from the empty state, which
+                    // is exactly the state a player now needs one click out of).
+                    if active_n > 0 {
+                        let all_on = sel_now == active_n;
                         if ui
-                            .small_button(RichText::new("all").size(theme::SIZE_TINY))
-                            .on_hover_text("clear the selection \u{2014} treat every active extract as usable")
+                            .small_button(
+                                RichText::new(if all_on { "none" } else { "all" }).size(theme::SIZE_TINY),
+                            )
+                            .on_hover_text(if all_on {
+                                "untick everything \u{2014} the loot plan stays unavailable until \
+                                 you tick one"
+                            } else {
+                                "tick every active extract"
+                            })
                             .clicked()
                         {
-                            ui_state.plan_extracts.clear();
+                            if all_on {
+                                ui_state.plan_extracts.clear();
+                            } else {
+                                for r in rows.iter().filter(|r| !r.inactive) {
+                                    ui_state.plan_extracts.insert(r.title.clone());
+                                }
+                            }
                         }
+                    }
+                    if sel_now > 0 {
                         ui.label(
-                            RichText::new(format!("{sel_n} usable"))
+                            RichText::new(format!("{sel_now} usable"))
                                 .size(theme::SIZE_TINY)
                                 .color(theme::ACCENT),
                         )
-                        .on_hover_text("the loot plan and ROUTE NEAREST EXTRACT use only these");
+                        .on_hover_text("the loot plan ends at one of these");
                     } else {
+                        // WARN, not FAINT: with nothing ticked the loot plan is disabled, so this
+                        // is an unmet requirement rather than an optional refinement.
                         ui.label(
                             RichText::new("tick the ones you can use")
                                 .size(theme::SIZE_TINY)
-                                .color(theme::FAINT),
+                                .color(theme::WARN),
                         )
                         .on_hover_text(
-                            "leave them all unticked to treat every active extract as usable",
+                            "the loot plan needs at least one \u{2014} it must end somewhere you \
+                             can actually leave from",
                         );
                     }
                 });
             });
+            // A map swap or a PMC/Scav flip silently deletes ticks, which now also disables the
+            // loot plan. Announce it rather than letting the button go dead unexplained.
+            if let Some((n, expiry)) = ui_state.plan_drop_notice {
+                if ctx.input(|i| i.time) < expiry {
+                    ui.label(
+                        RichText::new(format!(
+                            "{n} ticked extract(s) dropped \u{2014} map or side changed"
+                        ))
+                        .size(theme::SIZE_TINY)
+                        .color(theme::WARN),
+                    );
+                } else {
+                    ui_state.plan_drop_notice = None;
+                }
+            }
             if rows.is_empty() {
                 ui.label(
                     RichText::new("no extracts found on this map")
@@ -685,7 +766,7 @@ pub fn navigate_tab(
                                     } else if on {
                                         "usable this raid \u{00B7} click to deselect"
                                     } else {
-                                        "mark as usable this raid (loot plan + nearest-extract)"
+                                        "mark as usable this raid (the loot plan ends at one of these)"
                                     });
                                 tick_hit = tick.clicked() || tick.changed();
                                 if tick.changed() {

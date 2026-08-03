@@ -24,9 +24,6 @@ pub struct RouteRequest {
     pub dests: Vec<Vec3>,
     /// true -> cheapest visiting order (`chain`); false -> keep the given order (`tour`).
     pub optimize_order: bool,
-    /// true -> the dests are ALTERNATIVES: route to ONLY the one cheapest to reach by foot
-    /// (one A* per candidate, keep the shortest) instead of visiting all of them.
-    pub nearest_of: bool,
     /// Display labels aligned with `dests` (may be empty = unlabeled). The label of the dest the
     /// route actually ends at is echoed back in [`RouteResult::dest_label`] for the UI.
     pub labels: Vec<String>,
@@ -111,7 +108,8 @@ pub struct RouteOpts {
     /// `avoid_pmc` (a disc around the spawn) because being seen is a property of the geometry
     /// between you and them, not of distance.
     pub avoid_combat: bool,
-    /// Animate the A* search wavefront converging on the next single-destination route.
+    /// Animate the A* search wavefront converging on the next single-destination route. ON by
+    /// default; `EFT_VIZ=0` opts out so a headless capture gets a clean routed frame.
     pub visualize: bool,
 }
 impl Default for RouteOpts {
@@ -123,7 +121,11 @@ impl Default for RouteOpts {
             avoid_pmc: has("pmc"),
             avoid_scav: has("scav"),
             avoid_combat: has("combat"),
-            visualize: std::env::var("EFT_VIZ").map(|v| v.trim() == "1").unwrap_or(false),
+            // Opt-OUT, not opt-in: seeing the wavefront converge is how the router explains
+            // itself, and it is the difference between "no walkable path found" and watching the
+            // search dead-end somewhere you can go and look at. `EFT_VIZ=1` still means on, so
+            // nothing that set it changes meaning; only the unset case flips.
+            visualize: std::env::var("EFT_VIZ").map(|v| v.trim() != "0").unwrap_or(true),
         }
     }
 }
@@ -470,31 +472,20 @@ fn dispatch_route(
     let dests = req.dests.clone();
     let labels = req.labels.clone();
     let optimize = req.optimize_order;
-    let nearest_of = req.nearest_of;
     // Only the single-destination Direct leg records a wavefront — the flood is meaningless for a
     // multi-stop tour and adds cost to every leg.
-    let visualize = opts.visualize && dests.len() == 1 && nearest_of == false && !optimize;
+    let visualize = opts.visualize && dests.len() == 1 && !optimize;
     result.status = RouteStatus::Pending;
-    result.stop_count = if nearest_of { 1 } else { dests.len() };
+    result.stop_count = dests.len();
     // Route on a compute-pool thread — off the render loop; dropping the old task drops its result.
     let t = AsyncComputeTaskPool::get().spawn(async move {
         let mut s = crate::nav::pooled_scratch(grid.nodes());
         let lbl = |i: usize| labels.get(i).cloned();
         // One variant under a given avoid field. Multi-stop queries (chain/tour) stay single-plan;
-        // single-dest + nearest-of get the full Direct/Cautious/Wide-berth comparison.
+        // a single destination gets the full Direct/Cautious/Wide-berth comparison.
         let mut run = |s: &mut Scratch, avoid: Option<&crate::nav::AvoidMap>| -> Option<((Vec<Vec3>, f32), Option<String>)> {
             if dests.len() == 1 {
                 grid.path(start, dests[0], s, avoid).map(|r| (r, lbl(0)))
-            } else if nearest_of {
-                let mut best: Option<((Vec<Vec3>, f32), Option<String>)> = None;
-                for (i, d) in dests.iter().enumerate() {
-                    if let Some(r) = grid.path(start, *d, s, avoid) {
-                        if best.as_ref().is_none_or(|(b, _)| r.1 < b.1) {
-                            best = Some((r, lbl(i)));
-                        }
-                    }
-                }
-                best
             } else if optimize {
                 grid.chain(start, &dests, s, avoid).map(|r| (r, None))
             } else {
