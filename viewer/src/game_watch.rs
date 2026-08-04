@@ -31,7 +31,7 @@ enum GameEvent {
     /// A new screenshot fix: viewer-space position, FLATTENED facing for the map marker, and the
     /// full 3-D view direction (pitch included) for standing in the player's eyes. Both None when
     /// the filename carries no quaternion.
-    PlayerFix { pos: Vec3, fwd: Option<Vec3>, look: Option<Vec3> },
+    PlayerFix { pos: Vec3, fwd: Option<Vec3>, look: Option<Vec3>, game_hour: Option<f32> },
     /// Task status push: 10 = started, 11 = failed, 12 = finished.
     Task { id: String, status: i64 },
     /// The player's real in-game vertical FOV (application log, `Game settings:` JSON dump at
@@ -41,6 +41,10 @@ enum GameEvent {
     /// A raid STARTED. Carries the wall-clock instant the `GameStarted` line was written, which
     /// is the only raid-start timestamp EFT puts on disk.
     RaidStart(std::time::SystemTime),
+    /// The key the player has bound to MakeScreenshot, from the `Control settings` dump. The
+    /// overlay is summoned by that key, so the hint must name the real one rather than a default
+    /// the user may never have kept.
+    ScreenshotKey(String),
     /// The raid ended — the last fix is stale.
     RaidEnd,
     /// The local profile's side for the upcoming/current raid. This comes only from
@@ -96,6 +100,11 @@ pub struct PlayerFixState {
     pub fwd: Option<Vec3>,
     /// `Time::elapsed_secs` when the fix arrived (drives the marker pulse).
     pub at: f32,
+    /// In-game time of day, decimal hours, from the trailing field of the screenshot filename
+    /// (`..._14.54 (0).png`). It was always parsed and thrown away. EFT runs game time at 7x real
+    /// time, so this is the only way to show the player the clock THEY are playing against;
+    /// deriving it from the raid clock would be wrong by that factor.
+    pub game_hour: Option<f32>,
 }
 
 /// Local raid side as named by EFT's `raidSettings.side` log field.
@@ -198,6 +207,8 @@ impl RaidClock {
 pub struct GameLink {
     rx: Mutex<Receiver<GameEvent>>,
     pub player: Option<PlayerFixState>,
+    /// The player's own MakeScreenshot binding, when the logs have named it.
+    pub screenshot_key: Option<String>,
     /// The running raid, if the logs say one is in progress. Also the guard that makes
     /// `PrepareSelectedProfileLocally` mean "raid over": that line ALSO fires at login and on
     /// every return to the menu, so it is only an end signal while a clock is actually running.
@@ -256,6 +267,7 @@ impl Plugin for GameWatchPlugin {
         app.insert_resource(GameLink {
             rx: Mutex::new(rx),
             player: None,
+            screenshot_key: None,
             in_raid: None,
             pending_map: None,
             unbuilt_map: None,
@@ -321,9 +333,9 @@ fn apply_game_events(
                 }
                 continue;
             }
-            GameEvent::PlayerFix { pos, fwd, look } => {
+            GameEvent::PlayerFix { pos, fwd, look, game_hour } => {
                 info!("game link: player fix at {:.1},{:.1},{:.1}", pos.x, pos.y, pos.z);
-                link.player = Some(PlayerFixState { pos, fwd, at: time.elapsed_secs() });
+                link.player = Some(PlayerFixState { pos, fwd, at: time.elapsed_secs(), game_hour });
                 // "Screenshot to locate current position": stand in the player's EYES. EFT bakes
                 // the camera position + view quaternion into the filename, and both are already
                 // bridged to viewer space, so this is a 1:1 pose -- no framing, no offset. Without
@@ -444,6 +456,12 @@ with the overlay up"
                 if (cam_settings.fov_deg - v).abs() > 0.25 {
                     info!("game link: matching the game's FOV ({v} deg)");
                     cam_settings.fov_deg = v;
+                }
+            }
+            GameEvent::ScreenshotKey(k) => {
+                if link.screenshot_key.as_deref() != Some(k.as_str()) {
+                    info!("game link: screenshot key is {k}");
+                    link.screenshot_key = Some(k);
                 }
             }
             GameEvent::RaidStart(at) => {
@@ -856,20 +874,42 @@ fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) 
     // the session, so emitting each in turn would walk the app through hours of dead raids.
     let mut raid_start: Option<std::time::SystemTime> = None;
     let mut raid_end = false;
+    let mut shot_key: Option<String> = None;
     for line in pending[..upto].lines() {
         // `2026-08-04 07:15:55.659|1.1.0.0.46624|Info|application|GameStarted:51.54(0) real:...`
         // The numbers on the line are load timings, not a clock -- the LINE'S timestamp is the
         // raid start, and it is the only one EFT writes down.
         if line.contains("|application|GameStarted:") {
             raid_start = log_line_time(line).or(Some(std::time::SystemTime::now()));
-            raid_end = false; // a start later in the chunk outranks an earlier end
+            raid_end = false; // this start supersedes any earlier end in the same chunk
         }
         // Fires at login and 3x on every return to the menu, so it is an END signal only while a
         // raid clock is running -- enforced by the consumer, which ignores it when `in_raid` is
         // None. Chosen because UserMatchOver, the documented trigger, appears in 0 of 310 log
         // folders here and 0 of the last 8 sessions.
-        if line.contains("|application|PrepareSelectedProfileLocally") && raid_start.is_none() {
+        // LAST-ONE-WINS, by position in the chunk. Not "a start anywhere beats an end": the first
+        // read of a log tails from offset 0, so an ordinary finished raid is `GameStarted ... then
+        // PrepareSelectedProfileLocally`, and treating the start as the winner reported a raid
+        // that ended hours ago as live (observed: the HUD showing RAID 0:00 on launch). Clearing
+        // `raid_start` here is what makes the end the survivor.
+        if line.contains("|application|PrepareSelectedProfileLocally") {
             raid_end = true;
+            raid_start = None;
+        }
+        // `"MakeScreenshot","variants":[{"keyCode":["KeypadEnter"]}]` inside the Control settings
+        // JSON dump. Line-keyed like FieldOfView above, so no JSON reassembly.
+        if let Some(rest) = line.split("\"MakeScreenshot\"").nth(1) {
+            if let Some(after) = rest.split("\"keyCode\"").nth(1) {
+                let key: String = after
+                    .split('"')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !key.is_empty() && key.len() < 32 {
+                    shot_key = Some(key);
+                }
+            }
         }
         if let Some(rest) = line.split("scene preset path:maps/").nth(1) {
             if let Some(bundle) = rest.split(".bundle").next() {
@@ -893,6 +933,10 @@ fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) 
                 }
             }
         }
+    }
+    if let Some(k) = shot_key {
+        let _ = tx.send(GameEvent::ScreenshotKey(k));
+        LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(at) = raid_start {
         let _ = tx.send(GameEvent::RaidStart(at));
@@ -1045,10 +1089,14 @@ fn scan_screenshots(dir: &Path, last: &mut std::time::SystemTime, tx: &Sender<Ga
         )
     });
     let nz = |v: Vec3| (v != Vec3::ZERO).then_some(v);
+    // f[7] is EFT's in-game time of day in decimal hours, and it has always been parsed and
+    // dropped. Game time runs at 7x real time, so it cannot be derived from the raid clock.
+    let game_hour = f.get(7).copied().filter(|h| (0.0..24.0).contains(h));
     let _ = tx.send(GameEvent::PlayerFix {
         pos,
         fwd: dirs.and_then(|(f, _)| nz(f)),
         look: dirs.and_then(|(_, l)| nz(l)),
+        game_hour,
     });
     // House-keeping: EFT never cleans these up, and locating yourself a few times a raid leaves a
     // pile of full-resolution PNGs. Delete ONLY the file we just consumed — we parsed a position
@@ -1187,6 +1235,29 @@ mod raid_clock_tests {
         assert!(
             !events.iter().any(|e| matches!(e, GameEvent::RaidEnd)),
             "the login PrepareSelectedProfileLocally must not read as a raid end: {events:?}"
+        );
+    }
+
+    /// A cold tail of a whole session is `GameStarted ... PrepareSelectedProfileLocally`. Reading
+    /// that as a live raid is what put `RAID 0:00` on the HUD at launch for a raid that had ended
+    /// hours earlier. The timer must appear only while one is actually running, so the LAST event
+    /// in the chunk decides.
+    #[test]
+    fn a_finished_raid_does_not_report_as_live() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = String::new();
+        let done = "2026-08-04 07:15:55.659|v|Info|application|GameStarted:51.54(0) real:65.29(0)
+                    2026-08-04 07:40:37.481|v|Info|application|PrepareSelectedProfileLocally ProfileId:x
+";
+        parse_application(&mut pending, done, &tx);
+        let ev: Vec<_> = rx.try_iter().collect();
+        assert!(
+            ev.iter().any(|e| matches!(e, GameEvent::RaidEnd)),
+            "a finished raid must report RaidEnd, got {ev:?}"
+        );
+        assert!(
+            !ev.iter().any(|e| matches!(e, GameEvent::RaidStart(_))),
+            "a finished raid must NOT report a live start: {ev:?}"
         );
     }
 

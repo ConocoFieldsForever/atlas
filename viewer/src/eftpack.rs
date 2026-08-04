@@ -1015,7 +1015,21 @@ fn load_intel(
 // ---------------------------------------------------------------------------
 // Loaded pack (CPU side).
 // ---------------------------------------------------------------------------
+/// How much of a pack is loaded. Ordered: Markers < Routes < Full.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum PackTier {
+    /// gamedata.json only: every marker, no world, no routes.
+    Markers,
+    /// + the nav grid, so routes and walkable distances work.
+    Routes,
+    /// + geometry, textures and lighting: the 3D map.
+    Full,
+}
+
 pub struct Pack {
+    /// What was ACTUALLY loaded, which is what consumers must branch on -- not what the pack
+    /// directory could have supported.
+    pub tier: PackTier,
     pub root: PathBuf,
     pub manifest: Manifest,
     pub materials: Vec<Material>,
@@ -1059,7 +1073,41 @@ impl Pack {
         }
     }
 
+    /// What a pack directory can actually support, probed from FILES ON DISK.
+    ///
+    /// Deliberately not read from anything the pack says about itself: a half-swapped, hand-copied
+    /// or crashed-mid-assemble pack will happily claim a tier it cannot serve, and the whole point
+    /// is to answer "will this open" before trying. Files cannot lie about existing.
+    pub fn available_tier(dir: impl AsRef<Path>) -> Option<PackTier> {
+        let root = dir.as_ref();
+        let has = |n: &str| root.join(n).metadata().map(|m| m.len() > 0).unwrap_or(false);
+        if !has("manifest.json") {
+            return None;
+        }
+        if has("meshes.bin") && has("instances.bin") && has("materials.json") {
+            Some(PackTier::Full)
+        } else if has("nav.json") && has("nav.bin") {
+            Some(PackTier::Routes)
+        } else if has("gamedata.json") {
+            Some(PackTier::Markers)
+        } else {
+            None
+        }
+    }
+
     pub fn load(dir: impl AsRef<Path>) -> Result<Pack> {
+        Self::load_tier(dir, PackTier::Full)
+    }
+
+    /// Load only what `want` needs.
+    ///
+    /// `Markers` skips materials.json, meshes.bin and instances.bin entirely — on interchange that
+    /// is 708 MB of the 725 MB the loader otherwise reads, and it is the same change that makes the
+    /// world not draw, because everything downstream keys off an empty mesh table. It then forces
+    /// the manifest self-consistent, which is not tidiness: `seaLevel` in particular synthesises an
+    /// ocean quad plus material plus instance BEFORE the mesh-count bail, so leaving it set walks
+    /// the entire buffer and bind-group build around one giant water plane.
+    pub fn load_tier(dir: impl AsRef<Path>, want: PackTier) -> Result<Pack> {
         // Keep the pack root absolute from the moment it enters the loader.  Several rendering
         // sidecars are resolved in more than one stage (main world -> render world); a relative
         // root made an already-resolved path still look relative and produced paths such as
@@ -1071,7 +1119,7 @@ impl Pack {
             return Err(anyhow!("pack dir does not exist: {}", root.display()));
         }
 
-        let manifest: Manifest =
+        let mut manifest: Manifest =
             read_json(&root.join("manifest.json")).context("reading manifest.json")?;
         if manifest.version != 1 {
             return Err(anyhow!(
@@ -1080,24 +1128,47 @@ impl Pack {
             ));
         }
 
-        let materials: Vec<Material> =
-            read_json(&root.join("materials.json")).context("reading materials.json")?;
+        let draw_world = want == PackTier::Full;
+        let (materials, meshes_bin, instances) = if draw_world {
+            let materials: Vec<Material> =
+                read_json(&root.join("materials.json")).context("reading materials.json")?;
 
-        let meshes_bin = std::fs::read(root.join("meshes.bin"))
-            .with_context(|| format!("reading {}", root.join("meshes.bin").display()))?;
-        let inst_bin = std::fs::read(root.join("instances.bin"))
-            .with_context(|| format!("reading {}", root.join("instances.bin").display()))?;
+            let meshes_bin = std::fs::read(root.join("meshes.bin"))
+                .with_context(|| format!("reading {}", root.join("meshes.bin").display()))?;
+            let inst_bin = std::fs::read(root.join("instances.bin"))
+                .with_context(|| format!("reading {}", root.join("instances.bin").display()))?;
 
-        let instances = parse_instances(&manifest.instance, &inst_bin)
-            .context("parsing instances.bin by manifest layout")?;
+            let instances = parse_instances(&manifest.instance, &inst_bin)
+                .context("parsing instances.bin by manifest layout")?;
 
-        if instances.len() != manifest.instance_count as usize {
-            return Err(anyhow!(
-                "instanceCount {} disagrees with parsed {} records",
-                manifest.instance_count,
-                instances.len()
-            ));
-        }
+            if instances.len() != manifest.instance_count as usize {
+                return Err(anyhow!(
+                    "instanceCount {} disagrees with parsed {} records",
+                    manifest.instance_count,
+                    instances.len()
+                ));
+            }
+            (materials, meshes_bin, instances)
+        } else {
+            // Force the manifest to agree with what was actually loaded. Every consumer downstream
+            // decides "is there a world" from these, so a manifest still advertising 3.3M instances
+            // over an empty mesh table is the one way this could fail loudly and late.
+            manifest.meshes.clear();
+            manifest.instance_count = 0;
+            manifest.material_count = 0;
+            manifest.sea_level = None;
+            // The sidecars are separate render inputs that do NOT key off the mesh table, so an
+            // empty mesh list does not suppress them: grass builds its own instance stream,
+            // terrain draws from its own layer textures, and the SH volume is sampled by whatever
+            // still draws. Leaving any of them set gives you a world with no buildings, which is
+            // worse than either mode -- foliage and ground floating over a live raid.
+            manifest.sidecars.grass_json = None;
+            manifest.sidecars.terrain_layers = None;
+            manifest.sidecars.volume = None;
+            manifest.sidecars.volume_meta = None;
+            manifest.sidecars.volume_vis = None;
+            (Vec::new(), Vec::new(), Vec::new())
+        };
 
         // Realtime lights (best-effort; empty vec on any failure — never fatal). Parse+merge EVERY
         // sidecar in `lightsAll` (finding 3b); fall back to the single `lights` field when the list
@@ -1233,6 +1304,7 @@ impl Pack {
         };
 
         let pack = Pack {
+            tier: want,
             root,
             manifest,
             materials,

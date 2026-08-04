@@ -388,8 +388,18 @@ fn return_to_menu(
 /// Load the selected pack in-place: swap `LoadedPack`, reload pack-local grade/gfx flags, drop the
 /// per-map ground grid, and bump `MapEpoch` (which drives every per-map rebuild + the render-world
 /// GPU reset). On `EFT_RELAUNCH_ON_SWITCH=1`, falls back to spawning a fresh process + exiting.
+/// ESP / overlay-only mode: draw the markers, not the map.
+///
+/// It is a LOADER decision, not a render toggle. `Pack::load_tier(_, Markers)` skips meshes.bin,
+/// instances.bin and materials.json, and every downstream stage already bails on an empty mesh
+/// table -- so the 708 MB that is not read and the world that is not drawn are the same change,
+/// rather than a render path that has to be kept in agreement with a load path.
+#[derive(Resource, Clone, Copy)]
+pub struct EspMode(pub bool);
+
 fn load_map(
     mut sw: ResMut<MapSwitch>,
+    esp: Res<EspMode>,
     mut server: ResMut<pathfind::PathfindServer>,
     mut exit: MessageWriter<bevy::app::AppExit>,
     menu: Option<Res<menu::MenuState>>,
@@ -449,8 +459,9 @@ fn load_map(
     // without this the process would render a map while still advertising the GPU as free.
     // Idempotent, so a second switch is a no-op.
     crate::gpu_lease::hold("map loaded");
+    let want_tier = if esp.0 { eftpack::PackTier::Markers } else { eftpack::PackTier::Full };
     let task = bevy::tasks::AsyncComputeTaskPool::get()
-        .spawn(async move { Pack::load(&dir).map_err(|e| format!("{e:#}")) });
+        .spawn(async move { Pack::load_tier(&dir, want_tier).map_err(|e| format!("{e:#}")) });
     pending.0 = Some((name, task));
 }
 
@@ -515,6 +526,15 @@ fn poll_map_load(
             if let Some(s) = &gpu_load {
                 s.begin(); // GPU build starts next frame (build_cpu_data); keep the toast up
             }
+            // A Markers pack has no world, so every loot container that would have GLOWED ITS
+            // MODEL now has no model to glow: LootModelIndex is insert-only (nothing in the tree
+            // removes it), so toggling ESP on a session that already loaded a Full pack leaves the
+            // index resident, every container takes the glow branch, gets no Mesh3d, and is drawn
+            // by a world pass that no longer exists. The loot layer would be silently empty --
+            // which in ESP mode is indistinguishable from "this map has no loot".
+            if p.tier == eftpack::PackTier::Markers {
+                commands.remove_resource::<crate::loot::LootModelIndex>();
+            }
             info!(
                 "map switch: '{}' loaded in place ({} meshes, {} instances)",
                 p.manifest.dataset,
@@ -554,6 +574,7 @@ fn poll_map_load(
 /// flat grey backdrop. Menu mode (no pack) is skipped entirely.
 fn reset_map_view(
     mut commands: Commands,
+    esp: Res<EspMode>,
     pack: Option<Res<LoadedPack>>,
     epoch: Res<render::MapEpoch>,
     mut images: ResMut<Assets<Image>>,
@@ -622,6 +643,16 @@ fn reset_map_view(
     // the old image so it doesn't leak each swap) or INSERT one when the camera has none yet (the
     // async cold-load first frame — same params as `setup`'s insert).
     let (sun_dir, _) = pack_sun_dir(Some(&pack.0));
+    // Toggling ESP on a session that already loaded a Full map leaves the old skybox on the
+    // camera; nothing else removes it, and it would keep painting the frame.
+    if esp.0 {
+        if let Some(sb) = skybox {
+            let old = sb.image.clone();
+            images.remove(&old);
+        }
+        commands.entity(cam_entity).remove::<Skybox>();
+        return;
+    }
     let new_sky = build_sky_cubemap(&mut images, sun_dir);
     match skybox {
         Some(mut sb) => {
@@ -858,6 +889,12 @@ fn main() {
     // Pack::load runs off-thread. Only the GPU-driven path has that epoch-aware async rebuild; the
     // m0/std paths spawn geometry once at Startup, so they keep loading synchronously.
     // EFT_SYNC_LOAD=1 forces the old blocking load.
+    // ESP / overlay-only: read once here so both the sync and async load paths agree, and so the
+    // decision is made before anything touches the GPU.
+    let esp_mode = std::env::var("EFT_ESP")
+        .ok()
+        .map(|v| v.trim() == "1")
+        .unwrap_or_else(|| menu::config_bool_pub("espMode").unwrap_or(false));
     let async_cold_load = pack_dir.is_some()
         && render_path == RenderPath::GpuDriven
         && !std::env::var("EFT_SYNC_LOAD").map(|v| v.trim() == "1").unwrap_or(false);
@@ -868,7 +905,7 @@ fn main() {
         );
         None
     } else if let Some(dir) = &pack_dir {
-        match Pack::load(dir) {
+        match Pack::load_tier(dir, if esp_mode { eftpack::PackTier::Markers } else { eftpack::PackTier::Full }) {
             Ok(p) => {
                 eprintln!(
                     "loaded .eftpack '{}': {} unique meshes, {} instances, {} materials",
@@ -1202,6 +1239,11 @@ fn main() {
     // (menu_fx), so the 3D clear IS the menu field; setup() also skips the Skybox then.
     app.insert_resource(if menu_mode {
         ClearColor(Color::srgb_u8(9, 9, 9))
+    } else if esp_mode {
+        // ESP draws no world, so the overcast horizon stand-in would just be a grey wall over the
+        // game. Near-black rather than pure black: an opaque pure-black panel over a raid reads as
+        // "the app crashed", and the whole point is that the player can trust what they are seeing.
+        ClearColor(Color::srgb_u8(11, 13, 16))
     } else {
         ClearColor(Color::srgb(0.55, 0.58, 0.58))
     })
@@ -1266,6 +1308,8 @@ fn main() {
             PostUpdate,
             debug_bench_camera.before(bevy::transform::TransformSystems::Propagate),
         )
+        .insert_resource(EspMode(menu::config_bool_pub("espMode").unwrap_or(false)))
+        .insert_resource(EspMode(esp_mode))
         .init_resource::<render::PanelLensShift>()
         .init_resource::<render::OverlaySlice>()
         // The SOLE writer of Camera::sub_camera_view, after egui has finished laying out (so the
@@ -1624,6 +1668,7 @@ fn pack_sun_dir(pack: Option<&crate::eftpack::Pack>) -> (Vec3, bool) {
 /// Spawn camera + a key light, framed on the pack bounds if one is loaded.
 fn setup(
     mut commands: Commands,
+    esp: Res<EspMode>,
     pack: Option<Res<LoadedPack>>,
     mut images: ResMut<Assets<Image>>,
     grade: Option<Res<GradeLutCpu>>,
@@ -1724,7 +1769,10 @@ fn setup(
     // fog/horizon mismatch). Skipped in menu mode (sky is None there). brightness 900 nits maps a
     // cubemap value of 1.0 to ~0.9 render radiance under the default camera Exposure — the grade LUT
     // then remaps sky + scene identically, so relative brightness is preserved.
-    if let Some(image) = sky {
+    // ESP: no skybox. It is the one thing left that paints the WHOLE frame, so with it in place
+    // the near-black clear colour is never seen and the overlay is a tan gradient over the game
+    // rather than a cutout of markers.
+    if let Some(image) = sky.filter(|_| !esp.0) {
         cam.insert(Skybox {
             image,
             brightness: 900.0,

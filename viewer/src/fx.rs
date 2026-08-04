@@ -143,12 +143,19 @@ fn teardown_fx(mut commands: Commands, q: Query<Entity, Or<(With<FxQuad>, With<F
 }
 
 fn spawn_fx(
+    esp: Res<crate::EspMode>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     pack: Option<Res<crate::render::LoadedPack>>,
 ) {
+    // ESP draws no world, so this would be fire and smoke with nothing to burn. The TEARDOWN
+    // still runs (it is chained before this), which is what makes toggling ESP on a
+    // running session remove what is already spawned rather than freeze it.
+    if esp.0 {
+        return;
+    }
     if std::env::var("EFT_FX").map(|v| v.trim() == "0").unwrap_or(false) {
         return;
     }

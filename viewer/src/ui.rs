@@ -1969,6 +1969,8 @@ fn pos_hud(
     mut contexts: bevy_egui::EguiContexts,
     hud: Res<PosHud>,
     menu: Option<Res<crate::menu::MenuState>>,
+    link: Option<Res<crate::game_watch::GameLink>>,
+    intel: Option<Res<crate::poi::MapIntelMeta>>,
     cams: Query<&Transform, With<crate::render::CullCamera>>,
 ) {
     use bevy_egui::egui::{self, RichText};
@@ -2006,6 +2008,58 @@ fn pos_hud(
                 .fill(crate::ui_theme::HUD_BG)
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
+                    // RAID first, and largest, because it is the only number on this HUD that
+                    // is counting DOWN on the player. Shown only while the logs say a raid is
+                    // running; a stale clock ticking in the menu would be a lie with a number on
+                    // it. GAME is EFT's own time of day (7x real), straight off the screenshot
+                    // filename -- it cannot be derived from the raid clock.
+                    if let Some(raid) = link.as_ref().and_then(|l| l.in_raid) {
+                        let mins = intel.as_ref().and_then(|i| i.raid_minutes).map(|m| m as f32);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("RAID").size(11.0).color(dim));
+                            match raid.remaining_s(mins) {
+                                Some(left) => {
+                                    let (m, sec) = ((left / 60.0) as i32, (left % 60.0) as i32);
+                                    ui.label(
+                                        RichText::new(format!("{m}:{sec:02}"))
+                                            .size(16.0)
+                                            .strong()
+                                            .color(if left < 300.0 {
+                                                crate::ui_theme::WARN
+                                            } else {
+                                                bright
+                                            }),
+                                    );
+                                }
+                                None => {
+                                    // No raid_minutes for this map: say the elapsed time, which is
+                                    // known, instead of inventing the remaining time, which is not.
+                                    let e = raid.elapsed_s();
+                                    let (m, sec) = ((e / 60.0) as i32, (e % 60.0) as i32);
+                                    ui.label(
+                                        RichText::new(format!("+{m}:{sec:02}"))
+                                            .size(16.0)
+                                            .strong()
+                                            .color(bright),
+                                    )
+                                    .on_hover_text(
+                                        "elapsed, not remaining: this map's raid length is not in                                          the intel cache, and a guessed countdown is the number                                          you would decide when to run on",
+                                    );
+                                }
+                            }
+                            if let Some(h) = link.as_ref().and_then(|l| l.player.as_ref()).and_then(|p| p.game_hour) {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("GAME").size(11.0).color(dim));
+                                let hh = h.floor() as i32;
+                                let mm = ((h - h.floor()) * 60.0) as i32;
+                                ui.label(
+                                    RichText::new(format!("{hh:02}:{mm:02}"))
+                                        .size(13.0)
+                                        .color(bright),
+                                );
+                            }
+                        });
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("POS").size(11.0).color(dim));
                         ui.label(RichText::new(&pos_s).size(13.0).color(bright));

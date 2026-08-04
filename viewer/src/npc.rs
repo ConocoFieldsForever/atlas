@@ -124,6 +124,7 @@ fn teardown_npcs(mut commands: Commands, q: Query<Entity, With<Npc>>) {
 }
 
 fn spawn_npcs(
+    esp: Res<crate::EspMode>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -131,6 +132,12 @@ fn spawn_npcs(
     mut ibms: ResMut<Assets<SkinnedMeshInverseBindposes>>,
     pack: Option<Res<crate::render::LoadedPack>>,
 ) {
+    // ESP draws no world, so this would be simulated scavs walking a real raid. The TEARDOWN
+    // still runs (it is chained before this), which is what makes toggling ESP on a
+    // running session remove what is already spawned rather than freeze it.
+    if esp.0 {
+        return;
+    }
     if std::env::var("EFT_NPC").map(|v| v.trim() == "0").unwrap_or(false) {
         return;
     }

@@ -2366,6 +2366,11 @@ fn compute_cpu_blob(pack: &Pack, lod: i32, show_disabled: bool) -> Option<CpuDat
     };
     // (ctrl_tex_linear is declared above the material loop — vp heights masks share it.)
     'terrain: {
+        // Same reason as grass below: terrain draws from its own layer/control textures and does
+        // not key off the mesh table, so an ESP pack would render the ground with no buildings.
+        if pack.tier != crate::eftpack::PackTier::Full {
+            break 'terrain;
+        }
         let tl_path_owned = pack
             .manifest
             .sidecars
@@ -3100,6 +3105,13 @@ fn compute_cpu_blob(pack: &Pack, lod: i32, show_disabled: bool) -> Option<CpuDat
     //      rendered by the SAME cull + multidraw + alpha-cutout path. grass.bin = N×[x,y,z,rotY,
     //      scale] f32 from build_grass.py (deterministic, road-excluding GPU-Instancer density). ----
     'grass: {
+        // Grass reads grass.bin STRAIGHT off disk, so it is not suppressed by an empty mesh table
+        // or by nulling the sidecar -- it builds its own instance stream. Without this guard an
+        // ESP pack draws 3.26M grass clumps and nothing else: foliage floating over a live raid,
+        // which is worse than either mode.
+        if pack.tier != crate::eftpack::PackTier::Full {
+            break 'grass;
+        }
         let bin = match std::fs::read(pack.root.join("grass.bin")) {
             Ok(b) if !b.is_empty() => b,
             _ => {
