@@ -23,6 +23,13 @@ Env: EFT_JOBS overrides --jobs (EFT_JOBS=1 forces the plain serial single extrac
 """
 
 import argparse
+
+# Console windows: a background build runs DETACHED (no console), so every console child spawned
+# without CREATE_NO_WINDOW gets its own visible console window and steals foreground from the game.
+# See tools/procflags.py.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "tools"))
+import procflags as _pf
 import json
 import os
 import shutil
@@ -170,7 +177,7 @@ def _run_chunk(idx, chunk_levels, name, passthrough):
     cmd = [PY, EXTRACT, "--levels", ",".join(str(x) for x in chunk_levels), "--name", cname] + passthrough
     print(f"[CHUNK {idx}] {len(chunk_levels)} levels -> {cname}", flush=True)
     # Stream the child's stdout with a per-chunk prefix so progress is legible when interleaved.
-    p = subprocess.Popen(
+    p = _pf.popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="ascii", errors="replace",
     )
@@ -321,8 +328,10 @@ def main():
     # 1 job (or 1 level) -> just run the plain extractor into the dataset directly (no merge risk).
     if jobs <= 1:
         print(f"[PARALLEL] jobs=1 -> single-process extraction into {args.name}", flush=True)
-        rc = subprocess.call([PY, EXTRACT, "--levels", args.levels, "--name", args.name] + passthrough)
-        sys.exit(rc)
+        # .returncode, not the CompletedProcess: this was subprocess.call (an int) and sys.exit()
+        # of an object exits 1 regardless of whether the extraction actually succeeded.
+        rc = _pf.run([PY, EXTRACT, "--levels", args.levels, "--name", args.name] + passthrough)
+        sys.exit(rc.returncode)
 
     # Deterministic chunk plan (greedy LPT on level file sizes). It depends ONLY on levels+jobs+on-disk sizes,
     # so a re-run re-derives the SAME chunk<->levels assignment -> a resumed run lines up with existing staging.

@@ -15,6 +15,13 @@ the codex/agent review:
   python extraction/unity/eft_extract_v2.py --levels 63 --name ix_terrain --terrain-only
 """
 import os, sys, json, argparse, time, gc
+
+# Console windows: a background build runs DETACHED (no console), so every console child spawned
+# without CREATE_NO_WINDOW gets its own visible console window and steals foreground from the game.
+# See tools/procflags.py.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "..", "tools"))
+import procflags as _pf
 import shutil, hashlib, threading, subprocess, tempfile
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -638,7 +645,7 @@ def _terrain_bake_gpu(atlas, prep, out_path):
         tmp_out = out_path + ".gpu.tmp"                   # same dir as final -> os.replace is atomic
         json.dump({"R": int(R), "ss": int(ss), "out": tmp_out, "pixels": pbin, "texs": texs, "layers": layers},
                   open(os.path.join(d, "m.json"), "w"))
-        r = subprocess.run([atlas, "bake-terrain", os.path.join(d, "m.json")], capture_output=True, text=True)
+        r = _pf.run([atlas, "bake-terrain", os.path.join(d, "m.json")], capture_output=True, text=True)
         if r.returncode == 0 and os.path.isfile(tmp_out) and os.path.getsize(tmp_out) > 0:
             os.replace(tmp_out, out_path)
             return True

@@ -13,6 +13,13 @@ Env (same contract as build_map.py; unset -> standalone viewer defaults):
 """
 
 import json
+
+# Console windows: a background build runs DETACHED (no console), so every console child spawned
+# without CREATE_NO_WINDOW gets its own visible console window and steals foreground from the game.
+# See tools/procflags.py.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "."))
+import procflags as _pf
 import os
 import shutil
 import subprocess
@@ -78,7 +85,7 @@ def run(stage, total, name, cmd, optional=False):
     env["EFT_INTEL_OUT_DIR"] = BUILD_OUT
     if TK:
         env.setdefault("EFT_TARKMAP_ROOT", TK)
-    p = subprocess.Popen(cmd, cwd=VIEWER, env=env, stdout=subprocess.PIPE,
+    p = _pf.popen(cmd, cwd=VIEWER, env=env, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, encoding="ascii", errors="replace")
     for line in p.stdout:
         print("  " + line.rstrip(), flush=True)

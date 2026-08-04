@@ -17,6 +17,13 @@ Env (contract per README.md; unset -> legacy dev-machine defaults):
 """
 
 import json
+
+# Console windows: a background build runs DETACHED (no console), so every console child spawned
+# without CREATE_NO_WINDOW gets its own visible console window and steals foreground from the game.
+# See tools/procflags.py.
+import sys as _sys, os as _os
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "."))
+import procflags as _pf
 import os
 import re
 import shutil
@@ -116,7 +123,7 @@ def light_levels_for(m):
               f"lights will be skipped (optional)", flush=True)
         return []
     try:
-        out = subprocess.check_output(
+        out = _pf.check_output(
             [PY_UNITY, os.path.join(HERE, "gen_maps.py"), "--lights-for", folder],
             text=True, encoding="utf-8", errors="replace", stderr=subprocess.DEVNULL)
         levels = json.loads(out.strip().splitlines()[-1])
@@ -139,7 +146,7 @@ def run(stage, total, name, cmd, cwd, optional=False):
     # pass the contract values as-is (TK = the maps/+out/ dir, ASSETS = the datasets dir)
     env.setdefault("EFT_TARKMAP_ROOT", TK)
     env.setdefault("EFT_ASSETS_ROOT", ASSETS)
-    p = subprocess.Popen(
+    p = _pf.popen(
         cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace",
     )
@@ -202,7 +209,7 @@ def dataset_levels(m):
     derived = []
     if folder:
         try:
-            out = subprocess.check_output(
+            out = _pf.check_output(
                 [PY_UNITY, os.path.join(HERE, "gen_maps.py"), "--levels-for", folder],
                 text=True, stderr=subprocess.DEVNULL)
             derived = [int(x) for x in json.loads(out.strip().splitlines()[-1])]
@@ -1122,7 +1129,7 @@ def main():
     try:
         env = dict(os.environ, EFT_ASSETS_ROOT=ASSETS)
         flags = 0x00000008 | 0x08000000 if os.name == "nt" else 0  # DETACHED | CREATE_NO_WINDOW
-        subprocess.Popen(
+        _pf.popen(
             [sys.executable, os.path.join(HERE, "dedup_textures.py")], env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             creationflags=flags)
