@@ -24,6 +24,7 @@ use std::sync::Mutex;
 // Events from the watcher thread
 // ---------------------------------------------------------------------------------------------
 
+#[cfg_attr(test, derive(Debug))]
 enum GameEvent {
     /// A raid map started loading in the game (atlas map id, already bundle->id resolved).
     MapLoading(String),
@@ -37,7 +38,10 @@ enum GameEvent {
     /// boot and on every settings apply). Matching it makes the screenshot-eye view frame the
     /// world exactly like the game does.
     Fov(f32),
-    /// The raid ended (UserMatchOver) — the last fix is stale.
+    /// A raid STARTED. Carries the wall-clock instant the `GameStarted` line was written, which
+    /// is the only raid-start timestamp EFT puts on disk.
+    RaidStart(std::time::SystemTime),
+    /// The raid ended — the last fix is stale.
     RaidEnd,
     /// The local profile's side for the upcoming/current raid. This comes only from
     /// GroupMatchRaidSettings; uppercase `Side` fields elsewhere describe other profiles.
@@ -163,10 +167,41 @@ pub fn effective_side(
     link.and_then(|l| l.raid_side).or_else(|| choice.and_then(|c| c.0))
 }
 
+/// A running raid, from `|application|GameStarted:`.
+///
+/// EFT writes no raid countdown anywhere on disk, so this is derived: the log line's own timestamp
+/// is the start, and the duration comes from the map's `raid_minutes` (the client's own
+/// `EscapeTimeLimit`, already carried by `poi::MapIntelMeta`). `remaining()` is therefore only as
+/// honest as that pair, which is why it returns `None` rather than guessing when the duration for
+/// this map is unknown.
+#[derive(Clone, Copy, Debug)]
+pub struct RaidClock {
+    /// When `GameStarted` was logged.
+    pub started: std::time::SystemTime,
+}
+
+impl RaidClock {
+    /// Wall-clock seconds since the raid began.
+    pub fn elapsed_s(&self) -> f32 {
+        self.started.elapsed().map(|d| d.as_secs_f32()).unwrap_or(0.0)
+    }
+
+    /// Seconds left, given the map's raid length. `None` when the duration is unknown: a countdown
+    /// that invents its own end time is worse than no countdown, because it is the number a player
+    /// would decide when to run on.
+    pub fn remaining_s(&self, raid_minutes: Option<f32>) -> Option<f32> {
+        raid_minutes.map(|m| (m * 60.0 - self.elapsed_s()).max(0.0))
+    }
+}
+
 #[derive(Resource)]
 pub struct GameLink {
     rx: Mutex<Receiver<GameEvent>>,
     pub player: Option<PlayerFixState>,
+    /// The running raid, if the logs say one is in progress. Also the guard that makes
+    /// `PrepareSelectedProfileLocally` mean "raid over": that line ALSO fires at login and on
+    /// every return to the menu, so it is only an end signal while a clock is actually running.
+    pub in_raid: Option<RaidClock>,
     /// The map the LOGS say the player is on, parsed but NOT yet applied. The switch is deferred
     /// until the user actually summons the overlay: yanking the viewer onto another map while
     /// they are reading a different one (or browsing the menu) is worse than being a beat late.
@@ -221,6 +256,7 @@ impl Plugin for GameWatchPlugin {
         app.insert_resource(GameLink {
             rx: Mutex::new(rx),
             player: None,
+            in_raid: None,
             pending_map: None,
             unbuilt_map: None,
             raid_side: None,
@@ -410,7 +446,18 @@ with the overlay up"
                     cam_settings.fov_deg = v;
                 }
             }
+            GameEvent::RaidStart(at) => {
+                if link.in_raid.is_none() {
+                    info!("game link: raid started");
+                }
+                link.in_raid = Some(RaidClock { started: at });
+            }
             GameEvent::RaidEnd => {
+                // Reached from `PrepareSelectedProfileLocally` while a clock runs. UserMatchOver,
+                // which used to be the ONLY trigger, appears in 0 of 310 log folders on this
+                // machine -- so everything below had effectively stopped being cleared, and the
+                // stale-map failure the comment describes was live rather than guarded against.
+                link.in_raid = None;
                 link.unbuilt_map = None;
                 link.player = None;
                 link.raid_side = None;
@@ -710,6 +757,85 @@ fn read_new(tail: &mut Tail) -> Option<String> {
 }
 
 /// application.log: line-oriented. `scene preset path:maps/<bundle>.bundle` = a raid map loading.
+/// `2026-08-04 07:15:55.659|...` -> SystemTime, interpreting the stamp as LOCAL time (EFT writes
+/// local). Returns None on anything that does not match, so a BSG format change degrades to "the
+/// raid started when we noticed it" rather than to a wrong clock.
+fn log_line_time(line: &str) -> Option<std::time::SystemTime> {
+    let stamp = line.split('|').next()?.trim();
+    let (date, rest) = stamp.split_once(' ')?;
+    let mut d = date.split('-');
+    let (y, mo, da) = (
+        d.next()?.parse::<i32>().ok()?,
+        d.next()?.parse::<u32>().ok()?,
+        d.next()?.parse::<u32>().ok()?,
+    );
+    let hms = rest.split('.').next()?;
+    let mut t = hms.split(':');
+    let (h, mi, se) = (
+        t.next()?.parse::<u32>().ok()?,
+        t.next()?.parse::<u32>().ok()?,
+        t.next()?.parse::<u32>().ok()?,
+    );
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    // Days since the Unix epoch (civil-from-days, Howard Hinnant's algorithm). No chrono dep.
+    let (yy, mm) = if mo <= 2 { (y - 1, mo + 9) } else { (y, mo - 3) };
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = (yy - era * 400) as i64;
+    let doy = ((153 * mm as i64 + 2) / 5) + da as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as i64 * 146_097 + doe - 719_468;
+    let secs_local = days * 86_400 + (h as i64) * 3600 + (mi as i64) * 60 + se as i64;
+    // Local -> UTC without a tz crate: measure this machine's current offset once, from the same
+    // clock both sides of the comparison use. Good to the second except across a DST boundary
+    // mid-raid, where the clock would jump by an hour and still be self-consistent afterwards.
+    let now = std::time::SystemTime::now();
+    let now_unix = now.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    let offset = local_utc_offset_secs(now_unix);
+    let unix = secs_local - offset;
+    if unix < 0 {
+        return None;
+    }
+    std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(unix as u64))
+}
+
+/// This machine's current UTC offset in seconds, derived from the OS's own local-time formatting
+/// of a known instant. Avoids a timezone dependency for the one thing we need it for.
+fn local_utc_offset_secs(now_unix: i64) -> i64 {
+    #[cfg(windows)]
+    {
+        // GetTimeZoneInformation reports Bias/DaylightBias in MINUTES west of UTC.
+        #[repr(C)]
+        struct Tzi {
+            bias: i32,
+            _std_name: [u16; 32],
+            _std_date: [u16; 8],
+            std_bias: i32,
+            _dlt_name: [u16; 32],
+            _dlt_date: [u16; 8],
+            dlt_bias: i32,
+        }
+        unsafe extern "system" {
+            fn GetTimeZoneInformation(info: *mut Tzi) -> u32;
+        }
+        const TIME_ZONE_ID_DAYLIGHT: u32 = 2;
+        let mut tzi: Tzi = unsafe { std::mem::zeroed() };
+        let rc = unsafe { GetTimeZoneInformation(&mut tzi) };
+        if rc == u32::MAX {
+            return 0;
+        }
+        let extra = if rc == TIME_ZONE_ID_DAYLIGHT { tzi.dlt_bias } else { tzi.std_bias };
+        let _ = now_unix;
+        -((tzi.bias + extra) as i64) * 60
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = now_unix;
+        0
+    }
+}
+
 fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) {
     pending.push_str(chunk);
     // Keep the partial trailing line for the next read; process only complete lines.
@@ -725,7 +851,26 @@ fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) 
     // newest anyway.
     let mut latest: Option<&'static str> = None;
     let mut latest_fov: Option<f32> = None;
+    // Raid start/end. Only the LAST of each in the chunk matters, for the same reason the map
+    // preset takes the last: the first read of a log tails from offset 0 and holds every raid of
+    // the session, so emitting each in turn would walk the app through hours of dead raids.
+    let mut raid_start: Option<std::time::SystemTime> = None;
+    let mut raid_end = false;
     for line in pending[..upto].lines() {
+        // `2026-08-04 07:15:55.659|1.1.0.0.46624|Info|application|GameStarted:51.54(0) real:...`
+        // The numbers on the line are load timings, not a clock -- the LINE'S timestamp is the
+        // raid start, and it is the only one EFT writes down.
+        if line.contains("|application|GameStarted:") {
+            raid_start = log_line_time(line).or(Some(std::time::SystemTime::now()));
+            raid_end = false; // a start later in the chunk outranks an earlier end
+        }
+        // Fires at login and 3x on every return to the menu, so it is an END signal only while a
+        // raid clock is running -- enforced by the consumer, which ignores it when `in_raid` is
+        // None. Chosen because UserMatchOver, the documented trigger, appears in 0 of 310 log
+        // folders here and 0 of the last 8 sessions.
+        if line.contains("|application|PrepareSelectedProfileLocally") && raid_start.is_none() {
+            raid_end = true;
+        }
         if let Some(rest) = line.split("scene preset path:maps/").nth(1) {
             if let Some(bundle) = rest.split(".bundle").next() {
                 if let Some(id) = bundle_to_map(bundle.trim()) {
@@ -748,6 +893,14 @@ fn parse_application(pending: &mut String, chunk: &str, tx: &Sender<GameEvent>) 
                 }
             }
         }
+    }
+    if let Some(at) = raid_start {
+        let _ = tx.send(GameEvent::RaidStart(at));
+        LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if raid_end {
+        let _ = tx.send(GameEvent::RaidEnd);
+        LINK_HEALTH.events.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(id) = latest {
         let _ = tx.send(GameEvent::MapLoading(id.to_string()));
@@ -985,4 +1138,68 @@ fn sync_map_on_overlay_show(
     }
     info!("game link: overlay opened - loading the raid map '{id}'");
     sw.0 = Some(dir.to_string_lossy().into_owned());
+}
+
+#[cfg(test)]
+mod raid_clock_tests {
+    use super::*;
+
+    /// The timestamp parser against the REAL line format, including the local->UTC step. A wrong
+    /// offset here shows up as a raid clock that is hours out, which looks like a live countdown
+    /// and is not one.
+    #[test]
+    fn log_line_time_parses_the_real_format() {
+        let line = "2026-08-04 07:15:55.659|1.1.0.0.46624|Info|application|GameStarted:51.54(0) real:65.29(0) diff:13.75";
+        let t = log_line_time(line).expect("should parse");
+        // Round-trip through the same offset the parser used, so the assertion does not itself
+        // depend on the machine's timezone.
+        let unix = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let local = unix + local_utc_offset_secs(now_unix);
+        // 2026-08-04 07:15:55 local, expressed as seconds-of-day.
+        assert_eq!(local.rem_euclid(86_400), 7 * 3600 + 15 * 60 + 55);
+    }
+
+    #[test]
+    fn log_line_time_rejects_junk() {
+        assert!(log_line_time("not a log line").is_none());
+        assert!(log_line_time("2026-13-99 99:99:99.000|x|Info|application|GameStarted:1").is_none());
+    }
+
+    /// `PrepareSelectedProfileLocally` fires at LOGIN and 3x on every return to the menu, so a
+    /// chunk that contains a start AFTER an end must not report the end: that is the ordinary
+    /// login-then-raid sequence, and treating it as "raid over" would clear the live raid.
+    #[test]
+    fn a_start_after_an_end_wins_within_one_chunk() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = String::new();
+        let chunk = "2026-08-04 07:13:47.654|v|Info|application|PrepareSelectedProfileLocally ProfileId:x\n\
+                     2026-08-04 07:15:55.659|v|Info|application|GameStarted:51.54(0) real:65.29(0)\n";
+        parse_application(&mut pending, chunk, &tx);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(|e| matches!(e, GameEvent::RaidStart(_))),
+            "expected a RaidStart, got {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, GameEvent::RaidEnd)),
+            "the login PrepareSelectedProfileLocally must not read as a raid end: {events:?}"
+        );
+    }
+
+    #[test]
+    fn an_end_alone_is_reported() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut pending = String::new();
+        parse_application(
+            &mut pending,
+            "2026-08-04 07:40:37.481|v|Info|application|PrepareSelectedProfileLocally ProfileId:x\n",
+            &tx,
+        );
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, GameEvent::RaidEnd)), "{events:?}");
+    }
 }
