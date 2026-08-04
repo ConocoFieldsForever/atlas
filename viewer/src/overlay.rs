@@ -667,7 +667,11 @@ impl Plugin for OverlayPlugin {
         // the raid map -> panel up, camera already pinned by EFT_POSE). Consumed and REMOVED here
         // so a later PLAY relaunch doesn't inherit a stale summon.
         let summon = std::env::var("EFT_OVERLAY_SUMMON").is_ok_and(|v| v.trim() == "1");
-        if summon {
+        let remote = crate::remote_mode();
+        // Remote menu->map relaunches also carry EFT_POSE, but deliberately do not request the
+        // local overlay. Treat that pose as the same one-shot handoff so it cannot pin later maps.
+        let pose_handoff = summon || (remote && std::env::var_os("EFT_POSE").is_some());
+        if pose_handoff {
             std::env::remove_var("EFT_OVERLAY_SUMMON");
             // The handoff's EFT_POSE has done its job once `setup` (Startup) read it. Drop it in
             // PostStartup so the camera is free afterwards (main.rs gates on its presence) and a
@@ -689,14 +693,21 @@ impl Plugin for OverlayPlugin {
             info!("overlay: disabled for this finite EFT_SHOT/EFT_BENCH job (config untouched)");
             cfg.enabled = false;
         }
+        if remote {
+            if cfg.enabled {
+                info!("overlay: disabled in remote-renderer mode (config untouched)");
+            }
+            cfg.enabled = false;
+            cfg.show_on_screenshot = false;
+        }
         app.insert_resource(cfg)
             .insert_resource(OverlayState {
-                shown: summon && !automated,
+                shown: summon && !automated && !remote,
                 windowed: false,
                 raise_nonce: 0,
             })
             .init_resource::<OverlayViewSlice>();
-        if automated {
+        if automated || remote {
             app.add_systems(
                 Update,
                 (toggle_overlay, apply_overlay, apply_overlay_view_slice).chain(),

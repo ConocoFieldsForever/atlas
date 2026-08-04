@@ -815,7 +815,8 @@ fn main() {
                  atlas bake-nav <pack-dir> [--res 1.0] [--layers 8]  (headless CPU nav baker)\n\
                  no args: start menu (scans <exe>/packs).  env: EFT_PACK, EFT_RENDER, EFT_SHADOWS,\n\
                  EFT_GRADE/EFT_GRADE_EXPOSURE, EFT_FOG, EFT_UNCAPPED, EFT_HIDDEN, EFT_SHOT,\n\
-                 EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0. Docs: README.md"
+                 EFT_GAME_DATA, EFT_LOOT_JSON, EFT_TEX_BC=0, EFT_REMOTE_MODE=1,\n\
+                 EFT_SCREENSHOTS_DIR, EFT_GAME_LOGS_DIR. Docs: README.md"
             );
             return;
         }
@@ -1338,6 +1339,16 @@ pub fn automated_finite_job() -> bool {
     std::env::var_os("EFT_SHOT").is_some()
         || std::env::var_os("EFT_BENCH").is_some()
         || std::env::var("EFT_HIDDEN_ALLOW").map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+/// Remote-renderer mode: Atlas runs on another machine/VM, consumes screenshot and log files from
+/// configured network-visible directories, and streams its ordinary window back to the gaming PC.
+/// There is no local Tarkov window to raise or align against, so overlay presentation stands down;
+/// the passive game-link and camera/map updates remain active.
+pub fn remote_mode() -> bool {
+    std::env::var("EFT_REMOTE_MODE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
 }
 
 /// Startup echo of the resolved render path INTO the file log: the capability probe (incl. the
