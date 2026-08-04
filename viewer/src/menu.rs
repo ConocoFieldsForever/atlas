@@ -11,8 +11,10 @@
 //! path keeps its build-once buffers. DELETE removes the pack dir after an explicit confirm.
 
 use bevy::prelude::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One known/installed map row.
+#[derive(Clone)]
 pub struct MapEntry {
     /// Display title ("Streets of Tarkov").
     pub title: String,
@@ -101,7 +103,11 @@ fn prep_child(cmd: &mut std::process::Command, detached: bool) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         const DETACHED_PROCESS: u32 = 0x0000_0008;
-        cmd.creation_flags(if detached { DETACHED_PROCESS | CREATE_NO_WINDOW } else { CREATE_NO_WINDOW });
+        cmd.creation_flags(if detached {
+            DETACHED_PROCESS | CREATE_NO_WINDOW
+        } else {
+            CREATE_NO_WINDOW
+        });
     }
     #[cfg(unix)]
     {
@@ -112,7 +118,12 @@ fn prep_child(cmd: &mut std::process::Command, detached: bool) {
 }
 
 impl BuildJob {
-    pub fn spawn(key: &str, game_dir: &str, force: bool, background: bool) -> std::io::Result<Self> {
+    pub fn spawn(
+        key: &str,
+        game_dir: &str,
+        force: bool,
+        background: bool,
+    ) -> std::io::Result<Self> {
         // GUI builds are ALWAYS --self-contained: the pack copies its textures/sidecars in and
         // references them pack-relative, so it stays valid when shipped to a friend (without it,
         // assemble_bevy bakes absolute machine paths and the pack loads untextured elsewhere).
@@ -125,7 +136,14 @@ impl BuildJob {
         // `background` (the "Process in background" toggle, default ON): only MAP builds detach — a
         // build is the long pipeline worth surviving an app-close; intel/deps are quick and have no
         // row to reattach, so they always use the inherited-pipe path.
-        Self::spawn_script(key, game_dir, "tools/build_map.py", true, &extra, background)
+        Self::spawn_script(
+            key,
+            game_dir,
+            "tools/build_map.py",
+            true,
+            &extra,
+            background,
+        )
     }
 
     /// The menu's tarkov.dev INTEL refresh (tools/sync_intel.py) — same streaming-job shape as a
@@ -221,8 +239,10 @@ impl BuildJob {
                 "started": now_epoch(),
                 "force": force,
             });
-            let _ =
-                std::fs::write(&sidecar, serde_json::to_string_pretty(&manifest).unwrap_or_default());
+            let _ = std::fs::write(
+                &sidecar,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
             // The live panel TAILS the file (same [STAGE]/[SUBPROGRESS] parsing as the pipe path).
             spawn_log_tailer(log_path, log.clone(), exited.clone());
             // While Atlas stays open we still OWN the child, so reap via try_wait (accurate exit code)
@@ -258,8 +278,14 @@ impl BuildJob {
             .stderr(std::process::Stdio::piped())
             .spawn()?;
         for pipe in [
-            child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
-            child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
         ]
         .into_iter()
         .flatten()
@@ -273,7 +299,13 @@ impl BuildJob {
             });
         }
         let child = std::sync::Arc::new(std::sync::Mutex::new(child));
-        spawn_owned_reaper(child.clone(), log.clone(), None, done.clone(), exited.clone());
+        spawn_owned_reaper(
+            child.clone(),
+            log.clone(),
+            None,
+            done.clone(),
+            exited.clone(),
+        );
         Ok(Self {
             key: key.to_string(),
             proc: ProcHandle::Owned(child),
@@ -494,7 +526,10 @@ fn pid_alive(pid: u32) -> bool {
 /// A pack for `key` looks present on disk (its manifest exists). The rigorous validity check lives
 /// in `scan`; this is just the completion signal for a reattached build whose exit code we never saw.
 fn pack_present(key: &str) -> bool {
-    crate::paths::packs_root().join(format!("{key}.eftpack")).join("manifest.json").is_file()
+    crate::paths::packs_root()
+        .join(format!("{key}.eftpack"))
+        .join("manifest.json")
+        .is_file()
 }
 
 /// Does the captured log contain `marker` anywhere in its (capped) tail?
@@ -502,7 +537,9 @@ fn log_has(
     log: &std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     marker: &str,
 ) -> bool {
-    log.lock().map(|l| l.iter().any(|s| s.contains(marker))).unwrap_or(false)
+    log.lock()
+        .map(|l| l.iter().any(|s| s.contains(marker)))
+        .unwrap_or(false)
 }
 
 /// Read all currently-available bytes from a growing log file into `pending`, emitting each COMPLETE
@@ -654,10 +691,14 @@ fn spawn_detached_reaper(
 ///     the user can resume/rebuild, and drop the sidecar.
 /// Only ONE build can be in flight, so the first alive one is adopted; any others are left untouched.
 fn reattach_builds(worker: &mut crate::jobs::JobWorker, game_dir: &str) {
-    let Ok(rd) = std::fs::read_dir(build_logs_dir()) else { return };
+    let Ok(rd) = std::fs::read_dir(build_logs_dir()) else {
+        return;
+    };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let Some(map) = name.strip_prefix("build_").and_then(|s| s.strip_suffix(".running.json"))
+        let Some(map) = name
+            .strip_prefix("build_")
+            .and_then(|s| s.strip_suffix(".running.json"))
         else {
             continue;
         };
@@ -706,8 +747,7 @@ fn reattach_builds(worker: &mut crate::jobs::JobWorker, game_dir: &str) {
 
 /// Parse a `build_<map>.running.json` sidecar -> (pid, started_epoch, force). None if unreadable.
 fn read_running_sidecar(path: &std::path::Path) -> Option<(u32, u64, bool)> {
-    let v: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     let pid = v.get("pid").and_then(|x| x.as_u64())? as u32;
     let started = v.get("started").and_then(|x| x.as_u64()).unwrap_or(0);
     let force = v.get("force").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -727,11 +767,141 @@ fn instant_from_epoch(started_epoch: u64) -> std::time::Instant {
 /// Whole-file check for the `[BUILD OK]` success marker (the reattach scan's log evidence, used when
 /// the pack isn't detectable). Reads the file directly since there's no in-memory ring yet.
 fn file_has_build_ok(log_path: &std::path::Path) -> bool {
-    std::fs::read_to_string(log_path).map(|s| s.contains("[BUILD OK]")).unwrap_or(false)
+    std::fs::read_to_string(log_path)
+        .map(|s| s.contains("[BUILD OK]"))
+        .unwrap_or(false)
+}
+
+/// The kind of the active menu batch. Both options share one worker queue and progress model;
+/// only the source list differs.
+#[derive(Clone, Copy)]
+enum BuildBatchKind {
+    All,
+    Selected,
+}
+
+/// A pending BUILD ALL confirmation keeps a snapshot of the intended FIFO. The roster can rescan
+/// while the dialog is open, but confirmation still starts exactly what the user reviewed.
+struct BuildAllConfirmation {
+    jobs: Vec<(String, bool)>,
+    estimate_secs: Option<u64>,
 }
 
 /// Present ONLY in menu mode (bare launch, no pack): drives the fullscreen menu UI and
 /// suppresses the in-raid panels (ui.rs checks for this resource).
+#[derive(Default)]
+struct BuildBatchProgress {
+    total: usize,
+    completed: usize,
+    active: bool,
+    failed: bool,
+    kind: Option<BuildBatchKind>,
+    /// Snapshot of the batch order. This lets every map row show queued, building, done, or failed.
+    keys: Vec<String>,
+    failed_key: Option<String>,
+}
+
+const BUILD_TIMING_SAMPLES_KEY: &str = "buildTimingSamples";
+const BUILD_TIMING_SAMPLES_PER_MAP: usize = 5;
+
+/// Read the recent successful wall-clock build durations recorded locally for this computer.
+/// These stay in the per-user Atlas config, never in a pack or project file.
+fn load_build_timings() -> BTreeMap<String, Vec<f32>> {
+    let Some(text) = read_config_text() else {
+        return BTreeMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return BTreeMap::new();
+    };
+    let Some(maps) = value
+        .get(BUILD_TIMING_SAMPLES_KEY)
+        .and_then(|v| v.as_object())
+    else {
+        return BTreeMap::new();
+    };
+    maps.iter()
+        .filter_map(|(map, values)| {
+            let samples: Vec<f32> = values
+                .as_array()?
+                .iter()
+                .filter_map(|v| v.as_f64())
+                .map(|v| v as f32)
+                // Guard hand-edited or corrupt config values: 1 second to one day is a useful build sample.
+                .filter(|v| v.is_finite() && (1.0..=86_400.0).contains(v))
+                .collect();
+            (!samples.is_empty()).then(|| (map.clone(), samples))
+        })
+        .collect()
+}
+
+/// Persist timing samples through the same BOM-tolerant, per-user config path as menu settings.
+#[must_use]
+fn save_build_timings(timings: &BTreeMap<String, Vec<f32>>) -> bool {
+    let path = config_path();
+    let mut value: serde_json::Value = read_config_text()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    value[BUILD_TIMING_SAMPLES_KEY] = serde_json::json!(timings);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            error!(
+                "menu: could not save build timings to {}: {e}",
+                path.display()
+            );
+            false
+        }
+    }
+}
+
+fn record_build_timing(timings: &mut BTreeMap<String, Vec<f32>>, map: &str, elapsed_secs: f32) {
+    if !elapsed_secs.is_finite() || !(1.0..=86_400.0).contains(&elapsed_secs) {
+        return;
+    }
+    let samples = timings.entry(map.to_string()).or_default();
+    samples.push(elapsed_secs);
+    if samples.len() > BUILD_TIMING_SAMPLES_PER_MAP {
+        samples.drain(..samples.len() - BUILD_TIMING_SAMPLES_PER_MAP);
+    }
+}
+
+/// Sum the selected maps' own recent average durations. When a map has no sample, use the local
+/// all-map average so partial history remains helpful; no samples means no invented estimate.
+fn estimate_batch_secs(
+    jobs: &[(String, bool)],
+    timings: &BTreeMap<String, Vec<f32>>,
+) -> Option<u64> {
+    let all: Vec<f32> = timings.values().flatten().copied().collect();
+    let fallback = (!all.is_empty()).then(|| all.iter().sum::<f32>() / all.len() as f32)?;
+    let secs = jobs
+        .iter()
+        .map(|(map, _)| {
+            timings
+                .get(map)
+                .filter(|samples| !samples.is_empty())
+                .map(|samples| samples.iter().sum::<f32>() / samples.len() as f32)
+                .unwrap_or(fallback)
+        })
+        .sum::<f32>();
+    Some(secs.round().max(1.0) as u64)
+}
+
+fn fmt_duration(secs: u64) -> String {
+    let hours = secs / 3_600;
+    let minutes = (secs % 3_600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 #[derive(Resource)]
 pub struct MenuState {
     pub entries: Vec<MapEntry>,
@@ -770,6 +940,15 @@ pub struct MenuState {
     /// the pack list / intel and (for a sync) set the note. Builds/syncs now run on the shared
     /// worker, not owned by MenuState.
     pub seen_completed: u64,
+    /// Checked map keys for the next selected-map build.
+    selected_maps: BTreeSet<String>,
+    /// Recent successful build durations observed locally, keyed by map. Used only for the Build All estimate.
+    build_timings: BTreeMap<String, Vec<f32>>,
+    /// BUILD ALL requires an explicit confirmation before it owns the worker queue.
+    confirm_build_all: Option<BuildAllConfirmation>,
+    /// In-app batch state. The worker owns the actual FIFO; this supplies the overall progress and
+    /// the per-map queued/building/done/failed status shown in the roster.
+    build_all: BuildBatchProgress,
     /// EFT_MENU_BUILD auto-build map key, enqueued once on the first menu frame (CLI/testing hook).
     pub autobuild: Option<String>,
     /// Set when a config write FAILED (finding 12) — shown as a warning by the footer so the user
@@ -806,7 +985,9 @@ pub fn intel_status() -> (Option<f64>, Option<f64>, usize) {
     (
         age_days(&sh.join("loot.json")),
         age_days(&sh.join("tasks.json")),
-        std::fs::read_dir(sh.join("icons")).map(|d| d.count()).unwrap_or(0),
+        std::fs::read_dir(sh.join("icons"))
+            .map(|d| d.count())
+            .unwrap_or(0),
     )
 }
 
@@ -987,9 +1168,10 @@ fn read_config_text() -> Option<String> {
 }
 
 fn config_game_dir() -> Option<String> {
-    let v: serde_json::Value =
-        serde_json::from_str(&read_config_text()?).ok()?;
-    v.get("gameData").and_then(|s| s.as_str()).map(str::to_string)
+    let v: serde_json::Value = serde_json::from_str(&read_config_text()?).ok()?;
+    v.get("gameData")
+        .and_then(|s| s.as_str())
+        .map(str::to_string)
 }
 
 pub fn save_config_game_dir(dir: &str) -> bool {
@@ -998,8 +1180,7 @@ pub fn save_config_game_dir(dir: &str) -> bool {
 
 /// Generic single-key read from atlas.config.json (the game-dir helpers are the canonical example).
 fn config_str(key: &str) -> Option<String> {
-    let v: serde_json::Value =
-        serde_json::from_str(&read_config_text()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&read_config_text()?).ok()?;
     v.get(key).and_then(|s| s.as_str()).map(str::to_string)
 }
 
@@ -1052,8 +1233,7 @@ pub fn save_config_bool_pub(key: &str, val: bool) -> bool {
 }
 /// f32 variants (overlay geometry / fps cap). Stored as JSON numbers.
 pub fn config_f32_pub(key: &str) -> Option<f32> {
-    let v: serde_json::Value =
-        serde_json::from_str(&read_config_text()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&read_config_text()?).ok()?;
     v.get(key).and_then(|n| n.as_f64()).map(|n| n as f32)
 }
 #[must_use]
@@ -1101,15 +1281,17 @@ pub fn save_quality_preset_pub(preset: crate::render::QualityPreset) -> bool {
     match std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default()) {
         Ok(()) => true,
         Err(e) => {
-            error!("menu: could not save quality preset to {}: {e}", path.display());
+            error!(
+                "menu: could not save quality preset to {}: {e}",
+                path.display()
+            );
             false
         }
     }
 }
 
 fn config_bool(key: &str) -> Option<bool> {
-    let v: serde_json::Value =
-        serde_json::from_str(&read_config_text()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&read_config_text()?).ok()?;
     v.get(key).and_then(|b| b.as_bool())
 }
 
@@ -1173,8 +1355,12 @@ pub fn save_config_screenshot_locate(on: bool) -> bool {
 /// True once the user (or an env var) has chosen where extracted datasets live — drives the
 /// first-run onboarding gate. The default location existing on disk does NOT count as "configured".
 pub fn assets_configured() -> bool {
-    std::env::var("EFT_ASSETS_ROOT").map(|d| !d.is_empty()).unwrap_or(false)
-        || config_str("assetsRoot").map(|d| !d.is_empty()).unwrap_or(false)
+    std::env::var("EFT_ASSETS_ROOT")
+        .map(|d| !d.is_empty())
+        .unwrap_or(false)
+        || config_str("assetsRoot")
+            .map(|d| !d.is_empty())
+            .unwrap_or(false)
 }
 
 /// The extracted-datasets dir (`EFT_ASSETS_ROOT` the Python kit reads): env > saved config >
@@ -1188,7 +1374,10 @@ pub fn detect_assets_dir() -> String {
     if let Some(d) = config_str("assetsRoot").filter(|d| !d.is_empty()) {
         return d;
     }
-    crate::paths::exe_dir().join("eft_assets").to_string_lossy().into_owned()
+    crate::paths::exe_dir()
+        .join("eft_assets")
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn save_config_assets_dir(dir: &str) -> bool {
@@ -1216,9 +1405,9 @@ pub fn lang_switch_area(
     anchor: bevy_egui::egui::Align2,
     offset: bevy_egui::egui::Vec2,
 ) -> Option<crate::i18n::Lang> {
-    use bevy_egui::egui::{self, Color32, RichText, Stroke};
     use crate::i18n::{t, Lang, K};
     use crate::ui_theme as theme;
+    use bevy_egui::egui::{self, Color32, RichText, Stroke};
     let mut picked = None;
     egui::Area::new(egui::Id::new(id))
         .anchor(anchor, offset)
@@ -1231,7 +1420,11 @@ pub fn lang_switch_area(
                 .corner_radius(0.0)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(t(current, K::LangLabel)).size(10.0).color(theme::MUTED));
+                        ui.label(
+                            RichText::new(t(current, K::LangLabel))
+                                .size(10.0)
+                                .color(theme::MUTED),
+                        );
                         for l in [Lang::En, Lang::Ru] {
                             let active = current == l;
                             let btn = egui::Button::new(
@@ -1240,10 +1433,22 @@ pub fn lang_switch_area(
                                     .strong()
                                     .color(if active { theme::BONE } else { theme::MUTED }),
                             )
-                            .fill(if active { theme::RAIL } else { Color32::TRANSPARENT })
-                            .stroke(Stroke::new(1.0, if active { theme::BEIGE } else { theme::BORDER }))
+                            .fill(if active {
+                                theme::RAIL
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .stroke(Stroke::new(
+                                1.0,
+                                if active { theme::BEIGE } else { theme::BORDER },
+                            ))
                             .corner_radius(0.0);
-                            if ui.add(btn).on_hover_text(t(current, K::LanguageTip)).clicked() && !active {
+                            if ui
+                                .add(btn)
+                                .on_hover_text(t(current, K::LanguageTip))
+                                .clicked()
+                                && !active
+                            {
                                 picked = Some(l);
                             }
                         }
@@ -1258,7 +1463,9 @@ pub fn lang_switch_area(
 pub fn deps_ready() -> Option<bool> {
     let root = crate::paths::repo_root()?;
     let mut cmd = std::process::Command::new(crate::paths::python_exe(root));
-    cmd.current_dir(root).arg("-c").arg("import UnityPy, numpy, PIL");
+    cmd.current_dir(root)
+        .arg("-c")
+        .arg("import UnityPy, numpy, PIL");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1370,7 +1577,9 @@ fn steam_game_dir() -> Option<String> {
         for line in txt.lines() {
             // VDF rows look like:  "path"    "D:\\SteamLibrary"
             let l = line.trim();
-            let Some(rest) = l.strip_prefix("\"path\"") else { continue };
+            let Some(rest) = l.strip_prefix("\"path\"") else {
+                continue;
+            };
             let p = rest.trim().trim_matches('"').replace("\\\\", "\\");
             if !p.is_empty() {
                 libs.push(std::path::PathBuf::from(p));
@@ -1378,7 +1587,11 @@ fn steam_game_dir() -> Option<String> {
         }
     }
     for lib in libs {
-        for name in ["Escape from Tarkov", "Escape From Tarkov", "EscapeFromTarkov"] {
+        for name in [
+            "Escape from Tarkov",
+            "Escape From Tarkov",
+            "EscapeFromTarkov",
+        ] {
             let d = lib
                 .join("steamapps")
                 .join("common")
@@ -1514,7 +1727,11 @@ fn ensure_menu_prop(game_dir: &str) {
             Ok(Some(status)) => {
                 eprintln!(
                     "menu prop: extractor finished ({})",
-                    if status.success() { "ok" } else { "failed - vector camera" }
+                    if status.success() {
+                        "ok"
+                    } else {
+                        "failed - vector camera"
+                    }
                 );
                 return;
             }
@@ -1522,7 +1739,9 @@ fn ensure_menu_prop(game_dir: &str) {
                 if std::time::Instant::now() >= deadline {
                     // Never kill it: let it finish in the background so the files are
                     // there next launch; this launch simply keeps the vector camera.
-                    eprintln!("menu prop: extractor still running after 30s - vector camera this launch");
+                    eprintln!(
+                        "menu prop: extractor still running after 30s - vector camera this launch"
+                    );
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1543,7 +1762,9 @@ pub fn build_state() -> MenuState {
     let (entries, total_bytes) = scan(&game_fp);
     // EFT_MENU_BUILD=<map>[,--dry-run] auto-starts a build on menu open (CLI/testing hook);
     // enqueued on the shared worker on the first frame (build_state has no worker access here).
-    let autobuild = std::env::var("EFT_MENU_BUILD").ok().filter(|s| !s.is_empty());
+    let autobuild = std::env::var("EFT_MENU_BUILD")
+        .ok()
+        .filter(|s| !s.is_empty());
     let assets_dir = detect_assets_dir();
     MenuState {
         entries,
@@ -1563,6 +1784,10 @@ pub fn build_state() -> MenuState {
         intel: intel_status(),
         sync_note: None,
         seen_completed: 0,
+        selected_maps: BTreeSet::new(),
+        build_timings: load_build_timings(),
+        confirm_build_all: None,
+        build_all: BuildBatchProgress::default(),
         autobuild,
         config_err: None,
         process_in_background: config_process_in_background(),
@@ -1575,12 +1800,10 @@ pub fn build_state() -> MenuState {
             let preset = crate::render::QualityPreset::from_index(
                 (config_f32_pub("qualityPreset").unwrap_or(2.0) as u8).min(4),
             );
-            preset
-                .tex_quality()
-                .unwrap_or_else(|| {
-                    // Clamp: an out-of-range hand edit must not leave every button unselected.
-                    (config_f32_pub("textureQuality").unwrap_or(1.0) as u8).min(2)
-                })
+            preset.tex_quality().unwrap_or_else(|| {
+                // Clamp: an out-of-range hand edit must not leave every button unselected.
+                (config_f32_pub("textureQuality").unwrap_or(1.0) as u8).min(2)
+            })
         },
         quality_preset: (config_f32_pub("qualityPreset").unwrap_or(2.0) as u8).min(4), // High
         // EFT_SETTINGS_TAB=<0|1|2> opens a settings tab on launch (0 Overlay, 1 Live link,
@@ -1657,7 +1880,11 @@ fn build_frac(stage: &str, sub: Option<f32>, fresh: bool) -> f32 {
         return 0.0;
     };
     let done = stage.contains(": done") || stage.contains(": skipped");
-    let base = if done { 1.0 } else { sub.unwrap_or(0.5).clamp(0.0, 1.0) };
+    let base = if done {
+        1.0
+    } else {
+        sub.unwrap_or(0.5).clamp(0.0, 1.0)
+    };
     // Stage 1 of a map build is THREE serial passes over the game files (dataset -> grass ->
     // colliders), each re-emitting "[STAGE 1/N]" with its own name. Treating them as one pool
     // meant the bar finished stage 1's span with the dataset pass and then sat frozen through
@@ -1675,7 +1902,11 @@ fn build_frac(stage: &str, sub: Option<f32>, fresh: bool) -> f32 {
         // colliders pass that guess (48.65%) lands just ABOVE the real first reading (48.63%),
         // so `max_frac` latches it and the pass's own signal is clamped away for its whole run.
         // The grass pass emits nothing, so it keeps the midpoint guess inside its 1% slice.
-        let signalled = if done { 1.0 } else { sub.unwrap_or(0.0).clamp(0.0, 1.0) };
+        let signalled = if done {
+            1.0
+        } else {
+            sub.unwrap_or(0.0).clamp(0.0, 1.0)
+        };
         if stage.contains("extract dataset") {
             0.52 * signalled
         } else if stage.contains("grass density") {
@@ -1691,7 +1922,11 @@ fn build_frac(stage: &str, sub: Option<f32>, fresh: bool) -> f32 {
             // were then all discarded, so the bar did not move until the extract was ~96% done.
             // On streets that is ~45 min parked at 31.8% at the very start of a first build --
             // the same "reads as a hang" this table exists to remove. `done` still ends the span.
-            if done { 1.0 } else { 0.0 }
+            if done {
+                1.0
+            } else {
+                0.0
+            }
         }
     } else {
         base
@@ -1803,7 +2038,11 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
         // `max_frac` latches at 63%. Every later colliders reading is lower and gets clamped away,
         // freezing the bar for the whole (~45 min) pass. The emitters already tag their lines, so
         // match on the tag; anything untagged (older logs' plain `extract <d>/<t>`) still parses.
-        let tag = if stage.contains("physics colliders") { "colliders" } else { "extract" };
+        let tag = if stage.contains("physics colliders") {
+            "colliders"
+        } else {
+            "extract"
+        };
         tail.iter()
             .rev()
             .filter(|l| l.contains(tag))
@@ -1825,7 +2064,11 @@ fn build_view(w: &crate::jobs::JobWorker) -> Option<BuildView> {
         }
         job.fresh_extract.load(Relaxed)
     };
-    let raw = if finished && ok { 1.0 } else { build_frac(&stage, sub, fresh) };
+    let raw = if finished && ok {
+        1.0
+    } else {
+        build_frac(&stage, sub, fresh)
+    };
     let frac = {
         use std::sync::atomic::Ordering::Relaxed;
         let prev = f32::from_bits(job.max_frac.load(Relaxed));
@@ -1873,9 +2116,9 @@ pub fn menu_ui(
     // Apply lives immediately; persist once, when the drag ends.
     mut settings_save_pending: Local<bool>,
 ) {
-    use bevy_egui::egui::{self, Color32, RichText};
     use crate::i18n::{map_title, t, K};
     use crate::jobs::Job;
+    use bevy_egui::egui::{self, Color32, RichText};
     let Some(mut state) = state else { return };
     let real_prop = prop3d.is_some();
     let Ok(ctx) = contexts.ctx_mut() else { return };
@@ -1912,6 +2155,34 @@ pub fn menu_ui(
         // restart (python_exe now resolves to the freshly-created venv).
         state.deps_ok = deps_ready().unwrap_or(true);
         let ok = worker.last_outcome().map(|(_, ok)| ok).unwrap_or(false);
+        // Successful build wall times are local-only samples for the next Build All estimate.
+        // This works for both attached and reattached background builds because `started` is
+        // reconstructed from the sidecar's original epoch when necessary.
+        if worker.last_is_build() && ok {
+            if let (Some(map), Some(job)) = (worker.last_build_key(), worker.last_job()) {
+                record_build_timing(
+                    &mut state.build_timings,
+                    map,
+                    job.started.elapsed().as_secs_f32(),
+                );
+                if !save_build_timings(&state.build_timings) {
+                    state.config_err = Some(t(lg, K::ConfigSaveFailed).to_string());
+                }
+            }
+        }
+        if worker.last_is_build() && state.build_all.active {
+            if ok {
+                state.build_all.completed =
+                    (state.build_all.completed + 1).min(state.build_all.total);
+                if state.build_all.completed >= state.build_all.total {
+                    state.build_all.active = false;
+                }
+            } else {
+                state.build_all.active = false;
+                state.build_all.failed = true;
+                state.build_all.failed_key = worker.last_build_key().map(str::to_string);
+            }
+        }
         if worker.last_is_sync() {
             // "refreshed" only if the sync exited 0 AND fresh intel is actually VISIBLE where we scan
             // (state.intel was just re-read above). A green "refreshed" next to "synced never" means
@@ -1944,6 +2215,13 @@ pub fn menu_ui(
         }
     }
 
+    // A build that could not even spawn never reaches the normal completion counter. Mark the
+    // batch stopped here; `pump_jobs` has already removed its remaining queued map builds.
+    if state.build_all.active && worker.spawn_error.is_some() {
+        state.build_all.active = false;
+        state.build_all.failed = true;
+    }
+
     // The menu animates without input now (camera LED blink / servo slew / idle patrol and
     // the loading-bar pulse): keep frames coming even when no events arrive, at a faster
     // cadence while a pipeline build is streaming.
@@ -1974,8 +2252,12 @@ pub fn menu_ui(
 
     // Backdrop: the 2D reactive triangle field (default). Skipped when an env flag selects one of the
     // 3D backdrops instead (EFT_MENU_EXFIL / EFT_MENU_TERRAIN), so they don't double up.
-    let use_3d_bg = std::env::var("EFT_MENU_EXFIL").map(|v| v.trim() == "1").unwrap_or(false)
-        || std::env::var("EFT_MENU_TERRAIN").map(|v| v.trim() == "1").unwrap_or(false);
+    let use_3d_bg = std::env::var("EFT_MENU_EXFIL")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false)
+        || std::env::var("EFT_MENU_TERRAIN")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
     if !use_3d_bg {
         crate::menu_fx::triangle_field(ctx);
     }
@@ -1986,21 +2268,40 @@ pub fn menu_ui(
     let mut enqueue_sync = false;
     // (map key, force): force = the UPDATE path (build_map.py --force re-extracts stale data).
     let mut enqueue_build: Option<(String, bool)> = None;
+    let mut enqueue_build_batch: Option<Vec<(String, bool)>> = None;
     let mut enqueue_install = false;
     let mut cancel_current = false;
     let mut dismiss_build = false;
     // Per-frame snapshots so the closures don't hold a borrow on the worker.
     let wk_build_key = worker.current_build_key().map(|s| s.to_string());
+    let wk_queued_builds = worker.queued_build_count();
     let bv = build_view(&worker);
 
     egui::TopBottomPanel::top("menu_header")
-        .frame(egui::Frame::new().fill(HEADER).inner_margin(egui::Margin::symmetric(24, 10)))
+        .frame(
+            egui::Frame::new()
+                .fill(HEADER)
+                .inner_margin(egui::Margin::symmetric(24, 10)),
+        )
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ATLAS").color(BONE).size(theme::SIZE_DISPLAY).strong());
+                ui.label(
+                    RichText::new("ATLAS")
+                        .color(BONE)
+                        .size(theme::SIZE_DISPLAY)
+                        .strong(),
+                );
                 ui.add_space(14.0);
-                ui.label(RichText::new(format!("|  {}", t(lg, K::Map))).color(BEIGE).size(13.0));
-                ui.label(RichText::new(t(lg, K::SelectLocation)).color(DIM).size(13.0));
+                ui.label(
+                    RichText::new(format!("|  {}", t(lg, K::Map)))
+                        .color(BEIGE)
+                        .size(13.0),
+                );
+                ui.label(
+                    RichText::new(t(lg, K::SelectLocation))
+                        .color(DIM)
+                        .size(13.0),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // SETTINGS opens the tabbed panel beside the map list (overlay / live link /
                     // general). Toggles, so the same button closes it.
@@ -2012,11 +2313,17 @@ pub fn menu_ui(
                         .on_hover_text("Overlay, live game link and general options")
                         .clicked()
                     {
-                        state.settings_tab = if state.settings_tab.is_some() { None } else { Some(0) };
+                        state.settings_tab = if state.settings_tab.is_some() {
+                            None
+                        } else {
+                            Some(0)
+                        };
                     }
                     ui.add_space(10.0);
                     ui.label(
-                        RichText::new(fmt_size(state.total_bytes)).color(BEIGE).size(13.0),
+                        RichText::new(fmt_size(state.total_bytes))
+                            .color(BEIGE)
+                            .size(13.0),
                     );
                     ui.label(RichText::new(t(lg, K::PacksOnDisk)).color(DIM).size(11.0));
                 });
@@ -2029,12 +2336,21 @@ pub fn menu_ui(
             // toggle below. The sync writes no <packs>/logs file, so this is its only log surface.
             let sync_has_log = worker.current_is_sync() || worker.last_is_sync();
             ui.horizontal(|ui| {
-                ui.label(RichText::new(t(lg, K::Intel)).color(BEIGE).size(11.0).strong());
+                ui.label(
+                    RichText::new(t(lg, K::Intel))
+                        .color(BEIGE)
+                        .size(11.0)
+                        .strong(),
+                );
                 let (loot_d, tasks_d, icons) = state.intel;
                 let ru = lg == crate::i18n::Lang::Ru;
                 let age_txt = |d: Option<f64>| match d {
                     Some(d) if d < 1.0 => {
-                        format!("{:.0} {}", (d * 24.0).max(1.0), if ru { "ч назад" } else { "h ago" })
+                        format!(
+                            "{:.0} {}",
+                            (d * 24.0).max(1.0),
+                            if ru { "ч назад" } else { "h ago" }
+                        )
                     }
                     Some(d) => format!("{d:.0} {}", if ru { "д назад" } else { "d ago" }),
                     None => t(lg, K::Never).to_string(),
@@ -2070,12 +2386,17 @@ pub fn menu_ui(
                             .color(theme::ACCENT)
                             .size(11.0),
                     );
-                    if ui.small_button(RichText::new(t(lg, K::CancelLower)).size(10.0)).clicked() {
+                    if ui
+                        .small_button(RichText::new(t(lg, K::CancelLower)).size(10.0))
+                        .clicked()
+                    {
                         cancel_current = true;
                     }
                 } else {
                     if ui
-                        .add(egui::Button::new(RichText::new(t(lg, K::SyncNow)).size(11.0).color(BEIGE)))
+                        .add(egui::Button::new(
+                            RichText::new(t(lg, K::SyncNow)).size(11.0).color(BEIGE),
+                        ))
                         .on_hover_text(t(lg, K::SyncTip))
                         .clicked()
                     {
@@ -2089,7 +2410,11 @@ pub fn menu_ui(
                                 .size(11.0),
                         );
                     } else if let Some(err) = &worker.spawn_error {
-                        ui.label(RichText::new(err.as_str()).color(theme::DANGER_TEXT).size(11.0));
+                        ui.label(
+                            RichText::new(err.as_str())
+                                .color(theme::DANGER_TEXT)
+                                .size(11.0),
+                        );
                     }
                 }
                 // Show/Copy the sync's streamed log. build_view() skips sync jobs so the build panel
@@ -2097,15 +2422,30 @@ pub fn menu_ui(
                 // inline toggle is the only way to read/share a failed sync's [SYNC FAILED] stage.
                 if sync_has_log {
                     if ui
-                        .small_button(RichText::new(
-                            t(lg, if state.show_sync_log { K::HideLog } else { K::ShowLog }),
-                        ).size(10.0))
+                        .small_button(
+                            RichText::new(t(
+                                lg,
+                                if state.show_sync_log {
+                                    K::HideLog
+                                } else {
+                                    K::ShowLog
+                                },
+                            ))
+                            .size(10.0),
+                        )
                         .clicked()
                     {
                         state.show_sync_log = !state.show_sync_log;
                     }
-                    if ui.small_button(RichText::new(t(lg, K::CopyLog)).size(10.0)).clicked() {
-                        let job = if worker.current_is_sync() { worker.current_job() } else { worker.last_job() };
+                    if ui
+                        .small_button(RichText::new(t(lg, K::CopyLog)).size(10.0))
+                        .clicked()
+                    {
+                        let job = if worker.current_is_sync() {
+                            worker.current_job()
+                        } else {
+                            worker.last_job()
+                        };
                         if let Some(job) = job {
                             ui.ctx().copy_text(job.full_log());
                         }
@@ -2115,15 +2455,21 @@ pub fn menu_ui(
             // Sync log tail, inline under the INTEL row (capped ScrollArea like the build panel so a
             // long log scrolls INSIDE instead of shoving the map list up). Auto-opens on failure.
             if state.show_sync_log && sync_has_log {
-                let job = if worker.current_is_sync() { worker.current_job() } else { worker.last_job() };
+                let job = if worker.current_is_sync() {
+                    worker.current_job()
+                } else {
+                    worker.last_job()
+                };
                 if let Some(job) = job {
                     let (_, tail, _, _) = job.snapshot(200);
                     ui.add_space(4.0);
-                    egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                        for line in &tail {
-                            ui.label(RichText::new(line).color(DIM).size(11.0).monospace());
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for line in &tail {
+                                ui.label(RichText::new(line).color(DIM).size(11.0).monospace());
+                            }
+                        });
                 }
             }
         });
@@ -2138,7 +2484,11 @@ pub fn menu_ui(
     // BEFORE the CentralPanel (egui requirement), footer FIRST so it sits at the very bottom and the
     // build panel stacks just above it. Transparent frames keep the 3D globe showing behind them.
     egui::TopBottomPanel::bottom("menu_footer")
-        .frame(egui::Frame::new().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(24, 8)))
+        .frame(
+            egui::Frame::new()
+                .fill(Color32::TRANSPARENT)
+                .inner_margin(egui::Margin::symmetric(24, 8)),
+        )
         .show(ctx, |ui| {
             ui.add_space(8.0);
             ui.separator();
@@ -2147,7 +2497,12 @@ pub fn menu_ui(
             ui.horizontal(|ui| {
                 let mut bg = state.process_in_background;
                 if ui
-                    .checkbox(&mut bg, RichText::new(t(lg, K::ProcessInBackground)).color(BONE).size(11.0))
+                    .checkbox(
+                        &mut bg,
+                        RichText::new(t(lg, K::ProcessInBackground))
+                            .color(BONE)
+                            .size(11.0),
+                    )
                     .on_hover_text(t(lg, K::ProcessInBackgroundTip))
                     .changed()
                 {
@@ -2164,7 +2519,9 @@ pub fn menu_ui(
                 if ui
                     .checkbox(
                         &mut loc,
-                        RichText::new(t(lg, K::ScreenshotLocate)).color(BONE).size(11.0),
+                        RichText::new(t(lg, K::ScreenshotLocate))
+                            .color(BONE)
+                            .size(11.0),
                     )
                     .on_hover_text(t(lg, K::ScreenshotLocateTip))
                     .changed()
@@ -2195,8 +2552,8 @@ pub fn menu_ui(
                         state.overlay.delete_processed_shots = del;
                         *overlay_cfg = state.overlay.clone(); // live, no relaunch needed
                         crate::game_watch::set_delete_processed_shots(del);
-                        state.config_err = (!state.overlay.save())
-                            .then(|| t(lg, K::ConfigSaveFailed).to_string());
+                        state.config_err =
+                            (!state.overlay.save()).then(|| t(lg, K::ConfigSaveFailed).to_string());
                     }
                 });
             });
@@ -2207,14 +2564,19 @@ pub fn menu_ui(
             ui.horizontal(|ui| {
                 let mut ov = state.overlay.enabled;
                 if ui
-                    .checkbox(&mut ov, RichText::new(t(lg, K::OverlayEnable)).color(BONE).size(11.0))
+                    .checkbox(
+                        &mut ov,
+                        RichText::new(t(lg, K::OverlayEnable))
+                            .color(BONE)
+                            .size(11.0),
+                    )
                     .on_hover_text(t(lg, K::OverlayEnableTip))
                     .changed()
                 {
                     state.overlay.enabled = ov;
                     *overlay_cfg = state.overlay.clone(); // live, no relaunch needed
-                    state.config_err = (!state.overlay.save())
-                        .then(|| t(lg, K::ConfigSaveFailed).to_string());
+                    state.config_err =
+                        (!state.overlay.save()).then(|| t(lg, K::ConfigSaveFailed).to_string());
                 }
                 ui.label(RichText::new("\u{2139}").color(DIM).size(12.0))
                     .on_hover_text(t(lg, K::OverlayEnableTip));
@@ -2259,7 +2621,10 @@ pub fn menu_ui(
                 state.game_dir_edit = edit;
                 let dirty = state.game_dir_edit != state.game_dir;
                 if ui
-                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
+                    .add_enabled(
+                        dirty,
+                        egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)),
+                    )
                     .clicked()
                 {
                     if valid_game_dir(&state.game_dir_edit) {
@@ -2273,7 +2638,10 @@ pub fn menu_ui(
                     } else {
                         // An error!() line is invisible in a GUI: the button simply looked dead.
                         // Reuse the same warning strip every other settings failure uses.
-                        error!("menu: '{}' does not look like EscapeFromTarkov_Data", state.game_dir_edit);
+                        error!(
+                            "menu: '{}' does not look like EscapeFromTarkov_Data",
+                            state.game_dir_edit
+                        );
                         state.config_err = Some(
                             "That folder is not EscapeFromTarkov_Data \u{2014} pick the folder \
                              that contains globalgamemanagers."
@@ -2283,11 +2651,11 @@ pub fn menu_ui(
                 }
                 match &state.game_fp {
                     Some(fp) => ui.label(
-                        RichText::new(format!("[{}]", &fp[..8])).color(OK).size(11.0),
+                        RichText::new(format!("[{}]", &fp[..8]))
+                            .color(OK)
+                            .size(11.0),
                     ),
-                    None => ui.label(
-                        RichText::new(t(lg, K::GameNotFound)).color(WARN).size(11.0),
-                    ),
+                    None => ui.label(RichText::new(t(lg, K::GameNotFound)).color(WARN).size(11.0)),
                 };
             });
 
@@ -2295,17 +2663,32 @@ pub fn menu_ui(
             // datasets that BUILD reads. On first run explain it; CHOOSE opens a native folder picker.
             if !state.assets_ok {
                 ui.add_space(2.0);
-                ui.label(RichText::new(t(lg, K::FirstRunBanner)).color(WARN).size(11.0));
+                ui.label(
+                    RichText::new(t(lg, K::FirstRunBanner))
+                        .color(WARN)
+                        .size(11.0),
+                );
             } else {
                 // Even after the folder is chosen (the verbose banner above is gone), keep a short
                 // reminder that a map's FIRST build is a large one-time extraction — the user was
                 // surprised by the extraction cost / thought a finished deps install had built a map.
                 ui.add_space(2.0);
-                ui.label(RichText::new(t(lg, K::FirstBuildHint)).color(DIM).size(10.0));
+                ui.label(
+                    RichText::new(t(lg, K::FirstBuildHint))
+                        .color(DIM)
+                        .size(10.0),
+                );
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new(t(lg, K::ExtractedAssets)).color(DIM).size(11.0));
-                if ui.button(RichText::new(t(lg, K::Choose)).color(BONE)).clicked() {
+                ui.label(
+                    RichText::new(t(lg, K::ExtractedAssets))
+                        .color(DIM)
+                        .size(11.0),
+                );
+                if ui
+                    .button(RichText::new(t(lg, K::Choose)).color(BONE))
+                    .clicked()
+                {
                     let mut dlg = rfd::FileDialog::new().set_title(t(lg, K::FolderTitle));
                     if std::path::Path::new(&state.assets_dir).is_dir() {
                         dlg = dlg.set_directory(&state.assets_dir);
@@ -2328,7 +2711,10 @@ pub fn menu_ui(
                 state.assets_dir_edit = edit;
                 let dirty = state.assets_dir_edit != state.assets_dir;
                 if ui
-                    .add_enabled(dirty, egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)))
+                    .add_enabled(
+                        dirty,
+                        egui::Button::new(RichText::new(t(lg, K::Set)).color(BONE)),
+                    )
                     .clicked()
                 {
                     state.assets_dir = state.assets_dir_edit.clone();
@@ -2351,114 +2737,190 @@ pub fn menu_ui(
     if bv.is_some() {
         let show_log = state.show_log;
         egui::TopBottomPanel::bottom("menu_build")
-            .frame(egui::Frame::new().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(24, 6)))
-            .show(ctx, |ui| {
-            // The title row + progress bar are PINNED in the panel (always fully visible while a build
-            // runs); only the raw log below scrolls, in its OWN capped ScrollArea. Previously the whole
-            // panel was wrapped in one ScrollArea, so a long log could scroll the loading bar off-screen.
-            if let Some(bv) = &bv {
-                let (stage, tail, key) = (&bv.stage, &bv.tail, &bv.key);
-                let (finished, ok) = (bv.finished, bv.ok);
-                let failed = finished && !ok;
-                ui.add_space(10.0);
+            .frame(
                 egui::Frame::new()
-                    .fill(HEADER)
-                    .stroke(egui::Stroke::new(1.0, BORDER))
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let title = if key == "__deps__" {
-                                t(lg, K::InstallingDeps).to_string()
-                            } else {
-                                format!("{}: {}", t(lg, K::Building), map_title(lg, key, key).to_uppercase())
-                            };
-                            ui.label(RichText::new(title).color(BONE).strong());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if finished {
-                                        let col = if ok { OK } else { BAD };
-                                        let txt = t(lg, if ok { K::Done } else { K::Failed });
-                                        ui.label(RichText::new(txt).color(col).strong());
-                                        if ui.button(t(lg, K::Close)).clicked() {
-                                            dismiss_build = true;
+                    .fill(Color32::TRANSPARENT)
+                    .inner_margin(egui::Margin::symmetric(24, 6)),
+            )
+            .show(ctx, |ui| {
+                // The title row + progress bar are PINNED in the panel (always fully visible while a build
+                // runs); only the raw log below scrolls, in its OWN capped ScrollArea. Previously the whole
+                // panel was wrapped in one ScrollArea, so a long log could scroll the loading bar off-screen.
+                if let Some(bv) = &bv {
+                    let (stage, tail, key) = (&bv.stage, &bv.tail, &bv.key);
+                    let (finished, ok) = (bv.finished, bv.ok);
+                    let failed = finished && !ok;
+                    ui.add_space(10.0);
+                    egui::Frame::new()
+                        .fill(HEADER)
+                        .stroke(egui::Stroke::new(1.0, BORDER))
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let title = if key == "__deps__" {
+                                    t(lg, K::InstallingDeps).to_string()
+                                } else {
+                                    format!(
+                                        "{}: {}",
+                                        t(lg, K::Building),
+                                        map_title(lg, key, key).to_uppercase()
+                                    )
+                                };
+                                ui.label(RichText::new(title).color(BONE).strong());
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if finished {
+                                            let col = if ok { OK } else { BAD };
+                                            let txt = t(lg, if ok { K::Done } else { K::Failed });
+                                            ui.label(RichText::new(txt).color(col).strong());
+                                            if ui.button(t(lg, K::Close)).clicked() {
+                                                dismiss_build = true;
+                                            }
+                                        } else if ui
+                                            .button(RichText::new(t(lg, K::Cancel)).color(BAD))
+                                            .clicked()
+                                        {
+                                            cancel_current = true;
                                         }
-                                    } else if ui
-                                        .button(RichText::new(t(lg, K::Cancel)).color(BAD))
-                                        .clicked()
-                                    {
-                                        cancel_current = true;
-                                    }
-                                    // The tail is hidden by default — the loader bar carries
-                                    // the status; the raw log is one click away.
-                                    if ui
-                                        .button(t(lg, if show_log { K::HideLog } else { K::ShowLog }))
-                                        .clicked()
-                                    {
-                                        toggle_log = true;
-                                    }
-                                    // Full captured log (the panel shows only a tail) — for
-                                    // diagnosing which stage failed / sharing the output.
-                                    if ui.button(t(lg, K::CopyLog)).clicked() {
-                                        ui.ctx().copy_text(bv.full_log.clone());
-                                    }
-                                },
-                            );
-                        });
-                        // Weighted, MONOTONIC progress — computed once in build_view (phases weighted by
-                        // real relative duration so the ETA stops overshooting on the long extraction;
-                        // clamped so a nested sub-script's [STAGE i/M] marker can't jump the bar backward).
-                        let frac = bv.frac;
-                        // "LOADING OBJECTS..." style stage line for the loader bar: the text
-                        // between the [STAGE] marker and its status suffix, uppercased and
-                        // ASCII-whitelisted (menu glyph set is plain ASCII only).
-                        let stage_txt = if failed {
-                            t(lg, K::BuildFailed).to_string()
-                        } else if finished {
-                            // Only a deps-install reaches here now (a successful MAP build auto-dismisses
-                            // in build_view), so say "dependencies installed" rather than "BUILD COMPLETE"
-                            // — the user was confused that a finished deps install looked like a built map.
-                            if key == "__deps__" {
-                                t(lg, K::DepsDone).to_string()
-                            } else {
-                                t(lg, K::BuildComplete).to_string()
-                            }
-                        } else {
-                            let mut en = stage
-                                .split(']')
-                                .nth(1)
-                                .unwrap_or("")
-                                .split(':')
-                                .next()
-                                .unwrap_or("")
-                                .trim()
-                                .to_ascii_uppercase();
-                            en.retain(|c| c.is_ascii_graphic() || c == ' ');
-                            // The raw log is ASCII-only; the Russian stage name comes from our map
-                            // (not the log), so it renders fine past the ASCII whitelist above.
-                            let mut s = crate::i18n::stage_ru(lg, &en).map(str::to_string).unwrap_or(en);
-                            if s.is_empty() {
-                                s = t(lg, K::Starting).to_string();
-                            }
-                            // char-safe cap (Cyrillic is multi-byte; String::truncate would panic).
-                            let capped: String = s.chars().take(38).collect();
-                            format!("{capped}...")
-                        };
-                        ui.add_space(8.0);
-                        crate::menu_fx::eft_loading_bar(ui, frac, &stage_txt, bv.started_secs, failed, lg);
-                        if show_log {
-                            ui.add_space(6.0);
-                            // Only the streaming log scrolls (capped) — the loading bar above stays pinned.
-                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                                for line in tail {
-                                    ui.label(
-                                        RichText::new(line).color(DIM).size(11.0).monospace(),
-                                    );
-                                }
+                                        // The tail is hidden by default — the loader bar carries
+                                        // the status; the raw log is one click away.
+                                        if ui
+                                            .button(t(
+                                                lg,
+                                                if show_log { K::HideLog } else { K::ShowLog },
+                                            ))
+                                            .clicked()
+                                        {
+                                            toggle_log = true;
+                                        }
+                                        // Full captured log (the panel shows only a tail) — for
+                                        // diagnosing which stage failed / sharing the output.
+                                        if ui.button(t(lg, K::CopyLog)).clicked() {
+                                            ui.ctx().copy_text(bv.full_log.clone());
+                                        }
+                                    },
+                                );
                             });
-                        }
-                    });
-            }
+                            // Weighted, MONOTONIC progress — computed once in build_view (phases weighted by
+                            // real relative duration so the ETA stops overshooting on the long extraction;
+                            // clamped so a nested sub-script's [STAGE i/M] marker can't jump the bar backward).
+                            let frac = bv.frac;
+                            if state.build_all.total > 0
+                                && (state.build_all.active || state.build_all.failed)
+                                && key != "__deps__"
+                            {
+                                let current_credit = if state.build_all.active && !finished {
+                                    frac
+                                } else {
+                                    0.0
+                                };
+                                let overall = ((state.build_all.completed as f32 + current_credit)
+                                    / state.build_all.total as f32)
+                                    .clamp(0.0, 1.0);
+                                let batch_label = match state.build_all.kind {
+                                    Some(BuildBatchKind::All) => t(lg, K::BuildAll),
+                                    Some(BuildBatchKind::Selected) => t(lg, K::BuildSelected),
+                                    None => t(lg, K::BuildAll),
+                                };
+                                let stopped_label = match state.build_all.kind {
+                                    Some(BuildBatchKind::Selected) => {
+                                        t(lg, K::BuildSelectedStopped)
+                                    }
+                                    _ => t(lg, K::BuildAllStopped),
+                                };
+                                let label = if state.build_all.failed {
+                                    format!(
+                                        "{} — {}/{}",
+                                        stopped_label,
+                                        state.build_all.completed,
+                                        state.build_all.total
+                                    )
+                                } else {
+                                    format!(
+                                        "{} — {}/{}",
+                                        batch_label,
+                                        (state.build_all.completed + 1).min(state.build_all.total),
+                                        state.build_all.total
+                                    )
+                                };
+                                ui.add_space(8.0);
+                                ui.label(
+                                    RichText::new(label)
+                                        .color(if state.build_all.failed { BAD } else { BEIGE })
+                                        .size(11.0)
+                                        .strong(),
+                                );
+                                ui.add(
+                                    egui::ProgressBar::new(overall)
+                                        .desired_width(ui.available_width())
+                                        .show_percentage(),
+                                );
+                            }
+                            // "LOADING OBJECTS..." style stage line for the loader bar: the text
+                            // between the [STAGE] marker and its status suffix, uppercased and
+                            // ASCII-whitelisted (menu glyph set is plain ASCII only).
+                            let stage_txt = if failed {
+                                t(lg, K::BuildFailed).to_string()
+                            } else if finished {
+                                // Only a deps-install reaches here now (a successful MAP build auto-dismisses
+                                // in build_view), so say "dependencies installed" rather than "BUILD COMPLETE"
+                                // — the user was confused that a finished deps install looked like a built map.
+                                if key == "__deps__" {
+                                    t(lg, K::DepsDone).to_string()
+                                } else {
+                                    t(lg, K::BuildComplete).to_string()
+                                }
+                            } else {
+                                let mut en = stage
+                                    .split(']')
+                                    .nth(1)
+                                    .unwrap_or("")
+                                    .split(':')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_ascii_uppercase();
+                                en.retain(|c| c.is_ascii_graphic() || c == ' ');
+                                // The raw log is ASCII-only; the Russian stage name comes from our map
+                                // (not the log), so it renders fine past the ASCII whitelist above.
+                                let mut s = crate::i18n::stage_ru(lg, &en)
+                                    .map(str::to_string)
+                                    .unwrap_or(en);
+                                if s.is_empty() {
+                                    s = t(lg, K::Starting).to_string();
+                                }
+                                // char-safe cap (Cyrillic is multi-byte; String::truncate would panic).
+                                let capped: String = s.chars().take(38).collect();
+                                format!("{capped}...")
+                            };
+                            ui.add_space(8.0);
+                            crate::menu_fx::eft_loading_bar(
+                                ui,
+                                frac,
+                                &stage_txt,
+                                bv.started_secs,
+                                failed,
+                                lg,
+                            );
+                            if show_log {
+                                ui.add_space(6.0);
+                                // Only the streaming log scrolls (capped) — the loading bar above stays pinned.
+                                egui::ScrollArea::vertical()
+                                    .max_height(150.0)
+                                    .show(ui, |ui| {
+                                        for line in tail {
+                                            ui.label(
+                                                RichText::new(line)
+                                                    .color(DIM)
+                                                    .size(11.0)
+                                                    .monospace(),
+                                            );
+                                        }
+                                    });
+                            }
+                        });
+                }
             });
     }
     if toggle_log {
@@ -2509,32 +2971,68 @@ pub fn menu_ui(
                 egui::ScrollArea::vertical().show(ui, |ui| match tab {
                     0 => {
                         dirty |= ui
-                            .checkbox(&mut cfg.enabled, RichText::new(t(lg, K::OverlayEnable)).size(11.0))
+                            .checkbox(
+                                &mut cfg.enabled,
+                                RichText::new(t(lg, K::OverlayEnable)).size(11.0),
+                            )
                             .on_hover_text(t(lg, K::OverlayEnableTip))
                             .changed();
                         ui.label(
-                            RichText::new(t(lg, K::OverlayBorderlessNote)).size(10.0).color(DIM),
+                            RichText::new(t(lg, K::OverlayBorderlessNote))
+                                .size(10.0)
+                                .color(DIM),
                         );
                         ui.add_space(8.0);
                         ui.add_enabled_ui(cfg.enabled, |ui| {
                             dirty |= ui
-                                .checkbox(&mut cfg.always_on_top, RichText::new(t(lg, K::OverlayKeepAbove)).size(11.0))
+                                .checkbox(
+                                    &mut cfg.always_on_top,
+                                    RichText::new(t(lg, K::OverlayKeepAbove)).size(11.0),
+                                )
                                 .changed();
                             dirty |= ui
-                                .checkbox(&mut cfg.borderless, RichText::new(t(lg, K::OverlayBorderlessShown)).size(11.0))
+                                .checkbox(
+                                    &mut cfg.borderless,
+                                    RichText::new(t(lg, K::OverlayBorderlessShown)).size(11.0),
+                                )
                                 .changed();
                             ui.add_space(8.0);
-                            ui.label(RichText::new(t(lg, K::OverlayPanelSize)).size(10.0).color(DIM));
-                            dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.x, 0.2..=1.0).text("width")).changed();
-                            dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.y, 0.2..=1.0).text("height")).changed();
-                            ui.label(RichText::new(t(lg, K::OverlayPanelPos)).size(10.0).color(DIM));
-                            dirty |= ui.add(egui::Slider::new(&mut cfg.anchor.x, 0.0..=1.0).text("x")).changed();
-                            dirty |= ui.add(egui::Slider::new(&mut cfg.anchor.y, 0.0..=1.0).text("y")).changed();
+                            ui.label(
+                                RichText::new(t(lg, K::OverlayPanelSize))
+                                    .size(10.0)
+                                    .color(DIM),
+                            );
+                            dirty |= ui
+                                .add(
+                                    egui::Slider::new(&mut cfg.size_frac.x, 0.2..=1.0)
+                                        .text("width"),
+                                )
+                                .changed();
+                            dirty |= ui
+                                .add(
+                                    egui::Slider::new(&mut cfg.size_frac.y, 0.2..=1.0)
+                                        .text("height"),
+                                )
+                                .changed();
+                            ui.label(
+                                RichText::new(t(lg, K::OverlayPanelPos))
+                                    .size(10.0)
+                                    .color(DIM),
+                            );
+                            dirty |= ui
+                                .add(egui::Slider::new(&mut cfg.anchor.x, 0.0..=1.0).text("x"))
+                                .changed();
+                            dirty |= ui
+                                .add(egui::Slider::new(&mut cfg.anchor.y, 0.0..=1.0).text("y"))
+                                .changed();
                             ui.add_space(8.0);
                             ui.label(RichText::new(t(lg, K::OverlayPerf)).size(10.0).color(DIM));
                             let mut cap = cfg.fps_cap as f32;
                             if ui
-                                .add(egui::Slider::new(&mut cap, 0.0..=360.0).text(t(lg, K::OverlayFpsCap)))
+                                .add(
+                                    egui::Slider::new(&mut cap, 0.0..=360.0)
+                                        .text(t(lg, K::OverlayFpsCap)),
+                                )
                                 .on_hover_text(t(lg, K::OverlayFpsCapTip))
                                 .changed()
                             {
@@ -2562,7 +3060,10 @@ pub fn menu_ui(
                                     });
                             });
                             dirty |= ui
-                                .checkbox(&mut cfg.pause_when_hidden, RichText::new(t(lg, K::OverlayIdleHidden)).size(11.0))
+                                .checkbox(
+                                    &mut cfg.pause_when_hidden,
+                                    RichText::new(t(lg, K::OverlayIdleHidden)).size(11.0),
+                                )
                                 .on_hover_text(t(lg, K::OverlayIdleHiddenTip))
                                 .changed();
                             ui.add_space(8.0);
@@ -2602,33 +3103,41 @@ pub fn menu_ui(
                                 });
                             };
                             let alive = h.ticks.load(Relaxed) > 0;
-                            egui::Frame::new().fill(theme::INSET).inner_margin(8.0).show(ui, |ui| {
-                                ui.label(RichText::new(t(lg, K::LinkHealth)).size(11.0).color(BONE));
-                                row(ui, alive, t(lg, K::LinkWatcher));
-                                row(ui, h.game_dir.load(Relaxed), t(lg, K::LinkGameDir));
-                                row(ui, h.logs_dir.load(Relaxed), t(lg, K::LinkLogsDir));
-                                row(ui, h.app_log.load(Relaxed), t(lg, K::LinkAppLog));
-                                row(ui, h.shots_dir.load(Relaxed), t(lg, K::LinkShotsDir));
-                                let ev = h.events.load(Relaxed);
-                                ui.label(
-                                    RichText::new(format!("{} {ev}", t(lg, K::LinkEvents)))
-                                        .size(10.0)
-                                        .color(if ev > 0 { DIM } else { WARN }),
-                                );
-                                if h.app_log.load(Relaxed) && ev == 0 {
+                            egui::Frame::new()
+                                .fill(theme::INSET)
+                                .inner_margin(8.0)
+                                .show(ui, |ui| {
                                     ui.label(
-                                        RichText::new(t(lg, K::LinkNoEventsHint))
-                                            .size(10.0)
-                                            .color(WARN),
+                                        RichText::new(t(lg, K::LinkHealth)).size(11.0).color(BONE),
                                     );
-                                }
-                            });
+                                    row(ui, alive, t(lg, K::LinkWatcher));
+                                    row(ui, h.game_dir.load(Relaxed), t(lg, K::LinkGameDir));
+                                    row(ui, h.logs_dir.load(Relaxed), t(lg, K::LinkLogsDir));
+                                    row(ui, h.app_log.load(Relaxed), t(lg, K::LinkAppLog));
+                                    row(ui, h.shots_dir.load(Relaxed), t(lg, K::LinkShotsDir));
+                                    let ev = h.events.load(Relaxed);
+                                    ui.label(
+                                        RichText::new(format!("{} {ev}", t(lg, K::LinkEvents)))
+                                            .size(10.0)
+                                            .color(if ev > 0 { DIM } else { WARN }),
+                                    );
+                                    if h.app_log.load(Relaxed) && ev == 0 {
+                                        ui.label(
+                                            RichText::new(t(lg, K::LinkNoEventsHint))
+                                                .size(10.0)
+                                                .color(WARN),
+                                        );
+                                    }
+                                });
                             ui.add_space(6.0);
                         }
                         let loc_now = {
                             let mut loc = state.screenshot_locate;
                             if ui
-                                .checkbox(&mut loc, RichText::new(t(lg, K::ScreenshotLocate)).size(11.0))
+                                .checkbox(
+                                    &mut loc,
+                                    RichText::new(t(lg, K::ScreenshotLocate)).size(11.0),
+                                )
                                 .on_hover_text(t(lg, K::ScreenshotLocateTip))
                                 .changed()
                             {
@@ -2662,7 +3171,10 @@ pub fn menu_ui(
                     _ => {
                         let mut bg = state.process_in_background;
                         if ui
-                            .checkbox(&mut bg, RichText::new(t(lg, K::ProcessInBackground)).size(11.0))
+                            .checkbox(
+                                &mut bg,
+                                RichText::new(t(lg, K::ProcessInBackground)).size(11.0),
+                            )
                             .on_hover_text(t(lg, K::ProcessInBackgroundTip))
                             .changed()
                         {
@@ -2676,15 +3188,16 @@ pub fn menu_ui(
                         // crashes/TDRs in the compute bakes (e.g. a broken Vulkan ICD).
                         let mut cpu = state.force_cpu_process;
                         if ui
-                            .checkbox(&mut cpu, RichText::new(t(lg, K::ForceCpuProcess)).size(11.0))
+                            .checkbox(
+                                &mut cpu,
+                                RichText::new(t(lg, K::ForceCpuProcess)).size(11.0),
+                            )
                             .on_hover_text(t(lg, K::ForceCpuProcessTip))
                             .changed()
                         {
                             state.force_cpu_process = cpu;
                             if !save_config_force_cpu_process(cpu) {
-                                state.config_err = Some(
-                                    t(lg, K::ConfigSaveFailed).to_string(),
-                                );
+                                state.config_err = Some(t(lg, K::ConfigSaveFailed).to_string());
                             }
                         }
                         ui.add_space(10.0);
@@ -2720,9 +3233,8 @@ pub fn menu_ui(
                                         crate::render::gpu_driven::set_tex_mip_skip(q);
                                     }
                                     if !save_quality_preset_pub(p) {
-                                        state.config_err = Some(
-                                            t(lg, K::ConfigSaveFailed).to_string(),
-                                        );
+                                        state.config_err =
+                                            Some(t(lg, K::ConfigSaveFailed).to_string());
                                     }
                                 }
                             }
@@ -2761,8 +3273,10 @@ pub fn menu_ui(
                                     crate::render::gpu_driven::set_tex_mip_skip(i as u8);
                                     // Hand-picking a texture quality deviates from whatever preset
                                     // was active, so the preset becomes Custom rather than lying.
-                                    if crate::render::QualityPreset::from_index(state.quality_preset)
-                                        .tex_quality()
+                                    if crate::render::QualityPreset::from_index(
+                                        state.quality_preset,
+                                    )
+                                    .tex_quality()
                                         != Some(i as u8)
                                     {
                                         state.quality_preset =
@@ -2787,7 +3301,9 @@ pub fn menu_ui(
                             }
                         });
                         ui.label(
-                            RichText::new(t(lg, K::TexQualityNote)).size(10.0).color(DIM),
+                            RichText::new(t(lg, K::TexQualityNote))
+                                .size(10.0)
+                                .color(DIM),
                         );
                     }
                 });
@@ -2804,8 +3320,7 @@ pub fn menu_ui(
     // waits for the drag to end so a slider doesn't rewrite atlas.config.json hundreds of times.
     if *settings_save_pending && !ctx.input(|i| i.pointer.any_down()) {
         *settings_save_pending = false;
-        state.config_err = (!state.overlay.save())
-            .then(|| t(lg, K::ConfigSaveFailed).to_string());
+        state.config_err = (!state.overlay.save()).then(|| t(lg, K::ConfigSaveFailed).to_string());
     }
 
     egui::CentralPanel::default()
@@ -2840,6 +3355,30 @@ pub fn menu_ui(
             // and UPDATE must both stay disabled instead of spawn-erroring. UPDATE used to bypass
             // this entirely — it now shares `can_build`.
             let can_build = state.build_kit_available && state.deps_ok && state.game_fp.is_some();
+            // BUILD ALL uses the same freshness rule as the map rows. A present, structurally valid
+            // pack is complete only when its source fingerprint matches today's game files.
+            let build_all_jobs: Vec<(String, bool)> = state
+                .entries
+                .iter()
+                .filter(|e| !e.valid || e.fp_match != Some(true))
+                .map(|e| {
+                    // Installed-but-not-current packs get a forced re-extract; missing packs take
+                    // the normal first-build path. This mirrors each row's BUILD/REBUILD behavior.
+                    (e.key.clone(), e.pack_dir.is_some())
+                })
+                .collect();
+            let build_all_count = build_all_jobs.len();
+            // Selected maps deliberately do not inherit BUILD ALL's freshness filter: checking a
+            // map means the user explicitly wants that map processed, even if its existing pack is
+            // current. Installed maps use the same forced path as BUILD ALL so a selected rebuild
+            // cannot silently reuse stale extracted data.
+            let selected_build_jobs: Vec<(String, bool)> = state
+                .entries
+                .iter()
+                .filter(|e| state.selected_maps.contains(&e.key))
+                .map(|e| (e.key.clone(), e.pack_dir.is_some()))
+                .collect();
+            let selected_build_count = selected_build_jobs.len();
             // PLAY is gated on a tarkov.dev sync having happened at least once (loot/spawns/intel come
             // from it — playing before a sync gives an empty map). `intel` is (loot age, tasks age,
             // icons); a present loot age means the sync ran. Copied to a local so it reaches the PLAY
@@ -2895,11 +3434,59 @@ pub fn menu_ui(
                     });
                 ui.add_space(8.0);
             }
+            ui.horizontal(|ui| {
+                let selected_label =
+                    format!("{} ({selected_build_count})", t(lg, K::BuildSelected));
+                let batch_idle = building_key.is_none() && wk_queued_builds == 0;
+                let selected_response = ui
+                    .add_enabled_ui(can_build && batch_idle && selected_build_count > 0, |ui| {
+                        ui.add_sized([190.0, 32.0], theme::primary_button(&selected_label))
+                    })
+                    .inner
+                    .on_hover_text(t(lg, K::BuildSelectedTip));
+                if selected_response.clicked() {
+                    state.build_all = BuildBatchProgress {
+                        total: selected_build_count,
+                        completed: 0,
+                        active: true,
+                        failed: false,
+                        kind: Some(BuildBatchKind::Selected),
+                        keys: selected_build_jobs
+                            .iter()
+                            .map(|(key, _)| key.clone())
+                            .collect(),
+                        failed_key: None,
+                    };
+                    state.selected_maps.clear();
+                    enqueue_build_batch = Some(selected_build_jobs);
+                    state.show_log = false;
+                }
+                let label = format!("{} ({build_all_count})", t(lg, K::BuildAll));
+                let enabled = can_build && batch_idle && build_all_count > 0;
+                let response = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        ui.add_sized([190.0, 32.0], theme::primary_button(&label))
+                    })
+                    .inner
+                    .on_hover_text(t(lg, K::BuildAllTip));
+                if response.clicked() {
+                    state.confirm_build_all = Some(BuildAllConfirmation {
+                        estimate_secs: estimate_batch_secs(&build_all_jobs, &state.build_timings),
+                        jobs: build_all_jobs.clone(),
+                    });
+                }
+                if build_all_count == 0 {
+                    ui.label(RichText::new(t(lg, K::Ready)).color(OK).size(11.0).strong());
+                }
+            });
+            ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));
                 for i in 0..state.entries.len() {
-                    let e = &state.entries[i];
+                    // Keep row data independent from the mutable selection set inside the UI
+                    // closure. The roster itself only changes on an explicit rescan.
+                    let e = state.entries[i].clone();
                     let installed = e.pack_dir.is_some();
                     egui::Frame::new()
                         .fill(card_bg)
@@ -2909,39 +3496,94 @@ pub fn menu_ui(
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 ui.set_min_height(34.0);
+                                // An explicit selected build can rebuild a current pack as well as
+                                // build a missing/damaged one. Freeze this snapshot while a batch
+                                // owns the FIFO so each row's queued status stays meaningful.
+                                let mut selected = state.selected_maps.contains(&e.key);
+                                let select_response = ui
+                                    .add_enabled(
+                                        !state.build_all.active && wk_queued_builds == 0,
+                                        egui::Checkbox::without_text(&mut selected),
+                                    )
+                                    .on_hover_text(t(lg, K::Select));
+                                if select_response.changed() {
+                                    if selected {
+                                        state.selected_maps.insert(e.key.clone());
+                                    } else {
+                                        state.selected_maps.remove(&e.key);
+                                    }
+                                }
                                 let title = RichText::new(map_title(lg, &e.key, &e.title))
                                     .size(theme::SIZE_ROW_TITLE)
                                     .strong()
                                     .color(if installed { BEIGE } else { DIM });
                                 ui.add_sized([220.0, 30.0], egui::Label::new(title));
                                 // Status badge.
-                                let (txt, col) = if !installed {
-                                    (t(lg, K::NotInstalled), DIM)
+                                let (mut txt, mut col) = if !installed {
+                                    (t(lg, K::NotInstalled).to_string(), DIM)
                                 } else if !e.valid {
                                     // Pack dir present but manifest/meshes/instances broken or
                                     // missing (finding 4): never show READY — PLAY would blank out.
-                                    (t(lg, K::Damaged), BAD)
+                                    (t(lg, K::Damaged).to_string(), BAD)
                                 } else {
                                     match e.fp_match {
-                                        Some(true) => (t(lg, K::Ready), OK),
+                                        Some(true) => (t(lg, K::Ready).to_string(), OK),
                                         // Game-file hashes changed since this pack was built.
-                                        Some(false) => (t(lg, K::GameFilesUpdated), WARN),
-                                        None => (t(lg, K::ReadyUnstamped), WARN),
+                                        Some(false) => {
+                                            (t(lg, K::GameFilesUpdated).to_string(), WARN)
+                                        }
+                                        None => (t(lg, K::ReadyUnstamped).to_string(), WARN),
                                     }
                                 };
+                                if let Some(position) =
+                                    state.build_all.keys.iter().position(|key| key == &e.key)
+                                {
+                                    if building_key.as_deref() == Some(e.key.as_str()) {
+                                        txt = t(lg, K::Building).to_string();
+                                        col = BEIGE;
+                                    } else if position < state.build_all.completed {
+                                        txt = t(lg, K::Done).to_string();
+                                        col = OK;
+                                    } else if state.build_all.failed {
+                                        if state.build_all.failed_key.as_deref()
+                                            == Some(e.key.as_str())
+                                        {
+                                            txt = t(lg, K::Failed).to_string();
+                                            col = BAD;
+                                        } else {
+                                            txt = t(lg, K::Pending).to_string();
+                                            col = DIM;
+                                        }
+                                    } else if state.build_all.active {
+                                        txt = format!(
+                                            "{} {}",
+                                            t(lg, K::Queued),
+                                            position + 1 - state.build_all.completed
+                                        );
+                                        col = WARN;
+                                    }
+                                }
                                 ui.label(RichText::new(txt).color(col).size(12.0).strong());
                                 ui.add_space(10.0);
                                 if installed {
                                     ui.label(RichText::new(fmt_size(e.size_bytes)).color(BEIGE));
                                     ui.label(
-                                        RichText::new(format!("{} {}", t(lg, K::BuiltLabel), fmt_age_lg(lg, e.built_days)))
-                                            .color(DIM)
-                                            .size(11.0),
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            t(lg, K::BuiltLabel),
+                                            fmt_age_lg(lg, e.built_days)
+                                        ))
+                                        .color(DIM)
+                                        .size(11.0),
                                     );
                                     ui.label(
-                                        RichText::new(format!("{} {}", t(lg, K::IntelLabel), fmt_age_lg(lg, e.intel_days)))
-                                            .color(DIM)
-                                            .size(11.0),
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            t(lg, K::IntelLabel),
+                                            fmt_age_lg(lg, e.intel_days)
+                                        ))
+                                        .color(DIM)
+                                        .size(11.0),
                                     );
                                     // Each flag says what the PACK carries, which is not always
                                     // what the player sees on screen (a greyed "grass sim" on a
@@ -3009,7 +3651,10 @@ pub fn menu_ui(
                                                         switch.0 = e.pack_dir.clone();
                                                     }
                                                 } else {
-                                                    resp.on_disabled_hover_text(t(lg, K::PlayBusyBuilding));
+                                                    resp.on_disabled_hover_text(t(
+                                                        lg,
+                                                        K::PlayBusyBuilding,
+                                                    ));
                                                 }
                                             } else {
                                                 let reb = theme::warn_button(if this_building {
@@ -3018,9 +3663,10 @@ pub fn menu_ui(
                                                     t(lg, K::Build)
                                                 });
                                                 let resp = ui
-                                                    .add_enabled_ui(!any_building && can_build, |ui| {
-                                                        ui.add_sized([84.0, 30.0], reb)
-                                                    })
+                                                    .add_enabled_ui(
+                                                        !any_building && can_build,
+                                                        |ui| ui.add_sized([84.0, 30.0], reb),
+                                                    )
                                                     .inner;
                                                 let resp = if !can_build {
                                                     resp.on_disabled_hover_text(t(lg, setup_key))
@@ -3045,9 +3691,13 @@ pub fn menu_ui(
                                                 // (finding 11) and re-extracts stale data via
                                                 // --force (finding 1 / release blocker).
                                                 let resp = ui
-                                                    .add_enabled_ui(!any_building && can_build, |ui| {
-                                                        ui.add_sized([84.0, 30.0], upd).on_hover_text(t(lg, K::UpdateTip))
-                                                    })
+                                                    .add_enabled_ui(
+                                                        !any_building && can_build,
+                                                        |ui| {
+                                                            ui.add_sized([84.0, 30.0], upd)
+                                                                .on_hover_text(t(lg, K::UpdateTip))
+                                                        },
+                                                    )
                                                     .inner;
                                                 let resp = if !can_build {
                                                     resp.on_disabled_hover_text(t(lg, setup_key))
@@ -3069,15 +3719,22 @@ pub fn menu_ui(
                                                 // which it never was (the flag only cleared by
                                                 // deleting).
                                                 if ui
-                                                    .add_sized([84.0, 30.0], egui::Button::new(
-                                                        RichText::new(t(lg, K::Cancel)).color(BONE),
-                                                    ))
+                                                    .add_sized(
+                                                        [84.0, 30.0],
+                                                        egui::Button::new(
+                                                            RichText::new(t(lg, K::Cancel))
+                                                                .color(BONE),
+                                                        ),
+                                                    )
                                                     .clicked()
                                                 {
                                                     clear_confirm = true;
                                                 }
                                                 if ui
-                                                    .add_sized([120.0, 30.0], del_btn(t(lg, K::Confirm)))
+                                                    .add_sized(
+                                                        [120.0, 30.0],
+                                                        del_btn(t(lg, K::Confirm)),
+                                                    )
                                                     .on_hover_text(t(lg, K::DeleteConfirmTip))
                                                     .clicked()
                                                 {
@@ -3085,7 +3742,10 @@ pub fn menu_ui(
                                                 }
                                             } else if ui
                                                 .add_enabled_ui(!this_building, |ui| {
-                                                    ui.add_sized([84.0, 30.0], del_btn(t(lg, K::Delete)))
+                                                    ui.add_sized(
+                                                        [84.0, 30.0],
+                                                        del_btn(t(lg, K::Delete)),
+                                                    )
                                                 })
                                                 .inner
                                                 .clicked()
@@ -3099,7 +3759,8 @@ pub fn menu_ui(
                                                 t(lg, K::Build).to_string()
                                             };
                                             let b = egui::Button::new(RichText::new(build_label));
-                                            let resp = ui.add_enabled(!any_building && can_build, b);
+                                            let resp =
+                                                ui.add_enabled(!any_building && can_build, b);
                                             let resp = if !can_build {
                                                 resp.on_disabled_hover_text(t(lg, setup_key))
                                             } else {
@@ -3156,12 +3817,120 @@ pub fn menu_ui(
             if let Some((key, force)) = start_build {
                 info!(
                     "menu: queueing {} '{key}' via tools/build_map.py",
-                    if force { "UPDATE (forced re-extract)" } else { "build" }
+                    if force {
+                        "UPDATE (forced re-extract)"
+                    } else {
+                        "build"
+                    }
                 );
                 enqueue_build = Some((key, force));
+                state.build_all = BuildBatchProgress::default();
                 state.show_log = false; // fresh panel starts with the log collapsed
             }
         });
+
+    // BUILD ALL is intentionally a separate confirmation step: unlike a selected batch it can
+    // schedule a large amount of work and should never start from an accidental click.
+    let mut confirm_all = false;
+    let mut cancel_all = false;
+    if let Some(pending) = state.confirm_build_all.as_ref() {
+        let count = pending.jobs.len();
+        let estimate_secs = pending.estimate_secs;
+        egui::Area::new(egui::Id::new("build_all_confirm_dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+                ui.allocate_rect(screen, egui::Sense::click());
+            });
+        egui::Area::new(egui::Id::new("build_all_confirm"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(egui::Stroke::new(1.0, WARN))
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .corner_radius(0.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(440.0);
+                        ui.label(
+                            RichText::new(t(lg, K::BuildAllConfirmTitle))
+                                .color(BEIGE)
+                                .size(18.0)
+                                .strong(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("{} ({count})", t(lg, K::BuildAllConfirmBody)))
+                                .color(BEIGE)
+                                .size(12.0),
+                        );
+                        ui.add_space(10.0);
+                        match estimate_secs {
+                            Some(secs) => ui.label(
+                                RichText::new(format!(
+                                    "{}: ~{}",
+                                    t(lg, K::BuildAllEstimate),
+                                    fmt_duration(secs)
+                                ))
+                                .color(WARN)
+                                .size(12.0)
+                                .strong(),
+                            ),
+                            None => ui.label(
+                                RichText::new(t(lg, K::BuildAllEstimateUnknown))
+                                    .color(DIM)
+                                    .size(11.0),
+                            ),
+                        };
+                        ui.add_space(14.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_sized(
+                                    [156.0, 32.0],
+                                    theme::primary_button(t(lg, K::BuildAllConfirm)),
+                                )
+                                .clicked()
+                            {
+                                confirm_all = true;
+                            }
+                            if ui
+                                .add_sized(
+                                    [88.0, 32.0],
+                                    egui::Button::new(RichText::new(t(lg, K::Cancel)).color(BEIGE)),
+                                )
+                                .clicked()
+                            {
+                                cancel_all = true;
+                            }
+                        });
+                    });
+            });
+    }
+    if cancel_all {
+        state.confirm_build_all = None;
+    }
+    if confirm_all {
+        if let Some(pending) = state.confirm_build_all.take() {
+            let total = pending.jobs.len();
+            info!("menu: confirmed BUILD ALL with {total} map(s)");
+            state.build_all = BuildBatchProgress {
+                total,
+                completed: 0,
+                active: true,
+                failed: false,
+                kind: Some(BuildBatchKind::All),
+                keys: pending.jobs.iter().map(|(key, _)| key.clone()).collect(),
+                failed_key: None,
+            };
+            enqueue_build_batch = Some(pending.jobs);
+            state.show_log = false;
+        }
+    }
 
     // Language switch — floated on its OWN foreground Area anchored to the window bottom-right so a
     // short window's (non-scrolling) CentralPanel overflow can NEVER clip it. It used to be the last
@@ -3188,7 +3957,11 @@ pub fn menu_ui(
             .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(20.0, -14.0))
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
-                ui.label(RichText::new(format!("\u{26A0} {msg}")).color(theme::DANGER_TEXT).size(11.0));
+                ui.label(
+                    RichText::new(format!("\u{26A0} {msg}"))
+                        .color(theme::DANGER_TEXT)
+                        .size(11.0),
+                );
             });
     }
 
@@ -3224,7 +3997,8 @@ pub fn menu_ui(
             ui.horizontal(|ui| {
                 if available {
                     // A small accent badge dot before the label.
-                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    let (dot, _) =
+                        ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     ui.painter().circle_filled(dot.center(), 3.5, theme::ACCENT);
                     ui.label(
                         RichText::new(t(lg, K::UpdateAvailable))
@@ -3256,7 +4030,8 @@ pub fn menu_ui(
             .interactable(true)
             .show(ctx, |ui| {
                 let screen = ctx.screen_rect();
-                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(170));
                 ui.allocate_rect(screen, egui::Sense::click()); // block the menu behind
             });
 
@@ -3273,8 +4048,8 @@ pub fn menu_ui(
                     .show(ui, |ui| {
                         ui.set_max_width(440.0);
                         ui.horizontal(|ui| {
-                            let (dot, _) =
-                                ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            let (dot, _) = ui
+                                .allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                             ui.painter().circle_filled(dot.center(), 4.0, theme::ACCENT);
                             ui.label(
                                 RichText::new(t(lg, K::UpdateTitle))
@@ -3291,18 +4066,26 @@ pub fn menu_ui(
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            RichText::new(t(lg, K::UpdateWarn)).size(theme::SIZE_SMALL).color(WARN),
+                            RichText::new(t(lg, K::UpdateWarn))
+                                .size(theme::SIZE_SMALL)
+                                .color(WARN),
                         );
                         ui.add_space(16.0);
                         ui.horizontal(|ui| {
                             // Primary: UPDATE (beige) opens the release page in the browser.
-                            if ui.add_sized([120.0, 30.0], theme::primary_button(t(lg, K::Update))).clicked() {
+                            if ui
+                                .add_sized([120.0, 30.0], theme::primary_button(t(lg, K::Update)))
+                                .clicked()
+                            {
                                 do_update = true;
                             }
                             ui.add_space(8.0);
                             // Secondary: LATER (neutral outlined) dismisses for this session.
                             let later = egui::Button::new(
-                                RichText::new(t(lg, K::UpdateLater)).size(15.5).strong().color(BONE),
+                                RichText::new(t(lg, K::UpdateLater))
+                                    .size(15.5)
+                                    .strong()
+                                    .color(BONE),
                             )
                             .fill(HEADER)
                             .stroke(egui::Stroke::new(1.0, BORDER))
@@ -3337,8 +4120,24 @@ pub fn menu_ui(
             background: state.process_in_background,
         });
     }
+    if let Some(jobs) = enqueue_build_batch {
+        info!("menu: queueing map batch with {} map(s)", jobs.len());
+        for (map, force) in jobs {
+            worker.enqueue(Job::BuildMap {
+                map,
+                game_dir: state.game_dir.clone(),
+                force,
+                background: state.process_in_background,
+            });
+        }
+    }
     if cancel_current {
         worker.cancel_current();
+        worker.clear_queued_builds();
+        if state.build_all.active {
+            state.build_all.active = false;
+            state.build_all.failed = true;
+        }
     }
     if dismiss_build {
         worker.dismiss_last();
@@ -3347,7 +4146,20 @@ pub fn menu_ui(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_frac, subprogress_frac};
+    use super::{build_frac, estimate_batch_secs, subprogress_frac};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn batch_estimate_uses_local_per_map_history_then_local_fallback() {
+        let timings = BTreeMap::from([
+            ("woods".to_string(), vec![100.0, 140.0]),
+            ("customs".to_string(), vec![200.0]),
+        ]);
+        let jobs = vec![("woods".to_string(), false), ("reserve".to_string(), true)];
+        // woods average = 120; reserve falls back to all local samples average = 146.7.
+        assert_eq!(estimate_batch_secs(&jobs, &timings), Some(267));
+        assert_eq!(estimate_batch_secs(&jobs, &BTreeMap::new()), None);
+    }
 
     // ---- subprogress_frac: BOTH marker generations must parse to the same ratio semantics.
     // The byte-weighted emitters (extract_parallel / eft_extract_colliders) put the machine
@@ -3359,7 +4171,8 @@ mod tests {
     /// above check that a LINE is read correctly; this checks that the CURVE is usable, which is
     /// where both of the freezes this table was written to remove actually lived.
     fn replay(stream: &[&str]) -> Vec<f32> {
-        let (mut tail, mut stage, mut mx, mut out) = (Vec::new(), String::new(), 0.0f32, Vec::new());
+        let (mut tail, mut stage, mut mx, mut out) =
+            (Vec::new(), String::new(), 0.0f32, Vec::new());
         let mut fresh = false;
         for line in stream {
             tail.push(line.to_string());
@@ -3373,8 +4186,15 @@ mod tests {
                 fresh = true;
             }
             let sub = if stage.starts_with("[STAGE 1/") {
-                let tag = if stage.contains("physics colliders") { "colliders" } else { "extract" };
-                tail.iter().rev().filter(|l| l.contains(tag)).find_map(|l| subprogress_frac(l))
+                let tag = if stage.contains("physics colliders") {
+                    "colliders"
+                } else {
+                    "extract"
+                };
+                tail.iter()
+                    .rev()
+                    .filter(|l| l.contains(tag))
+                    .find_map(|l| subprogress_frac(l))
             } else {
                 None
             };
@@ -3422,7 +4242,11 @@ mod tests {
         // The three dataset [SUBPROGRESS] lines must each move the bar. Before the bookend fix
         // they computed 3.3% / 17.8% / 32.4% against a latched 31.8% and were clamped away.
         let f = replay(DRY_RUN_FRESH);
-        assert!(f[2] < f[3] && f[3] < f[4], "dataset readings did not advance: {:?}", &f[..5]);
+        assert!(
+            f[2] < f[3] && f[3] < f[4],
+            "dataset readings did not advance: {:?}",
+            &f[..5]
+        );
     }
 
     #[test]
@@ -3432,8 +4256,14 @@ mod tests {
         let f = replay(DRY_RUN_FRESH);
         let at_marker = f[8]; // "[STAGE 1/9] extract physics colliders"
         let at_reading = f[9]; // its first own [SUBPROGRESS]
-        assert!(at_marker < 0.60, "colliders marker jumped to {at_marker:.3} on stale sub");
-        assert!(at_reading > at_marker, "colliders reading did not advance the bar");
+        assert!(
+            at_marker < 0.60,
+            "colliders marker jumped to {at_marker:.3} on stale sub"
+        );
+        assert!(
+            at_reading > at_marker,
+            "colliders reading did not advance the bar"
+        );
     }
 
     #[test]
@@ -3477,8 +4307,14 @@ mod tests {
 
     #[test]
     fn subprogress_rejects_noise_and_degenerate_totals() {
-        assert_eq!(subprogress_frac("  [p3] level410: 7765 colliders in 60.0s"), None);
-        assert_eq!(subprogress_frac("[SUBPROGRESS] extract levels 0/0 bytes 0/0"), None);
+        assert_eq!(
+            subprogress_frac("  [p3] level410: 7765 colliders in 60.0s"),
+            None
+        );
+        assert_eq!(
+            subprogress_frac("[SUBPROGRESS] extract levels 0/0 bytes 0/0"),
+            None
+        );
         assert_eq!(subprogress_frac("[SUBPROGRESS] extract garbage"), None);
     }
 
@@ -3497,7 +4333,11 @@ mod tests {
         // fresh=true: these three sub-passes only ever run during the ONE-TIME extraction, so the
         // fresh window (0..0.636) is the only table they can be reached under. Pinning them against
         // the rebuild table asserted a state the pipeline cannot produce.
-        let f = build_frac("[STAGE 1/9] extract dataset (geometry + textures)", Some(1.0), true);
+        let f = build_frac(
+            "[STAGE 1/9] extract dataset (geometry + textures)",
+            Some(1.0),
+            true,
+        );
         assert!((f - 0.636 * 0.52).abs() < 1e-4);
     }
 
@@ -3518,10 +4358,18 @@ mod tests {
 
     #[test]
     fn fresh_table_dominates_extraction() {
-        let f = build_frac("[STAGE 1/9] extract dataset (geometry + textures)", Some(0.5), true);
+        let f = build_frac(
+            "[STAGE 1/9] extract dataset (geometry + textures)",
+            Some(0.5),
+            true,
+        );
         assert!((f - 0.636 * 0.52 * 0.5).abs() < 1e-4);
         // stage-1 fully done on the fresh (measured) table = 0.636, not 0.55
-        let f = build_frac("[STAGE 1/9] extract physics colliders: done (2673s)", None, true);
+        let f = build_frac(
+            "[STAGE 1/9] extract physics colliders: done (2673s)",
+            None,
+            true,
+        );
         assert!((f - 0.636).abs() < 1e-4);
     }
 
@@ -3532,7 +4380,11 @@ mod tests {
         // freezes) through the 27-minute bake.
         let assemble_done = build_frac("[STAGE 4/9] assemble pack: done (724s)", None, true);
         let bake_running = build_frac("[STAGE 3/9] bake lighting (portable SH)", None, true);
-        let bake_done = build_frac("[STAGE 3/9] bake lighting (portable SH): done (1625s)", None, true);
+        let bake_done = build_frac(
+            "[STAGE 3/9] bake lighting (portable SH): done (1625s)",
+            None,
+            true,
+        );
         assert!((assemble_done - 0.732).abs() < 1e-4);
         assert!(bake_running > assemble_done);
         assert!((bake_done - 0.917).abs() < 1e-4);
@@ -3543,9 +4395,18 @@ mod tests {
         // raw frac (before the max_frac guard) must never regress across the stage-1 handoffs;
         // the guard only needs to absorb the out-of-order stage-3/4 bake markers, not stage 1.
         let seq: &[(&str, Option<f32>)] = &[
-            ("[STAGE 1/9] extract dataset (geometry + textures)", Some(0.1)),
-            ("[STAGE 1/9] extract dataset (geometry + textures)", Some(0.9)),
-            ("[STAGE 1/9] extract dataset (geometry + textures): done (7200s)", None),
+            (
+                "[STAGE 1/9] extract dataset (geometry + textures)",
+                Some(0.1),
+            ),
+            (
+                "[STAGE 1/9] extract dataset (geometry + textures)",
+                Some(0.9),
+            ),
+            (
+                "[STAGE 1/9] extract dataset (geometry + textures): done (7200s)",
+                None,
+            ),
             ("[STAGE 1/9] extract grass density", None),
             ("[STAGE 1/9] extract grass density: done (300s)", None),
             ("[STAGE 1/9] extract physics colliders", Some(0.2)),
