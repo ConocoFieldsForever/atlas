@@ -557,8 +557,35 @@ class _PackShipper:
             os.link(src, dst)
             self.linked += 1
         except OSError:
-            shutil.copy2(src, dst)   # cross-volume / FS without hardlinks -> the old behaviour
-            self.copied += 1
+            # Cross-volume and SMB destinations cannot hardlink. Copying directly to `dst` made a
+            # transient share interruption leave a plausible-looking partial texture in the
+            # `.building` pack; the next run then had to overwrite that damaged final name and
+            # could fail with PermissionError. Copy into a same-directory temporary file, retry
+            # transient write failures, then atomically publish it with os.replace.
+            tmp = f"{dst}.copying-{os.getpid()}-{id(self):x}"
+            last_error = None
+            for attempt in range(1, 5):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    shutil.copyfile(src, tmp)
+                    os.replace(tmp, dst)  # same destination volume/share -> atomic
+                    self.copied += 1
+                    last_error = None
+                    break
+                except OSError as e:
+                    last_error = e
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except OSError:
+                        pass
+                    if attempt < 4:
+                        delay = 0.25 * (2 ** (attempt - 1))
+                        print(f"  [ship] retry {attempt}/3 for {os.path.basename(dst)}: {e}")
+                        time.sleep(delay)
+            if last_error is not None:
+                raise last_error
         self.files += 1; self.bytes += sz
         return rel
 

@@ -4,6 +4,7 @@ param(
     [string]$GameData,
     [string]$AssetsRoot,
     [string]$TarkmapRoot,
+    [switch]$ForceCpu,
     [switch]$DryRun
 )
 
@@ -22,6 +23,9 @@ if (Test-Path -LiteralPath $LocalConfigPath) {
     if (-not $PSBoundParameters.ContainsKey("GameData")) { $GameData = $LocalConfig.GameData }
     if (-not $PSBoundParameters.ContainsKey("AssetsRoot")) { $AssetsRoot = $LocalConfig.AssetsRoot }
     if (-not $PSBoundParameters.ContainsKey("TarkmapRoot")) { $TarkmapRoot = $LocalConfig.TarkmapRoot }
+    if (-not $PSBoundParameters.ContainsKey("ForceCpu") -and $LocalConfig.ContainsKey("ForceCpu")) {
+        $ForceCpu = [bool]$LocalConfig.ForceCpu
+    }
 }
 
 if (-not $AtlasRoot) { $AtlasRoot = $env:EFT_ATLAS_ROOT }
@@ -33,7 +37,91 @@ function Write-Status {
     param([string]$Message)
     $Line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
     Write-Host $Line
-    Add-Content -LiteralPath $LogPath -Value $Line
+    Add-Content -LiteralPath $LogPath -Value $Line -Encoding UTF8
+}
+
+function Test-PackComplete {
+    param([string]$Map)
+    $Manifest = Join-Path $AtlasRoot ("packs\{0}.eftpack\manifest.json" -f $Map)
+    if (-not (Test-Path -LiteralPath $Manifest)) { return $false }
+    try {
+        $Data = Get-Content -LiteralPath $Manifest -Raw | ConvertFrom-Json
+        # sourceFingerprint is written by stage 9, after assembly, lighting, gameplay data, icons,
+        # nav, and final manifest reconciliation. A bare manifest can exist during stage 4 and is
+        # therefore not sufficient evidence that an interrupted pack is complete.
+        return -not [string]::IsNullOrWhiteSpace([string]$Data.sourceFingerprint)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-MapStageFraction {
+    param(
+        [int]$Stage,
+        [int]$Total,
+        [string]$Label,
+        [Nullable[double]]$SubFraction,
+        [bool]$FreshExtract
+    )
+
+    if ($Total -ne 9) {
+        $Inner = if ($Label -match ": (done|skipped)") { 1.0 } elseif ($null -ne $SubFraction) { $SubFraction } else { 0.05 }
+        return [math]::Max(0.0, [math]::Min(1.0, (($Stage - 1) + $Inner) / $Total))
+    }
+
+    if ($FreshExtract) {
+        $Windows = @{
+            1 = @(0.000, 0.636); 2 = @(0.636, 0.649); 4 = @(0.649, 0.732)
+            3 = @(0.732, 0.917); 5 = @(0.917, 0.918); 6 = @(0.918, 0.941)
+            7 = @(0.941, 0.955); 8 = @(0.955, 0.999); 9 = @(0.999, 1.000)
+        }
+    }
+    else {
+        $Windows = @{
+            1 = @(0.000, 0.001); 2 = @(0.001, 0.030); 4 = @(0.030, 0.672)
+            3 = @(0.672, 0.826); 5 = @(0.826, 0.827); 6 = @(0.827, 0.867)
+            7 = @(0.867, 0.868); 8 = @(0.868, 0.999); 9 = @(0.999, 1.000)
+        }
+    }
+
+    $Done = $Label -match ": (done|skipped)"
+    if ($Done) {
+        $Inner = 1.0
+    }
+    elseif ($null -ne $SubFraction) {
+        $Inner = [math]::Max(0.0, [math]::Min(1.0, [double]$SubFraction))
+    }
+    else {
+        $Inner = 0.02
+    }
+
+    # Stage 1 contains three serial first-extraction passes. Give their live subprogress separate
+    # slices so the bar keeps moving through the longest part of a new map.
+    if ($FreshExtract -and $Stage -eq 1 -and -not $Done) {
+        if ($Label -match "extract dataset") { $Inner = 0.52 * $Inner }
+        elseif ($Label -match "grass density") { $Inner = 0.52 + (0.01 * $Inner) }
+        elseif ($Label -match "physics colliders") { $Inner = 0.53 + (0.47 * $Inner) }
+        else { $Inner = 0.0 }
+    }
+
+    $Window = $Windows[$Stage]
+    if ($null -eq $Window) { return 0.0 }
+    return [double]$Window[0] + (([double]$Window[1] - [double]$Window[0]) * $Inner)
+}
+
+function Show-BuildProgress {
+    param(
+        [int]$MapNumber,
+        [int]$MapCount,
+        [string]$Map,
+        [string]$StageLabel,
+        [double]$MapFraction
+    )
+    $MapPercent = [math]::Round([math]::Max(0.0, [math]::Min(1.0, $MapFraction)) * 100)
+    $Overall = [math]::Round((($MapNumber - 1) + $MapFraction) / $MapCount * 100)
+    Write-Progress -Id 1 -Activity "Atlas - Build All Maps" -Status ("Map {0}/{1}: {2}" -f $MapNumber, $MapCount, $Map) -PercentComplete $Overall
+    Write-Progress -Id 2 -ParentId 1 -Activity ("Building {0}" -f $Map) -Status $StageLabel -PercentComplete $MapPercent
 }
 
 function Get-FreeSpaceGiB {
@@ -93,8 +181,7 @@ if ($MapIds -contains "streets") { $Maps += "streets" }
 $Completed = @()
 $Pending = @()
 foreach ($Map in $Maps) {
-    $Manifest = Join-Path $AtlasRoot ("packs\{0}.eftpack\manifest.json" -f $Map)
-    if (Test-Path -LiteralPath $Manifest) {
+    if (Test-PackComplete -Map $Map) {
         $Completed += $Map
     }
     else {
@@ -106,6 +193,7 @@ Write-Host ("Release:   {0}" -f $AtlasRoot)
 Write-Host ("Game:      {0}" -f $GameData)
 Write-Host ("Assets:    {0}" -f $AssetsRoot)
 Write-Host ("Workspace: {0}" -f $TarkmapRoot)
+Write-Host ("Processing: {0}" -f $(if ($ForceCpu) { "CPU fallback" } else { "GPU acceleration where supported" }))
 Write-Host ("Complete:  {0}/{1}" -f $Completed.Count, $Maps.Count) -ForegroundColor Green
 Write-Host ("Pending:   {0}" -f (($Pending -join ", ")))
 
@@ -173,7 +261,12 @@ try {
     $env:EFT_ASSETS_ROOT = $AssetsRoot
     $env:EFT_TARKMAP_ROOT = $TarkmapRoot
     $env:EFT_ATLAS_EXE = $AtlasExe
-    $env:EFT_BAKE_CPU = "1"
+    if ($ForceCpu) {
+        $env:EFT_BAKE_CPU = "1"
+    }
+    else {
+        Remove-Item Env:EFT_BAKE_CPU -ErrorAction SilentlyContinue
+    }
     $env:PYTHONUTF8 = "1"
     $env:PYTHONIOENCODING = "utf-8"
 
@@ -182,32 +275,70 @@ try {
     $Number = 0
     foreach ($Map in $Maps) {
         $Number++
-        $Manifest = Join-Path $AtlasRoot ("packs\{0}.eftpack\manifest.json" -f $Map)
-        if (Test-Path -LiteralPath $Manifest) {
+        if (Test-PackComplete -Map $Map) {
             Write-Status ("SKIP {0}/{1}: {2} is already complete." -f $Number, $Maps.Count, $Map)
+            Show-BuildProgress -MapNumber $Number -MapCount $Maps.Count -Map $Map -StageLabel "Already complete" -MapFraction 1.0
             continue
         }
 
         Write-Status ("BUILD {0}/{1}: {2}" -f $Number, $Maps.Count, $Map)
+        $FreshExtract = $false
+        $CurrentStage = 0
+        $CurrentStageTotal = 9
+        $CurrentStageLabel = "Starting"
+        $CurrentSubFraction = $null
+        $MaxMapFraction = 0.0
+        Show-BuildProgress -MapNumber $Number -MapCount $Maps.Count -Map $Map -StageLabel $CurrentStageLabel -MapFraction 0.0
 
         # Continue is intentional here: native stderr must be displayed and logged without
         # PowerShell converting it into a terminating NativeCommandError.
         $PreviousErrorAction = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
-        & $Python $Builder $Map "--self-contained" 2>&1 |
-            Tee-Object -FilePath $LogPath -Append
+        & $Python $Builder $Map "--self-contained" 2>&1 | ForEach-Object {
+            $BuildLine = $_.ToString()
+            Write-Host $BuildLine
+            Add-Content -LiteralPath $LogPath -Value $BuildLine -Encoding UTF8
+
+            if ($BuildLine -match '^\[STAGE\s+(\d+)/(\d+)\]\s+(.+)$') {
+                $CurrentStage = [int]$Matches[1]
+                $CurrentStageTotal = [int]$Matches[2]
+                $CurrentStageLabel = $Matches[3]
+                $CurrentSubFraction = $null
+                if ($CurrentStage -eq 1 -and $CurrentStageLabel -match 'extract dataset') {
+                    $FreshExtract = $true
+                }
+            }
+            elseif ($BuildLine -match '^\[SUBPROGRESS\].*?([0-9]+(?:\.[0-9]+)?)/([0-9]+(?:\.[0-9]+)?)\s*$') {
+                $SubDone = [double]$Matches[1]
+                $SubTotal = [double]$Matches[2]
+                if ($SubTotal -gt 0) { $CurrentSubFraction = $SubDone / $SubTotal }
+            }
+            elseif ($BuildLine -match '^\[BUILD OK\]') {
+                $MaxMapFraction = 1.0
+            }
+
+            if ($CurrentStage -gt 0 -and $MaxMapFraction -lt 1.0) {
+                $Candidate = Get-MapStageFraction -Stage $CurrentStage -Total $CurrentStageTotal -Label $CurrentStageLabel -SubFraction $CurrentSubFraction -FreshExtract $FreshExtract
+                $MaxMapFraction = [math]::Max($MaxMapFraction, $Candidate)
+            }
+            Show-BuildProgress -MapNumber $Number -MapCount $Maps.Count -Map $Map -StageLabel $CurrentStageLabel -MapFraction $MaxMapFraction
+        }
         $BuildExitCode = $LASTEXITCODE
         $ErrorActionPreference = $PreviousErrorAction
 
-        if ($BuildExitCode -ne 0 -or -not (Test-Path -LiteralPath $Manifest)) {
+        if ($BuildExitCode -ne 0 -or -not (Test-PackComplete -Map $Map)) {
+            Write-Progress -Id 2 -Activity ("Building {0}" -f $Map) -Completed
             Write-Status ("FAILED: {0}. Fix the reported error, then run the shortcut again; completed maps will be skipped." -f $Map)
             exit 1
         }
 
+        Show-BuildProgress -MapNumber $Number -MapCount $Maps.Count -Map $Map -StageLabel "Ready" -MapFraction 1.0
+        Write-Progress -Id 2 -Activity ("Building {0}" -f $Map) -Completed
         Write-Status ("READY: {0}" -f $Map)
     }
 
-    Write-Status "All Atlas map packs are installed. Restart Atlas to refresh the map list."
+    Write-Progress -Id 1 -Activity "Atlas - Build All Maps" -Completed
+    Write-Status "All Atlas map packs are installed. Restart Atlas on the VM to refresh the map list."
     Write-Host ""
     Write-Host "ALL MAPS READY" -ForegroundColor Green
 }

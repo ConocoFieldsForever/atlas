@@ -732,6 +732,14 @@ fn file_has_build_ok(log_path: &std::path::Path) -> bool {
 
 /// Present ONLY in menu mode (bare launch, no pack): drives the fullscreen menu UI and
 /// suppresses the in-raid panels (ui.rs checks for this resource).
+#[derive(Default)]
+struct BuildAllProgress {
+    total: usize,
+    completed: usize,
+    active: bool,
+    failed: bool,
+}
+
 #[derive(Resource)]
 pub struct MenuState {
     pub entries: Vec<MapEntry>,
@@ -770,6 +778,9 @@ pub struct MenuState {
     /// the pack list / intel and (for a sync) set the note. Builds/syncs now run on the shared
     /// worker, not owned by MenuState.
     pub seen_completed: u64,
+    /// In-app BUILD ALL batch state. The worker owns the actual FIFO; this only supplies the
+    /// overall map X/Y progress UI and remembers whether the queue stopped on an error.
+    build_all: BuildAllProgress,
     /// EFT_MENU_BUILD auto-build map key, enqueued once on the first menu frame (CLI/testing hook).
     pub autobuild: Option<String>,
     /// Set when a config write FAILED (finding 12) — shown as a warning by the footer so the user
@@ -1563,6 +1574,7 @@ pub fn build_state() -> MenuState {
         intel: intel_status(),
         sync_note: None,
         seen_completed: 0,
+        build_all: BuildAllProgress::default(),
         autobuild,
         config_err: None,
         process_in_background: config_process_in_background(),
@@ -1912,6 +1924,17 @@ pub fn menu_ui(
         // restart (python_exe now resolves to the freshly-created venv).
         state.deps_ok = deps_ready().unwrap_or(true);
         let ok = worker.last_outcome().map(|(_, ok)| ok).unwrap_or(false);
+        if worker.last_is_build() && state.build_all.active {
+            if ok {
+                state.build_all.completed = (state.build_all.completed + 1).min(state.build_all.total);
+                if state.build_all.completed >= state.build_all.total {
+                    state.build_all.active = false;
+                }
+            } else {
+                state.build_all.active = false;
+                state.build_all.failed = true;
+            }
+        }
         if worker.last_is_sync() {
             // "refreshed" only if the sync exited 0 AND fresh intel is actually VISIBLE where we scan
             // (state.intel was just re-read above). A green "refreshed" next to "synced never" means
@@ -1942,6 +1965,13 @@ pub fn menu_ui(
                 worker.enqueue(Job::SyncIntel);
             }
         }
+    }
+
+    // A build that could not even spawn never reaches the normal completion counter. Mark the
+    // batch stopped here; `pump_jobs` has already removed its remaining queued map builds.
+    if state.build_all.active && worker.spawn_error.is_some() {
+        state.build_all.active = false;
+        state.build_all.failed = true;
     }
 
     // The menu animates without input now (camera LED blink / servo slew / idle patrol and
@@ -1986,11 +2016,13 @@ pub fn menu_ui(
     let mut enqueue_sync = false;
     // (map key, force): force = the UPDATE path (build_map.py --force re-extracts stale data).
     let mut enqueue_build: Option<(String, bool)> = None;
+    let mut enqueue_build_all: Option<Vec<(String, bool)>> = None;
     let mut enqueue_install = false;
     let mut cancel_current = false;
     let mut dismiss_build = false;
     // Per-frame snapshots so the closures don't hold a borrow on the worker.
     let wk_build_key = worker.current_build_key().map(|s| s.to_string());
+    let wk_queued_builds = worker.queued_build_count();
     let bv = build_view(&worker);
 
     egui::TopBottomPanel::top("menu_header")
@@ -2409,6 +2441,37 @@ pub fn menu_ui(
                         // real relative duration so the ETA stops overshooting on the long extraction;
                         // clamped so a nested sub-script's [STAGE i/M] marker can't jump the bar backward).
                         let frac = bv.frac;
+                        if state.build_all.total > 0
+                            && (state.build_all.active || state.build_all.failed)
+                            && key != "__deps__"
+                        {
+                            let current_credit = if state.build_all.active && !finished { frac } else { 0.0 };
+                            let overall = ((state.build_all.completed as f32 + current_credit)
+                                / state.build_all.total as f32)
+                                .clamp(0.0, 1.0);
+                            let label = if state.build_all.failed {
+                                format!(
+                                    "{} — {}/{}",
+                                    t(lg, K::BuildAllStopped),
+                                    state.build_all.completed,
+                                    state.build_all.total
+                                )
+                            } else {
+                                format!(
+                                    "{} — {}/{}",
+                                    t(lg, K::BuildAll),
+                                    (state.build_all.completed + 1).min(state.build_all.total),
+                                    state.build_all.total
+                                )
+                            };
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(label).color(if state.build_all.failed { BAD } else { BEIGE }).size(11.0).strong());
+                            ui.add(
+                                egui::ProgressBar::new(overall)
+                                    .desired_width(ui.available_width())
+                                    .show_percentage(),
+                            );
+                        }
                         // "LOADING OBJECTS..." style stage line for the loader bar: the text
                         // between the [STAGE] marker and its status suffix, uppercased and
                         // ASCII-whitelisted (menu glyph set is plain ASCII only).
@@ -2840,6 +2903,19 @@ pub fn menu_ui(
             // and UPDATE must both stay disabled instead of spawn-erroring. UPDATE used to bypass
             // this entirely — it now shares `can_build`.
             let can_build = state.build_kit_available && state.deps_ok && state.game_fp.is_some();
+            // BUILD ALL uses the same freshness rule as the map rows. A present, structurally valid
+            // pack is complete only when its source fingerprint matches today's game files.
+            let build_all_jobs: Vec<(String, bool)> = state
+                .entries
+                .iter()
+                .filter(|e| !e.valid || e.fp_match != Some(true))
+                .map(|e| {
+                    // Installed-but-not-current packs get a forced re-extract; missing packs take
+                    // the normal first-build path. This mirrors each row's BUILD/REBUILD behavior.
+                    (e.key.clone(), e.pack_dir.is_some())
+                })
+                .collect();
+            let build_all_count = build_all_jobs.len();
             // PLAY is gated on a tarkov.dev sync having happened at least once (loot/spawns/intel come
             // from it — playing before a sync gives an empty map). `intel` is (loot age, tasks age,
             // icons); a present loot age means the sync ran. Copied to a local so it reaches the PLAY
@@ -2895,6 +2971,33 @@ pub fn menu_ui(
                     });
                 ui.add_space(8.0);
             }
+            ui.horizontal(|ui| {
+                let label = format!("{} ({build_all_count})", t(lg, K::BuildAll));
+                let enabled = can_build
+                    && building_key.is_none()
+                    && wk_queued_builds == 0
+                    && build_all_count > 0;
+                let response = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        ui.add_sized([190.0, 32.0], theme::primary_button(&label))
+                    })
+                    .inner
+                    .on_hover_text(t(lg, K::BuildAllTip));
+                if response.clicked() {
+                    state.build_all = BuildAllProgress {
+                        total: build_all_count,
+                        completed: 0,
+                        active: true,
+                        failed: false,
+                    };
+                    enqueue_build_all = Some(build_all_jobs.clone());
+                    state.show_log = false;
+                }
+                if build_all_count == 0 {
+                    ui.label(RichText::new(t(lg, K::Ready)).color(OK).size(11.0).strong());
+                }
+            });
+            ui.add_space(8.0);
             egui::ScrollArea::vertical().show(ui, |ui| {
                 // Right gutter: keep the map rows clear of the globe backdrop's right side.
                 ui.set_max_width((ui.available_width() - 166.0).max(430.0));
@@ -3159,6 +3262,7 @@ pub fn menu_ui(
                     if force { "UPDATE (forced re-extract)" } else { "build" }
                 );
                 enqueue_build = Some((key, force));
+                state.build_all = BuildAllProgress::default();
                 state.show_log = false; // fresh panel starts with the log collapsed
             }
         });
@@ -3337,8 +3441,24 @@ pub fn menu_ui(
             background: state.process_in_background,
         });
     }
+    if let Some(jobs) = enqueue_build_all {
+        info!("menu: queueing BUILD ALL with {} map(s)", jobs.len());
+        for (map, force) in jobs {
+            worker.enqueue(Job::BuildMap {
+                map,
+                game_dir: state.game_dir.clone(),
+                force,
+                background: state.process_in_background,
+            });
+        }
+    }
     if cancel_current {
         worker.cancel_current();
+        worker.clear_queued_builds();
+        if state.build_all.active {
+            state.build_all.active = false;
+            state.build_all.failed = true;
+        }
     }
     if dismiss_build {
         worker.dismiss_last();

@@ -89,6 +89,9 @@ impl JobWorker {
     /// can flip the row to READY over stale geometry. So a forced build UPGRADES a queued non-force
     /// build in place, and appends after a running non-force build rather than being dropped.
     pub fn enqueue(&mut self, job: Job) {
+        // A new explicit request supersedes an old "failed to spawn" banner. If this request also
+        // fails, `pump_jobs` will put a fresh message back on the worker.
+        self.spawn_error = None;
         let l = job.label();
         let incoming_force = matches!(&job, Job::BuildMap { force: true, .. });
         // Same-label job already QUEUED?
@@ -116,6 +119,18 @@ impl JobWorker {
     }
     pub fn busy(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Number of map builds waiting behind the current job. Used by the menu's BUILD ALL control
+    /// to show/disable the batch without exposing the worker's queue implementation.
+    pub fn queued_build_count(&self) -> usize {
+        self.queue.iter().filter(|j| matches!(j, Job::BuildMap { .. })).count()
+    }
+
+    /// Drop only pending map builds. The current child is cancelled separately; sync/dependency
+    /// jobs are intentionally preserved because they are independent maintenance work.
+    pub fn clear_queued_builds(&mut self) {
+        self.queue.retain(|j| !matches!(j, Job::BuildMap { .. }));
     }
 
     /// Adopt a build started by a PREVIOUS Atlas process (survived an app-close because it was
@@ -205,10 +220,22 @@ fn pump_jobs(mut w: ResMut<JobWorker>) {
     // Reap the running job if its child has exited.
     let finished = w.current.as_ref().map(|(_, j)| j.snapshot(1).2).unwrap_or(false);
     if finished {
+        // BUILD ALL is deliberately fail-fast. A failed/cancelled map must stop the remaining map
+        // queue so the first error stays visible and a later map cannot make the batch look healthy.
+        let failed_build = w
+            .current
+            .as_ref()
+            .map(|(job, child)| {
+                matches!(job, Job::BuildMap { .. }) && !child.snapshot(0).3
+            })
+            .unwrap_or(false);
         if let Some(done) = w.current.take() {
             w.last = Some(done);
             w.last_dismissed = false;
             w.completed = w.completed.wrapping_add(1);
+        }
+        if failed_build {
+            w.clear_queued_builds();
         }
     }
     // Start the next queued job when idle.
@@ -219,7 +246,13 @@ fn pump_jobs(mut w: ResMut<JobWorker>) {
                     w.spawn_error = None;
                     w.current = Some((job, child));
                 }
-                Err(e) => w.spawn_error = Some(format!("{}: {e}", job.label())),
+                Err(e) => {
+                    let was_build = matches!(&job, Job::BuildMap { .. });
+                    w.spawn_error = Some(format!("{}: {e}", job.label()));
+                    if was_build {
+                        w.clear_queued_builds();
+                    }
+                }
             }
         }
     }
@@ -228,3 +261,31 @@ fn pump_jobs(mut w: ResMut<JobWorker>) {
 // (removed) `job_panel` + `JobPanelState`: the in-raid "MAP PROCESSING" floating pill. Builds and
 // intel sync are driven from the START MENU only now; the JobWorker above remains the shared queue
 // the menu frontend feeds and polls.
+
+#[cfg(test)]
+mod tests {
+    use super::{Job, JobWorker};
+
+    fn build(map: &str) -> Job {
+        Job::BuildMap {
+            map: map.to_string(),
+            game_dir: "game".to_string(),
+            force: false,
+            background: true,
+        }
+    }
+
+    #[test]
+    fn build_all_queue_is_deduped_and_can_be_cleared_without_dropping_sync() {
+        let mut worker = JobWorker::default();
+        worker.enqueue(build("woods"));
+        worker.enqueue(build("woods"));
+        worker.enqueue(build("customs"));
+        worker.enqueue(Job::SyncIntel);
+
+        assert_eq!(worker.queued_build_count(), 2);
+        worker.clear_queued_builds();
+        assert_eq!(worker.queued_build_count(), 0);
+        assert!(matches!(worker.queue.front(), Some(Job::SyncIntel)));
+    }
+}
