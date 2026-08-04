@@ -271,6 +271,9 @@ impl Plugin for UiPlugin {
                 map_loading_indicator,
                 map_load_error_panel,
                 drone_hud,
+                // After the panels so the labels paint over them in the foreground layer, before
+                // fit_camera_viewport which must stay last.
+                crate::esp_labels::draw_esp_labels,
                 fit_camera_viewport,
             )
                 .chain()
@@ -870,6 +873,8 @@ struct GfxUiParams<'w, 's> {
             bevy::prelude::Without<crate::poi::ZoneWall>,
         ),
     >,
+    /// ESP draws no world, so every knob fed by the world stream is a no-op there.
+    esp: Res<'w, crate::EspMode>,
 }
 
 /// Display name for a pack id: the GAME-DERIVED English title from the roster when the id is a
@@ -1644,12 +1649,27 @@ fn layers_panel(
                         // Standard (Bevy PBR) fallbacks. Grey them out there so a fallback user can't
                         // fiddle dead sliders. Bloom / grade LUT / SSAO / sharpen run in the shared
                         // camera+post chain on every path, so they stay enabled.
-                        let is_gpu = gfx_ui
-                            .render_path
-                            .as_deref()
-                            .map(|p| *p == crate::render::RenderPath::GpuDriven)
-                            .unwrap_or(true);
-                        if !is_gpu {
+                        // ESP draws no world at all, so shadows, fog, sky reflections, grass,
+                        // cull, LOD and the rest have nothing to act on. Leaving them live would
+                        // be a panel full of controls that do nothing -- the same complaint
+                        // finding 9 fixed for the fallback renderers, one mode further on.
+                        let esp = gfx_ui.esp.0;
+                        let is_gpu = !esp
+                            && gfx_ui
+                                .render_path
+                                .as_deref()
+                                .map(|p| *p == crate::render::RenderPath::GpuDriven)
+                                .unwrap_or(true);
+                        if esp {
+                            ui.label(
+                                RichText::new(
+                                    "overlay mode draws no map geometry, so the world effects below do nothing",
+                                )
+                                .size(10.0)
+                                .italics()
+                                .color(theme::WARN),
+                            );
+                        } else if !is_gpu {
                             ui.label(
                                 RichText::new("compatibility renderer: some effects below need the GPU-driven path")
                                     .size(10.0)

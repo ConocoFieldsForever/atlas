@@ -13,6 +13,7 @@ mod agent_link;
 mod assets;
 mod character;
 mod drone;
+mod esp_labels;
 mod eftpack;
 mod game_watch;
 mod gpu_lease;
@@ -1310,6 +1311,7 @@ fn main() {
         )
         .insert_resource(EspMode(menu::config_bool_pub("espMode").unwrap_or(false)))
         .insert_resource(EspMode(esp_mode))
+        .init_resource::<esp_labels::EspLabels>()
         .init_resource::<render::PanelLensShift>()
         .init_resource::<render::OverlaySlice>()
         // The SOLE writer of Camera::sub_camera_view, after egui has finished laying out (so the
