@@ -4892,15 +4892,26 @@ pub(crate) fn prepare_gpu_buffers(
     }
     // Loot-glow highlight lane: one u32 per instance (0 = no glow), zero-initialized; the
     // per-frame `prepare_loot_glow` rewrites it whenever the loot overlay's visible set changes.
+    // The lane only ever addresses the PRE-GRASS instance prefix: `inst_ancestry` is pushed before
+    // `grass_instance_base` is latched, so every glow index is below it by construction. Sizing it
+    // to `instance_total` meant each glow-gen bump allocated, zero-filled and uploaded a buffer
+    // covering all 3,328,315 interchange instances (12.70 MiB) to set about 983 entries, of which
+    // 3,261,251 slots were grass that can never glow. The bump fires whenever a marker crosses the
+    // 140 m / 320 m declutter ring, i.e. continuously while the camera moves, which is why the loot
+    // overlay measured 1.85 ms of a 10.11 ms frame under a fly-through and ~0.02 ms parked.
+    //
+    // NOT the last block: the sea quad is appended after grass. This is the pre-grass PREFIX, not
+    // "everything except the tail".
+    let glow_len = (cpu.grass_instance_base as u32).min(instance_total).max(1);
     let loot_glow_buf = render_device.create_buffer(&BufferDescriptor {
         label: Some("eft_loot_glow"),
-        size: (instance_total.max(1) as u64) * 4,
+        size: (glow_len as u64) * 4,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     commands.insert_resource(EftLootGlow {
         buffer: loot_glow_buf.clone(),
-        len: instance_total.max(1),
+        len: glow_len,
         last_gen: u64::MAX,
     });
     // Draw bind group starts on the WHITE AO fallback; `sync_draw_bg_ao` swaps in the live AO

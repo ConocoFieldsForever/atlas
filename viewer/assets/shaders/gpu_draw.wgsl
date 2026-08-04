@@ -1006,7 +1006,13 @@ fn vertex(v: Vertex, @builtin(instance_index) instance_index: u32) -> VOut {
     o.material_index = v.material_index;
     o.color = v.color;
     o.world_pos = world; // Phase1 SH-GI: fragment samples the irradiance volume at this point
-    o.glow = loot_glow[min(real, arrayLength(&loot_glow) - 1u)];
+    // Bounds TEST, not a clamp. The lane covers only the pre-grass instance prefix (grass is
+    // 3.26M of interchange's 3.33M instances and can never carry loot glow), so `min()` would pin
+    // every grass instance to the last valid index and smear that entry's glow across the whole
+    // field. Out of range means no glow.
+    var g: u32 = 0u;
+    if (real < arrayLength(&loot_glow)) { g = loot_glow[real]; }
+    o.glow = g;
     return o;
 }
 

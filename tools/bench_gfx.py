@@ -67,6 +67,24 @@ CONFIGS = [
     ("grass_off",       "Foliage/grass culled",                    {"EFT_CULL_PX": "1.5,1000"},     1),
     ("cull_aggressive", "Aggressive small-object cull (4px/8px)",  {"EFT_CULL_PX": "4,8"},          1),
     ("lod_bias2",       "LOD bias 2.0 (coarser shells sooner)",    {"EFT_LOD_BIAS": "2.0"},         1),
+    # --- OVERLAY LAYERS ---------------------------------------------------------------------
+    # The rows above price GRAPHICS. They cannot answer "what does the marker overlay cost me",
+    # which is a CPU question: every layer adds entities that two visibility systems walk on every
+    # camera move, and the loot layer alone is 2k+ markers on streets. `nocluster` is the one to
+    # watch -- it disables the declutter that keeps distant markers from all drawing at once, so it
+    # should read WORSE than baseline, and by how much is the value of that pass.
+    ("lay_base",        "LAYERS: defaults (loot on, clustering on)", {},                            1),
+    ("lay_noloot",      "LAYERS: loot overlay OFF",                {"EFT_LAYERS": "noloot"},        1),
+    ("lay_nocluster",   "LAYERS: dense declutter OFF",             {"EFT_LAYERS": "nocluster"},     1),
+    ("lay_spawns",      "LAYERS: + pmc/scav/boss spawns",          {"EFT_LAYERS": "pmc,scav,boss"}, 1),
+    ("lay_nav",         "LAYERS: + extract/door/interact/lock",
+     {"EFT_LAYERS": "extract,door,interact,lock"},                                                  1),
+    ("lay_zones",       "LAYERS: + hazard/minefield/sniper/botzone",
+     {"EFT_LAYERS": "hazard,minefield,sniper,botzone"},                                             1),
+    ("lay_patrol",      "LAYERS: + patrol polylines",              {"EFT_LAYERS": "patrol"},        1),
+    ("lay_all",         "LAYERS: everything on",
+     {"EFT_LAYERS": "pmc,scav,boss,extract,door,interact,lock,hazard,switch,transit,stationary,"
+                    "loose,minefield,sniper,botzone,patrol,airdrop,ritual,player,showinactive"},    1),
     # --- stacked presets, to check the knobs compose ---
     ("stack_low",       "STACK: quarter tex + no shadows/bloom/GI/lights + grass culled",
      {"EFT_SHADOWS": "0", "EFT_BLOOM": "0", "EFT_GI": "0", "EFT_LIGHTS": "0",
