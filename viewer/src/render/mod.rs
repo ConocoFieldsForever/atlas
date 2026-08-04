@@ -14,7 +14,7 @@
 //! the data is already instanced low-poly (p50 ~384 tris, ~10.5k unique meshes
 //! stored once).
 
-use bevy::prelude::Resource;
+use bevy::prelude::{Query, Res, Resource, With};
 
 pub mod fpv_cam;
 pub mod gpu_driven;
@@ -565,6 +565,45 @@ mod quality_preset_tests {
 /// so the initial map builds); each swap does `.0 += 1`.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, bevy::render::extract_resource::ExtractResource)]
 pub struct MapEpoch(pub u64);
+
+/// The panel lens-shift the egui layout wants: shift the rendered content left so the map re-centres
+/// in the free region beside the side panels. Written by `ui::fit_camera_viewport`, never applied
+/// directly.
+#[derive(Resource, Default)]
+pub struct PanelLensShift(pub Option<bevy::camera::SubCameraView>);
+
+/// The overlay's perspective-registration slice: which rectangle of Tarkov's full camera image the
+/// Atlas window has replaced. Written by `overlay::apply_overlay_view_slice`, never applied
+/// directly.
+#[derive(Resource, Default)]
+pub struct OverlaySlice(pub Option<bevy::camera::SubCameraView>);
+
+/// THE ONLY writer of `Camera::sub_camera_view`.
+///
+/// There used to be two. `overlay::apply_overlay_view_slice` wrote it from `Update`, and
+/// `ui::fit_camera_viewport` wrote it from `EguiPrimaryContextPass` — which runs LATER in the frame,
+/// so the panel shift silently won every time, and cleared the slice outright whenever no side panel
+/// happened to be up. That slice is the whole perspective match: it is what makes a marker land on
+/// the game pixel it belongs to instead of somewhere plausible. Two writers, one field, opposite
+/// intents, and the loser was the one the overlay depends on.
+///
+/// Precedence is explicit and one-directional: while the overlay is registered against the game's
+/// picture, that registration wins, because a lens shift for a panel that is drawn OVER the game
+/// would move the whole scene off the alignment it exists to hold. Outside the overlay the panel
+/// shift applies as before.
+pub fn apply_view_slice(
+    overlay: Res<OverlaySlice>,
+    panel: Res<PanelLensShift>,
+    mut cameras: Query<&mut bevy::camera::Camera, With<CullCamera>>,
+) {
+    let desired = overlay.0.or(panel.0);
+    for mut camera in &mut cameras {
+        if camera.sub_camera_view != desired {
+            camera.sub_camera_view = desired;
+        }
+    }
+}
+
 
 /// A/B render-path selector. `EFT_RENDER=m0` picks the working M0 custom instanced
 /// path (`instancing.rs`, zero culling); anything else (default) picks the M2

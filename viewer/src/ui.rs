@@ -603,13 +603,11 @@ fn fit_camera_viewport(
     mut contexts: bevy_egui::EguiContexts,
     menu: Option<Res<crate::menu::MenuState>>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
-    mut cam: Query<&mut bevy::camera::Camera, With<crate::render::CullCamera>>,
+    mut shift: ResMut<crate::render::PanelLensShift>,
 ) {
     if menu.is_some() {
-        if let Ok(mut c) = cam.single_mut() {
-            if c.sub_camera_view.is_some() {
-                c.sub_camera_view = None; // menu owns the whole screen — no shift
-            }
+        if shift.0.is_some() {
+            shift.0 = None; // menu owns the whole screen — no shift
         }
         return;
     }
@@ -628,13 +626,10 @@ fn fit_camera_viewport(
     }
     let vis_w = (avail.width() * ppp).clamp(0.0, win_w);
     let panel_w = (win_w - vis_w).max(0.0);
-    let Ok(mut camera) = cam.single_mut() else {
-        return;
-    };
     // No side panel (e.g. hide-all) -> centered full-window, no shift.
     if panel_w < 4.0 {
-        if camera.sub_camera_view.is_some() {
-            camera.sub_camera_view = None;
+        if shift.0.is_some() {
+            shift.0 = None;
         }
         return;
     }
@@ -645,12 +640,12 @@ fn fit_camera_viewport(
         size: UVec2::new(win_w as u32, win_h as u32),
     };
     let same = matches!(
-        &camera.sub_camera_view,
+        &shift.0,
         Some(s) if s.full_size == sub.full_size && s.size == sub.size
             && (s.offset - sub.offset).abs().max_element() < 0.5
     );
     if !same {
-        camera.sub_camera_view = Some(sub);
+        shift.0 = Some(sub);
     }
 }
 

@@ -1091,17 +1091,23 @@ fn apply_overlay_view_slice(
     cfg: Res<OverlayConfig>,
     state: Res<OverlayState>,
     view: Res<OverlayViewSlice>,
-    mut cameras: Query<&mut Camera, With<crate::render::CullCamera>>,
+    mut active: ResMut<crate::render::OverlaySlice>,
 ) {
+    // Publishes INTENT. `crate::render::apply_view_slice` is the sole writer of
+    // `Camera::sub_camera_view` and decides precedence, because this used to write the camera
+    // directly and so did `ui::fit_camera_viewport` -- two writers for one field, in two different
+    // schedules. `fit_camera_viewport` runs in EguiPrimaryContextPass, which is LATER in the frame
+    // than this Update system, so the panel lens-shift overwrote the overlay's asymmetric frustum
+    // every single frame (and cleared it outright whenever no side panel was up). That frustum is
+    // the entire perspective match: without it a marker no longer lands on the game pixel it
+    // belongs to, which is the one thing the overlay exists to guarantee.
     let desired = if cfg.enabled && state.shown && !state.windowed {
         view.0
     } else {
         None
     };
-    for mut camera in &mut cameras {
-        if camera.sub_camera_view != desired {
-            camera.sub_camera_view = desired;
-        }
+    if active.0 != desired {
+        active.0 = desired;
     }
 }
 

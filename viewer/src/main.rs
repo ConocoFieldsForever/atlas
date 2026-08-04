@@ -1266,6 +1266,16 @@ fn main() {
             PostUpdate,
             debug_bench_camera.before(bevy::transform::TransformSystems::Propagate),
         )
+        .init_resource::<render::PanelLensShift>()
+        .init_resource::<render::OverlaySlice>()
+        // The SOLE writer of Camera::sub_camera_view, after egui has finished laying out (so the
+        // panel width it derives from is this frame's) and before Bevy consumes the camera.
+        .add_systems(
+            PostUpdate,
+            render::apply_view_slice
+                .after(bevy_egui::EguiPostUpdateSet::ProcessOutput)
+                .before(bevy::camera::CameraUpdateSystems),
+        )
         .add_systems(
             Update,
             (apply_gfx_camera, load_map, poll_map_load, clear_map_error_on_new_load, flycam_scroll, apply_camera_fov, build_walk_ground),
