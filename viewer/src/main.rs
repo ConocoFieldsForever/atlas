@@ -862,7 +862,15 @@ fn main() {
         .filter(|a| !a.starts_with('-'))
         .or_else(|| std::env::var("EFT_PACK").ok().filter(|s| !s.is_empty()));
     // A/B selector: `EFT_RENDER=m0|gpu` env, or a 2nd argv token; default = GPU-driven.
+    let render_forced = std::env::var("EFT_RENDER").is_ok()
+        || std::env::args().nth(2).is_some_and(|a| !a.trim().is_empty());
     let render_path = RenderPath::from_env_or(std::env::args().nth(2).as_deref());
+    // A path that aborted the LAST run is not chosen again: see render/path_guard.rs. The marker
+    // brackets device creation -- written before Bevy touches the GPU, cleared only once this path
+    // has drawn real frames -- because `panic = "abort"` plus wgpu's `handle_error_fatal` (`-> !`)
+    // mean a lost device can never be caught in-process.
+    let render_path = render::path_guard::resolve_after_crash(render_path, render_forced);
+    render::path_guard::mark_attempt(render_path);
     eprintln!("render path: {render_path:?}  (override with EFT_RENDER=m0|gpu)");
     // Standard-path VRAM guard: Standard decodes textures as UNCOMPRESSED RGBA8 (no BC), so a
     // persisted textureQuality=Full that is fine on the GPU-driven path (~2.2 GB BC on
@@ -1198,6 +1206,7 @@ fn main() {
     // SsaoPlugin is told which path is installed: it orders against a render-graph node that only
     // the GPU-driven path creates, and `render_path` is not a resource yet at this point.
     app.add_plugins((
+        render::RenderPathGuardPlugin,
         GradePlugin,
         render::SsaoPlugin { gpu_driven: render_path == RenderPath::GpuDriven },
         render::TaaPlugin,

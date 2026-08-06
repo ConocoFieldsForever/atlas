@@ -20,6 +20,7 @@ pub mod fpv_cam;
 pub mod gpu_driven;
 pub mod grade;
 pub mod instancing;
+pub mod path_guard;
 pub mod ssao;
 pub mod ssr;
 pub mod standard;
@@ -35,6 +36,7 @@ pub use fpv_cam::FpvCamPlugin;
 pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin, GpuLoadSignal};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
+pub use path_guard::RenderPathGuardPlugin;
 pub use ssao::SsaoPlugin;
 pub use taa::TaaPlugin;
 pub use ssr::SsrPlugin;
@@ -708,23 +710,15 @@ fn probe_render_path() -> RenderPath {
     match adapter {
         Ok(a) => {
             let info = a.get_info();
-            // Driver quirk (field report: RX 7800 XT, driver_info "26.2.2 (LLPC)"): the LLPC
-            // shader-compiler stack (AMDVLK-lineage Vulkan ICD, not the standard Adrenalin
-            // compiler) device-loses on the FIRST FRAME of the gpu-driven path's bindless/
-            // indirect pipelines — the app dies at swapchain acquire right after "GPU buffers +
-            // bind groups built". The feature bits all report supported, so only the driver
-            // string identifies it. Bevy's standard PBR pipelines (the menu, and the Standard
-            // path) run fine there → fall back to Standard, which keeps textures.
-            if info.driver_info.contains("LLPC") {
-                eprintln!(
-                    "gpu probe: {} uses an LLPC Vulkan compiler ({}) — known to crash the \
-                     gpu-driven pipelines; auto-selecting the Standard (Bevy PBR) path. Install \
-                     the standard AMD Adrenalin driver for the full renderer, or force with \
-                     EFT_RENDER=gpu / EFT_RENDER=m0.",
-                    info.name, info.driver_info
-                );
-                return RenderPath::Standard;
-            }
+            // NOTE: a `driver_info.contains("LLPC")` rule here used to force the Standard path.
+            // It was removed deliberately; `path_guard.rs` carries the full account. Short
+            // version: "(LLPC)" is what the ORDINARY AMD Adrenalin driver reports on Windows
+            // (25.11.1 reports "25.11.1 (LLPC)"), so the rule demoted every AMD user on Windows
+            // rather than catching a rare ICD — and the device loss it was written for was
+            // root-caused two days later in f6a5b0c as OUR bug: gpu_shadow.wgsl read the 192-byte
+            // material table at a 176-byte stride, sending an unclamped index into a
+            // binding_array. That is fixed, pinned by `material_stride_tests`, and every bindless
+            // index is clamped. A vendor-agnostic crash sentinel now covers the general case.
             let ok = a.features().contains(need);
             eprintln!(
                 "gpu probe: {} ({:?}/{:?}) gpu-driven={}",

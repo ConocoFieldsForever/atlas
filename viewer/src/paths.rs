@@ -75,6 +75,10 @@ pub fn shared_dir() -> PathBuf {
 /// The writable per-user app-data root: `%APPDATA%\atlas` on Windows, `$XDG_DATA_HOME/atlas`
 /// (falling back to `~/.local/share/atlas`, the XDG default) on Linux/macOS. None only when even
 /// HOME can't be resolved (stripped env) — callers fall back to `exe_dir()` in that case.
+pub fn user_data_dir_pub() -> Option<PathBuf> {
+    user_data_dir()
+}
+
 fn user_data_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
