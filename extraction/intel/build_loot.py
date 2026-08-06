@@ -30,6 +30,36 @@ import sys as _sys, os as _os
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 from mapslugs import DEV_TO_ID, map_id as _shared_map_id
 
+# Some tarkov.dev maps are presentation variants of the same shipped Atlas pack. The loot builder
+# emits one record per pack id, so processing both aliases without choosing a representative makes
+# the later API row silently overwrite the earlier one. Factory's night row currently wins that
+# race and labels the day-built `factory_rework` pack "Night Factory". Keep the variant matching
+# the pack we actually build. The order of the upstream catalog must not decide user-visible data.
+PRIMARY_DEV_SLUG = {
+    'factory_rework': 'factory',
+    'ground_zero': 'ground-zero',
+    'labs': 'the-lab',
+}
+
+
+def select_map_variants(maps):
+    """Return one deterministic tarkov.dev record for each shipped Atlas pack id."""
+    selected = {}
+    order = []
+    for record in maps:
+        slug = record.get('normalizedName')
+        mid = DEV_TO_ID.get(slug)
+        if not mid:
+            continue
+        score = int(slug == PRIMARY_DEV_SLUG.get(mid))
+        previous = selected.get(mid)
+        if previous is None:
+            order.append(mid)
+            selected[mid] = (score, record)
+        elif score > previous[0]:
+            selected[mid] = (score, record)
+    return [selected[mid][1] for mid in order]
+
 # Per container TYPE: ev = roubles WHEN it spawns loot; spawn = P(worthwhile loot this raid = "fill rate"); t = seconds
 # to open+search; cls = class (for include/exclude filtering). EFFECTIVE value the optimiser uses = ev * spawn -- so a
 # hidden STASH (Ground/Buried cache) with a ~0.35 fill rate ranks far below a weapon box even at similar filled value,
@@ -288,7 +318,7 @@ def main():
               f'- search time derived from real grid cells')
     out = {}
     intel_used = 0
-    for m in data['maps']:
+    for m in select_map_variants(data['maps']):
         mid = DEV_TO_ID.get(m['normalizedName'])
         if not mid:
             continue

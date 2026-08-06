@@ -821,8 +821,12 @@ impl Plugin for OverlayPlugin {
         let summon = std::env::var("EFT_OVERLAY_SUMMON").is_ok_and(|v| v.trim() == "1");
         // A transparent launch IS the overlay: the user chose a window that only exists to sit
         // over the game, so it comes up summoned instead of waiting for a screenshot that the
-        // master `enabled` switch may never have armed.
-        if summon {
+        // master `enabled` switch may never have armed. (See also `summon_transparent_launch`.)
+        let remote = crate::remote_mode();
+        // Remote menu->map relaunches also carry EFT_POSE, but deliberately do not request the
+        // local overlay. Treat that pose as the same one-shot handoff so it cannot pin later maps.
+        let pose_handoff = summon || (remote && std::env::var_os("EFT_POSE").is_some());
+        if pose_handoff {
             std::env::remove_var("EFT_OVERLAY_SUMMON");
             // The handoff's EFT_POSE has done its job once `setup` (Startup) read it. Drop it in
             // PostStartup so the camera is free afterwards (main.rs gates on its presence) and a
@@ -844,15 +848,22 @@ impl Plugin for OverlayPlugin {
             info!("overlay: disabled for this finite EFT_SHOT/EFT_BENCH job (config untouched)");
             cfg.enabled = false;
         }
+        if remote {
+            if cfg.enabled {
+                info!("overlay: disabled in remote-renderer mode (config untouched)");
+            }
+            cfg.enabled = false;
+            cfg.show_on_screenshot = false;
+        }
         app.insert_resource(cfg)
             .insert_resource(OverlayState {
-                shown: summon && !automated,
+                shown: summon && !automated && !remote,
                 windowed: false,
                 raise_nonce: 0,
             })
             .init_resource::<OverlayViewSlice>()
             .init_resource::<OverlayFocus>();
-        if automated {
+        if automated || remote {
             app.add_systems(
                 Update,
                 (toggle_overlay, update_overlay_focus, apply_overlay, apply_overlay_view_slice)

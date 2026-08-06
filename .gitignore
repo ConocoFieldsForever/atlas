@@ -45,6 +45,8 @@ atlas.config.json
 .env
 .env.*
 !.env.example
+scripts/build-all-atlas-maps.local.psd1
+scripts/build-all-atlas-maps.running
 
 # python
 __pycache__/

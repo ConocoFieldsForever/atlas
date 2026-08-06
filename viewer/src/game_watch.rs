@@ -15,6 +15,10 @@
 //! A background thread polls (~0.7 s) and sends parsed events over an mpsc channel; Bevy systems
 //! apply them. Coordinates bridge with the same X-flip the whole pipeline uses:
 //! viewer = (-x, y, z). Disable entirely with `EFT_GAME_LINK=0`.
+//!
+//! Remote renderer mode (`EFT_REMOTE_MODE=1`) keeps this passive link active but reads optional
+//! network-visible roots from `EFT_SCREENSHOTS_DIR` and `EFT_GAME_LOGS_DIR`. The screenshot root
+//! may contain zero-byte marker files: only each `.png` filename and modification time are read.
 use bevy::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
@@ -255,9 +259,20 @@ impl Plugin for GameWatchPlugin {
         // Seed the shared flag from the persisted menu setting before the thread starts, so a
         // user who turned screenshot-locate OFF never gets a single poll of the folder.
         set_screenshot_locate(crate::menu::config_screenshot_locate());
-        set_delete_processed_shots(
-            crate::menu::config_bool_pub("deleteProcessedShots").unwrap_or(true),
-        );
+        // A remote override may point directly at the player's shared screenshot directory, so
+        // NEVER inherit the local default of deleting consumed PNGs. Deletion in remote mode is
+        // opt-in only through the explicit env var (safe for a marker-only relay inbox).
+        let delete_shots = match std::env::var("EFT_DELETE_PROCESSED_SHOTS")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+        {
+            Some("1") | Some("true") | Some("yes") => true,
+            Some("0") | Some("false") | Some("no") => false,
+            _ if crate::remote_mode() => false,
+            _ => crate::menu::config_bool_pub("deleteProcessedShots").unwrap_or(true),
+        };
+        set_delete_processed_shots(delete_shots);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("eft-game-watch".into())
@@ -285,6 +300,15 @@ impl Plugin for GameWatchPlugin {
 
 /// Drain the watcher channel and apply each event to the app's existing machinery: MapSwitch for
 /// the in-place swap, StartPoint + the marker for the player fix, PlayerProgress for tasks.
+/// Overlay-facing inputs of `apply_game_events`, bundled because the function sits at Bevy's
+/// 16-system-param limit (the same reason ui.rs has GfxUiParams and navigate_panel has NavLive).
+#[derive(bevy::ecs::system::SystemParam)]
+struct OverlayLink<'w> {
+    cfg: Option<Res<'w, crate::overlay::OverlayConfig>>,
+    transparent: Option<Res<'w, crate::TransparentWindow>>,
+    state: Option<ResMut<'w, crate::overlay::OverlayState>>,
+}
+
 fn apply_game_events(
     mut link: ResMut<GameLink>,
     mut start_pt: ResMut<crate::pathfind::StartPoint>,
@@ -299,10 +323,9 @@ fn apply_game_events(
     )>,
     mut last_route: Local<Option<crate::pathfind::RouteRequest>>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
-    overlay_cfg: Option<Res<crate::overlay::OverlayConfig>>,
-    transparent: Option<Res<crate::TransparentWindow>>,
-    mut overlay_state: Option<ResMut<crate::overlay::OverlayState>>,
+    mut overlay: OverlayLink,
     menu: Option<Res<crate::menu::MenuState>>,
+    loaded: Option<Res<crate::render::LoadedPack>>,
     mut sw: ResMut<crate::MapSwitch>,
     mut cam_settings: ResMut<crate::CameraSettings>,
     mut toggles: ResMut<crate::ui::LayerToggles>,
@@ -327,10 +350,34 @@ fn apply_game_events(
         match ev {
             GameEvent::MapLoading(id) => {
                 link.player = None; // a new raid invalidates the old fix
-                // RECORD ONLY. `sync_map_on_overlay_show` applies it when the overlay is summoned.
+                // Local mode records only: `sync_map_on_overlay_show` applies it when the overlay
+                // is summoned. A remote renderer has no local overlay/window, so follow the game
+                // immediately and keep the correct pack warm before the next screenshot arrives.
                 if link.pending_map.as_deref() != Some(id.as_str()) {
-                    info!("game link: raid is on '{id}' (will load when the overlay is opened)");
+                    if crate::remote_mode() {
+                        info!("game link: remote raid is on '{id}' (loading immediately)");
+                    } else {
+                        info!("game link: raid is on '{id}' (will load when the overlay is opened)");
+                    }
                     link.pending_map = Some(id.clone());
+                }
+                if crate::remote_mode() {
+                    let dir = crate::paths::packs_root().join(format!("{id}.eftpack"));
+                    if dir.join("manifest.json").is_file() {
+                        let current = loaded.as_ref().and_then(|p| {
+                            p.0.root
+                                .file_name()?
+                                .to_str()?
+                                .strip_suffix(".eftpack")
+                        });
+                        if current != Some(id.as_str()) && sw.0.is_none() {
+                            sw.0 = Some(dir.to_string_lossy().into_owned());
+                        }
+                        link.unbuilt_map = None;
+                    } else {
+                        warn!("game link: remote raid map '{id}' has no built pack");
+                        link.unbuilt_map = Some(id);
+                    }
                 }
                 continue;
             }
@@ -347,16 +394,20 @@ fn apply_game_events(
                 // what makes that single press mean "show me where I am" — no key interception,
                 // no injected input, nothing touching the game (see OverlayConfig::show_on_screenshot).
                 let transparent_session =
-                    transparent.as_ref().is_some_and(|t| t.0);
-                let summon = overlay_cfg
+                    overlay.transparent.as_ref().is_some_and(|t| t.0);
+                let summon = overlay
+                    .cfg
                     .as_ref()
                     .is_some_and(|c| (c.enabled || transparent_session) && c.show_on_screenshot);
+                // Remote mode has no window to summon, but the map-follow and menu-relaunch
+                // machinery below must still fire on a screenshot fix.
+                let activate = summon || crate::remote_mode();
                 if menu.is_some() {
                     // At the START MENU a summon means: relaunch into the raid map (menu-mode
                     // MapSwitch IS the PLAY path — new process, menu torn down) with the pose and
                     // "come up shown" handed over via env vars the child inherits. The child
                     // consumes and REMOVES both (overlay.rs), so later relaunches stay clean.
-                    if summon {
+                    if activate {
                         if let Some(id) = link.pending_map.clone() {
                             let dir = crate::paths::packs_root().join(format!("{id}.eftpack"));
                             if dir.join("manifest.json").is_file() {
@@ -372,10 +423,12 @@ fn apply_game_events(
                                 // but carry the already-known value across the relaunch so its first
                                 // rendered map frame has Tarkov's exact projection.
                                 std::env::set_var("EFT_GAME_FOV", cam_settings.fov_deg.to_string());
-                                std::env::set_var("EFT_OVERLAY_SUMMON", "1");
+                                if summon {
+                                    std::env::set_var("EFT_OVERLAY_SUMMON", "1");
+                                }
                                 info!(
-                                    "game link: screenshot at the menu -> relaunching into '{id}' \
-with the overlay up"
+                                    "game link: screenshot at the menu -> relaunching into '{id}'{}",
+                                    if summon { " with the overlay up" } else { " in remote mode" }
                                 );
                                 sw.0 = Some(dir.to_string_lossy().into_owned());
                             } else {
@@ -389,7 +442,7 @@ with the overlay up"
                     continue; // no camera/marker work behind the start menu
                 }
                 if summon {
-                    if let Some(st) = overlay_state.as_mut() {
+                    if let Some(st) = overlay.state.as_mut() {
                         // ALWAYS ask for a re-raise, even when already shown: the game reclaims the
                         // foreground (and on exclusive fullscreen can push us behind entirely)
                         // between screenshots, and a summon that only fires on the rising edge
@@ -671,10 +724,11 @@ fn watcher_thread(tx: Sender<GameEvent>) {
         }
         tick += 1;
         LINK_HEALTH.ticks.store(tick, std::sync::atomic::Ordering::Relaxed);
-        health_set(&LINK_HEALTH.game_dir, !game_dir.is_empty());
+        let explicit_logs = configured_dir("EFT_GAME_LOGS_DIR").is_some();
+        health_set(&LINK_HEALTH.game_dir, !game_dir.is_empty() || explicit_logs);
         health_set(&LINK_HEALTH.shots_dir, shots_dir.is_some());
 
-        if !game_dir.is_empty() {
+        if !game_dir.is_empty() || explicit_logs {
             let folder = latest_log_folder(Path::new(&game_dir));
             health_set(&LINK_HEALTH.logs_dir, folder.is_some());
             if let Some(folder) = folder {
@@ -709,8 +763,38 @@ fn watcher_thread(tx: Sender<GameEvent>) {
     }
 }
 
+/// A non-empty path from an env var, preserving UNC/network paths and non-UTF-8 paths.
+fn configured_dir(key: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(key)?);
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
+/// A Logs root -> its most recently modified `log_*` folder. An already-selected `log_*` folder
+/// is also accepted, which makes a narrowly shared current-session directory usable.
+fn latest_under_logs_root(root: &Path) -> Option<PathBuf> {
+    if root
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().starts_with("log_"))
+        && root.is_dir()
+    {
+        return Some(root.to_path_buf());
+    }
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_string_lossy().starts_with("log_")
+                && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        })
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
 /// `<game>\Logs` (or `<game>\build\Logs`) -> the most recently modified `log_*` folder.
 fn latest_log_folder(game: &Path) -> Option<PathBuf> {
+    if let Some(root) = configured_dir("EFT_GAME_LOGS_DIR") {
+        return latest_under_logs_root(&root);
+    }
     // `detect_game_dir` resolves the DATA folder (it validates on globalgamemanagers/sharedassets),
     // but EFT writes its logs beside the EXE, one level UP: <install>\Logs, not
     // <install>\EscapeFromTarkov_Data\Logs. Missing that candidate meant the log folder was never
@@ -725,15 +809,7 @@ fn latest_log_folder(game: &Path) -> Option<PathBuf> {
     .into_iter()
     .flatten()
     .find(|p| p.is_dir())?;
-    std::fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .filter(|e| {
-            e.file_name().to_string_lossy().starts_with("log_")
-                && e.file_type().map(|t| t.is_dir()).unwrap_or(false)
-        })
-        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
-        .map(|e| e.path())
+    latest_under_logs_root(&root)
 }
 
 /// Point a tail at the newest file in `folder` whose name contains `needle` (EFT rotates to
@@ -1039,8 +1115,12 @@ fn cap(pending: &mut String) {
     }
 }
 
-/// EFT saves screenshots under Documents (possibly OneDrive-redirected).
+/// EFT saves screenshots under Documents (possibly OneDrive-redirected). A remote renderer may
+/// instead watch a UNC/local relay inbox through `EFT_SCREENSHOTS_DIR`.
 fn find_screenshots_dir() -> Option<PathBuf> {
+    if let Some(dir) = configured_dir("EFT_SCREENSHOTS_DIR") {
+        return dir.is_dir().then_some(dir);
+    }
     let home = std::env::var("USERPROFILE").ok()?;
     for base in [
         Path::new(&home).join("Documents"),
