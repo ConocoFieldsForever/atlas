@@ -923,6 +923,16 @@ fn main() {
             .unwrap_or_else(|| {
                 menu::config_str_pub("overlayPresentation").as_deref() == Some("transparent")
             });
+    // Transparent windows are BORN at the game's client rect, because they must never resize.
+    // The summon path used to resize the default 1600x1000 window up to the game rect, and that
+    // first SetWindowPos froze the process solid inside the swapchain reconfigure (0 CPU,
+    // Responding=false, log dead at the summon line) -- a transparent PreMultiplied surface being
+    // recreated mid-session is exactly the resize-time stall class the vendored bevy_render
+    // acquire patch exists for, except this one never comes back. A fixed-size window created at
+    // its final geometry never reconfigures, so the freeze is unreachable. When the game is not
+    // up yet the default size stands and the first summon must do the one resize -- start the
+    // game first, as the settings tip says.
+    let transparent_rect = if transparent_launch { overlay::game_window_rect() } else { None };
     let async_cold_load = pack_dir.is_some()
         && render_path == RenderPath::GpuDriven
         && !std::env::var("EFT_SYNC_LOAD").map(|v| v.trim() == "1").unwrap_or(false);
@@ -1063,14 +1073,21 @@ fn main() {
                     title: "Atlas".into(),
                     // EFT_WIN=WxH overrides for benches (resolution scaling splits
                     // fragment-bound from CPU/fixed cost); default 1600x1000.
-                    resolution: std::env::var("EFT_WIN")
-                        .ok()
-                        .and_then(|s| {
-                            let (w, h) = s.trim().split_once('x')?;
-                            Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
-                        })
-                        .unwrap_or((1600u32, 1000u32))
-                        .into(),
+                    resolution: if let Some((_, size)) = transparent_rect {
+                        // Scale factor 1: the game rect is PHYSICAL desktop pixels, and the whole
+                        // point is pixel-exact registration with the game's own framebuffer.
+                        bevy::window::WindowResolution::new(size.x as u32, size.y as u32)
+                            .with_scale_factor_override(1.0)
+                    } else {
+                        std::env::var("EFT_WIN")
+                            .ok()
+                            .and_then(|s| {
+                                let (w, h) = s.trim().split_once('x')?;
+                                Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?))
+                            })
+                            .unwrap_or((1600u32, 1000u32))
+                            .into()
+                    },
                     present_mode,
                     // Frame-queue depth 1 (wgpu default: 2). On a GPU-bound machine under
                     // FIFO/vsync the deeper queue keeps the swapchain backlog permanently
@@ -1093,6 +1110,8 @@ fn main() {
                     visible: !hidden,
                     position: if hidden {
                         WindowPosition::At(IVec2::new(-20000, -20000))
+                    } else if let Some((origin, _)) = transparent_rect {
+                        WindowPosition::At(origin)
                     } else {
                         WindowPosition::Automatic
                     },

@@ -31,7 +31,7 @@ use bevy::winit::UpdateMode;
 
 /// Where the overlay should place itself: the GAME's window rect when we can see it, else the
 /// monitor. `(origin, size)` in physical desktop pixels.
-type TargetRect = (IVec2, Vec2);
+pub(crate) type TargetRect = (IVec2, Vec2);
 
 /// The part of Tarkov's full camera image covered by the Atlas window. Bevy turns this into an
 /// asymmetric perspective frustum, so every visible 3D pixel is projected at the same screen
@@ -90,7 +90,7 @@ fn title_is_game(title: &str) -> bool {
 /// Declared against user32 directly rather than pulling in the `windows` crate: two functions and a
 /// callback do not justify a dependency, and this file is the only caller.
 #[cfg(windows)]
-fn game_window_rect() -> Option<TargetRect> {
+pub(crate) fn game_window_rect() -> Option<TargetRect> {
     use std::ffi::c_void;
 
     #[repr(C)]
@@ -113,6 +113,7 @@ fn game_window_rect() -> Option<TargetRect> {
     unsafe extern "system" {
         fn EnumWindows(cb: extern "system" fn(*mut c_void, isize) -> i32, param: isize) -> i32;
         fn GetWindowTextW(hwnd: *mut c_void, buf: *mut u16, len: i32) -> i32;
+        fn GetWindowThreadProcessId(hwnd: *mut c_void, pid: *mut u32) -> u32;
         fn GetClientRect(hwnd: *mut c_void, rect: *mut Rect) -> i32;
         fn ClientToScreen(hwnd: *mut c_void, pt: *mut Point) -> i32;
         fn IsWindowVisible(hwnd: *mut c_void) -> i32;
@@ -131,6 +132,20 @@ fn game_window_rect() -> Option<TargetRect> {
         unsafe {
             // A minimised game is not something to centre on — fall through to the monitor.
             if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return 1;
+            }
+            // NEVER read the title of one of our OWN windows. They cannot be the game, and
+            // `GetWindowTextW` is only cached for OTHER processes -- for the calling process it
+            // SendMessages WM_GETTEXT, which on Atlas's own (same-thread) window dispatches
+            // reentrantly into winit's wndproc from inside `app.update()` and deadlocks the main
+            // thread solid: zero CPU, Responding=false, frozen at the summon. The bug hid for as
+            // long as summons only ever happened while the GAME was foreground, because
+            // EnumWindows walks in Z-order and the search stopped at the game before reaching us;
+            // the first summon that ran AFTER Atlas took focus put Atlas on top of the Z-order
+            // and enumerated it first.
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == std::process::id() {
                 return 1;
             }
             let mut buf = [0u16; 256];
@@ -178,7 +193,7 @@ fn game_window_rect() -> Option<TargetRect> {
 }
 
 #[cfg(not(windows))]
-fn game_window_rect() -> Option<TargetRect> {
+pub(crate) fn game_window_rect() -> Option<TargetRect> {
     None
 }
 
@@ -759,6 +774,9 @@ impl Plugin for OverlayPlugin {
         // the raid map -> panel up, camera already pinned by EFT_POSE). Consumed and REMOVED here
         // so a later PLAY relaunch doesn't inherit a stale summon.
         let summon = std::env::var("EFT_OVERLAY_SUMMON").is_ok_and(|v| v.trim() == "1");
+        // A transparent launch IS the overlay: the user chose a window that only exists to sit
+        // over the game, so it comes up summoned instead of waiting for a screenshot that the
+        // master `enabled` switch may never have armed.
         if summon {
             std::env::remove_var("EFT_OVERLAY_SUMMON");
             // The handoff's EFT_POSE has done its job once `setup` (Startup) read it. Drop it in
@@ -798,6 +816,7 @@ impl Plugin for OverlayPlugin {
                 Update,
                 (
                     focus_atlas_on_startup,
+                    summon_transparent_launch,
                     toggle_overlay,
                     apply_overlay,
                     apply_overlay_view_slice,
@@ -865,6 +884,34 @@ fn toggle_overlay(
     }
 }
 
+/// Summon a TRANSPARENT launch once the window has actually settled -- deliberately NOT at
+/// Startup. The first attempt summoned on frame 1, and `apply_overlay`'s geometry pass
+/// (SetWindowPos + restore + focus, all synchronous window-thread work) landed while winit was
+/// still initializing and the first swapchain configure was in flight; the process froze solid
+/// inside the driver -- zero CPU, `Responding = false`, log dead 0.2 s after "Creating new
+/// window". Every summon that has ever worked came minutes into a settled session, so this waits
+/// for one: thirty frames is imperceptible to a person and long past the first present.
+fn summon_transparent_launch(
+    mut st: ResMut<OverlayState>,
+    t: Res<crate::TransparentWindow>,
+    frames: Res<bevy::diagnostic::FrameCount>,
+    mut done: Local<bool>,
+) {
+    if *done {
+        return;
+    }
+    if !t.0 || crate::automated_finite_job() {
+        *done = true;
+        return;
+    }
+    if frames.0 >= 30 {
+        *done = true;
+        st.shown = true;
+        st.raise_nonce = st.raise_nonce.wrapping_add(1);
+        info!("overlay: transparent launch settled -- summoning");
+    }
+}
+
 /// Push `OverlayState` onto the real window. Runs only on a change (the window fields are all
 /// live-settable, so this is a handful of writes, never a rebuild).
 fn apply_overlay(
@@ -890,7 +937,12 @@ fn apply_overlay(
     // Re-run on a shown/hidden transition, on a settings change, OR on an explicit re-raise
     // request (see `OverlayState::raise_nonce`) -- the last one is what makes a second screenshot
     // pull the window back to the front after the game has taken the foreground.
-    let active = cfg.enabled && state.shown && !state.windowed;
+    // A transparent launch counts as enabled: the separate master switch exists so a PANEL never
+    // surprises anyone over their game, but a user who chose Transparent in the menu has already
+    // said exactly that. Requiring both silently ate the screenshot summon (field log: "summoning
+    // the overlay" fired, no "overlay: shown" ever followed) with nothing telling the user why.
+    let engaged = cfg.enabled || (transparent.0 && !crate::automated_finite_job());
+    let active = engaged && state.shown && !state.windowed;
     let active_changed = *last_active != Some(active);
     let nonce_changed = *last_nonce != Some(state.raise_nonce);
     let config_changed = cfg.is_changed();
@@ -1024,8 +1076,18 @@ fn apply_overlay(
             // thing it is supposed to sit on. `min` keeps it inside; `max` keeps it legible; the
             // min-of-max ordering means a genuinely tiny game window yields a panel that matches it
             // rather than one that overhangs.
-            let w = (size.x * cfg.size_frac.x).round().max(320.0).min(size.x.max(320.0));
-            let h = (size.y * cfg.size_frac.y).round().max(240.0).min(size.y.max(240.0));
+            // Transparent mode covers the game EXACTLY. The panel fractions exist so an opaque
+            // rectangle does not eat the whole screen, but a transparent window hides nothing --
+            // and full cover is what makes the view slice the identity mapping, so a marker sits
+            // on the very pixel of the thing it marks in the player's own field of view. Anything
+            // smaller crops the game camera's frustum and every label is offset by the margin.
+            let (fw, fh) = if transparent.0 {
+                (Vec2::ONE, Vec2::ONE)
+            } else {
+                (cfg.size_frac, cfg.size_frac)
+            };
+            let w = (size.x * fw.x).round().max(320.0).min(size.x.max(320.0));
+            let h = (size.y * fh.y).round().max(240.0).min(size.y.max(240.0));
             // The game rect and window position are PHYSICAL desktop pixels. `WindowResolution::set`
             // takes logical pixels and silently multiplies by DPI, making both placement and the
             // view crop drift on a scaled monitor. Keep this entire calculation in physical pixels.
@@ -1068,11 +1130,15 @@ fn apply_overlay(
         winit.unfocused_mode = overlay_update_mode(cfg.fps_cap);
         // Say WHICH rect we anchored to. "The overlay opened somewhere unexpected" is otherwise
         // undiagnosable from a log, and the two cases look identical on a single-monitor desk.
+        // Report the EFFECTIVE mode and coverage, not the config's: EFT_TRANSPARENT=1 overrides
+        // the config, and transparent mode covers 100% regardless of the panel fractions -- a log
+        // that says "Borderless, 55%x60%" for a transparent full-cover window sends whoever reads
+        // it down the wrong path.
         info!(
-            "overlay: shown ({:?}, {:.0}%x{:.0}% of {}, cap {} fps)",
-            cfg.presentation,
-            cfg.size_frac.x * 100.0,
-            cfg.size_frac.y * 100.0,
+            "overlay: shown ({}, {:.0}%x{:.0}% of {}, cap {} fps)",
+            if transparent.0 { "Transparent".to_string() } else { format!("{:?}", cfg.presentation) },
+            if transparent.0 { 100.0 } else { cfg.size_frac.x * 100.0 },
+            if transparent.0 { 100.0 } else { cfg.size_frac.y * 100.0 },
             if reuse_overlay_rect {
                 "the previous overlay rectangle".to_string()
             } else {
@@ -1092,7 +1158,7 @@ fn apply_overlay(
         // Overlay OFF entirely: behave like a stock desktop app. Restoring Continuous here (this
         // system only runs on change) undoes any throttle a previous enable left behind, and a
         // user who never opted in never sees their unfocused frame rate touched.
-        if state.windowed || !cfg.enabled {
+        if state.windowed || !engaged {
             // A transparent-created window must NEVER be re-decorated: DWM latched the
             // conjunction at creation and a decorated transparent window blends to white with no
             // way back (see OverlayPresentation). Hide it instead -- the user asked for a normal

@@ -2516,7 +2516,14 @@ pub fn menu_ui(
                             RichText::new(t(lg, K::OverlayBorderlessNote)).size(10.0).color(DIM),
                         );
                         ui.add_space(8.0);
-                        ui.add_enabled_ui(cfg.enabled, |ui| {
+                        // LAUNCH configuration, deliberately OUTSIDE the enabled gate below:
+                        // the presentation mode and ESP apply when a map is next opened, not when
+                        // the overlay is summoned, and greying them behind the summon master
+                        // switch hid the only settings a transparent-mode user actually needs.
+                        // Choosing Transparent is itself the overlay opt-in (apply_overlay treats
+                        // a transparent launch as engaged), so gating it on `enabled` was
+                        // circular.
+                        {
                             // ONE mode choice, not independent toggles: of the 8 combinations the
                             // old booleans allowed, transparency works under exactly one, and DWM
                             // fails the other seven silently (see OverlayPresentation). A radio
@@ -2555,12 +2562,21 @@ pub fn menu_ui(
                                 let _ = save_config_bool_pub("espMode", esp);
                             }
                             ui.add_space(8.0);
+                        }
+                        ui.add_enabled_ui(cfg.enabled, |ui| {
+                            // Size and anchor shape the PANEL modes; Transparent covers the whole
+                            // game window by definition, so these sliders would do nothing there.
+                            // Disable rather than let them lie (the Graphics-panel lesson).
+                            let panel_geometry = cfg.presentation
+                                != crate::overlay::OverlayPresentation::Transparent;
+                            ui.add_enabled_ui(panel_geometry, |ui| {
                             ui.label(RichText::new(t(lg, K::OverlayPanelSize)).size(10.0).color(DIM));
                             dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.x, 0.2..=1.0).text("width")).changed();
                             dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.y, 0.2..=1.0).text("height")).changed();
                             ui.label(RichText::new(t(lg, K::OverlayPanelPos)).size(10.0).color(DIM));
                             dirty |= ui.add(egui::Slider::new(&mut cfg.anchor.x, 0.0..=1.0).text("x")).changed();
                             dirty |= ui.add(egui::Slider::new(&mut cfg.anchor.y, 0.0..=1.0).text("y")).changed();
+                            });
                             ui.add_space(8.0);
                             ui.label(RichText::new(t(lg, K::OverlayPerf)).size(10.0).color(DIM));
                             let mut cap = cfg.fps_cap as f32;

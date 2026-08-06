@@ -300,6 +300,7 @@ fn apply_game_events(
     mut last_route: Local<Option<crate::pathfind::RouteRequest>>,
     mut cam_cmd: ResMut<crate::CameraCommand>,
     overlay_cfg: Option<Res<crate::overlay::OverlayConfig>>,
+    transparent: Option<Res<crate::TransparentWindow>>,
     mut overlay_state: Option<ResMut<crate::overlay::OverlayState>>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut sw: ResMut<crate::MapSwitch>,
@@ -345,8 +346,11 @@ fn apply_game_events(
                 // the file, and we just turned it into a position. Summoning the overlay here is
                 // what makes that single press mean "show me where I am" — no key interception,
                 // no injected input, nothing touching the game (see OverlayConfig::show_on_screenshot).
-                let summon =
-                    overlay_cfg.as_ref().is_some_and(|c| c.enabled && c.show_on_screenshot);
+                let transparent_session =
+                    transparent.as_ref().is_some_and(|t| t.0);
+                let summon = overlay_cfg
+                    .as_ref()
+                    .is_some_and(|c| (c.enabled || transparent_session) && c.show_on_screenshot);
                 if menu.is_some() {
                     // At the START MENU a summon means: relaunch into the raid map (menu-mode
                     // MapSwitch IS the PLAY path — new process, menu torn down) with the pose and
