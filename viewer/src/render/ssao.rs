@@ -320,7 +320,13 @@ impl ViewNode for SsaoNode {
 
 /// SSAO between the prepass and the main pass: the AO lane must be written before the opaque
 /// shading samples it. `sync_draw_bg_ao` (gpu_driven) swaps the sampled view per the toggle.
-pub struct SsaoPlugin;
+pub struct SsaoPlugin {
+    /// Whether the GPU-driven path is the one being installed, i.e. whether `EftPrepassLabel`
+    /// will exist in the render graph. It is passed in rather than read from the world because
+    /// `RenderPath` is not inserted as a resource until AFTER this plugin is added
+    /// (`main.rs`), and it cannot be inferred at build() time by any other means.
+    pub gpu_driven: bool,
+}
 
 impl Plugin for SsaoPlugin {
     fn build(&self, app: &mut App) {
@@ -329,16 +335,30 @@ impl Plugin for SsaoPlugin {
         };
         // NOTE: `prepare_ao_target` + gpu_driven's `sync_draw_bg_ao` are registered by
         // EftGpuDrivenPlugin (they order against its private `prepare_gpu_buffers`).
+        // The prepass edge is CONDITIONAL, because `EftPrepassLabel` exists on exactly one render
+        // path and `add_render_graph_edges` panics on a label that is not in the graph. This
+        // plugin is installed on every path, so naming it unconditionally killed the process at
+        // startup with "node EftPrepassLabel does not exist" -- on BOTH fallbacks, which is the
+        // entire population they exist for: they are what an under-featured GPU gets, and the
+        // LLPC probe routes AMD users straight onto Standard (issue #9, three reporters). It
+        // reproduces on any GPU with EFT_RENDER=std or =m0.
+        //
+        // It stays HERE rather than moving to the plugin that owns the node, which was the first
+        // thing tried: `EftGpuDrivenPlugin` builds well before this one, so at its build() the
+        // SsaoLabel node does not exist yet and the panic simply changes direction. An edge has
+        // to be declared where BOTH endpoints already exist, which is the later of the two.
+        //
+        // SsaoNode itself needs no guard: it early-returns without `EftPrepassResources`, which
+        // only the GPU-driven path inserts, so on the other paths it is an inert no-op. The node
+        // is still registered on every path because `taa.rs` orders against `SsaoLabel` and would
+        // panic in turn if it vanished.
         render_app
             .add_systems(RenderStartup, init_ssao_pipeline)
             .add_render_graph_node::<ViewNodeRunner<SsaoNode>>(Core3d, SsaoLabel)
-            .add_render_graph_edges(
-                Core3d,
-                (
-                    super::gpu_driven::EftPrepassLabel,
-                    SsaoLabel,
-                    Node3d::StartMainPass,
-                ),
-            );
+            .add_render_graph_edges(Core3d, (SsaoLabel, Node3d::StartMainPass));
+        if self.gpu_driven {
+            render_app
+                .add_render_graph_edges(Core3d, (super::gpu_driven::EftPrepassLabel, SsaoLabel));
+        }
     }
 }
