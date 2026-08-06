@@ -70,6 +70,11 @@ fn title_is_game(title: &str) -> bool {
     let Some(rest) = norm.strip_prefix("escapefromtarkov") else {
         return false;
     };
+    // ARENA is the same desk: `EscapeFromTarkovArena.exe` titles itself with the space-stripped
+    // product name, so after the prefix the remainder is "arena" (possibly with Unity's
+    // punctuation-led suffixes). Consume it before the separator rule below -- to that rule a
+    // bare "arena" is indistinguishable from "wiki".
+    let rest = rest.strip_prefix("arena").unwrap_or(rest);
     // The token must END the title or be followed by a separator. A bare `starts_with` also
     // accepted "Escape From Tarkov Wiki - Chrome" (spaces removed: "escapefromtarkovwiki..."),
     // which would have parked the overlay on a browser window; Unity's own suffixes are
@@ -1466,6 +1471,21 @@ fn idle_badge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn game_title_match_accepts_both_games_and_still_rejects_lookalikes() {
+        // EFT proper, with and without Unity's renderer suffix.
+        assert!(title_is_game("Escape From Tarkov"));
+        assert!(title_is_game("EscapeFromTarkov - Direct3D 11"));
+        // ARENA: its exe is EscapeFromTarkovArena.exe and titles itself accordingly.
+        assert!(title_is_game("Escape From Tarkov Arena"));
+        assert!(title_is_game("EscapeFromTarkovArena"));
+        assert!(title_is_game("Escape From Tarkov: Arena"));
+        // The lookalikes the separator rule exists for stay rejected.
+        assert!(!title_is_game("Escape From Tarkov Wiki - Chrome"));
+        assert!(!title_is_game("Escape From Tarkov Arenas guide - Chrome"));
+        assert!(!title_is_game("escapefromtarkovarenawiki"));
+    }
 
     #[test]
     fn right_enter_is_the_default_exit_hotkey_and_round_trips() {
