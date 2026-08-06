@@ -2517,12 +2517,43 @@ pub fn menu_ui(
                         );
                         ui.add_space(8.0);
                         ui.add_enabled_ui(cfg.enabled, |ui| {
-                            dirty |= ui
-                                .checkbox(&mut cfg.always_on_top, RichText::new(t(lg, K::OverlayKeepAbove)).size(11.0))
-                                .changed();
-                            dirty |= ui
-                                .checkbox(&mut cfg.borderless, RichText::new(t(lg, K::OverlayBorderlessShown)).size(11.0))
-                                .changed();
+                            // ONE mode choice, not independent toggles: of the 8 combinations the
+                            // old booleans allowed, transparency works under exactly one, and DWM
+                            // fails the other seven silently (see OverlayPresentation). A radio
+                            // row makes the invalid states unrepresentable instead of documented.
+                            use crate::overlay::OverlayPresentation as P;
+                            ui.label(RichText::new(t(lg, K::OverlayPresentationLabel)).size(10.0).color(DIM));
+                            for (mode, label, tip) in [
+                                (P::Windowed, K::OverlayModeWindowed, K::OverlayModeWindowedTip),
+                                (P::Borderless, K::OverlayModeBorderless, K::OverlayModeBorderlessTip),
+                                (P::Transparent, K::OverlayModeTransparent, K::OverlayModeTransparentTip),
+                            ] {
+                                let mut resp = ui.radio_value(
+                                    &mut cfg.presentation,
+                                    mode,
+                                    RichText::new(t(lg, label)).size(11.0),
+                                );
+                                resp = resp.on_hover_text(t(lg, tip));
+                                dirty |= resp.changed();
+                            }
+                            // The window's shape is latched at creation, so a change here cannot
+                            // take effect on an already-open map. The menu relaunches on PLAY,
+                            // which is exactly when this applies -- say so instead of letting the
+                            // user wonder why the open window did not change.
+                            if cfg.presentation == P::Transparent {
+                                ui.label(
+                                    RichText::new(t(lg, K::OverlayNextLaunchNote)).size(10.0).color(DIM),
+                                );
+                            }
+                            ui.add_space(8.0);
+                            let mut esp = config_bool("espMode").unwrap_or(false);
+                            if ui
+                                .checkbox(&mut esp, RichText::new(t(lg, K::EspModeLabel)).size(11.0))
+                                .on_hover_text(t(lg, K::EspModeTip))
+                                .changed()
+                            {
+                                let _ = save_config_bool_pub("espMode", esp);
+                            }
                             ui.add_space(8.0);
                             ui.label(RichText::new(t(lg, K::OverlayPanelSize)).size(10.0).color(DIM));
                             dirty |= ui.add(egui::Slider::new(&mut cfg.size_frac.x, 0.2..=1.0).text("width")).changed();

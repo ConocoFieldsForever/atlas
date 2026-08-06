@@ -460,11 +460,9 @@ pub struct OverlayConfig {
     /// Master switch. OFF by default: overlaying a game is the user's call to make, not ours
     /// (docs/OVERLAY_PLAN.md §7 — low but non-zero risk, and the residual risk is contractual).
     pub enabled: bool,
-    /// Keep the window above the game while the overlay is up. Off = a normal window that the
-    /// game will cover when it regains focus (useful on a second monitor).
-    pub always_on_top: bool,
-    /// Drop the window chrome while the overlay is up.
-    pub borderless: bool,
+    /// How the overlay window presents itself. Replaces the independent `always_on_top` +
+    /// `borderless` booleans; see [`OverlayPresentation`] for why they had to be collapsed.
+    pub presentation: OverlayPresentation,
     /// Overlay size as a FRACTION of the primary monitor (0.2..=1.0). A panel, not a takeover —
     /// the point is to read the map while the game is still visible around it.
     pub size_frac: Vec2,
@@ -513,8 +511,7 @@ impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            always_on_top: true,
-            borderless: true,
+            presentation: OverlayPresentation::Borderless,
             size_frac: Vec2::new(0.55, 0.6),
             // CENTRED over the game window. The old top-right default put the panel under the
             // stamina/hydration cluster on wide monitors, and on a multi-monitor desk it anchored
@@ -560,6 +557,75 @@ fn load_anchor(default: Vec2) -> Vec2 {
     stored
 }
 
+/// How the overlay window presents itself over the game.
+///
+/// WHY THIS IS ONE CHOICE AND NOT THREE CHECKBOXES. Transparency is not an independent flag that
+/// can be ORed onto the others: DWM decides whether a window composites per-pixel at
+/// `CreateWindowEx`, and measurement says it only does so for a specific CONJUNCTION of creation
+/// attributes. Same app, same alpha mode, same backdrop, only the creation flags differing:
+///
+/// | created as                          | result                          |
+/// |-------------------------------------|---------------------------------|
+/// | decorated + resizable               | `(255,255,255)` blended to white|
+/// | undecorated + resizable             | `(53,53,53)` opaque             |
+/// | undecorated + fixed + normal z       | `(53,53,53)` opaque             |
+/// | undecorated + fixed + always-on-top | `(41,255,41)` CORRECT           |
+///
+/// As three booleans that is 8 combinations, exactly one of which is transparent, and the other
+/// seven fail SILENTLY -- no error, no log, no crash, just an opaque window. Worse, the setting
+/// cannot be honoured after the fact: a window created decorated and later set `decorations=false`
+/// stays blended-to-white forever, which is precisely what the old summon-time code did on every
+/// summon. Encoding the valid conjunctions as named modes makes the broken combinations
+/// unrepresentable rather than merely documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayPresentation {
+    /// Ordinary decorated window at normal z-order. The game covers it when it takes focus, which
+    /// is what you want on a second monitor.
+    Windowed,
+    /// Undecorated panel held above the game, opaque. The default, and what every existing install
+    /// has been running.
+    Borderless,
+    /// Undecorated, fixed-size, always-on-top window that composites per-pixel, so the game shows
+    /// through wherever Atlas draws nothing. Must be chosen BEFORE the window exists, which is why
+    /// it applies at the next map launch rather than at the next summon.
+    Transparent,
+}
+
+impl OverlayPresentation {
+    /// Config token. Stored as a string so a future mode does not have to fit a bool.
+    pub fn config_value(self) -> &'static str {
+        match self {
+            Self::Windowed => "windowed",
+            Self::Borderless => "borderless",
+            Self::Transparent => "transparent",
+        }
+    }
+
+    fn from_config(s: &str) -> Option<Self> {
+        match s.trim() {
+            "windowed" => Some(Self::Windowed),
+            "borderless" => Some(Self::Borderless),
+            "transparent" => Some(Self::Transparent),
+            _ => None,
+        }
+    }
+
+    /// Window chrome is dropped.
+    pub fn borderless(self) -> bool {
+        !matches!(self, Self::Windowed)
+    }
+
+    /// Held above the game.
+    pub fn always_on_top(self) -> bool {
+        matches!(self, Self::Borderless | Self::Transparent)
+    }
+
+    /// Per-pixel alpha, and therefore launch-gated.
+    pub fn transparent(self) -> bool {
+        matches!(self, Self::Transparent)
+    }
+}
+
 impl OverlayConfig {
     /// Load from atlas.config.json, falling back to `Default` per field so a partial/older config
     /// still works (same forgiving shape as the other settings readers).
@@ -567,9 +633,21 @@ impl OverlayConfig {
         let d = Self::default();
         Self {
             enabled: crate::menu::config_bool_pub("overlayEnabled").unwrap_or(d.enabled),
-            always_on_top: crate::menu::config_bool_pub("overlayAlwaysOnTop")
-                .unwrap_or(d.always_on_top),
-            borderless: crate::menu::config_bool_pub("overlayBorderless").unwrap_or(d.borderless),
+            // MIGRATION: `overlayPresentation` is the key now, but installs predating it only have
+            // the two booleans. Read the new key first and derive from the old pair when it is
+            // absent, so an existing user's window does not silently change shape on upgrade.
+            // Neither old value could mean Transparent, so no migration can invent it -- the mode
+            // is only ever reachable by asking for it.
+            presentation: crate::menu::config_str_pub("overlayPresentation")
+                .as_deref()
+                .and_then(OverlayPresentation::from_config)
+                .unwrap_or_else(|| {
+                    match crate::menu::config_bool_pub("overlayBorderless") {
+                        Some(false) => OverlayPresentation::Windowed,
+                        Some(true) => OverlayPresentation::Borderless,
+                        None => d.presentation,
+                    }
+                }),
             size_frac: Vec2::new(
                 crate::menu::config_f32_pub("overlayWidthFrac").unwrap_or(d.size_frac.x),
                 crate::menu::config_f32_pub("overlayHeightFrac").unwrap_or(d.size_frac.y),
@@ -596,8 +674,22 @@ impl OverlayConfig {
     #[must_use]
     pub fn save(&self) -> bool {
         let mut ok = crate::menu::save_config_bool_pub("overlayEnabled", self.enabled);
-        ok &= crate::menu::save_config_bool_pub("overlayAlwaysOnTop", self.always_on_top);
-        ok &= crate::menu::save_config_bool_pub("overlayBorderless", self.borderless);
+        ok &= crate::menu::save_config_str_pub(
+            "overlayPresentation",
+            self.presentation.config_value(),
+        );
+        // The superseded booleans are still written, and deliberately so: a user who downgrades
+        // to an older build would otherwise land on its `borderless: true` default regardless of
+        // what they had chosen. Writing both keeps the two representations agreeing in the one
+        // direction that can be known.
+        ok &= crate::menu::save_config_bool_pub(
+            "overlayAlwaysOnTop",
+            self.presentation.always_on_top(),
+        );
+        ok &= crate::menu::save_config_bool_pub(
+            "overlayBorderless",
+            self.presentation.borderless(),
+        );
         ok &= crate::menu::save_config_f32_pub("overlayWidthFrac", self.size_frac.x);
         ok &= crate::menu::save_config_f32_pub("overlayHeightFrac", self.size_frac.y);
         ok &= crate::menu::save_config_f32_pub("overlayAnchorX", self.anchor.x);
@@ -776,6 +868,7 @@ fn toggle_overlay(
 /// Push `OverlayState` onto the real window. Runs only on a change (the window fields are all
 /// live-settable, so this is a handful of writes, never a rebuild).
 fn apply_overlay(
+    transparent: Res<crate::TransparentWindow>,
     cfg: Res<OverlayConfig>,
     state: Res<OverlayState>,
     mut q: Query<&mut Window, With<PrimaryWindow>>,
@@ -878,9 +971,13 @@ fn apply_overlay(
         if saved.is_none() {
             *saved = Some((win.position, win.resolution.physical_size()));
         }
-        win.decorations = !cfg.borderless;
+        win.decorations = !cfg.presentation.borderless();
         win.resizable = false;
-        win.window_level = if cfg.always_on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal };
+        win.window_level = if cfg.presentation.always_on_top() {
+            WindowLevel::AlwaysOnTop
+        } else {
+            WindowLevel::Normal
+        };
         // Raise + take focus: summoned from a raid the game owns the foreground, so an always-on-top
         // window that never asks for focus would appear without receiving the WASD that follows.
         win.visible = true;
@@ -972,9 +1069,8 @@ fn apply_overlay(
         // Say WHICH rect we anchored to. "The overlay opened somewhere unexpected" is otherwise
         // undiagnosable from a log, and the two cases look identical on a single-monitor desk.
         info!(
-            "overlay: shown (borderless={}, always_on_top={}, {:.0}%x{:.0}% of {}, cap {} fps)",
-            cfg.borderless,
-            cfg.always_on_top,
+            "overlay: shown ({:?}, {:.0}%x{:.0}% of {}, cap {} fps)",
+            cfg.presentation,
             cfg.size_frac.x * 100.0,
             cfg.size_frac.y * 100.0,
             if reuse_overlay_rect {
@@ -997,6 +1093,23 @@ fn apply_overlay(
         // system only runs on change) undoes any throttle a previous enable left behind, and a
         // user who never opted in never sees their unfocused frame rate touched.
         if state.windowed || !cfg.enabled {
+            // A transparent-created window must NEVER be re-decorated: DWM latched the
+            // conjunction at creation and a decorated transparent window blends to white with no
+            // way back (see OverlayPresentation). Hide it instead -- the user asked for a normal
+            // window, and an invisible one until the next summon is the nearest honest state.
+            if transparent.0 {
+                win.visible = false;
+                *overlay_rect = None;
+                view.0 = None;
+                winit.focused_mode = UpdateMode::Continuous;
+                winit.unfocused_mode = UpdateMode::Continuous;
+                if state.windowed {
+                    info!(
+                        "overlay: hidden (transparent windows cannot become ordinary windows;                          relaunch without transparent mode for a desktop window)"
+                    );
+                }
+                return;
+            }
             win.window_level = WindowLevel::Normal;
             win.decorations = true;
             win.resizable = true;
@@ -1023,6 +1136,10 @@ fn apply_overlay(
                 // Minimize in place. Restoring the desktop geometry before minimizing is what made
                 // the next screenshot reopen in a different position. Windows still gives Tarkov
                 // the keyboard, while `overlay_rect` retains the exact rectangle for the reopen.
+                win.set_minimized(true);
+            } else if transparent.0 {
+                // Same rule as the exit path: never re-decorate a transparent window. Minimize is
+                // the dismiss that preserves the conjunction.
                 win.set_minimized(true);
             } else {
                 // No automatic handoff: restore the ordinary desktop window immediately.

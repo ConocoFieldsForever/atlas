@@ -28,7 +28,12 @@ struct GradeParams {
     // vignette tuning (PRISM): aspect divisors + smoothstep edges + strength.
     // xy = (1.15, 0.95) axis divisors; z,w = smoothstep(0.55, 1.25).
     vig: vec4<f32>,
-    vig_strength: vec4<f32>,   // x = 0.488
+    // x = vignette strength (0.488). y = exposure-armed flag. z = PASS SCENE ALPHA (1 on a
+    // transparent launch, else 0): grade is a colour transform with no opinion about coverage,
+    // but its hardcoded 1.0 was the one line that made a transparent window opaque whenever grade
+    // was on. Opt-in per launch so map-mode output (and EFT_SHOT PNGs, which the bench diffs
+    // byte-compare) stays bit-identical to the historical constant.
+    vig_strength: vec4<f32>,
 };
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;   // linear HDR scene RT
@@ -145,7 +150,12 @@ fn fxaa(uv: vec2<f32>, ts: vec2<f32>, strength: f32) -> vec3<f32> {
 
 @fragment
 fn fs_grade(in: FsIn) -> @location(0) vec4<f32> {
-    var scene = textureSampleLevel(scene_tex, scene_samp, in.uv, 0.0).rgb;
+    // See vig_strength.z: alpha passes through on a transparent launch, and stays the historical
+    // constant 1.0 everywhere else (blended materials leave fractional alpha in the scene target,
+    // and map-mode screenshots must not inherit it).
+    let s0 = textureSampleLevel(scene_tex, scene_samp, in.uv, 0.0);
+    let scene_a = select(1.0, s0.a, grade.vig_strength.z > 0.5);
+    var scene = s0.rgb;
     // AA BEFORE the sharpen: sharpening first would harden the very aliased edge this then has to
     // undo, and the two would fight over the same pixels.
     if (grade.aa > 0.0) {
@@ -176,5 +186,5 @@ fn fs_grade(in: FsIn) -> @location(0) vec4<f32> {
     // swapchain encodes after us). Raise vig to the sRGB exponent so that after the encode the
     // corner attenuation equals encode(g)*vig — i.e. pow(x,1/2.4) of (g*vig^2.4) = encode(g)*vig.
     // Without this the vignette was applied in linear and corners darkened only ~half as much.
-    return vec4<f32>(g * pow(vec3<f32>(vig), vec3<f32>(2.4)), 1.0);
+    return vec4<f32>(g * pow(vec3<f32>(vig), vec3<f32>(2.4)), scene_a);
 }

@@ -25,6 +25,7 @@ pub mod ssao;
 pub mod ssr;
 pub mod standard;
 pub mod taa;
+pub mod transparency_check;
 
 /// Pre-LUT exposure calibrated for the native renderer's SH radiance scale.  Keep this in one
 /// place: both the startup LUT resource and the live graphics settings must begin at the same value.
@@ -37,6 +38,7 @@ pub use gpu_driven::{CullCamera, EftGpuDrivenPlugin, GpuLoadSignal};
 pub use grade::{load_grade_lut, GradeLutCpu, GradePlugin};
 pub use instancing::{EftInstancingPlugin, LoadedPack};
 pub use path_guard::RenderPathGuardPlugin;
+pub use transparency_check::TransparencyCheckPlugin;
 pub use ssao::SsaoPlugin;
 pub use taa::TaaPlugin;
 pub use ssr::SsrPlugin;

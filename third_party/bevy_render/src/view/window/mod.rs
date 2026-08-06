@@ -354,16 +354,68 @@ pub fn create_surfaces(
                         .desired_maximum_frame_latency
                         .map(NonZero::<u32>::get)
                         .unwrap_or(DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY),
-                    alpha_mode: match window.alpha_mode {
-                        CompositeAlphaMode::Auto => wgpu::CompositeAlphaMode::Auto,
-                        CompositeAlphaMode::Opaque => wgpu::CompositeAlphaMode::Opaque,
-                        CompositeAlphaMode::PreMultiplied => {
-                            wgpu::CompositeAlphaMode::PreMultiplied
+                    // ATLAS PATCH: downgrade an unsupported alpha mode instead of aborting.
+                    //
+                    // `configure_surface` does NOT negotiate this. wgpu-core's only fallback list
+                    // is for `Auto` and reads `[Opaque, Inherit]`, so `Auto` can never select a
+                    // blending mode, and any explicitly-requested mode the surface does not
+                    // advertise becomes `UnsupportedAlphaMode` -> `Validation` -> `panic!`. With
+                    // `panic = "abort"` that is process death at startup: measured as 0xC0000409
+                    // on `PostMultiplied` (NVIDIA) and on `PreMultiplied` (Intel). An
+                    // `on_uncaptured_error` handler does not rescue it either, because `configure`
+                    // only attaches the surface error sink on success.
+                    //
+                    // Which matters because the supported set is per-adapter and not knowable in
+                    // advance: measured `OPAQUE | PRE_MULTIPLIED` on an RTX 5090 but
+                    // `OPAQUE | INHERIT` on an Intel iGPU, and `bevy_window`'s own documentation
+                    // recommends `PostMultiplied`, which neither of them supports. So the choice
+                    // is between a degraded (opaque) window and a machine that cannot start.
+                    alpha_mode: {
+                        let want = match window.alpha_mode {
+                            CompositeAlphaMode::Auto => wgpu::CompositeAlphaMode::Auto,
+                            CompositeAlphaMode::Opaque => wgpu::CompositeAlphaMode::Opaque,
+                            CompositeAlphaMode::PreMultiplied => {
+                                wgpu::CompositeAlphaMode::PreMultiplied
+                            }
+                            CompositeAlphaMode::PostMultiplied => {
+                                wgpu::CompositeAlphaMode::PostMultiplied
+                            }
+                            CompositeAlphaMode::Inherit => wgpu::CompositeAlphaMode::Inherit,
+                        };
+                        // `Auto` is always accepted, so it must not be measured against the list.
+                        if want == wgpu::CompositeAlphaMode::Auto
+                            || caps.alpha_modes.contains(&want)
+                        {
+                            want
+                        } else {
+                            // A blending request degrades to another BLENDING mode first: the
+                            // caller asked for transparency, and the advertised set is just
+                            // vendor dialect (measured: NVIDIA offers PreMultiplied, Intel offers
+                            // Inherit, and the two composite identically). Only when the surface
+                            // has no blending mode at all does this fall to Opaque.
+                            let fallback = [
+                                wgpu::CompositeAlphaMode::PreMultiplied,
+                                wgpu::CompositeAlphaMode::PostMultiplied,
+                                wgpu::CompositeAlphaMode::Inherit,
+                            ]
+                            .into_iter()
+                            .find(|m| caps.alpha_modes.contains(m))
+                            .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
+                            warn!(
+                                "surface does not support composite alpha mode {:?} (supported: \
+                                 {:?}) - using {:?} instead.{}",
+                                want,
+                                caps.alpha_modes,
+                                fallback,
+                                if fallback == wgpu::CompositeAlphaMode::Opaque {
+                                    " A transparent window will be solid; everything else is \
+                                     unaffected."
+                                } else {
+                                    ""
+                                }
+                            );
+                            fallback
                         }
-                        CompositeAlphaMode::PostMultiplied => {
-                            wgpu::CompositeAlphaMode::PostMultiplied
-                        }
-                        CompositeAlphaMode::Inherit => wgpu::CompositeAlphaMode::Inherit,
                     },
                     view_formats: if !format.is_srgb() {
                         vec![format.add_srgb_suffix()]

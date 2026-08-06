@@ -398,6 +398,13 @@ fn return_to_menu(
 #[derive(Resource, Clone, Copy)]
 pub struct EspMode(pub bool);
 
+/// Whether THIS window was created transparent. A launch fact, not a setting: the overlay's
+/// dismiss/exit paths consult it because re-decorating a transparent-created window breaks the
+/// DWM conjunction it can never get back (see OverlayPresentation) -- those paths minimize or
+/// hide instead when this is set.
+#[derive(Resource, Clone, Copy)]
+pub struct TransparentWindow(pub bool);
+
 fn load_map(
     mut sw: ResMut<MapSwitch>,
     esp: Res<EspMode>,
@@ -904,6 +911,18 @@ fn main() {
         .ok()
         .map(|v| v.trim() == "1")
         .unwrap_or_else(|| menu::config_bool_pub("espMode").unwrap_or(false));
+    // Transparent overlay: resolved HERE, before the window exists, because the window's creation
+    // attributes are the one chance to honour it (see the WindowPlugin block). Menu sessions are
+    // always opaque -- the menu is a normal desktop app and its egui backdrop fills every pixel
+    // anyway; the mode is for a MAP session summoned over the game. EFT_TRANSPARENT=0/1 overrides
+    // for A/B and for scripted runs, same convention as EFT_ESP.
+    let transparent_launch = pack_dir.is_some()
+        && std::env::var("EFT_TRANSPARENT")
+            .ok()
+            .map(|v| v.trim() == "1")
+            .unwrap_or_else(|| {
+                menu::config_str_pub("overlayPresentation").as_deref() == Some("transparent")
+            });
     let async_cold_load = pack_dir.is_some()
         && render_path == RenderPath::GpuDriven
         && !std::env::var("EFT_SYNC_LOAD").map(|v| v.trim() == "1").unwrap_or(false);
@@ -1078,6 +1097,34 @@ fn main() {
                         WindowPosition::Automatic
                     },
                     skip_taskbar: hidden,
+                    // TRANSPARENT MODE: every one of these must be set at CREATION. DWM decides
+                    // whether a window composites per-pixel at CreateWindowEx, and measurement
+                    // says it only honours alpha for the undecorated + non-resizable +
+                    // always-on-top conjunction — created decorated it blends to white FOREVER,
+                    // and no runtime mutation (which is what the overlay's summon path does for
+                    // the other modes) can repair it. Menu sessions never take this branch: the
+                    // menu is its own launch, and PLAY relaunches into a fresh process, which is
+                    // what makes a launch-gated mode usable from a settings screen at all.
+                    // `composite_alpha_mode` stays Auto->Opaque on adapters with no blending mode
+                    // (the vendored bevy_render guard), so the worst case is an opaque window,
+                    // never an abort.
+                    transparent: transparent_launch,
+                    decorations: !transparent_launch,
+                    resizable: !transparent_launch,
+                    window_level: if transparent_launch {
+                        bevy::window::WindowLevel::AlwaysOnTop
+                    } else {
+                        bevy::window::WindowLevel::Normal
+                    },
+                    composite_alpha_mode: if transparent_launch {
+                        // PreMultiplied matches what Vulkan advertises on the measured NVIDIA
+                        // driver; Intel advertises Inherit, which measured numerically identical.
+                        // The bevy_render guard downgrades whichever is absent to Opaque with a
+                        // warning instead of the 0xC0000409 abort wgpu would otherwise raise.
+                        bevy::window::CompositeAlphaMode::PreMultiplied
+                    } else {
+                        bevy::window::CompositeAlphaMode::Auto
+                    },
                     ..default()
                 }),
                 ..default()
@@ -1205,6 +1252,11 @@ fn main() {
     }
     // SsaoPlugin is told which path is installed: it orders against a render-graph node that only
     // the GPU-driven path creates, and `render_path` is not a resource yet at this point.
+    if transparent_launch {
+        // Registered ONLY on transparent launches: both its checks are meaningless (and the
+        // readback not free) when the window is opaque by design.
+        app.add_plugins(render::TransparencyCheckPlugin);
+    }
     app.add_plugins((
         render::RenderPathGuardPlugin,
         GradePlugin,
@@ -1255,7 +1307,12 @@ fn main() {
     // In-raid: overcast horizon stand-in. Menu mode: the egui menu's near-black #090909 —
     // the CentralPanel goes transparent when the real-asset 3D CCTV decor is active
     // (menu_fx), so the 3D clear IS the menu field; setup() also skips the Skybox then.
-    app.insert_resource(if menu_mode {
+    app.insert_resource(if transparent_launch {
+        // Transparent window: the composite is PREMULTIPLIED, so "no coverage" must be (0,0,0,0)
+        // exactly -- a premultiplied pixel with rgb > 0 at alpha 0 is additive glow over the game,
+        // not absence. This is the one clear colour where the rgb values are load-bearing.
+        ClearColor(Color::srgba(0.0, 0.0, 0.0, 0.0))
+    } else if menu_mode {
         ClearColor(Color::srgb_u8(9, 9, 9))
     } else if esp_mode {
         // ESP draws no world, so the overcast horizon stand-in would just be a grey wall over the
@@ -1326,6 +1383,7 @@ fn main() {
             PostUpdate,
             debug_bench_camera.before(bevy::transform::TransformSystems::Propagate),
         )
+        .insert_resource(TransparentWindow(transparent_launch))
         .insert_resource(EspMode(menu::config_bool_pub("espMode").unwrap_or(false)))
         .insert_resource(EspMode(esp_mode))
         .init_resource::<esp_labels::EspLabels>()

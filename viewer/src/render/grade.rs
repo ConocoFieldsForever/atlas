@@ -229,7 +229,7 @@ fn init_grade_pipeline(
             aa: 0.0,      // ditto
             dt: 0.0,      // 0 => autoexposure snaps on the first frame instead of fading in
             vig: [1.15, 0.95, 0.55, 1.25], // PRISM defaults (see grade.wgsl header)
-            vig_strength: [lut.vignette, 0.0, 0.0, 0.0],
+            vig_strength: [lut.vignette, 0.0, pass_alpha_lane(), 0.0],
         }),
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
     });
@@ -487,11 +487,28 @@ fn update_grade_params(
             vig_strength: [
                 if s.vignette { 0.488 } else { 0.0 },
                 if s.exposure_armed { 1.0 } else { 0.0 },
-                0.0,
+                pass_alpha_lane(),
                 0.0,
             ],
         }),
     );
+}
+
+/// 1.0 on a transparent launch (grade must carry scene alpha to the swapchain), else 0.0 (the
+/// historical constant-1.0 behaviour, which map-mode screenshot diffs depend on byte-for-byte).
+/// Read from the env at each call: it is two atomically-cached string compares per frame at most,
+/// and it keeps the decision in exactly one place (main() sets EFT_TRANSPARENT for child sessions).
+fn pass_alpha_lane() -> f32 {
+    static LANE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *LANE.get_or_init(|| {
+        if std::env::var("EFT_TRANSPARENT").map(|v| v.trim() == "1").unwrap_or(false)
+            || crate::menu::config_str_pub("overlayPresentation").as_deref() == Some("transparent")
+        {
+            1.0
+        } else {
+            0.0
+        }
+    })
 }
 
 impl Plugin for GradePlugin {

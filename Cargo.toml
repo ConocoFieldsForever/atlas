@@ -86,12 +86,24 @@ panic = "abort"
 # prefixes to neutral tokens. Those flags carry the machine-specific home path, so they are computed
 # from the environment at build time and live in the build env, NOT committed here.
 
-# Vendored bevy_render 0.17.3 with ONE functional change (third_party/bevy_render/src/view/window/
-# mod.rs prepare_windows): swapchain-acquire Timeout/Other no longer panic — they skip the frame,
-# and Lost reconfigures like Outdated. Upstream panics there on Windows, which under our release
-# panic=abort was a silent process death when a window move/resize stalled presentation on a
-# GPU-bound machine (RX 6800 field report; bevy#13150, bevy#21753, wgpu#9029). Drop this patch
-# when upstream un-cfg's its Timeout tolerance. Keep the crate byte-identical to crates.io
-# otherwise, so a future diff against the registry copy shows only the prepare_windows change.
+# Vendored bevy_render 0.17.3 with TWO functional changes, both in
+# third_party/bevy_render/src/view/window/mod.rs prepare_windows, and both turning an upstream
+# process-abort into a degraded frame. Under our release panic=abort every one of these is a silent
+# death rather than an error a user can report.
+#
+#  1. Swapchain-acquire Timeout/Other no longer panic — they skip the frame, and Lost reconfigures
+#     like Outdated. Upstream panics there on Windows, which killed the process when a window
+#     move/resize stalled presentation on a GPU-bound machine (RX 6800 field report; bevy#13150,
+#     bevy#21753, wgpu#9029). Drop when upstream un-cfg's its Timeout tolerance.
+#  2. A composite alpha mode the surface does not advertise falls back to Opaque with a warning,
+#     instead of UnsupportedAlphaMode -> panic. wgpu only auto-negotiates for `Auto`, and its list
+#     there is [Opaque, Inherit], so `Auto` never yields a blending mode and an explicit request is
+#     all-or-nothing. The supported set is per-adapter (measured PRE_MULTIPLIED on an RTX 5090,
+#     INHERIT on an Intel iGPU) and bevy_window's own docs recommend PostMultiplied, which neither
+#     supports — so without this, asking for a transparent window is a coin flip on whether the
+#     machine starts at all. Drop when wgpu negotiates alpha modes the way it negotiates formats.
+#
+# Keep the crate byte-identical to crates.io otherwise, so a future diff against the registry copy
+# shows only these two changes.
 [patch.crates-io]
 bevy_render = { path = "third_party/bevy_render" }
