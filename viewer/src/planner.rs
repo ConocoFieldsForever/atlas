@@ -109,7 +109,10 @@ impl Plugin for PlannerPlugin {
         app.add_message::<PlanRequest>()
             .init_resource::<PlanResult>()
             .init_resource::<PlanTask>()
-            .add_systems(Update, (debug_plan, dispatch_plan, poll_plan, draw_stops).chain())
+            .add_systems(
+                Update,
+                (debug_plan, dispatch_plan, poll_plan, draw_stops).chain(),
+            )
             // In-place map swap: cancel the in-flight solve + clear the plan. BEFORE poll_plan so a
             // solve completing on the swap frame can't republish an old-map route/PlanResult (it
             // sees PlanTask=None). RouteResult is also cleared for order-independence.
@@ -151,13 +154,20 @@ fn debug_plan(mut frame: Local<u32>, mut done: Local<bool>, mut w: MessageWriter
     let Ok(spec) = std::env::var("EFT_PLAN") else {
         return;
     };
-    let nums: Vec<f32> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let nums: Vec<f32> = spec
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect();
     let req = PlanRequest {
-        min_value: nums.first().map(|v| *v as i64).filter(|&v| v > 1).unwrap_or(100_000),
+        min_value: nums
+            .first()
+            .map(|v| *v as i64)
+            .filter(|&v| v > 1)
+            .unwrap_or(100_000),
         max_stops: nums.get(1).map(|v| *v as usize).unwrap_or(10),
         budget_s: nums.get(2).copied().unwrap_or(25.0) * 60.0,
         include_loose: nums.get(3).map(|v| *v != 0.0).unwrap_or(true),
-            // debug harness: any active extract is acceptable
+        // debug harness: any active extract is acceptable
         extracts: Vec::new(),
     };
     info!(
@@ -244,7 +254,8 @@ fn dispatch_plan(
             v.0 >= req.min_value
                 && (cls.is_some() // loot.rs container
                     || (req.include_loose
-                        && matches!(layer, Some(crate::poi::PoiLayer::LooseLoot)))) // priced loose
+                        && matches!(layer, Some(crate::poi::PoiLayer::LooseLoot))))
+            // priced loose
         })
         .filter(|(gt, _, _, _, _, _, _, _)| {
             !locks.iter().any(|(lock_gt, keys)| {
@@ -331,9 +342,7 @@ fn dispatch_plan(
             zones.patrols.clone(),
             all_marks
                 .iter()
-                .filter(|(l, _, _, _, ps, _)| {
-                    **l == crate::poi::PoiLayer::PmcSpawn && ps.is_none()
-                })
+                .filter(|(l, _, _, _, ps, _)| **l == crate::poi::PoiLayer::PmcSpawn && ps.is_none())
                 .map(|(_, gt, _, _, _, _)| gt.translation())
                 .collect(),
         )
@@ -356,7 +365,15 @@ fn dispatch_plan(
                 }
             }
         }
-        solve(&grid, start, cands, extracts, max_stops, budget, avoid.as_ref())
+        solve(
+            &grid,
+            start,
+            cands,
+            extracts,
+            max_stops,
+            budget,
+            avoid.as_ref(),
+        )
     });
     task.0 = Some(t);
 }
@@ -379,25 +396,32 @@ pub(crate) fn solve(
     // ---- phase 0: ONE bounded Dijkstra flood from the start prunes unreachable candidates
     // up front. Without this, every shelf/roof loot point that isn't on the nav mesh cost a
     // full EXHAUSTIVE failed A* during threading (seconds each — the planner looked hung).
-    let mut field_s = crate::nav::pooled_scratch(grid.nodes());
     let walk_budget_m = ((budget - EXTRACT_BUFFER_S).max(60.0) * WALK_MPS).max(200.0);
-    if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
-        return Err("start is off the walkable mesh".into());
-    }
-    let cands: Vec<Cand> = cands
-        .into_iter()
-        .filter(|c| grid.field_dist(&field_s, c.pos).is_some())
-        .collect();
-    if cands.is_empty() {
-        return Err("no reachable loot above the value filter within the budget".into());
-    }
-    let extracts: Vec<(String, Vec3)> = extracts
-        .into_iter()
-        .filter(|e| grid.field_dist(&field_s, e.1).is_some())
-        .collect();
-    if extracts.is_empty() {
-        return Err("no reachable extract within the budget".into());
-    }
+    // Keep the phase-0 scratch inside this scope so it returns to the pool before phase 2b or
+    // phase 3 borrows another full-grid buffer. On large maps one Scratch is hundreds of MB; the
+    // old function-wide lifetime kept up to three alive per solve and made safe parallel
+    // verification prohibitively memory hungry even though the phases never overlap.
+    let (cands, extracts) = {
+        let mut field_s = crate::nav::pooled_scratch(grid.nodes());
+        if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
+            return Err("start is off the walkable mesh".into());
+        }
+        let cands: Vec<Cand> = cands
+            .into_iter()
+            .filter(|c| grid.field_dist(&field_s, c.pos).is_some())
+            .collect();
+        if cands.is_empty() {
+            return Err("no reachable loot above the value filter within the budget".into());
+        }
+        let extracts: Vec<(String, Vec3)> = extracts
+            .into_iter()
+            .filter(|e| grid.field_dist(&field_s, e.1).is_some())
+            .collect();
+        if extracts.is_empty() {
+            return Err("no reachable extract within the budget".into());
+        }
+        (cands, extracts)
+    };
 
     // Initial extract anchor: the one nearest the start (the final extract is re-picked after
     // the stops are chosen — a run drifting across the map should end at the FAR side's exit).
@@ -505,11 +529,7 @@ pub(crate) fn solve(
             // estimator's own detour factor and some slack. Flooding to the whole walk budget
             // instead would sweep the entire map 14 times for a set of stops that often sit within
             // one building, which is far too slow for a button a player presses and waits on.
-            let reach = pts
-                .iter()
-                .map(|q| est(pts[i], *q))
-                .fold(0.0f32, f32::max)
-                * 1.6;
+            let reach = pts.iter().map(|q| est(pts[i], *q)).fold(0.0f32, f32::max) * 1.6;
             let limit = reach.clamp(50.0, walk_budget_m * 1.4);
             if !grid.dijkstra_field(pts[i], limit, &mut fs) {
                 continue;
@@ -647,8 +667,12 @@ pub(crate) fn solve(
             // Over budget in the real world: drop the worst expected-value-per-second stop.
             let worst = (0..tour.len())
                 .min_by(|&a, &b| {
-                    (cands[tour[a]].score_value / (legs[a] / WALK_MPS + cands[tour[a]].loot_s).max(1.0))
-                        .total_cmp(&(cands[tour[b]].score_value / (legs[b] / WALK_MPS + cands[tour[b]].loot_s).max(1.0)))
+                    (cands[tour[a]].score_value
+                        / (legs[a] / WALK_MPS + cands[tour[a]].loot_s).max(1.0))
+                    .total_cmp(
+                        &(cands[tour[b]].score_value
+                            / (legs[b] / WALK_MPS + cands[tour[b]].loot_s).max(1.0)),
+                    )
                 })
                 .unwrap();
             last_reason = "no tour fits the walking budget";
@@ -670,7 +694,9 @@ pub(crate) fn solve(
                     let p = w[0].lerp(w[1], i as f32 / n as f32);
                     if !grid.on_floor(p.x, p.z, p.y, 1.5) {
                         off += 1;
-                        let d = grid.floor_near(p.x, p.z, p.y).map_or(99.0, |f| (p.y - f).abs());
+                        let d = grid
+                            .floor_near(p.x, p.z, p.y)
+                            .map_or(99.0, |f| (p.y - f).abs());
                         if d > worst {
                             worst = d;
                             at = p;
@@ -773,7 +799,15 @@ fn draw_stops(mut gizmos: Gizmos, plan: Res<PlanResult>) {
     }
     let gold = Color::srgb(1.0, 0.82, 0.2);
     for st in &plan.stops {
-        gizmos.sphere(Isometry3d::from_translation(st.pos + Vec3::Y * 0.5), 0.5, gold);
-        gizmos.line(st.pos + Vec3::Y * 0.9, st.pos + Vec3::Y * 2.2, Color::srgba(1.0, 0.82, 0.2, 0.6));
+        gizmos.sphere(
+            Isometry3d::from_translation(st.pos + Vec3::Y * 0.5),
+            0.5,
+            gold,
+        );
+        gizmos.line(
+            st.pos + Vec3::Y * 0.9,
+            st.pos + Vec3::Y * 2.2,
+            Color::srgba(1.0, 0.82, 0.2, 0.6),
+        );
     }
 }
