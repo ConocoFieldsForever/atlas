@@ -946,6 +946,15 @@ pub struct MenuState {
     build_timings: BTreeMap<String, Vec<f32>>,
     /// BUILD ALL requires an explicit confirmation before it owns the worker queue.
     confirm_build_all: Option<BuildAllConfirmation>,
+    /// Preview waiting for confirmation after the user chooses an older Atlas folder.
+    import_preview: Option<crate::import_packs::ImportPreview>,
+    /// Background copy job. Kept after completion until the user closes its results.
+    import_job: Option<crate::import_packs::ImportJob>,
+    /// Picker/validation error shown inline. Absolute source paths are intentionally not logged or
+    /// persisted because they can contain a personal Windows account or folder name.
+    import_note: Option<(String, bool)>,
+    /// One-shot rescan after an import reaches a terminal state.
+    import_rescanned: bool,
     /// In-app batch state. The worker owns the actual FIFO; this supplies the overall progress and
     /// the per-map queued/building/done/failed status shown in the roster.
     build_all: BuildBatchProgress,
@@ -1787,6 +1796,10 @@ pub fn build_state() -> MenuState {
         selected_maps: BTreeSet::new(),
         build_timings: load_build_timings(),
         confirm_build_all: None,
+        import_preview: None,
+        import_job: None,
+        import_note: None,
+        import_rescanned: false,
         build_all: BuildBatchProgress::default(),
         autobuild,
         config_err: None,
@@ -2215,6 +2228,19 @@ pub fn menu_ui(
         }
     }
 
+    // Import runs independently of the build worker because it is disk I/O only. Poll its small
+    // shared snapshot each frame and rescan exactly once when staged packs become visible.
+    let mut import_snapshot = state.import_job.as_ref().map(|job| job.snapshot());
+    if import_snapshot.as_ref().is_some_and(|p| p.finished) && !state.import_rescanned {
+        state.import_rescanned = true;
+        let (entries, total) = scan(&state.game_fp);
+        state.entries = entries;
+        state.total_bytes = total;
+        state.intel = intel_status();
+        import_snapshot = state.import_job.as_ref().map(|job| job.snapshot());
+    }
+    let import_active = import_snapshot.as_ref().is_some_and(|p| !p.finished);
+
     // A build that could not even spawn never reaches the normal completion counter. Mark the
     // batch stopped here; `pump_jobs` has already removed its remaining queued map builds.
     if state.build_all.active && worker.spawn_error.is_some() {
@@ -2225,7 +2251,7 @@ pub fn menu_ui(
     // The menu animates without input now (camera LED blink / servo slew / idle patrol and
     // the loading-bar pulse): keep frames coming even when no events arrive, at a faster
     // cadence while a pipeline build is streaming.
-    ctx.request_repaint_after(std::time::Duration::from_millis(if worker.busy() {
+    ctx.request_repaint_after(std::time::Duration::from_millis(if worker.busy() || import_active {
         50
     } else {
         80
@@ -3402,6 +3428,149 @@ pub fn menu_ui(
             } else {
                 K::SetGameFirst
             };
+            egui::Frame::new()
+                .fill(theme::INSET)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let picker_idle = building_key.is_none()
+                            && wk_queued_builds == 0
+                            && state.import_job.is_none()
+                            && state.import_preview.is_none()
+                            && state.confirm_build_all.is_none();
+                        let response = ui
+                            .add_enabled_ui(picker_idle, |ui| {
+                                ui.add_sized(
+                                    [190.0, 30.0],
+                                    egui::Button::new(
+                                        RichText::new(t(lg, K::ImportExisting)).color(BEIGE),
+                                    ),
+                                )
+                            })
+                            .inner
+                            .on_hover_text(t(lg, K::ImportExistingTip));
+                        if response.clicked() {
+                            let folder = rfd::FileDialog::new()
+                                .set_title(t(lg, K::ImportChooseTitle))
+                                .pick_folder();
+                            if let Some(folder) = folder {
+                                match crate::import_packs::preview(
+                                    &folder,
+                                    &crate::paths::packs_root(),
+                                ) {
+                                    Ok(preview) => {
+                                        state.import_preview = Some(preview);
+                                        state.import_note = None;
+                                    }
+                                    Err(error) => {
+                                        state.import_note = Some((error.to_string(), false));
+                                    }
+                                }
+                            }
+                        }
+                        ui.label(
+                            RichText::new(t(lg, K::ImportExistingTip))
+                                .color(DIM)
+                                .size(11.0),
+                        );
+                    });
+
+                    if let Some((note, ok)) = &state.import_note {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(note)
+                                .color(if *ok { OK } else { BAD })
+                                .size(11.0),
+                        );
+                    }
+
+                    if let Some(progress) = import_snapshot.as_ref() {
+                        ui.add_space(8.0);
+                        let fraction = if progress.finished {
+                            1.0
+                        } else if progress.total_bytes == 0 {
+                            0.0
+                        } else {
+                            (progress.copied_bytes as f32 / progress.total_bytes as f32)
+                                .clamp(0.0, 1.0)
+                        };
+                        let heading = if progress.finished {
+                            if progress.cancelled {
+                                t(lg, K::ImportCancelled)
+                            } else {
+                                t(lg, K::ImportComplete)
+                            }
+                        } else {
+                            t(lg, K::Importing)
+                        };
+                        ui.label(RichText::new(heading).color(BEIGE).strong());
+                        ui.add(
+                            egui::ProgressBar::new(fraction)
+                                .show_percentage()
+                                .animate(!progress.finished),
+                        );
+                        for map in &progress.maps {
+                            let (status, color) = match &map.status {
+                                crate::import_packs::ImportMapStatus::Queued => {
+                                    (t(lg, K::Queued).to_string(), WARN)
+                                }
+                                crate::import_packs::ImportMapStatus::Importing => {
+                                    (t(lg, K::Importing).to_string(), BEIGE)
+                                }
+                                crate::import_packs::ImportMapStatus::Imported => {
+                                    (t(lg, K::Imported).to_string(), OK)
+                                }
+                                crate::import_packs::ImportMapStatus::Skipped => {
+                                    (t(lg, K::ImportSkipped).to_string(), DIM)
+                                }
+                                crate::import_packs::ImportMapStatus::Failed(error) => {
+                                    (format!("{}: {error}", t(lg, K::Failed)), BAD)
+                                }
+                                crate::import_packs::ImportMapStatus::Cancelled => {
+                                    (t(lg, K::ImportCancelled).to_string(), DIM)
+                                }
+                            };
+                            ui.horizontal(|ui| {
+                                ui.add_sized(
+                                    [170.0, 18.0],
+                                    egui::Label::new(
+                                        RichText::new(map_title(lg, &map.key, &map.key))
+                                            .color(BEIGE)
+                                            .size(11.0),
+                                    ),
+                                );
+                                ui.label(RichText::new(status).color(color).size(11.0).strong());
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            if progress.finished {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}: {}  |  {}: {}  |  {}: {}",
+                                        t(lg, K::Imported),
+                                        progress.imported_count(),
+                                        t(lg, K::ImportSkipped),
+                                        progress.skipped_count(),
+                                        t(lg, K::Failed),
+                                        progress.failed_count()
+                                    ))
+                                    .color(DIM)
+                                    .size(11.0),
+                                );
+                                if ui.button(t(lg, K::Close)).clicked() {
+                                    state.import_job = None;
+                                    state.import_note = None;
+                                }
+                            } else if ui.button(t(lg, K::Cancel)).clicked() {
+                                if let Some(job) = state.import_job.as_ref() {
+                                    job.cancel();
+                                }
+                            }
+                        });
+                    }
+                });
+            ui.add_space(8.0);
             if !can_build {
                 // Persistent INLINE reason (not just the disabled-button hover tooltip) so a
                 // non-technical user actually sees WHY every BUILD is greyed out and what to do.
@@ -3437,7 +3606,10 @@ pub fn menu_ui(
             ui.horizontal(|ui| {
                 let selected_label =
                     format!("{} ({selected_build_count})", t(lg, K::BuildSelected));
-                let batch_idle = building_key.is_none() && wk_queued_builds == 0;
+                let batch_idle = building_key.is_none()
+                    && wk_queued_builds == 0
+                    && !import_active
+                    && state.import_preview.is_none();
                 let selected_response = ui
                     .add_enabled_ui(can_build && batch_idle && selected_build_count > 0, |ui| {
                         ui.add_sized([190.0, 32.0], theme::primary_button(&selected_label))
@@ -3502,7 +3674,10 @@ pub fn menu_ui(
                                 let mut selected = state.selected_maps.contains(&e.key);
                                 let select_response = ui
                                     .add_enabled(
-                                        !state.build_all.active && wk_queued_builds == 0,
+                                        !state.build_all.active
+                                            && wk_queued_builds == 0
+                                            && !import_active
+                                            && state.import_preview.is_none(),
                                         egui::Checkbox::without_text(&mut selected),
                                     )
                                     .on_hover_text(t(lg, K::Select));
@@ -3563,6 +3738,39 @@ pub fn menu_ui(
                                         col = WARN;
                                     }
                                 }
+                                if let Some(import_map) = import_snapshot
+                                    .as_ref()
+                                    .and_then(|progress| {
+                                        progress.maps.iter().find(|map| map.key == e.key)
+                                    })
+                                {
+                                    match &import_map.status {
+                                        crate::import_packs::ImportMapStatus::Queued => {
+                                            txt = t(lg, K::Queued).to_string();
+                                            col = WARN;
+                                        }
+                                        crate::import_packs::ImportMapStatus::Importing => {
+                                            txt = t(lg, K::Importing).to_string();
+                                            col = BEIGE;
+                                        }
+                                        crate::import_packs::ImportMapStatus::Imported => {
+                                            txt = t(lg, K::Imported).to_string();
+                                            col = OK;
+                                        }
+                                        crate::import_packs::ImportMapStatus::Skipped => {
+                                            txt = t(lg, K::ImportSkipped).to_string();
+                                            col = DIM;
+                                        }
+                                        crate::import_packs::ImportMapStatus::Failed(_) => {
+                                            txt = t(lg, K::Failed).to_string();
+                                            col = BAD;
+                                        }
+                                        crate::import_packs::ImportMapStatus::Cancelled => {
+                                            txt = t(lg, K::ImportCancelled).to_string();
+                                            col = DIM;
+                                        }
+                                    }
+                                }
                                 ui.label(RichText::new(txt).color(col).size(12.0).strong());
                                 ui.add_space(10.0);
                                 if installed {
@@ -3604,7 +3812,7 @@ pub fn menu_ui(
                                     |ui| {
                                         let this_building =
                                             building_key.as_deref() == Some(e.key.as_str());
-                                        let any_building = building_key.is_some();
+                                        let any_building = building_key.is_some() || import_active;
                                         if installed {
                                             // Only a VALID pack is playable (finding 4). A damaged
                                             // pack offers REBUILD (plain BUILD) where PLAY would be,
@@ -3741,7 +3949,7 @@ pub fn menu_ui(
                                                     delete_now = Some(i);
                                                 }
                                             } else if ui
-                                                .add_enabled_ui(!this_building, |ui| {
+                                                .add_enabled_ui(!any_building, |ui| {
                                                     ui.add_sized(
                                                         [84.0, 30.0],
                                                         del_btn(t(lg, K::Delete)),
@@ -3828,6 +4036,101 @@ pub fn menu_ui(
                 state.show_log = false; // fresh panel starts with the log collapsed
             }
         });
+
+    // Choosing a folder only prepares a read-only preview. Copying several large maps can take
+    // time, so require an explicit confirmation and show exactly what Atlas found first.
+    let mut confirm_import = false;
+    let mut cancel_import = false;
+    if let Some(preview) = state.import_preview.as_ref() {
+        let found = preview.maps.len();
+        let new_maps = preview.new_map_count();
+        let installed = preview.installed_map_count();
+        egui::Area::new(egui::Id::new("import_confirm_dim"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .interactable(true)
+            .show(ctx, |ui| {
+                let screen = ctx.screen_rect();
+                ui.painter()
+                    .rect_filled(screen, 0.0, Color32::from_black_alpha(170));
+                ui.allocate_rect(screen, egui::Sense::click());
+            });
+        egui::Area::new(egui::Id::new("import_confirm"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(CARD)
+                    .stroke(egui::Stroke::new(1.0, WARN))
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .corner_radius(0.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(520.0);
+                        ui.label(
+                            RichText::new(t(lg, K::ImportConfirmTitle))
+                                .color(BEIGE)
+                                .size(18.0)
+                                .strong(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(t(lg, K::ImportConfirmBody))
+                                .color(BEIGE)
+                                .size(12.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(preview.selected_folder.display().to_string())
+                                .color(DIM)
+                                .size(11.0),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{found} found  |  {new_maps} to copy  |  {installed} already installed  |  {}",
+                                fmt_size(preview.copy_bytes)
+                            ))
+                            .color(WARN)
+                            .size(12.0)
+                            .strong(),
+                        );
+                        ui.add_space(14.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_sized(
+                                    [156.0, 32.0],
+                                    theme::primary_button(t(lg, K::ImportStart)),
+                                )
+                                .clicked()
+                            {
+                                confirm_import = true;
+                            }
+                            if ui
+                                .add_sized(
+                                    [88.0, 32.0],
+                                    egui::Button::new(RichText::new(t(lg, K::Cancel)).color(BEIGE)),
+                                )
+                                .clicked()
+                            {
+                                cancel_import = true;
+                            }
+                        });
+                    });
+            });
+    }
+    if cancel_import {
+        state.import_preview = None;
+    }
+    if confirm_import {
+        if let Some(preview) = state.import_preview.take() {
+            state.import_rescanned = false;
+            state.import_note = None;
+            state.import_job = Some(crate::import_packs::ImportJob::start(
+                preview,
+                crate::paths::packs_root().to_path_buf(),
+            ));
+        }
+    }
 
     // BUILD ALL is intentionally a separate confirmation step: unlike a selected batch it can
     // schedule a large amount of work and should never start from an accidental click.
