@@ -164,7 +164,12 @@ fn load_agent() -> Option<NavAgent> {
         .iter()
         .find(|a| a.get("name").and_then(|n| n.as_str()) == Some("Humanoid"))
         .or_else(|| list.first())?;
-    let f = |k: &str, d: f32| a.get(k).and_then(|x| x.as_f64()).map(|x| x as f32).unwrap_or(d);
+    let f = |k: &str, d: f32| {
+        a.get(k)
+            .and_then(|x| x.as_f64())
+            .map(|x| x as f32)
+            .unwrap_or(d)
+    };
     let slope_deg = f("agentSlope", 48.0).clamp(10.0, 80.0);
     Some(NavAgent {
         radius: f("agentRadius", 0.30),
@@ -249,12 +254,27 @@ const DOOR_FOOTPRINT_MAX: f32 = 1.5;
 /// threaded -- every sample landing in a gap -- which is exactly how routes crossed railings even
 /// when the bars WERE in the wall set. The player is a solid 0.64 m-wide capsule; sampling it
 /// densely is the cheap approximation of sweeping it.
-const CAP_OFF: [f32; 5] = [-PLAYER_RADIUS, -PLAYER_RADIUS * 0.5, 0.0, PLAYER_RADIUS * 0.5, PLAYER_RADIUS];
+const CAP_OFF: [f32; 5] = [
+    -PLAYER_RADIUS,
+    -PLAYER_RADIUS * 0.5,
+    0.0,
+    PLAYER_RADIUS * 0.5,
+    PLAYER_RADIUS,
+];
 /// Body sample heights above the floor (shins / waist / head) — start above STEP_UP so low curbs
 /// aren't over-blocked; matches `walk_ground::resolve_walls`'s capsule samples.
 const CAP_H: [f32; 3] = [STEP_UP_NAV + 0.1, 1.0, PLAYER_HEIGHT_NAV - 0.15];
 /// 8-neighbour offsets — MUST match `nav.rs` NB order (block-mask bit d = the edge to NB_BAKE[d]).
-const NB_BAKE: [(i32, i32); 8] = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)];
+const NB_BAKE: [(i32, i32); 8] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (1, -1),
+    (-1, 1),
+    (-1, -1),
+];
 
 /// One world-space triangle. Shared with `sh_bake` (the wgpu lighting bake reuses the same
 /// world-triangle assembly + BVH), hence `pub(crate)`.
@@ -468,7 +488,10 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
                 let mat = face_mat[fi];
                 let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
                 // Defensive: a bad index just skips the face (release is panic=abort).
-                if i0 >= geom.positions.len() || i1 >= geom.positions.len() || i2 >= geom.positions.len() {
+                if i0 >= geom.positions.len()
+                    || i1 >= geom.positions.len()
+                    || i2 >= geom.positions.len()
+                {
                     continue;
                 }
                 let a = aff.transform_point3(Vec3::from(geom.positions[i0]));
@@ -492,7 +515,14 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
                     && ny.abs() < WALL_MAX_NY
                     && (0.5 * nlen >= WALL_MIN_AREA || span_y >= WALL_MIN_SPAN_Y)
                 {
-                    walls.push(Tri { a, b, c, ny, door: false, mat });
+                    walls.push(Tri {
+                        a,
+                        b,
+                        c,
+                        ny,
+                        door: false,
+                        mat,
+                    });
                 }
                 // Column BVH input — UNCHANGED: drop only the vertical faces (XZ projection ~ a
                 // line, a vertical ray can't register them); keep floors AND ceilings for headroom.
@@ -505,7 +535,14 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
                 if door {
                     door_tris += 1;
                 }
-                tris.push(Tri { a, b, c, ny, door, mat });
+                tris.push(Tri {
+                    a,
+                    b,
+                    c,
+                    ny,
+                    door,
+                    mat,
+                });
             }
         }
     }
@@ -626,7 +663,12 @@ fn add_collider_tris(
         verts.clear();
         idx.clear();
         match c.kind {
-            0 => shape_box(Vec3::from(c.center), Vec3::from(c.shape), &mut verts, &mut idx),
+            0 => shape_box(
+                Vec3::from(c.center),
+                Vec3::from(c.shape),
+                &mut verts,
+                &mut idx,
+            ),
             1 => shape_sphere(Vec3::from(c.center), c.shape[0], &mut verts, &mut idx),
             2 => shape_capsule(
                 Vec3::from(c.center),
@@ -689,7 +731,14 @@ fn add_collider_tris(
                 && ny.abs() < WALL_MAX_NY
                 && (0.5 * nlen >= WALL_MIN_AREA || span_y >= WALL_MIN_SPAN_Y)
             {
-                walls.push(Tri { a, b, c: cc, ny, door: false, mat: 0 });
+                walls.push(Tri {
+                    a,
+                    b,
+                    c: cc,
+                    ny,
+                    door: false,
+                    mat: 0,
+                });
             }
             let xz_area2 = (e1.x * e2.z - e1.z * e2.x).abs();
             if xz_area2 < MIN_XZ_AREA2 {
@@ -697,14 +746,24 @@ fn add_collider_tris(
             }
             *min_y = min_y.min(a.y.min(b.y.min(cc.y)));
             *max_y = max_y.max(a.y.max(b.y.max(cc.y)));
-            tris.push(Tri { a, b, c: cc, ny, door: is_door, mat: 0 });
+            tris.push(Tri {
+                a,
+                b,
+                c: cc,
+                ny,
+                door: is_door,
+                mat: 0,
+            });
         }
     }
     eprintln!(
         "  nav-bake: colliders {} total -> {} used ({} triggers skipped, {} off-layer, \
          {} nav-ignored by the game, {} map-spanning world backstop)",
         pack.colliders.len(),
-        pack.colliders.len() - skipped_trigger - skipped_layer - skipped_navignore
+        pack.colliders.len()
+            - skipped_trigger
+            - skipped_layer
+            - skipped_navignore
             - skipped_worldfloor,
         skipped_trigger,
         skipped_layer,
@@ -985,12 +1044,18 @@ fn shape_box(center: Vec3, size: Vec3, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]
     }
     // corner index = (z<<2)|(y<<1)|x
     const F: [[u32; 3]; 12] = [
-        [0, 2, 1], [1, 2, 3], // -z
-        [4, 5, 6], [5, 7, 6], // +z
-        [0, 1, 4], [1, 5, 4], // -y
-        [2, 6, 3], [3, 6, 7], // +y
-        [0, 4, 2], [2, 4, 6], // -x
-        [1, 3, 5], [3, 7, 5], // +x
+        [0, 2, 1],
+        [1, 2, 3], // -z
+        [4, 5, 6],
+        [5, 7, 6], // +z
+        [0, 1, 4],
+        [1, 5, 4], // -y
+        [2, 6, 3],
+        [3, 6, 7], // +y
+        [0, 4, 2],
+        [2, 4, 6], // -x
+        [1, 3, 5],
+        [3, 7, 5], // +x
     ];
     idx.extend_from_slice(&F);
 }
@@ -1028,7 +1093,14 @@ fn shape_sphere(center: Vec3, r: f32, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]>
 /// Unity CapsuleCollider: a cylinder of `height` (total, including the two hemisphere caps) with
 /// radius `r`, aligned to `dir` (0=X, 1=Y, 2=Z). Approximated by a capped cylinder — exact enough
 /// at nav resolution, and the caps matter only for headroom.
-fn shape_capsule(center: Vec3, r: f32, height: f32, dir: u32, v: &mut Vec<Vec3>, idx: &mut Vec<[u32; 3]>) {
+fn shape_capsule(
+    center: Vec3,
+    r: f32,
+    height: f32,
+    dir: u32,
+    v: &mut Vec<Vec3>,
+    idx: &mut Vec<[u32; 3]>,
+) {
     const SEGS: u32 = 10;
     let half = (height * 0.5 - r).max(0.0); // cylindrical half-length between the cap centres
     let axis = match dir {
@@ -1037,10 +1109,20 @@ fn shape_capsule(center: Vec3, r: f32, height: f32, dir: u32, v: &mut Vec<Vec3>,
         _ => Vec3::Y,
     };
     // Two orthogonal radial axes.
-    let u = if axis.x.abs() < 0.9 { Vec3::X.cross(axis) } else { Vec3::Y.cross(axis) }.normalize();
+    let u = if axis.x.abs() < 0.9 {
+        Vec3::X.cross(axis)
+    } else {
+        Vec3::Y.cross(axis)
+    }
+    .normalize();
     let w = axis.cross(u);
     // Rings at -half-r (pole), -half, +half, +half+r (pole): a cylinder plus flat-ish caps.
-    for &(off, rad) in &[(-(half + r), 0.0f32), (-half, r), (half, r), (half + r, 0.0)] {
+    for &(off, rad) in &[
+        (-(half + r), 0.0f32),
+        (-half, r),
+        (half, r),
+        (half + r, 0.0),
+    ] {
         for j in 0..SEGS {
             let th = std::f32::consts::TAU * j as f32 / SEGS as f32;
             let (st, ct) = th.sin_cos();
@@ -1137,8 +1219,18 @@ impl Bvh {
             let mid = (lo + hi) / 2;
             idx[lo..hi].select_nth_unstable_by(mid - lo, |&x, &y| key(x).total_cmp(&key(y)));
             let l = nodes.len();
-            nodes.push(BvhNode { min: mn, max: mx, start: 0, count: 0 });
-            nodes.push(BvhNode { min: mn, max: mx, start: 0, count: 0 });
+            nodes.push(BvhNode {
+                min: mn,
+                max: mx,
+                start: 0,
+                count: 0,
+            });
+            nodes.push(BvhNode {
+                min: mn,
+                max: mx,
+                start: 0,
+                count: 0,
+            });
             nodes[node] = BvhNode {
                 min: mn,
                 max: mx,
@@ -1157,7 +1249,15 @@ impl Bvh {
     }
 
     /// Gather every surface hit under the column (x,z) with hit-Y in [y_low, y_high] into `out`.
-    fn column(&self, x: f32, z: f32, y_low: f32, y_high: f32, out: &mut Vec<Hit>, stack: &mut Vec<u32>) {
+    fn column(
+        &self,
+        x: f32,
+        z: f32,
+        y_low: f32,
+        y_high: f32,
+        out: &mut Vec<Hit>,
+        stack: &mut Vec<u32>,
+    ) {
         out.clear();
         stack.clear();
         stack.push(0);
@@ -1172,7 +1272,11 @@ impl Bvh {
                 for t in &self.tris[s..s + node.count as usize] {
                     if let Some(y) = tri_vertical_y(t, x, z) {
                         if y >= y_low && y <= y_high {
-                            out.push(Hit { y, ny: t.ny, door: t.door });
+                            out.push(Hit {
+                                y,
+                                ny: t.ny,
+                                door: t.door,
+                            });
                         }
                     }
                 }
@@ -1223,14 +1327,24 @@ impl WallBvh {
         let n = tris.len();
         if n == 0 {
             return WallBvh {
-                nodes: vec![BvhNode { min: Vec3::ZERO, max: Vec3::ZERO, start: 0, count: 0 }],
+                nodes: vec![BvhNode {
+                    min: Vec3::ZERO,
+                    max: Vec3::ZERO,
+                    start: 0,
+                    count: 0,
+                }],
                 tris,
             };
         }
         let cen: Vec<Vec3> = tris.iter().map(|t| (t.a + t.b + t.c) / 3.0).collect();
         let mut idx: Vec<u32> = (0..n as u32).collect();
         let mut nodes: Vec<BvhNode> = Vec::with_capacity(2 * (n / LEAF_MAX).max(1) + 8);
-        nodes.push(BvhNode { min: Vec3::ZERO, max: Vec3::ZERO, start: 0, count: 0 });
+        nodes.push(BvhNode {
+            min: Vec3::ZERO,
+            max: Vec3::ZERO,
+            start: 0,
+            count: 0,
+        });
         let mut stack: Vec<(usize, usize, usize)> = vec![(0usize, 0usize, n)];
         while let Some((node, lo, hi)) = stack.pop() {
             let mut mn = Vec3::splat(f32::INFINITY);
@@ -1242,7 +1356,12 @@ impl WallBvh {
             }
             let count = hi - lo;
             if count <= LEAF_MAX {
-                nodes[node] = BvhNode { min: mn, max: mx, start: lo as u32, count: count as u32 };
+                nodes[node] = BvhNode {
+                    min: mn,
+                    max: mx,
+                    start: lo as u32,
+                    count: count as u32,
+                };
                 continue;
             }
             // Split on the widest of x/y/z.
@@ -1265,14 +1384,32 @@ impl WallBvh {
             let mid = (lo + hi) / 2;
             idx[lo..hi].select_nth_unstable_by(mid - lo, |&x, &y| key(x).total_cmp(&key(y)));
             let l = nodes.len();
-            nodes.push(BvhNode { min: mn, max: mx, start: 0, count: 0 });
-            nodes.push(BvhNode { min: mn, max: mx, start: 0, count: 0 });
-            nodes[node] = BvhNode { min: mn, max: mx, start: l as u32, count: 0 };
+            nodes.push(BvhNode {
+                min: mn,
+                max: mx,
+                start: 0,
+                count: 0,
+            });
+            nodes.push(BvhNode {
+                min: mn,
+                max: mx,
+                start: 0,
+                count: 0,
+            });
+            nodes[node] = BvhNode {
+                min: mn,
+                max: mx,
+                start: l as u32,
+                count: 0,
+            };
             stack.push((l, lo, mid));
             stack.push((l + 1, mid, hi));
         }
         let tris_ordered: Vec<Tri> = idx.iter().map(|&i| tris[i as usize]).collect();
-        WallBvh { nodes, tris: tris_ordered }
+        WallBvh {
+            nodes,
+            tris: tris_ordered,
+        }
     }
 
     /// True if the segment p0->p1 intersects ANY wall triangle. Slab-prune AABBs vs the segment,
@@ -1283,9 +1420,21 @@ impl WallBvh {
         }
         let dir = p1 - p0;
         let inv = Vec3::new(
-            if dir.x != 0.0 { 1.0 / dir.x } else { f32::INFINITY },
-            if dir.y != 0.0 { 1.0 / dir.y } else { f32::INFINITY },
-            if dir.z != 0.0 { 1.0 / dir.z } else { f32::INFINITY },
+            if dir.x != 0.0 {
+                1.0 / dir.x
+            } else {
+                f32::INFINITY
+            },
+            if dir.y != 0.0 {
+                1.0 / dir.y
+            } else {
+                f32::INFINITY
+            },
+            if dir.z != 0.0 {
+                1.0 / dir.z
+            } else {
+                f32::INFINITY
+            },
         );
         stack.clear();
         stack.push(0);
@@ -1319,9 +1468,21 @@ impl WallBvh {
         }
         let dir = p1 - p0;
         let inv = Vec3::new(
-            if dir.x != 0.0 { 1.0 / dir.x } else { f32::INFINITY },
-            if dir.y != 0.0 { 1.0 / dir.y } else { f32::INFINITY },
-            if dir.z != 0.0 { 1.0 / dir.z } else { f32::INFINITY },
+            if dir.x != 0.0 {
+                1.0 / dir.x
+            } else {
+                f32::INFINITY
+            },
+            if dir.y != 0.0 {
+                1.0 / dir.y
+            } else {
+                f32::INFINITY
+            },
+            if dir.z != 0.0 {
+                1.0 / dir.z
+            } else {
+                f32::INFINITY
+            },
         );
         stack.clear();
         stack.push(0);
@@ -1712,7 +1873,10 @@ fn locate_crossings(
             }
             let Some((t, hy)) = hit else { continue };
             let ty = [t.a.y, t.b.y, t.c.y];
-            let (tlo, thi) = (ty.iter().copied().fold(f32::MAX, f32::min), ty.iter().copied().fold(f32::MIN, f32::max));
+            let (tlo, thi) = (
+                ty.iter().copied().fold(f32::MAX, f32::min),
+                ty.iter().copied().fold(f32::MIN, f32::max),
+            );
             eprintln!(
                 "  [verify]     tri y[{:.2},{:.2}] span {:.2} m, ny {:.2}, ray at floor+{:.2};                  parent seg [{:.2},{:.2},{:.2}]->[{:.2},{:.2},{:.2}] len {:.2} m",
                 tlo, thi, thi - tlo, t.ny, hy, a.x, a.y, a.z, b.x, b.y, b.z, el
@@ -1860,14 +2024,14 @@ fn resolve_column(
                 floors.push(h.y);
             }
             last_down = h.y; // a floor also caps clearance for anything below it
-            // NO early break at `floors.len() >= k`. The scan runs top -> bottom, so stopping once
-            // k floors were collected kept the TOPMOST k and threw the rest away — and the sort
-            // below, which exists precisely to keep the LOWEST k, then had nothing left to choose
-            // from. On Streets that silently deleted the street itself under every building with
-            // more than k stacked surfaces: a player spawn at y = 0.6 found no floor within 8 m and
-            // snapped 20 m up onto the roof, stranding it on a rooftop island. Scanning the whole
-            // column costs a few hits per cell and is the difference between a map that is 40%
-            // connected and one that is whole.
+                             // NO early break at `floors.len() >= k`. The scan runs top -> bottom, so stopping once
+                             // k floors were collected kept the TOPMOST k and threw the rest away — and the sort
+                             // below, which exists precisely to keep the LOWEST k, then had nothing left to choose
+                             // from. On Streets that silently deleted the street itself under every building with
+                             // more than k stacked surfaces: a player spawn at y = 0.6 found no floor within 8 m and
+                             // snapped 20 m up onto the roof, stranding it on a rooftop island. Scanning the whole
+                             // column costs a few hits per cell and is the difference between a map that is 40%
+                             // connected and one that is whole.
         } else if h.ny <= -ny_min {
             last_down = h.y; // down-facing ceiling / underside
         }
@@ -1892,10 +2056,10 @@ pub struct Baked {
     nz: usize,
     k: usize,
     y_high: f32,
-    heights: Vec<f32>,   // nx*nz*k, ascending, MISS empty
-    door: Vec<u8>,       // nx*nz
-    blk: Vec<u8>,        // nx*nz*k, 8-dir edge mask
-    wall_cell: Vec<u8>,  // nx*nz, 1 = a wall sits in this cell's body column (simplify guard)
+    heights: Vec<f32>,  // nx*nz*k, ascending, MISS empty
+    door: Vec<u8>,      // nx*nz
+    blk: Vec<u8>,       // nx*nz*k, 8-dir edge mask
+    wall_cell: Vec<u8>, // nx*nz, 1 = a wall sits in this cell's body column (simplify guard)
     walkable: usize,
     door_cells: usize,
     blocked_edges: usize,
@@ -2073,12 +2237,14 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
         .for_each_init(
             // `support` is the footprint probe's output buffer and must be K long, exactly like
             // the per-cell `hout` slice `resolve_column` normally writes into.
-            || (
-                Vec::<Hit>::with_capacity(64),
-                Vec::<u32>::with_capacity(64),
-                Vec::<f32>::with_capacity(16),
-                vec![MISS; k],
-            ),
+            || {
+                (
+                    Vec::<Hit>::with_capacity(64),
+                    Vec::<u32>::with_capacity(64),
+                    Vec::<f32>::with_capacity(16),
+                    vec![MISS; k],
+                )
+            },
             |(hits, nstack, floors, support), (cell, (hout, dout))| {
                 let ix = cell % nx;
                 let iz = cell / nx;
@@ -2119,7 +2285,10 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
                             let (sn, _, _) = resolve_column(hits, k, support, floors);
                             // Supported if ANY floor under the offset probe is within a climb step
                             // of this one -- the agent's edge still has ground beneath it.
-                            if !support[..sn].iter().any(|&sh| (sh - h).abs() <= erode_climb) {
+                            if !support[..sn]
+                                .iter()
+                                .any(|&sh| (sh - h).abs() <= erode_climb)
+                            {
                                 supported = false;
                                 break;
                             }
@@ -2175,10 +2344,7 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
             deepest.next_power_of_two().max(k)
         );
     }
-    let walkable = heights
-        .par_chunks(k)
-        .filter(|c| c[0] > MISS_HALF)
-        .count();
+    let walkable = heights.par_chunks(k).filter(|c| c[0] > MISS_HALF).count();
     // Stamp door cells from the TYPED door table (gamedata.json), not just from column-ray hits.
     //
     // A door panel is a near-vertical sheet, so its XZ projection is ~a line and it is deliberately
@@ -2360,80 +2526,85 @@ pub fn bake(pack: &Pack, res: f32, k: usize) -> Result<Baked> {
     // Runs over whatever `heights` currently holds. It has to be repeatable because pruning below
     // changes `heights`, and every bit in `blk` encodes a test against a SPECIFIC neighbour layer.
     let capsule_pass = |heights: &[f32], blk: &mut [u8], wall_cell: &mut [u8]| {
-        blk.par_chunks_mut(k).zip(wall_cell.par_iter_mut()).enumerate().for_each_init(
-            || Vec::<u32>::with_capacity(64),
-            |wstack, (c, (bout, wc))| {
-                let ix = c % nx;
-                let iz = c / nx;
-                let cx = min_x + ix as f32 * res;
-                let cz = min_z + iz as f32 * res;
-                let door_c = door[c] != 0;
-                let mut any_floor = false;
-                for l in 0..k {
-                    let floor_c = heights[c * k + l];
-                    if floor_c <= MISS_HALF {
-                        break; // ascending; MISS sinks to the end
-                    }
-                    any_floor = true;
-                    let mut mask = 0u8;
-                    for d in 0..8 {
-                        let (dx, dz) = NB_BAKE[d];
-                        let jx = ix as i64 + dx as i64;
-                        let jz = iz as i64 + dz as i64;
-                        if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
-                            continue;
-                        }
-                        let nc = (jz * nx as i64 + jx) as usize;
-                        let nl = best_layer_bake(&heights, nc, k, floor_c);
-                        if nl < 0 {
-                            continue; // neighbour has no floor (matches nav.rs `continue`)
-                        }
-                        let floor_nc = heights[nc * k + nl as usize];
-                        let up = floor_nc - floor_c;
-                        let horiz = ((dx * dx + dz * dz) as f32).sqrt() * res;
-                        if !walkable_step_bake(up, horiz, res) {
-                            continue; // an edge the router would never traverse — don't bother
-                        }
-                        if door_c || door[nc] != 0 {
-                            continue; // doors stay transparent (never blocked)
-                        }
-                        let ncx = min_x + jx as f32 * res;
-                        let ncz = min_z + jz as f32 * res;
-                        if capsule_blocked(cx, cz, floor_c, ncx, ncz, floor_nc, &wall_bvh, wstack) {
-                            mask |= 1u8 << d;
-                        }
-                    }
-                    bout[l] = mask;
-                }
-                // Flag the cell if a wall sits in the body column of ANY of its floors (skip doors —
-                // a door footprint must stay straightenable so routes can head straight for it).
-                if any_floor && !door_c {
+        blk.par_chunks_mut(k)
+            .zip(wall_cell.par_iter_mut())
+            .enumerate()
+            .for_each_init(
+                || Vec::<u32>::with_capacity(64),
+                |wstack, (c, (bout, wc))| {
+                    let ix = c % nx;
+                    let iz = c / nx;
+                    let cx = min_x + ix as f32 * res;
+                    let cz = min_z + iz as f32 * res;
+                    let door_c = door[c] != 0;
+                    let mut any_floor = false;
                     for l in 0..k {
                         let floor_c = heights[c * k + l];
                         if floor_c <= MISS_HALF {
-                            break;
+                            break; // ascending; MISS sinks to the end
                         }
-                        // Body band top = the highest point the ACCEPTANCE ray can reach: a chord
-                        // may ride up to `chord_rise_max` above the floor, and its topmost capsule
-                        // sample sits CAP_H[2] above that. This was `PLAYER_HEIGHT + STEP_UP_NAV`,
-                        // citing `segment_clear`'s float_tol — a symbol that no longer exists, and
-                        // a constant (0.45) the rise tolerance stopped tracking when the free step
-                        // became res-dependent. It left ~0.11 m of band unguarded at res 0.5 and
-                        // 0.60 m at res 1.0, which cannot route anyone through a wall (it is above
-                        // head height) but DOES let count_wall_crossings report a crossing on a
-                        // chord segment_clear certified as clear, polluting the metric that is
-                        // supposed to be zero.
-                        let band = crate::nav::chord_rise_max(free_step(res)) + CAP_H[2];
-                        let bmin = Vec3::new(cx - wc_half, floor_c, cz - wc_half);
-                        let bmax = Vec3::new(cx + wc_half, floor_c + band, cz + wc_half);
-                        if wall_bvh.box_overlaps(bmin, bmax, wstack) {
-                            *wc = 1;
-                            break;
+                        any_floor = true;
+                        let mut mask = 0u8;
+                        for d in 0..8 {
+                            let (dx, dz) = NB_BAKE[d];
+                            let jx = ix as i64 + dx as i64;
+                            let jz = iz as i64 + dz as i64;
+                            if jx < 0 || jz < 0 || jx >= nx as i64 || jz >= nz as i64 {
+                                continue;
+                            }
+                            let nc = (jz * nx as i64 + jx) as usize;
+                            let nl = best_layer_bake(&heights, nc, k, floor_c);
+                            if nl < 0 {
+                                continue; // neighbour has no floor (matches nav.rs `continue`)
+                            }
+                            let floor_nc = heights[nc * k + nl as usize];
+                            let up = floor_nc - floor_c;
+                            let horiz = ((dx * dx + dz * dz) as f32).sqrt() * res;
+                            if !walkable_step_bake(up, horiz, res) {
+                                continue; // an edge the router would never traverse — don't bother
+                            }
+                            if door_c || door[nc] != 0 {
+                                continue; // doors stay transparent (never blocked)
+                            }
+                            let ncx = min_x + jx as f32 * res;
+                            let ncz = min_z + jz as f32 * res;
+                            if capsule_blocked(
+                                cx, cz, floor_c, ncx, ncz, floor_nc, &wall_bvh, wstack,
+                            ) {
+                                mask |= 1u8 << d;
+                            }
+                        }
+                        bout[l] = mask;
+                    }
+                    // Flag the cell if a wall sits in the body column of ANY of its floors (skip doors —
+                    // a door footprint must stay straightenable so routes can head straight for it).
+                    if any_floor && !door_c {
+                        for l in 0..k {
+                            let floor_c = heights[c * k + l];
+                            if floor_c <= MISS_HALF {
+                                break;
+                            }
+                            // Body band top = the highest point the ACCEPTANCE ray can reach: a chord
+                            // may ride up to `chord_rise_max` above the floor, and its topmost capsule
+                            // sample sits CAP_H[2] above that. This was `PLAYER_HEIGHT + STEP_UP_NAV`,
+                            // citing `segment_clear`'s float_tol — a symbol that no longer exists, and
+                            // a constant (0.45) the rise tolerance stopped tracking when the free step
+                            // became res-dependent. It left ~0.11 m of band unguarded at res 0.5 and
+                            // 0.60 m at res 1.0, which cannot route anyone through a wall (it is above
+                            // head height) but DOES let count_wall_crossings report a crossing on a
+                            // chord segment_clear certified as clear, polluting the metric that is
+                            // supposed to be zero.
+                            let band = crate::nav::chord_rise_max(free_step(res)) + CAP_H[2];
+                            let bmin = Vec3::new(cx - wc_half, floor_c, cz - wc_half);
+                            let bmax = Vec3::new(cx + wc_half, floor_c + band, cz + wc_half);
+                            if wall_bvh.box_overlaps(bmin, bmax, wstack) {
+                                *wc = 1;
+                                break;
+                            }
                         }
                     }
-                }
-            },
-        );
+                },
+            );
     };
     if blk_on && !wall_bvh.tris.is_empty() {
         capsule_pass(&heights, &mut blk, &mut wall_cell);
@@ -2553,7 +2724,9 @@ fn count_floor_violations(poly: &[Vec3], grid: &NavGrid) -> (usize, usize, f32, 
             if !grid.on_floor(p.x, p.z, p.y, TOL) {
                 bad += 1;
                 // Depth of the miss, measured against the containing cell (None = over a void).
-                let d = grid.floor_near(p.x, p.z, p.y).map_or(99.0, |f| (p.y - f).abs());
+                let d = grid
+                    .floor_near(p.x, p.z, p.y)
+                    .map_or(99.0, |f| (p.y - f).abs());
                 if d > worst {
                     worst = d;
                     worst_at = Some(p);
@@ -2562,7 +2735,12 @@ fn count_floor_violations(poly: &[Vec3], grid: &NavGrid) -> (usize, usize, f32, 
             }
         }
     }
-    (samples, bad, worst, worst_at.map(|p| (p, worst_seg.unwrap_or((p, p)))))
+    (
+        samples,
+        bad,
+        worst,
+        worst_at.map(|p| (p, worst_seg.unwrap_or((p, p)))),
+    )
 }
 
 /// Could a BOT actually walk this drawn line?
@@ -2580,11 +2758,11 @@ fn count_floor_violations(poly: &[Vec3], grid: &NavGrid) -> (usize, usize, f32, 
 /// Returns (samples, illegal, worst delta).
 fn count_ledge_violations(poly: &[Vec3], grid: &NavGrid) -> (usize, usize, f32) {
     const STEP: f32 = 0.25; // short: a coarse stride hides a ledge inside one interval
-    // The floor can only change where the GRID changes, so judge a delta against the most
-    // permissive single move the router itself allows — a diagonal step, run = res*sqrt(2). Using
-    // max_step(STEP) instead would flag every legal 1 m router step as a violation and measure the
-    // sampling stride rather than the route. Anything over this is a step the router should never
-    // have taken, at any resolution.
+                            // The floor can only change where the GRID changes, so judge a delta against the most
+                            // permissive single move the router itself allows — a diagonal step, run = res*sqrt(2). Using
+                            // max_step(STEP) instead would flag every legal 1 m router step as a violation and measure the
+                            // sampling stride rather than the route. Anything over this is a step the router should never
+                            // have taken, at any resolution.
     let limit = agent().max_step(grid.res * std::f32::consts::SQRT_2);
     let (mut samples, mut bad, mut worst) = (0usize, 0usize, 0.0f32);
     let mut prev: Option<f32> = None;
@@ -2650,6 +2828,44 @@ fn tour_self_crossings(stops: &[Vec3]) -> usize {
     n
 }
 
+/// Number of independent verification workers to use for one grid.
+///
+/// Every worker owns one [`Scratch`] (four 4-byte arrays per nav node), which is about 396 MiB on
+/// Customs. Blindly using Rayon's full machine-wide thread count can therefore exhaust RAM on the
+/// exact large maps whose verification takes longest. Cap the default at four CPUs and a 1 GiB
+/// aggregate scratch budget. Advanced benchmarkers can tune the two caps without changing output.
+fn verification_jobs(nodes: usize) -> usize {
+    const BYTES_PER_NODE: usize = 16;
+    const DEFAULT_MEMORY_MIB: usize = 1024;
+    const MAX_AUTO_JOBS: usize = 4;
+
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let memory_mib = std::env::var("EFT_NAV_VERIFY_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MEMORY_MIB);
+    let per_worker = nodes.saturating_mul(BYTES_PER_NODE).max(1);
+    let memory_jobs = memory_mib
+        .saturating_mul(1024 * 1024)
+        .checked_div(per_worker)
+        .unwrap_or(1)
+        .max(1);
+    let automatic = cpus.min(MAX_AUTO_JOBS).min(memory_jobs).max(1);
+    std::env::var("EFT_NAV_VERIFY_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(automatic)
+        .min(cpus)
+        .min(memory_jobs)
+        .max(1)
+}
+
+fn verification_chunk_len(items: usize, jobs: usize) -> usize {
+    items.div_ceil(jobs.max(1)).max(1)
+}
+
 /// Route the map's REAL loot runs and hold them to the same wall/floor/ledge rules as the random
 /// legs. Worth doing separately because random walkable cells are overwhelmingly open street: the
 /// planner's stops are containers and loose spawns, which sit indoors, in corners, on shelves and
@@ -2658,9 +2874,13 @@ fn tour_self_crossings(stops: &[Vec3]) -> usize {
 ///
 /// Runs the shipped planner (`planner::solve`), not a reimplementation of it, so the thing under
 /// test is the stitched multi-leg tour the user actually sees, seams included.
-fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
-    let Ok(txt) = std::fs::read_to_string(dir.join("gamedata.json")) else { return };
-    let Ok(gd) = serde_json::from_str::<serde_json::Value>(&txt) else { return };
+fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid, jobs: usize) {
+    let Ok(txt) = std::fs::read_to_string(dir.join("gamedata.json")) else {
+        return;
+    };
+    let Ok(gd) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return;
+    };
     let pt = |v: &serde_json::Value| -> Option<Vec3> {
         let a = v.get("pos")?.as_array()?;
         (a.len() >= 3).then(|| {
@@ -2677,7 +2897,11 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
         for e in gd.get(key).and_then(|v| v.as_array()).unwrap_or(&empty) {
             let Some(pos) = pt(e) else { continue };
             cands.push(crate::planner::Cand {
-                name: e.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                name: e
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
                 value: 10_000,
                 score_value: 10_000.0,
                 pos,
@@ -2690,9 +2914,7 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
         .and_then(|v| v.as_array())
         .unwrap_or(&empty)
         .iter()
-        .filter_map(|e| {
-            Some((e.get("name")?.as_str()?.to_string(), pt(e)?))
-        })
+        .filter_map(|e| Some((e.get("name")?.as_str()?.to_string(), pt(e)?)))
         .collect();
     if cands.len() < 8 || extracts.is_empty() {
         return;
@@ -2716,6 +2938,89 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
     }
     let want = 12usize.min(spawns.len());
     let stride = (spawns.len() / want).max(1);
+    let starts: Vec<Vec3> = (0..want)
+        .map(|i| spawns[(i * stride) % spawns.len()])
+        .collect();
+
+    #[derive(Default)]
+    struct LootCheck {
+        planned: bool,
+        failed: bool,
+        stops: usize,
+        metres: f32,
+        segs: usize,
+        cross: usize,
+        cross_door: usize,
+        selfx: usize,
+        straight: f32,
+        lg_n: usize,
+        lg_bad: usize,
+        lg_worst: f32,
+        fs_n: usize,
+        fs_bad: usize,
+        fs_worst: f32,
+        worst_leg: Option<(Vec3, usize)>,
+    }
+
+    let t_plans = Instant::now();
+    // `par_chunks`, rather than one Rayon task per spawn, bounds concurrent full-grid scratch
+    // buffers to `jobs`. Each chunk is serial internally and results collect in original spawn
+    // order, so the first-offender report remains deterministic.
+    let batches: Vec<Vec<LootCheck>> = starts
+        .par_chunks(verification_chunk_len(starts.len(), jobs))
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|&start| {
+                    let Ok(plan) = crate::planner::solve(
+                        grid,
+                        start,
+                        cands.clone(),
+                        extracts.clone(),
+                        12,
+                        1800.0,
+                        None,
+                    ) else {
+                        return LootCheck {
+                            failed: true,
+                            ..Default::default()
+                        };
+                    };
+                    // start -> every stop -> the extract it actually ends at. The extract leg is
+                    // part of total_dist, so leaving it out of the straight-line baseline would
+                    // inflate the ratio and make an honest route look like a bad one.
+                    let mut seq: Vec<Vec3> = vec![start];
+                    seq.extend(plan.stops.iter().map(|st| st.pos));
+                    if let Some(e) = extracts.iter().find(|e| e.0 == plan.extract) {
+                        seq.push(e.1);
+                    }
+                    let (segs, cross) = count_wall_crossings(&plan.polyline, &baked.wall_bvh);
+                    let cross_door = count_door_crossings(&plan.polyline, baked);
+                    let (lg_n, lg_bad, lg_worst) = count_ledge_violations(&plan.polyline, grid);
+                    let (fs_n, fs_bad, fs_worst, _) = count_floor_violations(&plan.polyline, grid);
+                    LootCheck {
+                        planned: true,
+                        stops: plan.stops.len(),
+                        metres: plan.total_dist,
+                        segs,
+                        cross,
+                        cross_door,
+                        selfx: tour_self_crossings(&seq),
+                        straight: seq.windows(2).map(|w| w[0].distance(w[1])).sum(),
+                        lg_n,
+                        lg_bad,
+                        lg_worst,
+                        fs_n,
+                        fs_bad,
+                        fs_worst,
+                        worst_leg: (cross > cross_door).then_some((start, cross - cross_door)),
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
     let (mut planned, mut failed) = (0usize, 0usize);
     let (mut segs, mut cross, mut cross_door) = (0usize, 0usize, 0usize);
     let (mut stops, mut metres) = (0usize, 0.0f32);
@@ -2723,43 +3028,30 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
     let (mut lg_n, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
     let (mut fs_n, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
     let mut worst_leg: Option<(Vec3, usize)> = None;
-    for i in 0..want {
-        let start = spawns[(i * stride) % spawns.len()];
-        match crate::planner::solve(grid, start, cands.clone(), extracts.clone(), 12, 1800.0, None) {
-            Ok(plan) => {
-                planned += 1;
-                stops += plan.stops.len();
-                metres += plan.total_dist;
-                // start -> every stop -> the extract it actually ends at. The extract leg is
-                // part of total_dist, so leaving it out of the straight-line baseline would
-                // inflate the ratio and make an honest route look like a bad one.
-                let mut seq: Vec<Vec3> = vec![start];
-                seq.extend(plan.stops.iter().map(|st| st.pos));
-                if let Some(e) = extracts.iter().find(|e| e.0 == plan.extract) {
-                    seq.push(e.1);
-                }
-                selfx += tour_self_crossings(&seq);
-                straight_total += seq.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>();
-                let (sg, cr) = count_wall_crossings(&plan.polyline, &baked.wall_bvh);
-                let crd = count_door_crossings(&plan.polyline, baked);
-                segs += sg;
-                cross += cr;
-                cross_door += crd;
-                if cr > crd && worst_leg.is_none() {
-                    worst_leg = Some((start, cr - crd));
-                }
-                let (n, b, w) = count_ledge_violations(&plan.polyline, grid);
-                lg_n += n;
-                lg_bad += b;
-                lg_worst = lg_worst.max(w);
-                let (n2, b2, w2, _) = count_floor_violations(&plan.polyline, grid);
-                fs_n += n2;
-                fs_bad += b2;
-                fs_worst = fs_worst.max(w2);
-            }
-            Err(_) => failed += 1,
+    for result in batches.into_iter().flatten() {
+        planned += result.planned as usize;
+        failed += result.failed as usize;
+        stops += result.stops;
+        metres += result.metres;
+        segs += result.segs;
+        cross += result.cross;
+        cross_door += result.cross_door;
+        selfx += result.selfx;
+        straight_total += result.straight;
+        lg_n += result.lg_n;
+        lg_bad += result.lg_bad;
+        lg_worst = lg_worst.max(result.lg_worst);
+        fs_n += result.fs_n;
+        fs_bad += result.fs_bad;
+        fs_worst = fs_worst.max(result.fs_worst);
+        if worst_leg.is_none() {
+            worst_leg = result.worst_leg;
         }
     }
+    eprintln!(
+        "  [verify] loot plans: evaluated {want} spawn(s) on {jobs} CPU worker(s) in {:.2}s",
+        t_plans.elapsed().as_secs_f32()
+    );
     if planned == 0 {
         eprintln!("  [verify] loot plans: none of {want} spawn(s) could produce a run");
         return;
@@ -2785,13 +3077,16 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
         );
     }
     if real == 0 && lg_bad == 0 && fs_bad == 0 {
-        eprintln!("  [verify] loot plans: PASS (no wall crossing, no illegal ledge, never off the floor)");
+        eprintln!(
+            "  [verify] loot plans: PASS (no wall crossing, no illegal ledge, never off the floor)"
+        );
     } else {
         eprintln!("  [verify] loot plans: FAIL");
     }
 }
 
 fn self_check(baked: &Baked, dir: &Path) {
+    let t_verify = Instant::now();
     let Some(grid) = NavGrid::load(dir) else {
         eprintln!("  [verify] FAILED: NavGrid::load returned None on the freshly baked pack");
         return;
@@ -2813,11 +3108,18 @@ fn self_check(baked: &Baked, dir: &Path) {
         }
     }
     if walk.len() < 2 {
-        eprintln!("  [verify] only {} walkable cell(s) — no route to test", walk.len());
+        eprintln!(
+            "  [verify] only {} walkable cell(s) — no route to test",
+            walk.len()
+        );
         return;
     }
     let world = |w: &(usize, usize, f32)| {
-        Vec3::new(baked.min_x + w.0 as f32 * baked.res, w.2, baked.min_z + w.1 as f32 * baked.res)
+        Vec3::new(
+            baked.min_x + w.0 as f32 * baked.res,
+            w.2,
+            baked.min_z + w.1 as f32 * baked.res,
+        )
     };
 
     // Deterministic varied legs: coprime-ish index strides sweep start/dest position, direction and
@@ -2850,25 +3152,18 @@ fn self_check(baked: &Baked, dir: &Path) {
     let sa = coprime((n as f64 * 0.618_033_988_7) as usize);
     let sb = coprime((n as f64 * 0.381_966_011_3) as usize);
     let min_span2 = (8.0f32 / baked.res).powi(2); // non-trivial legs (>= ~8 m)
-    let mut sc_a = Scratch::new(grid.nodes());
-    let mut sc_b = Scratch::new(grid_before.nodes());
-    let (mut routes_after, mut routes_before) = (0usize, 0usize);
-    let (mut segs_after, mut segs_before) = (0usize, 0usize);
-    let (mut cross_after, mut cross_before) = (0usize, 0usize);
-    let mut cross_raw = 0usize; // crossings on the RAW (unsimplified) A* path — attributes the gap
-    let mut cross_after_door = 0usize; // AFTER crossings whose segment passes through a door cell
-    // Floor adherence: the wall metric is blind to horizontal surfaces (see
-    // `count_floor_violations`), so track how much of each drawn route is nowhere near a floor.
-    let (mut fs_total, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
-    let mut fs_at: FloorWorst = None;
-    // Ledge legality: the floor UNDER the drawn line must be continuous within one climb step.
-    let (mut lg_total, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
-    // Offending legs, so a failure is a place to go LOOK at rather than a number.
-    let mut bad_walls: Vec<(Vec3, Vec3, usize, Vec<(Vec3, bool)>)> = Vec::new();
-    let mut attempts = 0usize;
-    let mut example: Option<(Vec3, Vec3)> = None;
+    let jobs = verification_jobs(grid.nodes());
+    let scratch_mib = grid.nodes().saturating_mul(16) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "  [verify] route proof: {jobs} CPU worker(s), about {scratch_mib:.0} MiB scratch each"
+    );
+
+    // Build the exact deterministic leg list first. Parallel execution below consumes this list in
+    // order-preserving chunks, so counts, first examples and failure details remain byte-for-byte
+    // deterministic regardless of worker scheduling.
+    let mut legs: Vec<(Vec3, Vec3)> = Vec::with_capacity(want);
     let mut i = 0usize;
-    while attempts < want && i < want * 8 {
+    while legs.len() < want && i < want * 8 {
         let si = i.wrapping_mul(sa) % n;
         let di = (i.wrapping_mul(sb) + 1) % n;
         i += 1;
@@ -2880,56 +3175,154 @@ fn self_check(baked: &Baked, dir: &Path) {
         if span2 < min_span2 {
             continue;
         }
-        attempts += 1;
-        let (a, b) = (world(&s), world(&d));
-        if let Some((raw, simp)) = grid.route_debug(a, b, &mut sc_a) {
-            routes_after += 1;
-            let (segs, cr) = count_wall_crossings(&simp, &baked.wall_bvh);
-            segs_after += segs;
-            cross_after += cr;
-            // Attribute the crossing: does the offending segment pass through a DOOR cell? A door
-            // frame is a wall the router is ALLOWED to cross (you open the door), so a graze there
-            // is not a violation of "never cross a wall a player can't pass".
-            let cr_door = count_door_crossings(&simp, baked);
-            cross_after_door += cr_door;
-            let (_, cr_raw) = count_wall_crossings(&raw, &baked.wall_bvh);
-            cross_raw += cr_raw;
-            let (ln, lb, lw) = count_ledge_violations(&simp, &grid);
-            lg_total += ln;
-            lg_bad += lb;
-            lg_worst = lg_worst.max(lw);
-            let (n, nb, w, wat) = count_floor_violations(&simp, &grid);
-            fs_total += n;
-            fs_bad += nb;
-            if w > fs_worst {
-                fs_worst = w;
-                fs_at = wat;
-            }
-            if cr > cr_door && bad_walls.len() < 8 {
-                let at = locate_crossings(
-                    &simp,
-                    &baked.wall_bvh,
-                    baked.res,
-                    &baked.door,
-                    baked.nx,
-                    baked.nz,
-                    baked.min_x,
-                    baked.min_z,
-                    4,
-                );
-                bad_walls.push((a, b, cr - cr_door, at));
-            }
+        legs.push((world(&s), world(&d)));
+    }
+
+    #[derive(Default)]
+    struct AfterCheck {
+        routed: bool,
+        segs: usize,
+        cross: usize,
+        cross_raw: usize,
+        cross_door: usize,
+        lg_total: usize,
+        lg_bad: usize,
+        lg_worst: f32,
+        fs_total: usize,
+        fs_bad: usize,
+        fs_worst: f32,
+        fs_at: FloorWorst,
+        bad_wall: Option<(Vec3, Vec3, usize, Vec<(Vec3, bool)>)>,
+    }
+
+    let t_after = Instant::now();
+    let after_batches: Vec<Vec<AfterCheck>> = legs
+        .par_chunks(verification_chunk_len(legs.len(), jobs))
+        .map(|batch| {
+            let mut scratch = Scratch::new(grid.nodes());
+            batch
+                .iter()
+                .map(|&(a, b)| {
+                    let Some((raw, simp)) = grid.route_debug(a, b, &mut scratch) else {
+                        return AfterCheck::default();
+                    };
+                    let (segs, cross) = count_wall_crossings(&simp, &baked.wall_bvh);
+                    // Attribute the crossing: does the offending segment pass through a DOOR cell?
+                    let cross_door = count_door_crossings(&simp, baked);
+                    let (_, cross_raw) = count_wall_crossings(&raw, &baked.wall_bvh);
+                    let (lg_total, lg_bad, lg_worst) = count_ledge_violations(&simp, &grid);
+                    let (fs_total, fs_bad, fs_worst, fs_at) = count_floor_violations(&simp, &grid);
+                    let bad_wall = (cross > cross_door).then(|| {
+                        let at = locate_crossings(
+                            &simp,
+                            &baked.wall_bvh,
+                            baked.res,
+                            &baked.door,
+                            baked.nx,
+                            baked.nz,
+                            baked.min_x,
+                            baked.min_z,
+                            4,
+                        );
+                        (a, b, cross - cross_door, at)
+                    });
+                    AfterCheck {
+                        routed: true,
+                        segs,
+                        cross,
+                        cross_raw,
+                        cross_door,
+                        lg_total,
+                        lg_bad,
+                        lg_worst,
+                        fs_total,
+                        fs_bad,
+                        fs_worst,
+                        fs_at,
+                        bad_wall,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    let (mut routes_after, mut routes_before) = (0usize, 0usize);
+    let (mut segs_after, mut segs_before) = (0usize, 0usize);
+    let (mut cross_after, mut cross_before) = (0usize, 0usize);
+    let mut cross_raw = 0usize; // crossings on the RAW (unsimplified) A* path — attributes the gap
+    let mut cross_after_door = 0usize; // AFTER crossings whose segment passes through a door cell
+                                       // Floor adherence: the wall metric is blind to horizontal surfaces (see
+                                       // `count_floor_violations`), so track how much of each drawn route is nowhere near a floor.
+    let (mut fs_total, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
+    let mut fs_at: FloorWorst = None;
+    // Ledge legality: the floor UNDER the drawn line must be continuous within one climb step.
+    let (mut lg_total, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
+    // Offending legs, so a failure is a place to go LOOK at rather than a number.
+    let mut bad_walls: Vec<(Vec3, Vec3, usize, Vec<(Vec3, bool)>)> = Vec::new();
+    let attempts = legs.len();
+    let mut example: Option<(Vec3, Vec3)> = None;
+    for result in after_batches.into_iter().flatten() {
+        routes_after += result.routed as usize;
+        segs_after += result.segs;
+        cross_after += result.cross;
+        cross_after_door += result.cross_door;
+        cross_raw += result.cross_raw;
+        lg_total += result.lg_total;
+        lg_bad += result.lg_bad;
+        lg_worst = lg_worst.max(result.lg_worst);
+        fs_total += result.fs_total;
+        fs_bad += result.fs_bad;
+        if result.fs_worst > fs_worst {
+            fs_worst = result.fs_worst;
+            fs_at = result.fs_at;
         }
-        if let Some((poly, _)) = grid_before.path(a, b, &mut sc_b, None) {
-            routes_before += 1;
-            let (segs, cr) = count_wall_crossings(&poly, &baked.wall_bvh);
-            segs_before += segs;
-            cross_before += cr;
-            if cr > 0 && example.is_none() {
-                example = Some((a, b)); // a leg the OLD router threaded through a wall
+        if bad_walls.len() < 8 {
+            if let Some(bad) = result.bad_wall {
+                bad_walls.push(bad);
             }
         }
     }
+    let after_secs = t_after.elapsed().as_secs_f32();
+
+    #[derive(Default)]
+    struct BeforeCheck {
+        routed: bool,
+        segs: usize,
+        cross: usize,
+        example: Option<(Vec3, Vec3)>,
+    }
+    let t_before = Instant::now();
+    let before_batches: Vec<Vec<BeforeCheck>> = legs
+        .par_chunks(verification_chunk_len(legs.len(), jobs))
+        .map(|batch| {
+            let mut scratch = Scratch::new(grid_before.nodes());
+            batch
+                .iter()
+                .map(|&(a, b)| {
+                    let Some((poly, _)) = grid_before.path(a, b, &mut scratch, None) else {
+                        return BeforeCheck::default();
+                    };
+                    let (segs, cross) = count_wall_crossings(&poly, &baked.wall_bvh);
+                    BeforeCheck {
+                        routed: true,
+                        segs,
+                        cross,
+                        example: (cross > 0).then_some((a, b)),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    for result in before_batches.into_iter().flatten() {
+        routes_before += result.routed as usize;
+        segs_before += result.segs;
+        cross_before += result.cross;
+        if example.is_none() {
+            example = result.example; // first leg the OLD router threaded through a wall
+        }
+    }
+    let before_secs = t_before.elapsed().as_secs_f32();
+    eprintln!("  [verify] route proof timing: AFTER {after_secs:.2}s; BEFORE {before_secs:.2}s");
 
     eprintln!(
         "  [verify] machine proof: {attempts} legs attempted; routed AFTER {routes_after} / BEFORE {routes_before} ({:.0}% reachable)",
@@ -2989,9 +3382,18 @@ fn self_check(baked: &Baked, dir: &Path) {
             "  [verify] PASS: ZERO impassable-wall crossings across all {routes_after} simplified routes ({cross_after_door} door-frame graze(s) excluded — doors are passable)"
         );
     } else {
-        eprintln!("  [verify] FAIL: {cross_after_walls} wall-crossing(s) remain on the simplified routes");
+        eprintln!(
+            "  [verify] FAIL: {cross_after_walls} wall-crossing(s) remain on the simplified routes"
+        );
     }
-    loot_plan_check(baked, dir, &grid);
+    let t_loot = Instant::now();
+    loot_plan_check(baked, dir, &grid, jobs);
+    eprintln!(
+        "  [verify] timing: machine proof {:.2}s; loot plans {:.2}s; total {:.2}s",
+        after_secs + before_secs,
+        t_loot.elapsed().as_secs_f32(),
+        t_verify.elapsed().as_secs_f32()
+    );
 }
 
 // ---- CLI entry: `atlas check-nav <pack_dir> --to "<exfil>" [--side ...]` -----------------------
@@ -3017,8 +3419,10 @@ pub fn run_check_cli(args: &[String]) -> i32 {
             "--from" => {
                 i += 1;
                 let parsed = args.get(i).and_then(|v| {
-                    let n: Vec<f32> =
-                        v.split(',').filter_map(|t| t.trim().parse::<f32>().ok()).collect();
+                    let n: Vec<f32> = v
+                        .split(',')
+                        .filter_map(|t| t.trim().parse::<f32>().ok())
+                        .collect();
                     (n.len() == 3).then(|| Vec3::new(n[0], n[1], n[2]))
                 });
                 match parsed {
@@ -3087,23 +3491,36 @@ pub fn run_check_cli(args: &[String]) -> i32 {
     // Locale: the serialized exfil id -> English display name (tarkov.dev `maps_en`), so `--to`
     // accepts either. Missing cache is fine; matching then falls back to the serialized name.
     let locale: serde_json::Value = std::fs::read_to_string(
-        crate::paths::shared_dir().join(".tarkov-json-cache").join("maps_en.json"),
+        crate::paths::shared_dir()
+            .join(".tarkov-json-cache")
+            .join("maps_en.json"),
     )
     .ok()
     .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
     .and_then(|v| v.get("data").cloned())
     .unwrap_or(serde_json::Value::Null);
     let display = |name: &str| -> String {
-        locale.get(name).and_then(|v| v.as_str()).unwrap_or(name).to_string()
+        locale
+            .get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or(name)
+            .to_string()
     };
 
     let empty = vec![];
-    let exfils = gd.get("exfils").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let exfils = gd
+        .get("exfils")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
     let want_s = want.unwrap_or_default();
     let wl = want_s.to_lowercase();
     let mut targets: Vec<(String, String, Vec3)> = Vec::new();
     for e in exfils {
-        let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let name = e
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let disp = display(&name);
         let p = e.get("pos").and_then(|v| v.as_array());
         let Some(p) = p else { continue };
@@ -3133,7 +3550,10 @@ pub fn run_check_cli(args: &[String]) -> i32 {
     // gantry or onto a roof, so this names the offending legs (and the height they reach) instead
     // of leaving "the path goes up in the air" to be diagnosed by eye.
     if side == "patrols" {
-        let ways = gd.get("patrol_ways").and_then(|v| v.as_array()).unwrap_or(&empty);
+        let ways = gd
+            .get("patrol_ways")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty);
         let pt = |v: &serde_json::Value| -> Option<Vec3> {
             let a = v.as_array()?;
             if a.len() < 3 {
@@ -3149,12 +3569,16 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         let (mut legs, mut routed, mut climbers) = (0usize, 0usize, 0usize);
         let mut worst: Vec<(f32, Vec3, Vec3, Vec3)> = Vec::new();
         for w in ways {
-            let Some(pts) = w.get("points").and_then(|v| v.as_array()) else { continue };
+            let Some(pts) = w.get("points").and_then(|v| v.as_array()) else {
+                continue;
+            };
             let ps: Vec<Vec3> = pts.iter().filter_map(pt).collect();
             for pair in ps.windows(2) {
                 let (a, b) = (pair[0], pair[1]);
                 legs += 1;
-                let Some((poly, _)) = grid.path(a, b, &mut sc, None) else { continue };
+                let Some((poly, _)) = grid.path(a, b, &mut sc, None) else {
+                    continue;
+                };
                 routed += 1;
                 let base = a.y.max(b.y);
                 let mut top = f32::NEG_INFINITY;
@@ -3202,7 +3626,8 @@ pub fn run_check_cli(args: &[String]) -> i32 {
     );
     // Extent + vertical band per component. "8034 components" is a number; "this 122k-node island
     // spans the whole map but only 2 m of height" is a diagnosis.
-    let mut bbox: Vec<(Vec3, Vec3)> = vec![(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); comp_sizes.len()];
+    let mut bbox: Vec<(Vec3, Vec3)> =
+        vec![(Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)); comp_sizes.len()];
     for (n, &lb) in comp.iter().enumerate() {
         if lb < 0 {
             continue;
@@ -3235,7 +3660,12 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         ),
     };
     for (name, disp, tgt) in &targets {
-        println!("  exfil {:<26} {} -> {}", name, disp, comp_desc(comp_of(*tgt)));
+        println!(
+            "  exfil {:<26} {} -> {}",
+            name,
+            disp,
+            comp_desc(comp_of(*tgt))
+        );
     }
 
     // --loot: run the REAL planner over this pack's own loot and hold the tours to the properties
@@ -3263,7 +3693,11 @@ pub fn run_check_cli(args: &[String]) -> i32 {
             for e in gd.get(key).and_then(|v| v.as_array()).unwrap_or(&empty) {
                 let Some(pos) = pt(e) else { continue };
                 cands.push(crate::planner::Cand {
-                    name: e.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                    name: e
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
                     value: 10_000,
                     score_value: 10_000.0,
                     pos,
@@ -3299,7 +3733,10 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         }
         let want = 12usize.min(starts.len());
         let stride = (starts.len() / want).max(1);
-        println!("\n=== loot plans ({want} start(s), {} candidate stop(s)) ===", cands.len());
+        println!(
+            "\n=== loot plans ({want} start(s), {} candidate stop(s)) ===",
+            cands.len()
+        );
         let (mut solved, mut refused) = (0usize, 0usize);
         // Bucketed by CAUSE. "7 refused" on its own reads as a routing failure, and on interchange
         // it is not one: every refusal there is this harness's own budget (1800 s, 12 stops, every
@@ -3312,7 +3749,15 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         let (mut selfx, mut walked, mut straight) = (0usize, 0.0f32, 0.0f32);
         for i in 0..want {
             let start = starts[(i * stride) % starts.len()];
-            match crate::planner::solve(&grid, start, cands.clone(), ex_all.clone(), 12, 1800.0, None) {
+            match crate::planner::solve(
+                &grid,
+                start,
+                cands.clone(),
+                ex_all.clone(),
+                12,
+                1800.0,
+                None,
+            ) {
                 Ok(plan) => {
                     solved += 1;
                     walked += plan.total_dist;
@@ -3396,7 +3841,10 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         let mut sc = Scratch::new(grid.nodes());
         let mut rc = 0;
         let fc = comp_of(from);
-        println!("\n=== from [{:.1}, {:.1}, {:.1}] ===", from.x, from.y, from.z);
+        println!(
+            "\n=== from [{:.1}, {:.1}, {:.1}] ===",
+            from.x, from.y, from.z
+        );
         println!("  component: {}", comp_desc(fc));
         if let Some(c) = fc {
             let (lo, hi) = bbox[c as usize];
@@ -3483,7 +3931,10 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         return rc;
     }
 
-    let spawns = gd.get("spawn_points").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let spawns = gd
+        .get("spawn_points")
+        .and_then(|v| v.as_array())
+        .unwrap_or(&empty);
     let mut sc = Scratch::new(grid.nodes());
     let mut rc = 0;
 
@@ -3492,7 +3943,11 @@ pub fn run_check_cli(args: &[String]) -> i32 {
         let mut fail: Vec<(String, String, Vec3)> = Vec::new();
         let mut skipped = 0usize;
         for s in spawns {
-            let sside = s.get("side").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+            let sside = s
+                .get("side")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
             // `--side player` selects where a HUMAN actually starts, which is not the same set as
             // `--side pmc`. On streets the 40 `side=pmc` points carry categories bit8/bit16/bit32
             // and no `player` at all, while the 241 real player starts are `side=all` with
@@ -3511,7 +3966,9 @@ pub fn run_check_cli(args: &[String]) -> i32 {
             if !keep {
                 continue;
             }
-            let Some(p) = s.get("pos").and_then(|v| v.as_array()) else { continue };
+            let Some(p) = s.get("pos").and_then(|v| v.as_array()) else {
+                continue;
+            };
             if p.len() < 3 {
                 continue;
             }
@@ -3520,7 +3977,11 @@ pub fn run_check_cli(args: &[String]) -> i32 {
                 p[1].as_f64().unwrap_or(0.0) as f32,
                 p[2].as_f64().unwrap_or(0.0) as f32,
             );
-            let sname = s.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let sname = s
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string();
             match grid.path(from, *tgt, &mut sc, None) {
                 Some((pts, _)) if pts.len() >= 2 => ok += 1,
                 _ => {
@@ -3530,7 +3991,11 @@ pub fn run_check_cli(args: &[String]) -> i32 {
             }
         }
         let total = ok + fail.len() + skipped;
-        let pct = if total > 0 { 100.0 * ok as f32 / total as f32 } else { 0.0 };
+        let pct = if total > 0 {
+            100.0 * ok as f32 / total as f32
+        } else {
+            0.0
+        };
         println!(
             "\n=== {} ({}) at [{:.1}, {:.1}, {:.1}] ===",
             disp, name, tgt.x, tgt.y, tgt.z
@@ -3683,7 +4148,11 @@ mod tests {
     /// i.e. it invents a walkable surface in mid-air, the exact artifact this bake exists to avoid.
     fn assert_outward(verts: &[Vec3], idx: &[[u32; 3]], centre: Vec3, what: &str) {
         for (i, t) in idx.iter().enumerate() {
-            let (a, b, c) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+            let (a, b, c) = (
+                verts[t[0] as usize],
+                verts[t[1] as usize],
+                verts[t[2] as usize],
+            );
             let n = (b - a).cross(c - a);
             // A lat/long sphere collapses all SEGS vertices onto each pole, so the polar band is
             // made of zero-area triangles with no meaningful orientation. `add_collider_tris`
@@ -3768,11 +4237,31 @@ mod tests {
         // A deterministic spread of awkward triangles: axis-aligned, oblique, thin slivers, and
         // the tall thin vertical facade that actually broke this (24 m of wall, 0.3 m of width).
         let tris = [
-            (Vec3::new(0.0, -12.0, 0.0), Vec3::new(0.0, 12.0, 0.0), Vec3::new(0.3, 12.0, 0.2)),
-            (Vec3::new(-1.0, 0.1, -1.0), Vec3::new(1.0, 0.1, -1.0), Vec3::new(0.0, 0.1, 1.0)),
-            (Vec3::new(-2.0, -2.0, -2.0), Vec3::new(2.0, 1.0, -0.5), Vec3::new(0.1, 2.0, 1.7)),
-            (Vec3::new(0.4, -3.0, 0.4), Vec3::new(0.41, 3.0, 0.4), Vec3::new(0.4, 0.0, 0.41)),
-            (Vec3::new(-5.0, 0.6, 0.2), Vec3::new(5.0, 0.6, 0.25), Vec3::new(0.0, 0.65, 0.3)),
+            (
+                Vec3::new(0.0, -12.0, 0.0),
+                Vec3::new(0.0, 12.0, 0.0),
+                Vec3::new(0.3, 12.0, 0.2),
+            ),
+            (
+                Vec3::new(-1.0, 0.1, -1.0),
+                Vec3::new(1.0, 0.1, -1.0),
+                Vec3::new(0.0, 0.1, 1.0),
+            ),
+            (
+                Vec3::new(-2.0, -2.0, -2.0),
+                Vec3::new(2.0, 1.0, -0.5),
+                Vec3::new(0.1, 2.0, 1.7),
+            ),
+            (
+                Vec3::new(0.4, -3.0, 0.4),
+                Vec3::new(0.41, 3.0, 0.4),
+                Vec3::new(0.4, 0.0, 0.41),
+            ),
+            (
+                Vec3::new(-5.0, 0.6, 0.2),
+                Vec3::new(5.0, 0.6, 0.25),
+                Vec3::new(0.0, 0.65, 0.3),
+            ),
         ];
         let h = Vec3::new(0.55, 1.075, 0.55);
         let mut checked = 0usize;
@@ -3823,8 +4312,14 @@ mod tests {
                 if v <= MISS_HALF {
                     seen_miss = true;
                 } else {
-                    assert!(!seen_miss, "{what}: cell {c} layer {l} is a floor AFTER a MISS");
-                    assert!(v >= prev, "{what}: cell {c} layer {l} breaks ascending order");
+                    assert!(
+                        !seen_miss,
+                        "{what}: cell {c} layer {l} is a floor AFTER a MISS"
+                    );
+                    assert!(
+                        v >= prev,
+                        "{what}: cell {c} layer {l} breaks ascending order"
+                    );
                     prev = v;
                 }
             }
@@ -3842,9 +4337,16 @@ mod tests {
         let mid = (nz / 2) * nx + nx / 2;
         h[mid * k + 1] = 18.0;
         let removed = filter_ledge_spans(&mut h, nx, nz, k);
-        assert!(removed > 0, "the pillar top should have been removed as a ledge");
+        assert!(
+            removed > 0,
+            "the pillar top should have been removed as a ledge"
+        );
         assert_invariant(&h, k, "after filter_ledge_spans");
-        assert_eq!(h[mid * k], 10.0, "ground must survive and compact to layer 0");
+        assert_eq!(
+            h[mid * k],
+            10.0,
+            "ground must survive and compact to layer 0"
+        );
         assert!(h[mid * k + 1] <= MISS_HALF, "the pillar top must be gone");
     }
 }
