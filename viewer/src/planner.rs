@@ -379,25 +379,32 @@ pub(crate) fn solve(
     // ---- phase 0: ONE bounded Dijkstra flood from the start prunes unreachable candidates
     // up front. Without this, every shelf/roof loot point that isn't on the nav mesh cost a
     // full EXHAUSTIVE failed A* during threading (seconds each — the planner looked hung).
-    let mut field_s = crate::nav::pooled_scratch(grid.nodes());
     let walk_budget_m = ((budget - EXTRACT_BUFFER_S).max(60.0) * WALK_MPS).max(200.0);
-    if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
-        return Err("start is off the walkable mesh".into());
-    }
-    let cands: Vec<Cand> = cands
-        .into_iter()
-        .filter(|c| grid.field_dist(&field_s, c.pos).is_some())
-        .collect();
-    if cands.is_empty() {
-        return Err("no reachable loot above the value filter within the budget".into());
-    }
-    let extracts: Vec<(String, Vec3)> = extracts
-        .into_iter()
-        .filter(|e| grid.field_dist(&field_s, e.1).is_some())
-        .collect();
-    if extracts.is_empty() {
-        return Err("no reachable extract within the budget".into());
-    }
+    // Keep the phase-0 scratch inside this scope so it returns to the pool before phase 2b or
+    // phase 3 borrows another full-grid buffer. On large maps one Scratch is hundreds of MB; the
+    // old function-wide lifetime kept up to three alive per solve and made safe parallel
+    // verification prohibitively memory hungry even though the phases never overlap.
+    let (cands, extracts) = {
+        let mut field_s = crate::nav::pooled_scratch(grid.nodes());
+        if !grid.dijkstra_field(start, walk_budget_m * 1.4, &mut field_s) {
+            return Err("start is off the walkable mesh".into());
+        }
+        let cands: Vec<Cand> = cands
+            .into_iter()
+            .filter(|c| grid.field_dist(&field_s, c.pos).is_some())
+            .collect();
+        if cands.is_empty() {
+            return Err("no reachable loot above the value filter within the budget".into());
+        }
+        let extracts: Vec<(String, Vec3)> = extracts
+            .into_iter()
+            .filter(|e| grid.field_dist(&field_s, e.1).is_some())
+            .collect();
+        if extracts.is_empty() {
+            return Err("no reachable extract within the budget".into());
+        }
+        (cands, extracts)
+    };
 
     // Initial extract anchor: the one nearest the start (the final extract is re-picked after
     // the stops are chosen — a run drifting across the map should end at the FAR side's exit).

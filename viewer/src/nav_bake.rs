@@ -2650,6 +2650,44 @@ fn tour_self_crossings(stops: &[Vec3]) -> usize {
     n
 }
 
+/// Number of independent verification workers to use for one grid.
+///
+/// Every worker owns one [`Scratch`] (four 4-byte arrays per nav node), which is about 396 MiB on
+/// Customs. Blindly using Rayon's full machine-wide thread count can therefore exhaust RAM on the
+/// exact large maps whose verification takes longest. Cap the default at four CPUs and a 1 GiB
+/// aggregate scratch budget. Advanced benchmarkers can tune the two caps without changing output.
+fn verification_jobs(nodes: usize) -> usize {
+    const BYTES_PER_NODE: usize = 16;
+    const DEFAULT_MEMORY_MIB: usize = 1024;
+    const MAX_AUTO_JOBS: usize = 4;
+
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let memory_mib = std::env::var("EFT_NAV_VERIFY_MEMORY_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MEMORY_MIB);
+    let per_worker = nodes.saturating_mul(BYTES_PER_NODE).max(1);
+    let memory_jobs = memory_mib
+        .saturating_mul(1024 * 1024)
+        .checked_div(per_worker)
+        .unwrap_or(1)
+        .max(1);
+    let automatic = cpus.min(MAX_AUTO_JOBS).min(memory_jobs).max(1);
+    std::env::var("EFT_NAV_VERIFY_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(automatic)
+        .min(cpus)
+        .min(memory_jobs)
+        .max(1)
+}
+
+fn verification_chunk_len(items: usize, jobs: usize) -> usize {
+    items.div_ceil(jobs.max(1)).max(1)
+}
+
 /// Route the map's REAL loot runs and hold them to the same wall/floor/ledge rules as the random
 /// legs. Worth doing separately because random walkable cells are overwhelmingly open street: the
 /// planner's stops are containers and loose spawns, which sit indoors, in corners, on shelves and
@@ -2658,9 +2696,13 @@ fn tour_self_crossings(stops: &[Vec3]) -> usize {
 ///
 /// Runs the shipped planner (`planner::solve`), not a reimplementation of it, so the thing under
 /// test is the stitched multi-leg tour the user actually sees, seams included.
-fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
-    let Ok(txt) = std::fs::read_to_string(dir.join("gamedata.json")) else { return };
-    let Ok(gd) = serde_json::from_str::<serde_json::Value>(&txt) else { return };
+fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid, jobs: usize) {
+    let Ok(txt) = std::fs::read_to_string(dir.join("gamedata.json")) else {
+        return;
+    };
+    let Ok(gd) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return;
+    };
     let pt = |v: &serde_json::Value| -> Option<Vec3> {
         let a = v.get("pos")?.as_array()?;
         (a.len() >= 3).then(|| {
@@ -2677,7 +2719,11 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
         for e in gd.get(key).and_then(|v| v.as_array()).unwrap_or(&empty) {
             let Some(pos) = pt(e) else { continue };
             cands.push(crate::planner::Cand {
-                name: e.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string(),
+                name: e
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
                 value: 10_000,
                 score_value: 10_000.0,
                 pos,
@@ -2690,9 +2736,7 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
         .and_then(|v| v.as_array())
         .unwrap_or(&empty)
         .iter()
-        .filter_map(|e| {
-            Some((e.get("name")?.as_str()?.to_string(), pt(e)?))
-        })
+        .filter_map(|e| Some((e.get("name")?.as_str()?.to_string(), pt(e)?)))
         .collect();
     if cands.len() < 8 || extracts.is_empty() {
         return;
@@ -2716,6 +2760,89 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
     }
     let want = 12usize.min(spawns.len());
     let stride = (spawns.len() / want).max(1);
+    let starts: Vec<Vec3> = (0..want)
+        .map(|i| spawns[(i * stride) % spawns.len()])
+        .collect();
+
+    #[derive(Default)]
+    struct LootCheck {
+        planned: bool,
+        failed: bool,
+        stops: usize,
+        metres: f32,
+        segs: usize,
+        cross: usize,
+        cross_door: usize,
+        selfx: usize,
+        straight: f32,
+        lg_n: usize,
+        lg_bad: usize,
+        lg_worst: f32,
+        fs_n: usize,
+        fs_bad: usize,
+        fs_worst: f32,
+        worst_leg: Option<(Vec3, usize)>,
+    }
+
+    let t_plans = Instant::now();
+    // `par_chunks`, rather than one Rayon task per spawn, bounds concurrent full-grid scratch
+    // buffers to `jobs`. Each chunk is serial internally and results collect in original spawn
+    // order, so the first-offender report remains deterministic.
+    let batches: Vec<Vec<LootCheck>> = starts
+        .par_chunks(verification_chunk_len(starts.len(), jobs))
+        .map(|batch| {
+            batch
+                .iter()
+                .map(|&start| {
+                    let Ok(plan) = crate::planner::solve(
+                        grid,
+                        start,
+                        cands.clone(),
+                        extracts.clone(),
+                        12,
+                        1800.0,
+                        None,
+                    ) else {
+                        return LootCheck {
+                            failed: true,
+                            ..Default::default()
+                        };
+                    };
+                    // start -> every stop -> the extract it actually ends at. The extract leg is
+                    // part of total_dist, so leaving it out of the straight-line baseline would
+                    // inflate the ratio and make an honest route look like a bad one.
+                    let mut seq: Vec<Vec3> = vec![start];
+                    seq.extend(plan.stops.iter().map(|st| st.pos));
+                    if let Some(e) = extracts.iter().find(|e| e.0 == plan.extract) {
+                        seq.push(e.1);
+                    }
+                    let (segs, cross) = count_wall_crossings(&plan.polyline, &baked.wall_bvh);
+                    let cross_door = count_door_crossings(&plan.polyline, baked);
+                    let (lg_n, lg_bad, lg_worst) = count_ledge_violations(&plan.polyline, grid);
+                    let (fs_n, fs_bad, fs_worst, _) = count_floor_violations(&plan.polyline, grid);
+                    LootCheck {
+                        planned: true,
+                        stops: plan.stops.len(),
+                        metres: plan.total_dist,
+                        segs,
+                        cross,
+                        cross_door,
+                        selfx: tour_self_crossings(&seq),
+                        straight: seq.windows(2).map(|w| w[0].distance(w[1])).sum(),
+                        lg_n,
+                        lg_bad,
+                        lg_worst,
+                        fs_n,
+                        fs_bad,
+                        fs_worst,
+                        worst_leg: (cross > cross_door).then_some((start, cross - cross_door)),
+                        ..Default::default()
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
     let (mut planned, mut failed) = (0usize, 0usize);
     let (mut segs, mut cross, mut cross_door) = (0usize, 0usize, 0usize);
     let (mut stops, mut metres) = (0usize, 0.0f32);
@@ -2723,43 +2850,30 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
     let (mut lg_n, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
     let (mut fs_n, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
     let mut worst_leg: Option<(Vec3, usize)> = None;
-    for i in 0..want {
-        let start = spawns[(i * stride) % spawns.len()];
-        match crate::planner::solve(grid, start, cands.clone(), extracts.clone(), 12, 1800.0, None) {
-            Ok(plan) => {
-                planned += 1;
-                stops += plan.stops.len();
-                metres += plan.total_dist;
-                // start -> every stop -> the extract it actually ends at. The extract leg is
-                // part of total_dist, so leaving it out of the straight-line baseline would
-                // inflate the ratio and make an honest route look like a bad one.
-                let mut seq: Vec<Vec3> = vec![start];
-                seq.extend(plan.stops.iter().map(|st| st.pos));
-                if let Some(e) = extracts.iter().find(|e| e.0 == plan.extract) {
-                    seq.push(e.1);
-                }
-                selfx += tour_self_crossings(&seq);
-                straight_total += seq.windows(2).map(|w| w[0].distance(w[1])).sum::<f32>();
-                let (sg, cr) = count_wall_crossings(&plan.polyline, &baked.wall_bvh);
-                let crd = count_door_crossings(&plan.polyline, baked);
-                segs += sg;
-                cross += cr;
-                cross_door += crd;
-                if cr > crd && worst_leg.is_none() {
-                    worst_leg = Some((start, cr - crd));
-                }
-                let (n, b, w) = count_ledge_violations(&plan.polyline, grid);
-                lg_n += n;
-                lg_bad += b;
-                lg_worst = lg_worst.max(w);
-                let (n2, b2, w2, _) = count_floor_violations(&plan.polyline, grid);
-                fs_n += n2;
-                fs_bad += b2;
-                fs_worst = fs_worst.max(w2);
-            }
-            Err(_) => failed += 1,
+    for result in batches.into_iter().flatten() {
+        planned += result.planned as usize;
+        failed += result.failed as usize;
+        stops += result.stops;
+        metres += result.metres;
+        segs += result.segs;
+        cross += result.cross;
+        cross_door += result.cross_door;
+        selfx += result.selfx;
+        straight_total += result.straight;
+        lg_n += result.lg_n;
+        lg_bad += result.lg_bad;
+        lg_worst = lg_worst.max(result.lg_worst);
+        fs_n += result.fs_n;
+        fs_bad += result.fs_bad;
+        fs_worst = fs_worst.max(result.fs_worst);
+        if worst_leg.is_none() {
+            worst_leg = result.worst_leg;
         }
     }
+    eprintln!(
+        "  [verify] loot plans: evaluated {want} spawn(s) on {jobs} CPU worker(s) in {:.2}s",
+        t_plans.elapsed().as_secs_f32()
+    );
     if planned == 0 {
         eprintln!("  [verify] loot plans: none of {want} spawn(s) could produce a run");
         return;
@@ -2785,13 +2899,16 @@ fn loot_plan_check(baked: &Baked, dir: &Path, grid: &NavGrid) {
         );
     }
     if real == 0 && lg_bad == 0 && fs_bad == 0 {
-        eprintln!("  [verify] loot plans: PASS (no wall crossing, no illegal ledge, never off the floor)");
+        eprintln!(
+            "  [verify] loot plans: PASS (no wall crossing, no illegal ledge, never off the floor)"
+        );
     } else {
         eprintln!("  [verify] loot plans: FAIL");
     }
 }
 
 fn self_check(baked: &Baked, dir: &Path) {
+    let t_verify = Instant::now();
     let Some(grid) = NavGrid::load(dir) else {
         eprintln!("  [verify] FAILED: NavGrid::load returned None on the freshly baked pack");
         return;
@@ -2813,11 +2930,18 @@ fn self_check(baked: &Baked, dir: &Path) {
         }
     }
     if walk.len() < 2 {
-        eprintln!("  [verify] only {} walkable cell(s) — no route to test", walk.len());
+        eprintln!(
+            "  [verify] only {} walkable cell(s) — no route to test",
+            walk.len()
+        );
         return;
     }
     let world = |w: &(usize, usize, f32)| {
-        Vec3::new(baked.min_x + w.0 as f32 * baked.res, w.2, baked.min_z + w.1 as f32 * baked.res)
+        Vec3::new(
+            baked.min_x + w.0 as f32 * baked.res,
+            w.2,
+            baked.min_z + w.1 as f32 * baked.res,
+        )
     };
 
     // Deterministic varied legs: coprime-ish index strides sweep start/dest position, direction and
@@ -2850,25 +2974,18 @@ fn self_check(baked: &Baked, dir: &Path) {
     let sa = coprime((n as f64 * 0.618_033_988_7) as usize);
     let sb = coprime((n as f64 * 0.381_966_011_3) as usize);
     let min_span2 = (8.0f32 / baked.res).powi(2); // non-trivial legs (>= ~8 m)
-    let mut sc_a = Scratch::new(grid.nodes());
-    let mut sc_b = Scratch::new(grid_before.nodes());
-    let (mut routes_after, mut routes_before) = (0usize, 0usize);
-    let (mut segs_after, mut segs_before) = (0usize, 0usize);
-    let (mut cross_after, mut cross_before) = (0usize, 0usize);
-    let mut cross_raw = 0usize; // crossings on the RAW (unsimplified) A* path — attributes the gap
-    let mut cross_after_door = 0usize; // AFTER crossings whose segment passes through a door cell
-    // Floor adherence: the wall metric is blind to horizontal surfaces (see
-    // `count_floor_violations`), so track how much of each drawn route is nowhere near a floor.
-    let (mut fs_total, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
-    let mut fs_at: FloorWorst = None;
-    // Ledge legality: the floor UNDER the drawn line must be continuous within one climb step.
-    let (mut lg_total, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
-    // Offending legs, so a failure is a place to go LOOK at rather than a number.
-    let mut bad_walls: Vec<(Vec3, Vec3, usize, Vec<(Vec3, bool)>)> = Vec::new();
-    let mut attempts = 0usize;
-    let mut example: Option<(Vec3, Vec3)> = None;
+    let jobs = verification_jobs(grid.nodes());
+    let scratch_mib = grid.nodes().saturating_mul(16) as f64 / (1024.0 * 1024.0);
+    eprintln!(
+        "  [verify] route proof: {jobs} CPU worker(s), about {scratch_mib:.0} MiB scratch each"
+    );
+
+    // Build the exact deterministic leg list first. Parallel execution below consumes this list in
+    // order-preserving chunks, so counts, first examples and failure details remain byte-for-byte
+    // deterministic regardless of worker scheduling.
+    let mut legs: Vec<(Vec3, Vec3)> = Vec::with_capacity(want);
     let mut i = 0usize;
-    while attempts < want && i < want * 8 {
+    while legs.len() < want && i < want * 8 {
         let si = i.wrapping_mul(sa) % n;
         let di = (i.wrapping_mul(sb) + 1) % n;
         i += 1;
@@ -2880,56 +2997,154 @@ fn self_check(baked: &Baked, dir: &Path) {
         if span2 < min_span2 {
             continue;
         }
-        attempts += 1;
-        let (a, b) = (world(&s), world(&d));
-        if let Some((raw, simp)) = grid.route_debug(a, b, &mut sc_a) {
-            routes_after += 1;
-            let (segs, cr) = count_wall_crossings(&simp, &baked.wall_bvh);
-            segs_after += segs;
-            cross_after += cr;
-            // Attribute the crossing: does the offending segment pass through a DOOR cell? A door
-            // frame is a wall the router is ALLOWED to cross (you open the door), so a graze there
-            // is not a violation of "never cross a wall a player can't pass".
-            let cr_door = count_door_crossings(&simp, baked);
-            cross_after_door += cr_door;
-            let (_, cr_raw) = count_wall_crossings(&raw, &baked.wall_bvh);
-            cross_raw += cr_raw;
-            let (ln, lb, lw) = count_ledge_violations(&simp, &grid);
-            lg_total += ln;
-            lg_bad += lb;
-            lg_worst = lg_worst.max(lw);
-            let (n, nb, w, wat) = count_floor_violations(&simp, &grid);
-            fs_total += n;
-            fs_bad += nb;
-            if w > fs_worst {
-                fs_worst = w;
-                fs_at = wat;
-            }
-            if cr > cr_door && bad_walls.len() < 8 {
-                let at = locate_crossings(
-                    &simp,
-                    &baked.wall_bvh,
-                    baked.res,
-                    &baked.door,
-                    baked.nx,
-                    baked.nz,
-                    baked.min_x,
-                    baked.min_z,
-                    4,
-                );
-                bad_walls.push((a, b, cr - cr_door, at));
-            }
+        legs.push((world(&s), world(&d)));
+    }
+
+    #[derive(Default)]
+    struct AfterCheck {
+        routed: bool,
+        segs: usize,
+        cross: usize,
+        cross_raw: usize,
+        cross_door: usize,
+        lg_total: usize,
+        lg_bad: usize,
+        lg_worst: f32,
+        fs_total: usize,
+        fs_bad: usize,
+        fs_worst: f32,
+        fs_at: FloorWorst,
+        bad_wall: Option<(Vec3, Vec3, usize, Vec<(Vec3, bool)>)>,
+    }
+
+    let t_after = Instant::now();
+    let after_batches: Vec<Vec<AfterCheck>> = legs
+        .par_chunks(verification_chunk_len(legs.len(), jobs))
+        .map(|batch| {
+            let mut scratch = Scratch::new(grid.nodes());
+            batch
+                .iter()
+                .map(|&(a, b)| {
+                    let Some((raw, simp)) = grid.route_debug(a, b, &mut scratch) else {
+                        return AfterCheck::default();
+                    };
+                    let (segs, cross) = count_wall_crossings(&simp, &baked.wall_bvh);
+                    // Attribute the crossing: does the offending segment pass through a DOOR cell?
+                    let cross_door = count_door_crossings(&simp, baked);
+                    let (_, cross_raw) = count_wall_crossings(&raw, &baked.wall_bvh);
+                    let (lg_total, lg_bad, lg_worst) = count_ledge_violations(&simp, &grid);
+                    let (fs_total, fs_bad, fs_worst, fs_at) = count_floor_violations(&simp, &grid);
+                    let bad_wall = (cross > cross_door).then(|| {
+                        let at = locate_crossings(
+                            &simp,
+                            &baked.wall_bvh,
+                            baked.res,
+                            &baked.door,
+                            baked.nx,
+                            baked.nz,
+                            baked.min_x,
+                            baked.min_z,
+                            4,
+                        );
+                        (a, b, cross - cross_door, at)
+                    });
+                    AfterCheck {
+                        routed: true,
+                        segs,
+                        cross,
+                        cross_raw,
+                        cross_door,
+                        lg_total,
+                        lg_bad,
+                        lg_worst,
+                        fs_total,
+                        fs_bad,
+                        fs_worst,
+                        fs_at,
+                        bad_wall,
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    let (mut routes_after, mut routes_before) = (0usize, 0usize);
+    let (mut segs_after, mut segs_before) = (0usize, 0usize);
+    let (mut cross_after, mut cross_before) = (0usize, 0usize);
+    let mut cross_raw = 0usize; // crossings on the RAW (unsimplified) A* path — attributes the gap
+    let mut cross_after_door = 0usize; // AFTER crossings whose segment passes through a door cell
+                                       // Floor adherence: the wall metric is blind to horizontal surfaces (see
+                                       // `count_floor_violations`), so track how much of each drawn route is nowhere near a floor.
+    let (mut fs_total, mut fs_bad, mut fs_worst) = (0usize, 0usize, 0.0f32);
+    let mut fs_at: FloorWorst = None;
+    // Ledge legality: the floor UNDER the drawn line must be continuous within one climb step.
+    let (mut lg_total, mut lg_bad, mut lg_worst) = (0usize, 0usize, 0.0f32);
+    // Offending legs, so a failure is a place to go LOOK at rather than a number.
+    let mut bad_walls: Vec<(Vec3, Vec3, usize, Vec<(Vec3, bool)>)> = Vec::new();
+    let attempts = legs.len();
+    let mut example: Option<(Vec3, Vec3)> = None;
+    for result in after_batches.into_iter().flatten() {
+        routes_after += result.routed as usize;
+        segs_after += result.segs;
+        cross_after += result.cross;
+        cross_after_door += result.cross_door;
+        cross_raw += result.cross_raw;
+        lg_total += result.lg_total;
+        lg_bad += result.lg_bad;
+        lg_worst = lg_worst.max(result.lg_worst);
+        fs_total += result.fs_total;
+        fs_bad += result.fs_bad;
+        if result.fs_worst > fs_worst {
+            fs_worst = result.fs_worst;
+            fs_at = result.fs_at;
         }
-        if let Some((poly, _)) = grid_before.path(a, b, &mut sc_b, None) {
-            routes_before += 1;
-            let (segs, cr) = count_wall_crossings(&poly, &baked.wall_bvh);
-            segs_before += segs;
-            cross_before += cr;
-            if cr > 0 && example.is_none() {
-                example = Some((a, b)); // a leg the OLD router threaded through a wall
+        if bad_walls.len() < 8 {
+            if let Some(bad) = result.bad_wall {
+                bad_walls.push(bad);
             }
         }
     }
+    let after_secs = t_after.elapsed().as_secs_f32();
+
+    #[derive(Default)]
+    struct BeforeCheck {
+        routed: bool,
+        segs: usize,
+        cross: usize,
+        example: Option<(Vec3, Vec3)>,
+    }
+    let t_before = Instant::now();
+    let before_batches: Vec<Vec<BeforeCheck>> = legs
+        .par_chunks(verification_chunk_len(legs.len(), jobs))
+        .map(|batch| {
+            let mut scratch = Scratch::new(grid_before.nodes());
+            batch
+                .iter()
+                .map(|&(a, b)| {
+                    let Some((poly, _)) = grid_before.path(a, b, &mut scratch, None) else {
+                        return BeforeCheck::default();
+                    };
+                    let (segs, cross) = count_wall_crossings(&poly, &baked.wall_bvh);
+                    BeforeCheck {
+                        routed: true,
+                        segs,
+                        cross,
+                        example: (cross > 0).then_some((a, b)),
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    for result in before_batches.into_iter().flatten() {
+        routes_before += result.routed as usize;
+        segs_before += result.segs;
+        cross_before += result.cross;
+        if example.is_none() {
+            example = result.example; // first leg the OLD router threaded through a wall
+        }
+    }
+    let before_secs = t_before.elapsed().as_secs_f32();
+    eprintln!("  [verify] route proof timing: AFTER {after_secs:.2}s; BEFORE {before_secs:.2}s");
 
     eprintln!(
         "  [verify] machine proof: {attempts} legs attempted; routed AFTER {routes_after} / BEFORE {routes_before} ({:.0}% reachable)",
@@ -2989,9 +3204,18 @@ fn self_check(baked: &Baked, dir: &Path) {
             "  [verify] PASS: ZERO impassable-wall crossings across all {routes_after} simplified routes ({cross_after_door} door-frame graze(s) excluded — doors are passable)"
         );
     } else {
-        eprintln!("  [verify] FAIL: {cross_after_walls} wall-crossing(s) remain on the simplified routes");
+        eprintln!(
+            "  [verify] FAIL: {cross_after_walls} wall-crossing(s) remain on the simplified routes"
+        );
     }
-    loot_plan_check(baked, dir, &grid);
+    let t_loot = Instant::now();
+    loot_plan_check(baked, dir, &grid, jobs);
+    eprintln!(
+        "  [verify] timing: machine proof {:.2}s; loot plans {:.2}s; total {:.2}s",
+        after_secs + before_secs,
+        t_loot.elapsed().as_secs_f32(),
+        t_verify.elapsed().as_secs_f32()
+    );
 }
 
 // ---- CLI entry: `atlas check-nav <pack_dir> --to "<exfil>" [--side ...]` -----------------------
