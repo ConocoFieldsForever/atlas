@@ -1015,6 +1015,7 @@ struct Ctx<'a> {
 fn assets_panel(
     mut contexts: bevy_egui::EguiContexts,
     tab: Res<crate::ui::RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut ab: ResMut<AssetBrowser>,
     pack: Option<Res<crate::render::LoadedPack>>,
@@ -1023,7 +1024,7 @@ fn assets_panel(
 ) {
     use crate::ui_theme as theme;
     use bevy_egui::egui::{self, RichText};
-    if menu.is_some() || *tab != crate::ui::RightPanelTab::Assets {
+    if menu.is_some() || focus.0 || *tab != crate::ui::RightPanelTab::Assets {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else { return };

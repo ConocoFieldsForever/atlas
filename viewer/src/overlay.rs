@@ -642,6 +642,18 @@ impl OverlayPresentation {
 }
 
 impl OverlayConfig {
+    /// Whether the overlay machinery is ON for this session. The master `enabled` switch is the
+    /// consent gate for the opaque panel; a TRANSPARENT launch is that consent given a different
+    /// way, so either one engages. ONE method, because the last time this predicate lived in two
+    /// places they drifted: `apply_overlay` learned the transparent-launch clause and
+    /// `apply_overlay_view_slice` did not, so a transparent session with the master switch off
+    /// summoned the window but never published its view slice -- the panel lens-shift won the
+    /// camera instead and the whole scene sat offset from the game's picture. (Same disease as
+    /// the SSAO/EftPrepassLabel crash: two sites that must agree, with nothing forcing them to.)
+    pub fn engaged(&self, transparent_launch: bool) -> bool {
+        self.enabled || (transparent_launch && !crate::automated_finite_job())
+    }
+
     /// Load from atlas.config.json, falling back to `Default` per field so a partial/older config
     /// still works (same forgiving shape as the other settings readers).
     pub fn load() -> Self {
@@ -765,6 +777,34 @@ pub struct OverlayState {
     pub raise_nonce: u32,
 }
 
+/// True while the overlay is presenting OVER THE GAME: an ESP or transparent session,
+/// summoned, not exited to a window. The map-session furniture (tab rail, side panels, the pick
+/// hint) reads THIS ONE RESOURCE instead of recomputing the predicate, because twice today a
+/// second copy of an overlay predicate drifted from the first (`engaged` in the view slice; the
+/// `cfg.enabled` summon gate) and each time the failure was silent misbehaviour in the field.
+/// A raid overlay wants the game visible, not a settings workstation: what stays is what earns
+/// its pixels over live play -- the labels, the position HUD, the link banners, and the way back.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayFocus(pub bool);
+
+/// Sole writer of [`OverlayFocus`]. Runs before `apply_overlay` in the chain so panels and the
+/// window agree within a frame.
+fn update_overlay_focus(
+    cfg: Res<OverlayConfig>,
+    state: Res<OverlayState>,
+    esp: Res<crate::EspMode>,
+    transparent: Res<crate::TransparentWindow>,
+    mut focus: ResMut<OverlayFocus>,
+) {
+    let v = (esp.0 || transparent.0)
+        && cfg.engaged(transparent.0)
+        && state.shown
+        && !state.windowed;
+    if focus.0 != v {
+        focus.0 = v;
+    }
+}
+
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
@@ -805,11 +845,13 @@ impl Plugin for OverlayPlugin {
                 windowed: false,
                 raise_nonce: 0,
             })
-            .init_resource::<OverlayViewSlice>();
+            .init_resource::<OverlayViewSlice>()
+            .init_resource::<OverlayFocus>();
         if automated {
             app.add_systems(
                 Update,
-                (toggle_overlay, apply_overlay, apply_overlay_view_slice).chain(),
+                (toggle_overlay, update_overlay_focus, apply_overlay, apply_overlay_view_slice)
+                    .chain(),
             );
         } else {
             app.add_systems(
@@ -818,6 +860,7 @@ impl Plugin for OverlayPlugin {
                     focus_atlas_on_startup,
                     summon_transparent_launch,
                     toggle_overlay,
+                    update_overlay_focus,
                     apply_overlay,
                     apply_overlay_view_slice,
                 )
@@ -941,7 +984,7 @@ fn apply_overlay(
     // surprises anyone over their game, but a user who chose Transparent in the menu has already
     // said exactly that. Requiring both silently ate the screenshot summon (field log: "summoning
     // the overlay" fired, no "overlay: shown" ever followed) with nothing telling the user why.
-    let engaged = cfg.enabled || (transparent.0 && !crate::automated_finite_job());
+    let engaged = cfg.engaged(transparent.0);
     let active = engaged && state.shown && !state.windowed;
     let active_changed = *last_active != Some(active);
     let nonce_changed = *last_nonce != Some(state.raise_nonce);
@@ -1273,6 +1316,7 @@ mod overlay_update_mode_tests {
 fn apply_overlay_view_slice(
     cfg: Res<OverlayConfig>,
     state: Res<OverlayState>,
+    transparent: Res<crate::TransparentWindow>,
     view: Res<OverlayViewSlice>,
     mut active: ResMut<crate::render::OverlaySlice>,
 ) {
@@ -1284,7 +1328,7 @@ fn apply_overlay_view_slice(
     // every single frame (and cleared it outright whenever no side panel was up). That frustum is
     // the entire perspective match: without it a marker no longer lands on the game pixel it
     // belongs to, which is the one thing the overlay exists to guarantee.
-    let desired = if cfg.enabled && state.shown && !state.windowed {
+    let desired = if cfg.engaged(transparent.0) && state.shown && !state.windowed {
         view.0
     } else {
         None

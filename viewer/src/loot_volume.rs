@@ -225,6 +225,7 @@ impl Plugin for LootVolumePlugin {
 fn analysis_panel(
     mut contexts: bevy_egui::EguiContexts,
     tab: Res<crate::ui::RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut settings: ResMut<LootVolumeSettings>,
     vol: Res<LootVolume>,
@@ -232,7 +233,7 @@ fn analysis_panel(
 ) {
     use crate::ui_theme as theme;
     use bevy_egui::egui::{self, Color32, RichText};
-    if menu.is_some() || *tab != crate::ui::RightPanelTab::Analysis {
+    if menu.is_some() || focus.0 || *tab != crate::ui::RightPanelTab::Analysis {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else { return };

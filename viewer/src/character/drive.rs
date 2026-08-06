@@ -594,9 +594,13 @@ pub struct PlayerMesh;
 pub fn toggle_view(
     keys: Res<ButtonInput<KeyCode>>,
     ui_kb: Res<crate::inspect::UiWantsKeyboard>,
+    esp: Res<crate::EspMode>,
+    transparent: Res<crate::TransparentWindow>,
     mut cs: ResMut<CharacterSettings>,
 ) {
-    if ui_kb.0 {
+    // Pinned camera in ESP/transparent sessions (see main.rs flycam_look): a third-person
+    // toggle re-frames the view, which is camera control by another name.
+    if ui_kb.0 || esp.0 || transparent.0 {
         return;
     }
     if keys.just_pressed(KeyCode::KeyV) {

@@ -842,6 +842,8 @@ struct GfxUiParams<'w, 's> {
     tab: Res<'w, RightPanelTab>,
     /// Present only in start-menu mode (bare launch) — the panel stands down entirely.
     menu: Option<Res<'w, crate::menu::MenuState>>,
+    /// Overlay presenting over the game — the panel stands down for the raid (OverlayFocus).
+    focus: Res<'w, crate::overlay::OverlayFocus>,
     pack: Option<Res<'w, crate::render::LoadedPack>>,
     /// (pack id, pack path) list, scanned from the packs/ dir beside the current pack. Refreshed
     /// each time the map combo is opened so a mid-session build appears without a relaunch.
@@ -924,8 +926,8 @@ fn layers_panel(
     use bevy_egui::egui::{self, Color32, CollapsingHeader, RichText};
     use crate::pathfind::{RouteRequest, ServerStatus};
     use crate::poi::PoiLayer;
-    if gfx_ui.menu.is_some() {
-        return; // start-menu mode: menu.rs owns the whole screen
+    if gfx_ui.menu.is_some() || gfx_ui.focus.0 {
+        return; // start-menu mode owns the screen; overlay focus hands it to the game
     }
     if *gfx_ui.tab != RightPanelTab::Visibility {
         return; // another tab owns the content panel this frame
@@ -2102,14 +2104,15 @@ fn pos_hud(
 fn toolbar_panel(
     mut contexts: bevy_egui::EguiContexts,
     mut tab: ResMut<RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut go_menu: ResMut<crate::ReturnToMenu>,
     mut confirm_menu: Local<bool>,
 ) {
     use bevy_egui::egui;
     use crate::ui_theme as theme;
-    if menu.is_some() {
-        return; // start menu owns the screen (and themes egui itself)
+    if menu.is_some() || focus.0 {
+        return; // start menu owns the screen; over a raid the game owns it (OverlayFocus)
     }
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -2222,6 +2225,7 @@ fn toolbar_panel(
 fn level_panel(
     mut contexts: bevy_egui::EguiContexts,
     tab: Res<RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     pack: Option<Res<crate::render::LoadedPack>>,
     mut gfx: ResMut<crate::render::GfxSettings>,
@@ -2230,7 +2234,7 @@ fn level_panel(
 ) {
     use bevy_egui::egui::{self, RichText};
     use crate::ui_theme as theme;
-    if menu.is_some() || *tab != RightPanelTab::Level {
+    if menu.is_some() || focus.0 || *tab != RightPanelTab::Level {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -2450,6 +2454,7 @@ fn level_panel(
 fn camera_panel(
     mut contexts: bevy_egui::EguiContexts,
     tab: Res<RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut cam: ResMut<crate::CameraSettings>,
     mut gfx: ResMut<crate::render::GfxSettings>,
@@ -2459,7 +2464,7 @@ fn camera_panel(
     use bevy_egui::egui::{self, RichText};
     use crate::ui_theme as theme;
     use crate::CamMode;
-    if menu.is_some() || *tab != RightPanelTab::Camera {
+    if menu.is_some() || focus.0 || *tab != RightPanelTab::Camera {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {
@@ -2757,11 +2762,12 @@ fn drone_hud(
 fn tasks_tab(
     mut contexts: bevy_egui::EguiContexts,
     tab: Res<RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     mut params: crate::tasks_panel::TasksPanelParams,
 ) {
     use bevy_egui::egui;
-    if menu.is_some() || *tab != RightPanelTab::Tasks {
+    if menu.is_some() || focus.0 || *tab != RightPanelTab::Tasks {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else {

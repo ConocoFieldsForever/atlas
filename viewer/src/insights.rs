@@ -214,6 +214,7 @@ fn draw_crumbs(
 fn insights_panel(
     mut contexts: bevy_egui::EguiContexts,
     tab: Res<crate::ui::RightPanelTab>,
+    focus: Res<crate::overlay::OverlayFocus>,
     menu: Option<Res<crate::menu::MenuState>>,
     pack: Option<Res<crate::render::LoadedPack>>,
     mut ins: ResMut<Insights>,
@@ -221,7 +222,7 @@ fn insights_panel(
 ) {
     use crate::ui_theme as theme;
     use bevy_egui::egui::{self, RichText};
-    if menu.is_some() || *tab != crate::ui::RightPanelTab::Insights {
+    if menu.is_some() || focus.0 || *tab != crate::ui::RightPanelTab::Insights {
         return;
     }
     let Ok(ctx) = contexts.ctx_mut() else { return };

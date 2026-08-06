@@ -100,6 +100,9 @@ pub(crate) struct NavLive<'w> {
     game_link: Option<Res<'w, crate::game_watch::GameLink>>,
     /// Manual PMC/Scav choice for desk planning; the live raid side still wins when known.
     side_choice: Option<ResMut<'w, crate::game_watch::SideChoice>>,
+    /// Overlay presenting over the game — the tab stands down (bundled here for the same
+    /// 16-param reason as ui.rs's GfxUiParams: navigate_tab sits at the system-param limit).
+    focus: Res<'w, crate::overlay::OverlayFocus>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -131,8 +134,8 @@ pub fn navigate_tab(
     mut live: NavLive,
     mut ui_state: Local<NavUiState>,
 ) {
-    if menu.is_some() {
-        return; // start-menu mode owns the screen
+    if menu.is_some() || live.focus.0 {
+        return; // start-menu mode owns the screen; overlay focus hands it to the game
     }
     // In-place map swap: forget the pending extract row (its Entity is from the OLD map).
     if live.epoch.0 != ui_state.last_epoch {

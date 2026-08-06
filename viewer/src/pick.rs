@@ -122,9 +122,12 @@ fn spawn_pick_ui(mut commands: Commands) {
 /// per launch, but it's cheap and keeps the debug hint off the menu screen.
 fn sync_pick_ui_visibility(
     menu: Option<Res<crate::menu::MenuState>>,
+    focus: Res<crate::overlay::OverlayFocus>,
     mut q: Query<&mut Visibility, With<PickReadout>>,
 ) {
-    let want = if menu.is_some() {
+    // Hidden over a raid too (OverlayFocus): "double-click to identify geometry" is a debug hint
+    // for browsing the map, and in an ESP session there is no geometry to identify anyway.
+    let want = if menu.is_some() || focus.0 {
         Visibility::Hidden
     } else {
         Visibility::Visible

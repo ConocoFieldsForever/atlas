@@ -214,9 +214,12 @@ impl Default for CameraSettings {
 fn flycam_scroll(
     scroll: Res<bevy::input::mouse::AccumulatedMouseScroll>,
     pointer_on_ui: Res<inspect::PointerOnUi>,
+    esp: Res<EspMode>,
+    transparent: Res<TransparentWindow>,
     mut settings: ResMut<CameraSettings>,
 ) {
-    if pointer_on_ui.0 || scroll.delta.y == 0.0 {
+    // Speed/tilt tweaks are camera control too — see flycam_look.
+    if esp.0 || transparent.0 || pointer_on_ui.0 || scroll.delta.y == 0.0 {
         return;
     }
     // ~1.15x per notch; clamp so it never crawls or teleports.
@@ -1403,7 +1406,6 @@ fn main() {
             debug_bench_camera.before(bevy::transform::TransformSystems::Propagate),
         )
         .insert_resource(TransparentWindow(transparent_launch))
-        .insert_resource(EspMode(menu::config_bool_pub("espMode").unwrap_or(false)))
         .insert_resource(EspMode(esp_mode))
         .init_resource::<esp_labels::EspLabels>()
         .init_resource::<render::PanelLensShift>()
@@ -1896,10 +1898,17 @@ fn setup(
 fn cursor_grab(
     mouse: Res<ButtonInput<MouseButton>>,
     pointer_on_ui: Res<inspect::PointerOnUi>,
+    esp: Res<EspMode>,
+    transparent: Res<TransparentWindow>,
     // Bevy 0.17 split cursor state out of `Window` into a `CursorOptions` component
     // on the same window entity.
     mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    // Pinned camera (see flycam_look) -- and beyond the pin, LOCKING AND HIDING THE OS CURSOR on
+    // a window that sits over a live game is disorienting in a way plain camera drift is not.
+    if esp.0 || transparent.0 {
+        return;
+    }
     let Ok(mut cursor) = cursors.single_mut() else {
         return;
     };
@@ -1923,8 +1932,19 @@ fn flycam_look(
     motion: Res<AccumulatedMouseMotion>,
     pointer_on_ui: Res<inspect::PointerOnUi>,
     settings: Res<CameraSettings>,
+    esp: Res<EspMode>,
+    transparent: Res<TransparentWindow>,
     mut q: Query<(&mut Transform, &mut FlyCam)>,
 ) {
+    // PINNED CAMERA: in ESP mode -- and in ANY transparent session, the two are independent
+    // flags -- the camera IS the game camera. Its pose comes from screenshot fixes and its fov
+    // from the game, and the marker registration is only as honest as that lock. A drag that
+    // turns the view leaves every label floating over the wrong pixels with nothing on screen to
+    // say why, which is worse than a camera that refuses to move. Same gate on every camera-input
+    // system (WASD, zoom, walk, drone, V); the menu pins its camera the same way (MenuState).
+    if esp.0 || transparent.0 {
+        return;
+    }
     // Drone mode: the camera is bolted to the airframe — mouse X feeds the drone's yaw stick
     // (drone::drone_move), never free-look.
     if !mouse.pressed(MouseButton::Right) || pointer_on_ui.0 || settings.mode == CamMode::Drone {
@@ -1949,11 +1969,14 @@ fn flycam_move(
     time: Res<Time>,
     ui_kb: Res<inspect::UiWantsKeyboard>,
     settings: Res<CameraSettings>,
+    esp: Res<EspMode>,
+    transparent: Res<TransparentWindow>,
     mut q: Query<(&mut Transform, &FlyCam)>,
 ) {
     // Typing 'wasd' into the marker-search box must not fly the camera (Codex review).
     // In walk/drone mode, walk_move / drone_move owns locomotion — fly is inert.
-    if ui_kb.0 || settings.mode != CamMode::Fly {
+    // Pinned camera in ESP/transparent sessions — see flycam_look.
+    if ui_kb.0 || settings.mode != CamMode::Fly || esp.0 || transparent.0 {
         return;
     }
     let dt = time.delta_secs();
@@ -2007,11 +2030,16 @@ fn drone_move(
     time: Res<Time>,
     ui_kb: Res<inspect::UiWantsKeyboard>,
     settings: Res<CameraSettings>,
+    esp: Res<EspMode>,
+    transparent: Res<TransparentWindow>,
     shared: Option<Res<agent_link::AgentShared>>,
     grid: Option<Res<walk_ground::GroundGrid>>,
     mut q: Query<(&mut Transform, &mut FlyCam, &mut drone::DroneRig), With<CullCamera>>,
 ) {
-    if settings.mode != CamMode::Drone {
+    // Pinned camera in ESP/transparent sessions — see flycam_look. Matters doubly here: the
+    // drone rig OVERWRITES the Transform from its own physics every frame, so even without input
+    // it would destroy the screenshot pose the moment the mode was armed.
+    if esp.0 || transparent.0 || settings.mode != CamMode::Drone {
         // Leaving drone mode: the rig respawns fresh at the camera pose next activation.
         for (_, _, mut rig) in &mut q {
             if rig.live {
@@ -2215,11 +2243,14 @@ fn walk_move(
     time: Res<Time>,
     ui_kb: Res<inspect::UiWantsKeyboard>,
     settings: Res<CameraSettings>,
+    esp: Res<EspMode>,
+    transparent: Res<TransparentWindow>,
     grid: Option<Res<walk_ground::GroundGrid>>,
     mut q: Query<(&mut Transform, &FlyCam, &mut walk_ground::WalkState), With<CullCamera>>,
 ) {
     use walk_ground::{EYE_HEIGHT, GRAVITY, KILL_DROP, STEP_UP};
-    if settings.mode != CamMode::Walk {
+    // Pinned camera in ESP/transparent sessions — see flycam_look.
+    if esp.0 || transparent.0 || settings.mode != CamMode::Walk {
         return;
     }
     let Some(grid) = grid else { return }; // still building
