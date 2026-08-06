@@ -32,7 +32,13 @@ if ($running -and -not $SkipBuild) {
 # 1. Version = Cargo.toml package version + short git hash.
 $verLine = Select-String -Path "viewer\Cargo.toml" -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 $ver = $verLine.Matches[0].Groups[1].Value
-$sha = (git rev-parse --short HEAD).Trim()
+# Source archives / delegated workspaces may not carry a root .git directory. Keep local release
+# packaging usable there while preserving the commit suffix for normal clones and CI checkouts.
+$sha = "local"
+if (Test-Path (Join-Path $repo ".git")) {
+    $shaOut = & git rev-parse --short HEAD
+    if ($LASTEXITCODE -eq 0 -and $shaOut) { $sha = $shaOut.Trim() }
+}
 $name = "atlas-$ver-$sha-win64"
 Write-Host "[release] $name"
 

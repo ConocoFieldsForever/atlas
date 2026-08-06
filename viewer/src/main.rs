@@ -18,6 +18,7 @@ mod eftpack;
 mod game_watch;
 mod gpu_lease;
 mod insights;
+mod import_packs;
 mod overlay;
 mod i18n;
 mod inspect;
