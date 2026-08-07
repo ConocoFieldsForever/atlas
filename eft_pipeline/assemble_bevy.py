@@ -692,6 +692,19 @@ def main():
     cfg = MapConfig.load(MAP)
     DS = cfg.dataset
     scene = json.load(open(os.path.join(DS, 'scene.json'), encoding='utf-8'))
+    # Projected decals (StaticDeferredDecal -> quads; extraction/intel/extract_decals.py). They
+    # arrive in the SAME instance schema, so every downstream stage (culls, materials, texcache,
+    # instancing) treats them as ordinary geometry; role='decal' rides the existing BLEND path.
+    _dec_p = os.path.join(DS, 'decals.json')
+    if os.path.exists(_dec_p):
+        try:
+            _dec = json.load(open(_dec_p, encoding='utf-8')).get('instances') or []
+            _live = [d for d in _dec if not d.get('drop')]
+            scene['instances'].extend(_live)
+            print(f"[decals] +{len(_live)} projected-decal quads ({len(_dec) - len(_live)} "
+                  f"scene-disabled kept out)")
+        except (ValueError, OSError) as e:
+            print(f"[decals] decals.json unreadable ({e}) - building without projected decals")
     tex = _TexTest(DS)
 
     # ---- STEP 1: structural culls (culls.Culls -- verbatim) --------------------------------------------------

@@ -944,6 +944,20 @@ def main():
         # at 74.9% for two thirds of a rebuild. The real marker is printed below when the bake runs.
         print("  lighting: portable SH bake (GPU auto, CPU fallback) runs after assemble", flush=True)
 
+    # 4a: projected decals (StaticDeferredDecal -> quads). FAST (reads the game's level files
+    #     directly, minutes) and cached by decals.json presence; --force re-extracts. Optional:
+    #     a failure builds the map without spray paint, never a broken pack.
+    _dec = os.path.join(dataset, "decals.json")
+    if force or not os.path.isfile(_dec):
+        _dlv = dataset_levels(m)
+        if _dlv:
+            run(4, total, "extract projected decals (spray paint / graffiti / stains)",
+                [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_decals.py"), m,
+                 "--dataset=" + dataset, "--levels=" + ",".join(str(x) for x in _dlv)],
+                VIEWER, optional=True)
+    else:
+        print(f"[STAGE 4/{total}] projected decals: present ({_dec})", flush=True)
+
     # 4: assemble the pack (atomic; auto-ships loot/tasks/grade sidecars)
     run(4, total, "assemble pack",
         [PY, "-m", "eft_pipeline.assemble_bevy", m] + sc_flag + keeplods_flag, VIEWER)
