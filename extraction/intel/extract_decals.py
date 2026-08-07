@@ -72,13 +72,21 @@ G3 = np.diag([-1.0, 1.0, 1.0])
 
 
 def write_quad(path):
-    """Two-sided unit quad, XY plane, +/-Z faces, verts at z=+0.01 (a ~centimetre lift against
-    z-fighting once the projector's scale is applied). X-NEGATED like every extractor OBJ, and
-    both windings written so the decal shows regardless of the receiving pipeline's cull mode."""
+    """Two-sided unit quad in the XZ PLANE, facing +/-Y.
+
+    The projector's box spans local X and Z and projects along local Y, not the XY/along-Z that
+    "decal projector" naively suggests. Measured, not assumed: across all 1,269 Interchange
+    projectors the atlas cell's aspect matches |colX|/|colZ| about three times better than
+    |colX|/|colY| (mean |log| error 0.43 vs 1.34), and the checkpoint's own sprays sit in a box
+    scaled (3.53, 0.63, 1.13) against a 469x149 cell whose 3.15 aspect matches 3.53/1.13 = 3.12.
+    Building the quad in XY laid every decal on its side.
+
+    Verts lift +0.01 along Y against z-fighting; X-NEGATED like every extractor OBJ, and both
+    windings are written so the decal shows regardless of the receiving pipeline's cull mode."""
     with open(path, "w", encoding="utf-8") as f:
         f.write("g decal_quad__gen\n")
-        for x, y in ((-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)):
-            f.write("v %g %g 0.01\n" % (-x, y))  # X-negated local frame
+        for x, z in ((-0.5, -0.5), (0.5, -0.5), (0.5, 0.5), (-0.5, 0.5)):
+            f.write("v %g 0.01 %g\n" % (-x, z))  # X-negated local frame, XZ plane
         for u, v in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)):
             f.write("vt %g %g\n" % (u, v))
         # front (as-negated winding) + back, both referencing the same vt
@@ -401,8 +409,12 @@ def main():
                 n_bad_payload += 1
                 continue
             su, sv = (cx2 - cx1) / W, (cy2 - cy1) / H
-            # rect origin is texture TOP-left; UV origin is BOTTOM-left -> flip V
-            ou, ov = cx1 / W, 1.0 - cy2 / H
+            # The rect's Y origin is the texture's BOTTOM-left -- Unity's own texture convention,
+            # NOT the top-left image convention -- so V passes through unflipped. Flipping it
+            # mirrored the row selection: the checkpoint plates rendered the atlas's top rows
+            # ("НЕ ПРОЕХАТЬ", "ЖОПА ОБЪЕЗД") where the game paints its bottom rows ("СТОП STOP",
+            # "UNTAR GO HOME"). Confirmed against a photograph of the real checkpoint.
+            ou, ov = cx1 / W, cy1 / H
             if _trace:
                 print("  [trace] %s: EMITTED at (%.1f, %.1f, %.1f)" % (_tname, pos[0], pos[1], pos[2]))
             instances.append({
