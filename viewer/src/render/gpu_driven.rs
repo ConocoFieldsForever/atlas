@@ -1618,6 +1618,11 @@ impl Plugin for EftGpuDrivenPlugin {
                     reset_gpu_map_if_epoch_changed
                         .in_set(RenderSystems::PrepareResources)
                         .before(prepare_gpu_buffers),
+                    // Same slot, BEFORE prepare: dropping the buffers here means the very next
+                    // prepare in this frame rebuilds them with grass included.
+                    regrow_grass
+                        .in_set(RenderSystems::PrepareResources)
+                        .before(prepare_gpu_buffers),
                     prepare_gpu_buffers.in_set(RenderSystems::PrepareResources),
                     // Loot glow: rewrite the per-instance highlight lane when the overlay's
                     // visible set changed (toggle flip, min-value change, marker respawn).
@@ -3789,6 +3794,11 @@ struct EftGpuBuffers {
     /// quads were really rasterized or not (18.606 vs 18.609 ms), i.e. fill was never the cost.
     /// Dropping the draw range removes the invocations too (~1.75 ms of a 6.3 ms shadow pass).
     grass_mesh_range: Option<(u32, u32)>,
+    /// Grass was OMITTED from this upload (foliage off at load, or the run did not fit the
+    /// binding limit). The buffers are otherwise complete so nothing rebuilds them, which means a
+    /// user who later ticks the foliage box gets a checkbox that does nothing. Recorded here so
+    /// `regrow_grass` can notice the flag turning back on and rebuild once.
+    grass_omitted: bool,
     vertex: Buffer,
     index: Buffer,
     /// Width the index buffer was uploaded in (u16 when every mesh fits under 64Ki vertices).
@@ -4158,7 +4168,39 @@ struct GpuUploadPlan {
     instance_bytes: u64,
 }
 
+/// Rebuild the GPU buffers when foliage is switched ON after a load that omitted it.
+///
+/// `prepare_gpu_buffers` returns early once `EftGpuBuffers` exists, so the grass decision taken at
+/// load time is permanent for that map: load with foliage off, tick the box, and nothing happens
+/// with nothing on screen to say why (field report: "foliage/grass is checked and I also dont see
+/// it"). Dropping the buffers makes the next frame rebuild them with grass included. It fires only
+/// on the OFF -> ON edge of a load that actually omitted grass, so it costs nothing normally and
+/// cannot loop -- the rebuilt buffers carry `grass_omitted = false`.
+///
+/// The other direction needs no rebuild: switching foliage OFF screen-size-culls every clump
+/// immediately, so only ON is the lossy edge.
+fn regrow_grass(
+    mut commands: Commands,
+    buffers: Option<Res<EftGpuBuffers>>,
+    settings: Option<Res<crate::render::GfxSettings>>,
+    mut was_on: Local<Option<bool>>,
+) {
+    let on = settings.as_ref().map(|s| s.grass).unwrap_or(true);
+    let edge_on = *was_on == Some(false) && on;
+    *was_on = Some(on);
+    if !edge_on {
+        return;
+    }
+    let Some(b) = buffers else { return };
+    if !b.grass_omitted {
+        return;
+    }
+    info!("gpu-driven grass: foliage switched on after a load that omitted it - rebuilding buffers");
+    commands.remove_resource::<EftGpuBuffers>();
+}
+
 /// Decide whether this map can be represented by the adapter before creating any large buffers.
+///
 /// If grass alone pushes the instance SSBO over the binding limit, omitting that contiguous run is
 /// a compatible fallback: the rest of the map remains exact and the grass mesh indirect counts are
 /// zeroed. Vertex/index geometry cannot be split without changing the draw architecture, so those
@@ -5761,6 +5803,7 @@ pub(crate) fn prepare_gpu_buffers(
 
     commands.insert_resource(EftGpuBuffers {
         grass_mesh_range: cpu.grass_mesh_range,
+        grass_omitted: upload_plan.omit_grass,
         vertex,
         index,
         indirect,
