@@ -949,11 +949,15 @@ def main():
     #     a failure builds the map without spray paint, never a broken pack.
     _dec = os.path.join(dataset, "decals.json")
     if force or not os.path.isfile(_dec):
+        # dataset_levels returns the levels ALREADY comma-joined (same string the stage-1
+        # extraction passes). Re-joining it iterated the string CHARACTER by character and
+        # produced "5,2,,,5,4,,,..." -- which only ever failed from the build, never from a
+        # hand-run that passed --levels itself.
         _dlv = dataset_levels(m)
         if _dlv:
             run(4, total, "extract projected decals (spray paint / graffiti / stains)",
                 [PY_UNITY, os.path.join(VIEWER, "extraction", "intel", "extract_decals.py"), m,
-                 "--dataset=" + dataset, "--levels=" + ",".join(str(x) for x in _dlv)],
+                 "--dataset=" + dataset, "--levels=" + _dlv],
                 VIEWER, optional=True)
     else:
         print(f"[STAGE 4/{total}] projected decals: present ({_dec})", flush=True)
