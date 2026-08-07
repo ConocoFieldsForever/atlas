@@ -820,6 +820,11 @@ struct GdSpawn {
     /// routing must key on side+mask (`gd_spawn_layer`), never on this flag.
     #[serde(default)]
     ai: bool,
+    /// Unity enabled-chain verdict (GameObject ancestors + component m_Enabled), stamped by the
+    /// extractor since 2026-08-07. Absent in older packs = assume live, which is what those
+    /// packs were already claiming implicitly.
+    #[serde(default = "default_true")]
+    active: bool,
 }
 /// An ordered PatrolWay (gamedata.json `patrol_ways`). Points are the game's own
 /// PatrolPoint transforms IN SERIALIZED ROUTE ORDER — but bots treat a way as a point set,
@@ -2709,6 +2714,11 @@ fn spawn_pois(
             let mat = (layer == PoiLayer::PmcSpawn && !player_side).then(|| ai_pmc_mat.clone());
             let e = spawn(&mut commands, layer, s.pos, gd_spawn_info(s, layer, zd.as_deref()), mat);
             commands.entity(e).insert(DenseMarker);
+            // Disabled-in-scene spawns ride the SAME inactive machinery as disabled exfils:
+            // hidden under the default "hide inactive", visible dimmed when the user opts in.
+            if !s.active {
+                commands.entity(e).insert(SceneInactive);
+            }
             // PlayerStart tags REAL raid starts only — the danger fields exempt these from
             // "avoid PMCs", so tagging the co-op/group markers (pmc side, no `player` category)
             // was quietly excluding 46 non-start points from avoidance on interchange.

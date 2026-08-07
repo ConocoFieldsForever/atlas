@@ -1155,6 +1155,10 @@ def scan_level(lv, sink, ai=False):
                 rec = {
                     "pos": bridge(pos), "name": sname, "side": SIDE_MASK.get(sides, str(sides)),
                     "categories_mask": cats, "infiltration": inf or None, "lv": lv,
+                    # Same verdict exfils/minefields/doors already carry (GameObject chain +
+                    # m_Enabled): a spawn under a disabled parent is authored-but-off content,
+                    # and the viewer must not present it as a live raid start.
+                    "active": active,
                 }
                 # AI-scene tail fields, all omitted when absent so pre-audit consumers and
                 # payloads that failed the defensive tail read see the classic record.
@@ -1175,7 +1179,8 @@ def scan_level(lv, sink, ai=False):
                 sink["spawn_points"].append(rec)
             else:
                 rec = {"pos": tpos, "name": name, "side": None,
-                       "categories_mask": None, "infiltration": None, "lv": lv}
+                       "categories_mask": None, "infiltration": None, "lv": lv,
+                       "active": active}
                 if ai:
                     rec["ai"] = True
                 sink["spawn_points"].append(rec)

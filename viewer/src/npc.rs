@@ -45,8 +45,16 @@ impl Plugin for NpcPlugin {
 fn npcs_need_rebuild(
     epoch: Res<crate::render::MapEpoch>,
     pack: Option<Res<crate::render::LoadedPack>>,
+    toggles: Res<crate::ui::LayerToggles>,
+    mut last_flag: Local<Option<bool>>,
 ) -> bool {
-    epoch.is_changed() || pack.is_some_and(|p| p.is_added())
+    // React to the Animated-AI checkbox EDGE, not to LayerToggles change (any marker click
+    // marks that resource changed, and rebuilding the cast on every layer toggle would reload
+    // character packs from disk each time).
+    let flag = toggles.npc_agents;
+    let flag_edge = *last_flag != Some(flag);
+    *last_flag = Some(flag);
+    epoch.is_changed() || pack.is_some_and(|p| p.is_added()) || flag_edge
 }
 
 /// One agent: a plan (the game's own target points) and the nav-routed path currently walked.
@@ -140,6 +148,7 @@ fn teardown_npcs(mut commands: Commands, q: Query<Entity, With<Npc>>) {
 
 fn spawn_npcs(
     esp: Res<crate::EspMode>,
+    toggles: Res<crate::ui::LayerToggles>,
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
@@ -153,8 +162,14 @@ fn spawn_npcs(
     if esp.0 {
         return;
     }
-    if std::env::var("EFT_NPC").map(|v| v.trim() == "0").unwrap_or(false) {
-        return;
+    // The FLAG: animated agents are opt-in (Layers > Spawns & POIs > Animated AI, or
+    // EFT_LAYERS=npc, or EFT_NPC=1). EFT_NPC=0 stays a hard off for scripting. The teardown
+    // chained before this is what makes unticking the box remove live agents.
+    match std::env::var("EFT_NPC").ok().as_deref().map(str::trim) {
+        Some("0") => return,
+        Some("1") => {}
+        _ if !toggles.npc_agents => return,
+        _ => {}
     }
     let Some(pack) = pack else { return };
     // Patrol routes from the pack's own gamedata (the game's AI scene data), WITH their names —
@@ -346,6 +361,9 @@ fn load_pmc_spawn_clusters(root: &std::path::Path) -> Vec<Vec<Vec3>> {
         return Vec::new();
     };
     let mut by_infil: std::collections::BTreeMap<String, Vec<Vec3>> = Default::default();
+    // (filled below, then split into ~40 m spatial groups -- the game's raid starts come in
+    // physical clusters of a few points each, and ONE body per cluster is what a raid looks
+    // like: bodies near every spawn area instead of two lonely agents on a kilometre map.)
     for s in v
         .get("spawn_points")
         .and_then(|x| x.as_array())
@@ -353,6 +371,11 @@ fn load_pmc_spawn_clusters(root: &std::path::Path) -> Vec<Vec<Vec3>> {
         .unwrap_or(&[])
     {
         if s.get("side").and_then(|x| x.as_str()) != Some("pmc") {
+            continue;
+        }
+        // A spawn the scene ships DISABLED is not a raid start; the extractor stamps the Unity
+        // enabled-chain verdict (absent in older packs = live).
+        if s.get("active").and_then(|x| x.as_bool()) == Some(false) {
             continue;
         }
         let is_player = s
@@ -376,7 +399,24 @@ fn load_pmc_spawn_clusters(root: &std::path::Path) -> Vec<Vec<Vec3>> {
             pos[2].as_f64().unwrap_or(0.0) as f32,
         ));
     }
-    by_infil.into_values().collect()
+    let mut clusters: Vec<Vec<Vec3>> = Vec::new();
+    for pts in by_infil.into_values() {
+        let mut remaining = pts;
+        while let Some(seed) = remaining.pop() {
+            let (near, far): (Vec<Vec3>, Vec<Vec3>) = remaining
+                .into_iter()
+                .partition(|p| p.distance(seed) < 40.0);
+            let mut c = vec![seed];
+            c.extend(near);
+            remaining = far;
+            if c.len() >= 2 {
+                clusters.push(c);
+            }
+        }
+    }
+    // Big groups first: a body at the main spawn rows beats one at a stray pair.
+    clusters.sort_by_key(|c| std::cmp::Reverse(c.len()));
+    clusters
 }
 
 /// `core_points` grouped by the game's own `cg` (core-group) id -> wander circuits.

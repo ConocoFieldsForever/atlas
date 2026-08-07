@@ -752,6 +752,25 @@ impl OverlayConfig {
 /// helper so focused and unfocused windows cannot accidentally drift back to different policies.
 /// Device events (raw mouse motion) do not wake an extra frame; ordinary keyboard/window events
 /// still do, which keeps input responsive while the timer supplies the steady redraw cadence.
+/// The DESK-TOOL frame clock for a session with no overlay engaged: full rate focused, ~2 Hz
+/// in the background. This mirrors main.rs's startup default EXACTLY, because the overlay-off
+/// restore below used to "restore" Continuous/Continuous instead -- which silently repealed the
+/// background throttle in every session where the overlay was off. Field report: an RX 9070 XT
+/// user's GAME dropped from 200 fps to 15-25 with Atlas merely open at the start menu; the menu
+/// was burning the GPU at full rate from the background. Uncapped bench/automation sessions keep
+/// Continuous, matching the same exemptions main.rs applies.
+fn desk_clock() -> (UpdateMode, UpdateMode) {
+    let uncapped = std::env::var("EFT_UNCAPPED").map(|v| v.trim() == "1").unwrap_or(false);
+    if uncapped || crate::automated_finite_job() {
+        (UpdateMode::Continuous, UpdateMode::Continuous)
+    } else {
+        (
+            UpdateMode::Continuous,
+            UpdateMode::reactive_low_power(std::time::Duration::from_millis(500)),
+        )
+    }
+}
+
 fn overlay_update_mode(fps_cap: u32) -> UpdateMode {
     if fps_cap > 0 {
         UpdateMode::Reactive {
@@ -1226,8 +1245,9 @@ fn apply_overlay(
                 win.visible = false;
                 *overlay_rect = None;
                 view.0 = None;
-                winit.focused_mode = UpdateMode::Continuous;
-                winit.unfocused_mode = UpdateMode::Continuous;
+                let (f, u) = desk_clock();
+                winit.focused_mode = f;
+                winit.unfocused_mode = u;
                 if state.windowed {
                     info!(
                         "overlay: hidden (transparent windows cannot become ordinary windows;                          relaunch without transparent mode for a desktop window)"
@@ -1246,7 +1266,11 @@ fn apply_overlay(
             }
             *overlay_rect = None;
             view.0 = None;
-            winit.focused_mode = UpdateMode::Continuous;
+            {
+                let (f, u) = desk_clock();
+                winit.focused_mode = f;
+                winit.unfocused_mode = u;
+            }
             winit.unfocused_mode = UpdateMode::Continuous;
             if state.windowed {
                 info!("overlay: exited to the ordinary resizable Atlas window");

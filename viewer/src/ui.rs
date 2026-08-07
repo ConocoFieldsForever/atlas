@@ -57,6 +57,10 @@ pub struct LayerToggles {
     pub bot_zones: bool,
     /// PatrolWay polylines + waypoint dots.
     pub patrols: bool,
+    /// ANIMATED AI agents (npc.rs): scav/PMC/boss bodies walking the game's own patrol data.
+    /// Default OFF -- they are simulation flavour, not map data, and they cost GPU/CPU; the
+    /// checkbox lives beside the spawn layers they animate. `EFT_LAYERS=npc` starts it on.
+    pub npc_agents: bool,
     /// AirdropPoint candidate landing spots (Scripts scene).
     pub airdrops: bool,
     /// CultistSignEffect event ritual signs (AI scene).
@@ -100,6 +104,7 @@ impl Default for LayerToggles {
             sniper_zones: has("sniper"),
             bot_zones: has("botzone"),
             patrols: has("patrol"),
+            npc_agents: has("npc"),
             airdrops: has("airdrop"),
             rituals: has("ritual"),
             player_marker: has("player"),
@@ -1491,6 +1496,14 @@ fn layers_panel(
                             // patrol polylines (poi::draw_gamedata_outlines).
                             poi_row(ui, &mut toggles.bot_zones, "Bot zones", PoiLayer::BotZone, &poi_counts);
                             poi_row(ui, &mut toggles.patrols, "Patrol areas", PoiLayer::Patrol, &poi_counts);
+                            ui.checkbox(
+                                &mut toggles.npc_agents,
+                                egui::RichText::new("Animated AI (scavs, PMCs, bosses)").size(11.0),
+                            )
+                            .on_hover_text(
+                                "Walk animated bodies along the game's own patrol routes and \
+                                 spawn clusters. Costs GPU/CPU; markers above work without it.",
+                            );
                             poi_row(ui, &mut toggles.extracts, "Extracts", PoiLayer::Extract, &poi_counts);
                             ui.horizontal(|ui| {
                                 ui.add_space(30.0);
