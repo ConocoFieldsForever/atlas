@@ -85,6 +85,37 @@ fn screenshot_locate() -> bool {
 
 /// Flip the screenshot-locate setting live (the menu checkbox calls this the moment it changes;
 /// no restart needed).
+/// User-configured override roots (issue #8: game on one PC, Atlas on another, folders shared
+/// over the network). Runtime-settable from the menu, which is why these are process statics like
+/// their `SCREENSHOT_LOCATE` neighbour rather than plumbed resources: the watcher THREAD reads
+/// them, and it has no access to the ECS world. Precedence at every use site is
+/// env var (scripted override) > this setting > automatic discovery, and an explicitly configured
+/// path that does not exist FAILS rather than falling back -- the link-health panel then shows the
+/// honest cross, instead of Atlas silently watching a default folder the user asked it not to.
+static CUSTOM_SHOTS_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+static CUSTOM_LOGS_DIR: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+/// Bumped on every set_custom_* call. The watcher caches its resolved screenshots folder and only
+/// re-probes when it has none; this is how a mid-session settings change forces the re-probe.
+static CUSTOM_DIR_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn normalized_custom(dir: Option<String>) -> Option<PathBuf> {
+    dir.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
+pub fn set_custom_shots_dir(dir: Option<String>) {
+    *CUSTOM_SHOTS_DIR.write().unwrap_or_else(|p| p.into_inner()) = normalized_custom(dir);
+    CUSTOM_DIR_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn set_custom_logs_dir(dir: Option<String>) {
+    *CUSTOM_LOGS_DIR.write().unwrap_or_else(|p| p.into_inner()) = normalized_custom(dir);
+    CUSTOM_DIR_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn custom_dir(lock: &std::sync::RwLock<Option<PathBuf>>) -> Option<PathBuf> {
+    lock.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
 pub fn set_screenshot_locate(on: bool) {
     SCREENSHOT_LOCATE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -259,6 +290,10 @@ impl Plugin for GameWatchPlugin {
         // Seed the shared flag from the persisted menu setting before the thread starts, so a
         // user who turned screenshot-locate OFF never gets a single poll of the folder.
         set_screenshot_locate(crate::menu::config_screenshot_locate());
+        // Custom folder overrides persist in the config (issue #8); seed them before the watcher
+        // thread starts so its very first probe already looks in the right place.
+        set_custom_shots_dir(crate::menu::config_str_pub("screenshotsDir"));
+        set_custom_logs_dir(crate::menu::config_str_pub("gameLogsDir"));
         // A remote override may point directly at the player's shared screenshot directory, so
         // NEVER inherit the local default of deleting consumed PNGs. Deletion in remote mode is
         // opt-in only through the explicit env var (safe for a marker-only relay inbox).
@@ -713,10 +748,17 @@ fn watcher_thread(tx: Sender<GameEvent>) {
     let mut last_shot = std::time::SystemTime::now();
     let mut game_dir = String::new();
     let mut tick: u64 = 0;
+    let mut last_custom_gen = CUSTOM_DIR_GEN.load(std::sync::atomic::Ordering::Relaxed);
     loop {
         // Re-resolve the game install + screenshots folder occasionally (cheap registry/config
         // probes; the user can point Atlas at the game after launch).
-        if tick % 20 == 0 {
+        let gen = CUSTOM_DIR_GEN.load(std::sync::atomic::Ordering::Relaxed);
+        if gen != last_custom_gen {
+            // A settings change must beat the cache: the old resolved folder may be the very
+            // default the user just configured away from.
+            last_custom_gen = gen;
+            shots_dir = find_screenshots_dir();
+        } else if tick % 20 == 0 {
             game_dir = crate::menu::detect_game_dir();
             if shots_dir.is_none() {
                 shots_dir = find_screenshots_dir();
@@ -724,7 +766,8 @@ fn watcher_thread(tx: Sender<GameEvent>) {
         }
         tick += 1;
         LINK_HEALTH.ticks.store(tick, std::sync::atomic::Ordering::Relaxed);
-        let explicit_logs = configured_dir("EFT_GAME_LOGS_DIR").is_some();
+        let explicit_logs =
+            configured_dir("EFT_GAME_LOGS_DIR").is_some() || custom_dir(&CUSTOM_LOGS_DIR).is_some();
         health_set(&LINK_HEALTH.game_dir, !game_dir.is_empty() || explicit_logs);
         health_set(&LINK_HEALTH.shots_dir, shots_dir.is_some());
 
@@ -793,6 +836,9 @@ fn latest_under_logs_root(root: &Path) -> Option<PathBuf> {
 /// `<game>\Logs` (or `<game>\build\Logs`) -> the most recently modified `log_*` folder.
 fn latest_log_folder(game: &Path) -> Option<PathBuf> {
     if let Some(root) = configured_dir("EFT_GAME_LOGS_DIR") {
+        return latest_under_logs_root(&root);
+    }
+    if let Some(root) = custom_dir(&CUSTOM_LOGS_DIR) {
         return latest_under_logs_root(&root);
     }
     // `detect_game_dir` resolves the DATA folder (it validates on globalgamemanagers/sharedassets),
@@ -1119,6 +1165,11 @@ fn cap(pending: &mut String) {
 /// instead watch a UNC/local relay inbox through `EFT_SCREENSHOTS_DIR`.
 fn find_screenshots_dir() -> Option<PathBuf> {
     if let Some(dir) = configured_dir("EFT_SCREENSHOTS_DIR") {
+        return dir.is_dir().then_some(dir);
+    }
+    // The menu's custom folder (issue #8) sits between the scripted env override and automatic
+    // discovery, with the same fail-don't-fall-back rule as the env var.
+    if let Some(dir) = custom_dir(&CUSTOM_SHOTS_DIR) {
         return dir.is_dir().then_some(dir);
     }
     let home = std::env::var("USERPROFILE").ok()?;

@@ -972,6 +972,12 @@ pub struct MenuState {
     /// "Screenshot to locate current position" — poll the EFT screenshot folder and move the
     /// camera onto each new position fix (see `config_screenshot_locate`).
     pub screenshot_locate: bool,
+    /// Custom screenshots/logs folder edits (issue #8). Empty string = automatic discovery.
+    /// The `_saved` copies are what the SET buttons diff against, mirroring `game_dir_edit`.
+    pub shots_dir_edit: String,
+    pub shots_dir_saved: String,
+    pub logs_dir_edit: String,
+    pub logs_dir_saved: String,
     /// Overlay settings (the menu edits them; `overlay::OverlayPlugin` reads the same keys back
     /// out of atlas.config.json at startup). One struct so a settings panel can bind to it.
     pub overlay: crate::overlay::OverlayConfig,
@@ -1806,6 +1812,10 @@ pub fn build_state() -> MenuState {
         process_in_background: config_process_in_background(),
         force_cpu_process: config_force_cpu_process(),
         screenshot_locate: config_screenshot_locate(),
+        shots_dir_edit: config_str_pub("screenshotsDir").unwrap_or_default(),
+        shots_dir_saved: config_str_pub("screenshotsDir").unwrap_or_default(),
+        logs_dir_edit: config_str_pub("gameLogsDir").unwrap_or_default(),
+        logs_dir_saved: config_str_pub("gameLogsDir").unwrap_or_default(),
         overlay: crate::overlay::OverlayConfig::load().sanitized(),
         // A named preset owns texture quality. Derive the visible texture button from it too, so
         // even a stale/hand-edited file cannot show (for example) Ultra + Quarter for one frame.
@@ -3210,6 +3220,84 @@ pub fn menu_ui(
                                     .changed();
                             });
                         });
+                        ui.add_space(10.0);
+                        // Custom folders (issue #8): the game on one PC, Atlas on another, the
+                        // folders shared over the network. Blank means the automatic discovery
+                        // that every single-PC user already relies on -- the field being empty IS
+                        // the default path, so nothing changes for them.
+                        let mut dir_row = |ui: &mut egui::Ui,
+                                           label: &str,
+                                           edit: &mut String,
+                                           saved: &mut String|
+                         -> bool {
+                            let mut applied = false;
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(label).size(11.0).color(DIM));
+                                ui.add(
+                                    egui::TextEdit::singleline(edit)
+                                        .desired_width(360.0)
+                                        .font(egui::TextStyle::Monospace),
+                                );
+                                let dirty = *edit != *saved;
+                                if ui
+                                    .add_enabled(
+                                        dirty,
+                                        egui::Button::new(
+                                            RichText::new(t(lg, K::Set)).color(BONE),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    *saved = edit.trim().to_string();
+                                    *edit = saved.clone();
+                                    applied = true;
+                                }
+                                // An explicitly configured path that does not exist gets a
+                                // visible warning, because the watcher deliberately FAILS on it
+                                // rather than falling back (a silent fallback would watch a
+                                // folder the user asked it not to).
+                                let t_edit = edit.trim();
+                                if !t_edit.is_empty() && !std::path::Path::new(t_edit).is_dir() {
+                                    ui.label(
+                                        RichText::new(t(lg, K::CustomDirMissing))
+                                            .size(10.0)
+                                            .color(WARN),
+                                    );
+                                }
+                            });
+                            applied
+                        };
+                        // Clone-in/write-back like the GameInstall row: `state` is behind a
+                        // deref, so two simultaneous field borrows read as one double borrow.
+                        let (mut sh_e, mut sh_s) =
+                            (state.shots_dir_edit.clone(), state.shots_dir_saved.clone());
+                        let sh_applied =
+                            dir_row(ui, t(lg, K::CustomShotsDir), &mut sh_e, &mut sh_s);
+                        state.shots_dir_edit = sh_e;
+                        state.shots_dir_saved = sh_s;
+                        if sh_applied {
+                            let v = state.shots_dir_saved.clone();
+                            crate::game_watch::set_custom_shots_dir(
+                                (!v.is_empty()).then(|| v.clone()),
+                            );
+                            state.config_err = (!save_config_str_pub("screenshotsDir", &v))
+                                .then(|| t(lg, K::ConfigSaveFailed).to_string());
+                        }
+                        let (mut lo_e, mut lo_s) =
+                            (state.logs_dir_edit.clone(), state.logs_dir_saved.clone());
+                        let lo_applied =
+                            dir_row(ui, t(lg, K::CustomLogsDir), &mut lo_e, &mut lo_s);
+                        state.logs_dir_edit = lo_e;
+                        state.logs_dir_saved = lo_s;
+                        if lo_applied {
+                            let v = state.logs_dir_saved.clone();
+                            crate::game_watch::set_custom_logs_dir(
+                                (!v.is_empty()).then(|| v.clone()),
+                            );
+                            state.config_err = (!save_config_str_pub("gameLogsDir", &v))
+                                .then(|| t(lg, K::ConfigSaveFailed).to_string());
+                        }
+                        ui.label(RichText::new(t(lg, K::CustomDirHint)).size(10.0).color(DIM));
                         ui.add_space(8.0);
                         ui.label(RichText::new(t(lg, K::LiveLinkNote)).size(10.0).color(DIM));
                     }
