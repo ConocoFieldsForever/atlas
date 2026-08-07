@@ -210,10 +210,18 @@ fn spawn_npcs(
             })
             .unwrap_or_default()
     };
+    // A pack id's boss TOKEN: `bosskilla_0` -> "killa", and a bare specced id (`tagilla`) is
+    // its own token. When both exist for one boss the BARE id wins: those are the
+    // characters.json-specced builds, and the spec is where equipment lives -- the auto
+    // `boss*_0` variant is how Tagilla walked out without his welding mask.
     let boss_token = |id: &str| -> Option<String> {
         let stem = id.strip_suffix("_0").unwrap_or(id);
-        let t = stem.strip_prefix("boss")?;
-        (!t.is_empty()).then(|| t.to_ascii_lowercase())
+        if let Some(t) = stem.strip_prefix("boss") {
+            return (!t.is_empty()).then(|| t.to_ascii_lowercase());
+        }
+        // Bare ids: only ones that are not the base/pmc/utility packs act as boss tokens.
+        (!matches!(stem, "scav" | "assault" | "player" | "pmcbear" | "pmcusec" | "pmc_bear" | "pmc_usec"))
+            .then(|| stem.to_ascii_lowercase())
     };
     let mut packs: Vec<Arc<CharacterPack>> = vec![base];
     let mut pack_ids: Vec<String> = vec![base_id.clone()];
@@ -289,15 +297,18 @@ fn spawn_npcs(
         // A boss walks its own patrol: the game names the way after them.
         let hay = format!("{} {} {}", route.name, route.zone, route.go).to_ascii_lowercase();
         let mut cast = 0usize;
-        for id in &available {
-            if let Some(tok) = boss_token(id) {
-                if hay.contains(&tok) {
-                    if let Some(i) = ensure_pack(id, &mut packs, &mut pack_ids) {
-                        cast = i;
-                        bosses_cast += 1;
-                    }
-                    break;
-                }
+        // Collect every matching pack for this way, then prefer the bare specced id (equipment
+        // lives there) over the auto boss variant.
+        let mut matches: Vec<&String> = available
+            .iter()
+            .filter(|id| boss_token(id).is_some_and(|tok| hay.contains(&tok)))
+            .collect();
+        matches.sort_by_key(|id| id.starts_with("boss")); // bare ids first
+        for id in matches {
+            if let Some(i) = ensure_pack(id, &mut packs, &mut pack_ids) {
+                cast = i;
+                bosses_cast += 1;
+                break;
             }
         }
         spawn_agent(route.points.clone(), true, cast, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
@@ -340,9 +351,9 @@ fn spawn_npcs(
     if n > 0 {
         info!(
             "npc: {n} agent(s) — {} on patrol_ways ({bosses_cast} boss-cast), {wanderers} \
-             circulating core-point groups, {pmc_cast} PMCs on infiltration clusters ({} pack(s))",
+             circulating core-point groups, {pmc_cast} PMCs on spawn clusters — cast: {}",
             n - wanderers - pmc_cast,
-            packs.len(),
+            pack_ids.join(", "),
         );
         commands.insert_resource(NpcCharacter(packs));
     }
@@ -370,19 +381,21 @@ fn load_pmc_spawn_clusters(root: &std::path::Path) -> Vec<Vec<Vec3>> {
         .map(|a| a.as_slice())
         .unwrap_or(&[])
     {
-        if s.get("side").and_then(|x| x.as_str()) != Some("pmc") {
-            continue;
-        }
         // A spawn the scene ships DISABLED is not a raid start; the extractor stamps the Unity
         // enabled-chain verdict (absent in older packs = live).
         if s.get("active").and_then(|x| x.as_bool()) == Some(false) {
             continue;
         }
-        let is_player = s
-            .get("categories")
-            .and_then(|c| c.as_array())
-            .is_some_and(|a| a.iter().any(|c| c.as_str() == Some("player")));
-        if !is_player {
+        let side = s.get("side").and_then(|x| x.as_str()).unwrap_or("");
+        let cats = s.get("categories").and_then(|c| c.as_array());
+        let has = |k: &str| cats.is_some_and(|a| a.iter().any(|c| c.as_str() == Some(k)));
+        // Two kinds of PMC presence, both real: raid starts (side pmc + player category) and the
+        // AI-PMC anchors (savage side, botpmc category) -- the bot PMCs the raid actually
+        // contains. The user-visible complaint behind the second kind: maroon AI-PMC markers on
+        // the map with no body anywhere near them.
+        let is_start = side == "pmc" && has("player");
+        let is_ai_pmc = has("botpmc");
+        if !is_start && !is_ai_pmc {
             continue;
         }
         let Some(pos) = s.get("pos").and_then(|p| p.as_array()).filter(|p| p.len() >= 3) else {
@@ -569,15 +582,26 @@ fn drive_npcs(
     let Some(cpack) = cpack else { return };
     let dt = time.delta_secs().min(0.1);
     let grid = nav.as_ref().and_then(|n| n.0.as_ref());
+    // Routes IN FLIGHT are throttled hard: every A* borrows a full-grid scratch (hundreds of MB
+    // on a big map) and the toggle spawns the whole cast at once -- 30+ simultaneous requests
+    // was a memory stampede that kept every agent waiting for minutes. A handful at a time
+    // finishes the same work without the spike; everyone else idle-animates until their turn.
+    const MAX_ROUTES_IN_FLIGHT: usize = 4;
+    let mut in_flight = pending.iter().count();
 
     for (e, mut npc, cast, mut root, mut tf) in &mut root_q {
         let Some(pack) = cpack.0.get(cast.0) else { continue };
         let pack: &CharacterPack = pack;
         // ---- plan: (re)route the current leg through the NAV GRID, OFF the main thread ----
+        // `planning` NEVER skips the animator. The old shape `continue`d out of the loop while a
+        // route was computing, which bypassed the pose entirely -- on a big map, where 30 agents
+        // queue behind a few route slots, that was the whole cast frozen in BIND POSE at spawn
+        // for as long as the routes took. The field report was literal statues.
+        let mut planning = false;
         if npc.path.len() < 2 {
             match pending.get_mut(e) {
                 Ok(mut task) => {
-                    // A route is in flight: take it when it lands, else keep standing.
+                    // A route is in flight: take it when it lands, else idle-animate this frame.
                     if let Some(res) = block_on(future::poll_once(&mut task.0)) {
                         let from = tf.translation;
                         let next = npc.targets
@@ -597,39 +621,48 @@ fn drive_npcs(
                         npc.leg = 0;
                         npc.dist = 0.0;
                         commands.entity(e).remove::<PendingRoute>();
+                        in_flight = in_flight.saturating_sub(1);
                     } else {
-                        continue; // still computing — the agent is dwelling anyway
+                        planning = true;
                     }
                 }
                 Err(_) => {
-                    // No task yet: dispatch one and stand until it returns.
                     let from = tf.translation;
                     let next = npc.targets
                         [((npc.at as i32 + npc.dir).rem_euclid(npc.targets.len() as i32)) as usize];
                     if let Some(g) = grid.cloned() {
-                        let pool = AsyncComputeTaskPool::get();
-                        let task = pool.spawn(async move {
-                            let mut sc = crate::nav::pooled_scratch(g.nodes());
-                            g.path(from, next, &mut sc, None).map(|(poly, _)| poly)
-                        });
-                        commands.entity(e).insert(PendingRoute(task));
+                        if in_flight < MAX_ROUTES_IN_FLIGHT {
+                            let pool = AsyncComputeTaskPool::get();
+                            let task = pool.spawn(async move {
+                                let mut sc = crate::nav::pooled_scratch(g.nodes());
+                                g.path(from, next, &mut sc, None).map(|(poly, _)| poly)
+                            });
+                            commands.entity(e).insert(PendingRoute(task));
+                            in_flight += 1;
+                        }
+                        planning = true; // dispatched or queued behind the throttle: idle either way
                     } else {
                         npc.path = vec![from, next]; // nav still streaming in
                         npc.leg = 0;
                         npc.dist = 0.0;
                     }
-                    continue;
                 }
             }
         }
         // ---- agent step: dwell at plan targets, else walk the current path leg ----
-        let moving = if npc.dwell > 0.0 {
+        let moving = if planning {
+            false // no route yet: stand and BREATHE (idle animation), never a statue
+        } else if npc.dwell > 0.0 {
             npc.dwell -= dt;
             false
         } else {
             true
         };
-        let (a, b) = (npc.path[npc.leg], npc.path[npc.leg + 1]);
+        let (a, b) = if planning {
+            (tf.translation, tf.translation)
+        } else {
+            (npc.path[npc.leg], npc.path[npc.leg + 1])
+        };
         let leg_vec = b - a;
         let leg_len = leg_vec.length().max(1.0e-3);
 
@@ -671,7 +704,7 @@ fn drive_npcs(
         // the current leg afterwards. Writing with the stale `a` while `dist` had been reset to 0
         // snapped the body back to the START of the leg it had just finished, for exactly one
         // frame, at every leg boundary — the twitch every few steps.
-        if moving && root_speed > 1.0e-3 {
+        if moving && !planning && root_speed > 1.0e-3 {
             npc.dist += root_speed * dt;
             if npc.dist >= leg_len {
                 // Carry the OVERSHOOT into the next leg instead of discarding it: dropping it
@@ -706,16 +739,19 @@ fn drive_npcs(
             }
         }
         // Re-read the CURRENT leg (it may have advanced above) and place the body on it.
-        let (ca, cb) = if npc.path.len() >= 2 && npc.leg + 1 < npc.path.len() {
+        // While planning there is no leg: hold position and heading, animate in place.
+        let (ca, cb) = if !planning && npc.path.len() >= 2 && npc.leg + 1 < npc.path.len() {
             (npc.path[npc.leg], npc.path[npc.leg + 1])
         } else {
             (a, b)
         };
         let cvec = cb - ca;
         let clen = cvec.length().max(1.0e-3);
-        let t = (npc.dist / clen).clamp(0.0, 1.0);
-        tf.translation = ca + cvec * t;
-        let walk_dir = cvec / clen;
+        if !planning {
+            let t = (npc.dist / clen).clamp(0.0, 1.0);
+            tf.translation = ca + cvec * t;
+        }
+        let walk_dir = if clen > 1.0e-2 { cvec / clen } else { Vec3::new(npc.heading.sin(), 0.0, npc.heading.cos()) };
         // Face the walk direction, turning at a bounded rate.
         // The rig's forward is +Z (manifest `characterForward`, derived from walk_aim_0's root
         // motion), and rotation_y(yaw) maps +Z to (sin yaw, 0, cos yaw) — so the yaw that faces
