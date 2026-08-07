@@ -135,7 +135,7 @@ def light_levels_for(m):
         return []
 
 
-def run(stage, total, name, cmd, cwd, optional=False):
+def run(stage, total, name, cmd, cwd, optional=False, env_extra=None):
     print(f"[STAGE {stage}/{total}] {name}", flush=True)
     print(f"  $ {' '.join(cmd)}", flush=True)
     t0 = time.time()
@@ -143,6 +143,8 @@ def run(stage, total, name, cmd, cwd, optional=False):
     # ignores it, but our own stdout is UTF-8 above and we read the child as UTF-8 below, so a
     # non-ASCII line is handled either way instead of crashing the build).
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    if env_extra:
+        env.update(env_extra)
     # pass the contract values as-is (TK = the maps/+out/ dir, ASSETS = the datasets dir)
     env.setdefault("EFT_TARKMAP_ROOT", TK)
     env.setdefault("EFT_ASSETS_ROOT", ASSETS)
@@ -940,9 +942,23 @@ def main():
     # cheerfully reported success over a volume baked for the OLD geometry — a grid whose very
     # dimensions no longer match the pack. Report what actually happened, and say plainly when the
     # lighting on disk is stale.
+    # RECOVERABLE DEVICE LOSS, at the only layer that can recover it. bake-sh is a subprocess,
+    # and a GPU watchdog reset that escapes every in-process guard aborts it (panic = "abort").
+    # The freshness check below already detects exactly that outcome -- an optional stage that
+    # "succeeded" without producing a volume -- so instead of merely WARNING, run the bake once
+    # more with the CPU forced. Slow lighting beats stale lighting, and stale lighting shipping
+    # silently is the second bug of the original post-mortem.
     _vol = os.path.join(pack, "volume.bin")
+    _fresh = os.path.isfile(_vol) and os.path.getmtime(_vol) >= _stage3_started
+    if not _fresh and bake_mode != "warp" and find_atlas_exe():
+        print("  lighting: the GPU-auto bake produced no fresh volume (likely a device "
+              "loss/watchdog abort) - retrying once with the CPU forced (EFT_BAKE_CPU=1)",
+              flush=True)
+        run(3, total, "bake lighting (CPU retry after GPU failure)",
+            [find_atlas_exe(), "bake-sh", pack, "--indirect-only"], VIEWER,
+            optional=True, env_extra={"EFT_BAKE_CPU": "1"})
+        _fresh = os.path.isfile(_vol) and os.path.getmtime(_vol) >= _stage3_started
     if os.path.isfile(_vol):
-        _fresh = os.path.getmtime(_vol) >= _stage3_started
         if _fresh:
             print("  lighting: SH irradiance volume baked into pack", flush=True)
         else:

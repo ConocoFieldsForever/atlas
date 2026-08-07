@@ -76,12 +76,19 @@ fn init_gpu() -> Option<Gpu> {
         backends: crate::render::allowed_backends(),
         ..Default::default()
     });
-    let adapter = bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+    let adapter = match bevy::tasks::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         force_fallback_adapter: false,
         compatible_surface: None,
-    }))
-    .ok()?;
+    })) {
+        Ok(a) => a,
+        Err(e) => {
+            // The silent fallback is how the CPU-only regression stayed invisible for a week --
+            // every path that declines the GPU says so out loud now.
+            eprintln!("  sh-bake/gpu: no usable adapter ({e}) — CPU");
+            return None;
+        }
+    };
     let info = adapter.get_info();
     let limits = adapter.limits();
     let (device, queue) = bevy::tasks::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -204,6 +211,45 @@ fn node_bufs(device: &wgpu::Device, bvh: &Bvh, plan: &ChunkPlan) -> Option<Vec<w
     Some(out)
 }
 
+/// The TRUE probe positions, one vec4 per probe (16 B; ~24 MB on interchange, noise next to the
+/// multi-GiB triangle chunks). Uploaded ALWAYS -- when virtual offset moved nothing the host hands
+/// the plain grid positions -- so the shaders never derive a position and can never disagree with
+/// the CPU pass about where a probe actually sits. This is requirement #1 from the n_moved-gate
+/// post-mortem: the gate existed because the GPU was blind to relocation, not because relocation
+/// and the GPU are incompatible.
+fn positions_buf(
+    device: &wgpu::Device,
+    positions: &[Vec3],
+    gmin: Vec3,
+    spacing: [f32; 3],
+    dims: [usize; 3],
+    n_probe: usize,
+) -> Option<wgpu::Buffer> {
+    let buf = checked_mapped(device, n_probe as u64 * 16, "sh_bake positions")?;
+    {
+        let mut view = buf.slice(..).get_mapped_range_mut();
+        let f: &mut [f32] = bytemuck::cast_slice_mut(&mut view[..]);
+        let [nx, ny, _] = dims;
+        for pi in 0..n_probe {
+            let p = if positions.len() == n_probe {
+                positions[pi]
+            } else {
+                // virtual offset disabled or nothing to move: the grid position IS the position
+                let (x, y, z) = (pi % nx, (pi / nx) % ny, pi / (nx * ny));
+                gmin + Vec3::new(x as f32, y as f32, z as f32)
+                    * Vec3::new(spacing[0], spacing[1], spacing[2])
+            };
+            let o = pi * 4;
+            f[o] = p.x;
+            f[o + 1] = p.y;
+            f[o + 2] = p.z;
+            f[o + 3] = 0.0;
+        }
+    }
+    buf.unmap();
+    Some(buf)
+}
+
 fn dummy(device: &wgpu::Device, size: u64, label: &str) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
@@ -279,6 +325,7 @@ fn to_sh4(f: &[f32], n_probe: usize) -> Vec<[Vec3; 4]> {
 pub fn pass_a_gpu(
     bvh: &Bvh,
     lights: &[Light],
+    positions: &[Vec3],
     gmin: Vec3,
     spacing: [f32; 3],
     dims: [usize; 3],
@@ -296,9 +343,9 @@ pub fn pass_a_gpu(
     }
     let g = init_gpu()?;
     let plan = plan_chunks(n_tris, n_nodes, &g.limits)?;
-    // storage buffers used = 3 tri + 3 node + lights + out = 8
-    if g.limits.max_storage_buffers_per_shader_stage < 8 {
-        eprintln!("  sh-bake/gpu: adapter has {} storage buffers/stage (< 8) — CPU", g.limits.max_storage_buffers_per_shader_stage);
+    // storage buffers used = 3 tri + 3 node + lights + positions + out = 9
+    if g.limits.max_storage_buffers_per_shader_stage < 9 {
+        eprintln!("  sh-bake/gpu: adapter has {} storage buffers/stage (< 9) — CPU", g.limits.max_storage_buffers_per_shader_stage);
         return None;
     }
     let out_bytes = n_probe as u64 * 12 * 4;
@@ -316,6 +363,7 @@ pub fn pass_a_gpu(
     // /dispatch) and is popped in finish_read.
     let tbufs = tri_bufs(&g.device, bvh, &plan, false)?;
     let nbufs = node_bufs(&g.device, bvh, &plan)?;
+    let pos_buf = positions_buf(&g.device, positions, gmin, spacing, dims, n_probe)?;
 
     // lights (>=1 element so the binding is valid; the shader loops n_light so a dummy is unread)
     let light_buf = storage_buf_mapped(&g.device, lights.len().max(1) as u64 * LIGHT_STRIDE, "sh_bake lights")?;
@@ -366,6 +414,7 @@ pub fn pass_a_gpu(
         entries.push(ro(b));
     }
     entries.push(bgl_entry(8, wgpu::BufferBindingType::Storage { read_only: false }));
+    entries.push(ro(9)); // positions
     let (pipeline, bgl) = compute_pipeline(&g, &shader, "cs_bake", &entries);
     let bind = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sh_bake bg"),
@@ -373,6 +422,7 @@ pub fn pass_a_gpu(
         entries: &[
             be(0, &param_buf), be(1, &tbufs[0]), be(2, &tbufs[1]), be(3, &tbufs[2]),
             be(4, &nbufs[0]), be(5, &nbufs[1]), be(6, &nbufs[2]), be(7, &light_buf), be(8, &out_buf),
+            be(9, &pos_buf),
         ],
     });
 
@@ -392,6 +442,7 @@ pub fn pass_a_gpu(
 pub fn pass_b_gpu(
     bvh: &Bvh,
     sh_a: &[[Vec3; 4]],
+    positions: &[Vec3],
     gmin: Vec3,
     spacing: [f32; 3],
     dims: [usize; 3],
@@ -410,9 +461,9 @@ pub fn pass_b_gpu(
     }
     let g = init_gpu()?;
     let plan = plan_chunks(n_tris, n_nodes, &g.limits)?;
-    // storage buffers used = 3 tri + 3 node + sh_a + mats + out = 9
-    if g.limits.max_storage_buffers_per_shader_stage < 9 {
-        eprintln!("  sh-bake/gpu: adapter has {} storage buffers/stage (< 9 needed for bounce) — CPU pass B", g.limits.max_storage_buffers_per_shader_stage);
+    // storage buffers used = 3 tri + 3 node + sh_a + mats + positions + out = 10
+    if g.limits.max_storage_buffers_per_shader_stage < 10 {
+        eprintln!("  sh-bake/gpu: adapter has {} storage buffers/stage (< 10 needed for bounce) — CPU pass B", g.limits.max_storage_buffers_per_shader_stage);
         return None;
     }
     let out_bytes = n_probe as u64 * 12 * 4;
@@ -432,6 +483,7 @@ pub fn pass_b_gpu(
     // outer pair below covers post-upload work and is popped in finish_read.
     let tbufs = tri_bufs(&g.device, bvh, &plan, true)?; // bounce needs material ids in a.w
     let nbufs = node_bufs(&g.device, bvh, &plan)?;
+    let pos_buf = positions_buf(&g.device, positions, gmin, spacing, dims, n_probe)?;
 
     // pass-A grid (12 f32/probe)
     let sha_buf = storage_buf_mapped(&g.device, out_bytes, "sh_bake sh_a")?;
@@ -500,6 +552,7 @@ pub fn pass_b_gpu(
         entries.push(ro(b));
     }
     entries.push(bgl_entry(9, wgpu::BufferBindingType::Storage { read_only: false }));
+    entries.push(ro(10)); // positions
     let (pipeline, bgl) = compute_pipeline(&g, &shader, "cs_bounce", &entries);
     let bind = g.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("sh_bounce bg"),
@@ -507,7 +560,7 @@ pub fn pass_b_gpu(
         entries: &[
             be(0, &param_buf), be(1, &tbufs[0]), be(2, &tbufs[1]), be(3, &tbufs[2]),
             be(4, &nbufs[0]), be(5, &nbufs[1]), be(6, &nbufs[2]),
-            be(7, &sha_buf), be(8, &mat_buf), be(9, &out_buf),
+            be(7, &sha_buf), be(8, &mat_buf), be(9, &out_buf), be(10, &pos_buf),
         ],
     });
 

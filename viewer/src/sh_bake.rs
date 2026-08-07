@@ -711,29 +711,27 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         (sh, n_sky == 0)
     };
 
-    // The GPU pass computes probe positions from (gmin, spacing) internally, so it cannot honour
-    // virtual offset, and the relocated probes are fixed up on the CPU below.
-    //
-    // WHY THE `n_moved == 0` GATE IS BACK. Dropping it to win the other 87% of probes looked free
-    // and was not: on streets (123 M occluder tris / 67 M BVH nodes / 769,104 probes) the GPU pass
-    // LOST THE DEVICE mid-bake — "Error in Device::poll: Parent device is lost" — and because this
-    // binary is built with `panic = "abort"`, wgpu's internal poll panic killed the bake process
-    // outright (rc 0xC0000409). Neither guard helped: the adaptive batching never got to measure a
-    // safe size, and the all-zero watchdog net only catches a reset that still RETURNS. The build
-    // then continued (bake-sh is optional) and silently shipped the PREVIOUS pack's volume.
-    //
-    // The gate is therefore load-bearing, not incidental: heavy relocation and a watchdog-blowing
-    // scene are the same maps. A future attempt needs the GPU pass to honour virtual offset itself
-    // (probe positions uploaded, not derived) AND a recoverable device-loss path — not a wider gate.
-    let gpu_a = if n_moved == 0 && matches!(backend, Backend::Gpu | Backend::Auto) {
+    // The `n_moved == 0` gate that used to sit here is gone, because both of the requirements
+    // its post-mortem set for removing it are now met. (1) The GPU pass reads TRUE probe
+    // positions from an uploaded buffer instead of deriving them from (gmin, spacing, index), so
+    // virtual offset is honoured on the GPU itself and the CPU fixup that used to re-light the
+    // relocated probes has nothing left to fix. (2) Device loss is survivable at every layer: the
+    // non-panicking uncaptured-error handler keeps wgpu's poll from aborting the process, the
+    // opening batch is scaled down by BVH depth so a giant scene cannot blow the ~2 s watchdog
+    // before the adaptive sizing has a measurement, the all-zero net catches a reset that still
+    // returns a buffer, and if the process dies anyway the BUILD retries the stage with
+    // EFT_BAKE_CPU=1 (tools/build_map.py) -- the stale-volume freshness check from the original
+    // post-mortem is what arms that retry.
+    let gpu_a = if matches!(backend, Backend::Gpu | Backend::Auto) {
         crate::sh_bake_gpu::pass_a_gpu(
-            &bvh, lights, gmin, spacing, dims, n_dir, sky_scale, light_scale, indirect_only,
+            &bvh, lights, &positions, gmin, spacing, dims, n_dir, sky_scale, light_scale,
+            indirect_only,
         )
     } else {
         None
     };
     let used_gpu = gpu_a.is_some();
-    let (mut sh_a, inside_solid): (Vec<[Vec3; 4]>, usize) = if let Some(v) = gpu_a {
+    let (sh_a, inside_solid): (Vec<[Vec3; 4]>, usize) = if let Some(v) = gpu_a {
         (v, 0) // inside-solid is a CPU-pass diagnostic only (never serialized); GPU path skips the count
     } else {
         if backend == Backend::Gpu {
@@ -753,29 +751,6 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         );
         (sh_a, inside.into_inner())
     };
-    // RELOCATED-PROBE FIXUP (GPU path only). The GPU computed every probe at its GRID position;
-    // probes that virtual-offset moved out of geometry must be re-lit from where they actually sit,
-    // or they keep the occluded-in-a-wall result the relocation existed to escape. Same closure as
-    // the CPU pass, so these probes are bit-identical to an all-CPU bake.
-    if used_gpu && n_moved > 0 && !positions.is_empty() {
-        let t_fix = Instant::now();
-        let fixed: Vec<(usize, [Vec3; 4])> = (0..n_probe)
-            .into_par_iter()
-            .filter(|&pi| positions[pi] != probe_o(pi, nx, ny, gmin, spacing))
-            .map_init(
-                || Vec::<u32>::with_capacity(64),
-                |stack, pi| (pi, pass_a_probe(pi, stack).0),
-            )
-            .collect();
-        let n_fixed = fixed.len();
-        for (pi, sh) in fixed {
-            sh_a[pi] = sh;
-        }
-        eprintln!(
-            "  sh-bake: pass A relocated-probe fixup {n_fixed} probes on CPU in {:.2}s",
-            t_fix.elapsed().as_secs_f32()
-        );
-    }
     eprintln!(
         "  sh-bake: pass A (direct) {n_probe} probes in {:.2}s ({} fully-occluded/inside-solid){}",
         t_bake.elapsed().as_secs_f32(),
@@ -805,20 +780,16 @@ fn bake(pack: &Pack, backend: Backend) -> Result<Baked> {
         // more per-probe-variable than pass A's any-hit occlusion, so a hot batch can exceed the OS GPU
         // watchdog (~2 s) and reset the device; TDR-safe batches for it would be so small that giant-map
         // GPU pass B barely beats the rayon pass anyway. Default is the reliable CPU bounce below.
-        // `n_moved == 0` for the same reason pass A carries it: the GPU derives every probe
-        // position from (gmin, spacing) and the grid index, so it CANNOT honour a probe that the
-        // virtual-offset pass relocated out of solid geometry. Pass A was gated and given a CPU
-        // fixup; pass B landed first and never received the rule, so with the flag set it cast all
-        // its bounce rays from the buried grid cell for every relocated probe. That is 25.7% of
-        // probes on interchange (405,223 of 1,574,326), and the shipped bakes are --indirect-only,
-        // where the bounce IS essentially the whole signal. The unreachable
-        // `if used_gpu && n_moved > 0` below is the leftover shape of the rule pass B never got.
-        let gpu_b = if n_moved == 0
-            && matches!(backend, Backend::Gpu | Backend::Auto)
+        // The n_moved gate is gone here for the same reason as pass A's: the shader now reads
+        // every probe's TRUE position from the uploaded buffer, so a relocated probe casts its
+        // bounce rays from where it actually sits. That mattered doubly for this pass -- the
+        // shipped bakes are --indirect-only, where the bounce IS essentially the whole signal,
+        // and 25.7% of interchange's probes are relocated.
+        let gpu_b = if matches!(backend, Backend::Gpu | Backend::Auto)
             && env_usize("EFT_SH_GPU_BOUNCE", 0) > 0
         {
             crate::sh_bake_gpu::pass_b_gpu(
-                &bvh, &sh_a, gmin, spacing, [nx, ny, nz], bounce_rays,
+                &bvh, &sh_a, &positions, gmin, spacing, [nx, ny, nz], bounce_rays,
                 &albedo_lut, &emis_lut, inv_pi_boost, emis_gain,
             )
         } else {

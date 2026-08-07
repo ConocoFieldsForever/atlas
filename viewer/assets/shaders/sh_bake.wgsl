@@ -33,6 +33,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read> nodes1: array<Node>;
 @group(0) @binding(6) var<storage, read> nodes2: array<Node>;
 @group(0) @binding(7) var<storage, read> lights: array<Light>;
+@group(0) @binding(9) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(8) var<storage, read_write> out_sh: array<f32>;   // 12 floats (4 coeffs x rgb) per probe
 
 const RAY_EPS: f32 = 0.02;   // matches sh_bake.rs RAY_EPS (origin push-off / slab entry clamp)
@@ -128,12 +129,13 @@ fn cs_bake(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pi = P.chunk.z + gid.x; // chunk.z = probe batch offset (TDR-avoiding batched dispatch)
     if (pi >= P.counts.w) { return; }
 
-    // probe origin (idx = ((z*ny)+y)*nx + x) — matches sh_bake.rs::probe_o
-    let nx = P.dims.x; let ny = P.dims.y;
-    let x = pi % nx;
-    let y = (pi / nx) % ny;
-    let z = pi / (nx * ny);
-    let o = P.gmin.xyz + vec3<f32>(f32(x), f32(y), f32(z)) * P.spacing.xyz;
+    // probe origin: the ACTUAL position, uploaded by the host. Deriving it here from
+    // (gmin, spacing, index) was what made the GPU pass blind to virtual offset — a probe the
+    // relocation pass had moved out of solid geometry was ray-cast from inside the wall it had
+    // been rescued from, which is why the whole pass used to be gated off whenever any probe
+    // had moved (26% of interchange). The host writes grid positions when nothing moved, so
+    // this is exact in both regimes.
+    let o = positions[pi].xyz;
 
     let n_dir = P.dims.w;
     let ga = P.consts.z;

@@ -30,6 +30,7 @@ struct Params {
 @group(0) @binding(6) var<storage, read> nodes2: array<Node>;
 @group(0) @binding(7) var<storage, read> sh_a: array<f32>;        // pass-A grid, 12 f32/probe
 @group(0) @binding(8) var<storage, read> mats: array<vec4<f32>>;  // 2 vec4/material: [albedo.xyz|_ , emissive.xyz|_]
+@group(0) @binding(10) var<storage, read> positions: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read_write> out_sh: array<f32>; // 12 f32/probe (combined)
 
 const RAY_EPS: f32 = 0.02;
@@ -158,11 +159,9 @@ fn sh_basis(d: vec3<f32>) -> vec4<f32> {
 fn cs_bounce(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pi = P.chunk.z + gid.x; // chunk.z = probe batch offset (TDR-avoiding batched dispatch)
     if (pi >= P.counts.y) { return; }
-    let nx = P.dims.x; let ny = P.dims.y;
-    let x = pi % nx;
-    let y = (pi / nx) % ny;
-    let z = pi / (nx * ny);
-    let o = P.gmin.xyz + vec3<f32>(f32(x), f32(y), f32(z)) * P.spacing.xyz;
+    // The ACTUAL probe position (see sh_bake.wgsl): derived-from-grid was blind to virtual
+    // offset, and in an --indirect-only bake the bounce is essentially the whole signal.
+    let o = positions[pi].xyz;
 
     let brays = P.dims.w;
     let ga = P.fconst.y;
