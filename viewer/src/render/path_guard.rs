@@ -80,15 +80,16 @@ fn from_token(s: &str) -> Option<RenderPath> {
 
 /// The next path to try after `p` has proven unsafe here.
 ///
-/// Standard before M0: both avoid the gpu-driven pipelines, but Standard keeps textures and M0 is
-/// deliberately untextured (`instancing.rs` scope note), and a user who has just survived a crash
-/// should not also be told their map is white. M0 is the last rung because it is the simplest thing
-/// that still draws real geometry. `None` means every rung has been tried.
+/// Standard is the ONLY automatic fallback. M0 used to be the last rung, and both times it was
+/// reached in the field the reaction was the same: the map is white (M0 is untextured BY DESIGN,
+/// a first-pixel dev path -- `instancing.rs` scope note), so the user reads the rescue as the
+/// breakage. A fallback that looks broken is not a fallback. Standard keeps textures; if Standard
+/// itself is dying, staying on it and failing visibly beats a white map that looks like success.
+/// M0 remains reachable explicitly via EFT_RENDER=m0.
 fn downgrade(p: RenderPath) -> Option<RenderPath> {
     match p {
         RenderPath::GpuDriven => Some(RenderPath::Standard),
-        RenderPath::Standard => Some(RenderPath::M0Instanced),
-        RenderPath::M0Instanced => None,
+        RenderPath::Standard | RenderPath::M0Instanced => None,
     }
 }
 
@@ -188,6 +189,7 @@ struct TrustCounter {
 fn trust_current_path(
     mut c: ResMut<TrustCounter>,
     pack: Option<Res<super::LoadedPack>>,
+    menu: Option<Res<crate::menu::MenuState>>,
     mut exits: MessageReader<bevy::app::AppExit>,
 ) {
     if c.cleared {
@@ -198,7 +200,13 @@ fn trust_current_path(
         clear_marker();
         return;
     }
-    if pack.is_none() {
+    // Frames count in a MAP session only once the pack is loaded (the danger window this sentinel
+    // exists for opens when the gpu-driven pipelines first draw a pack, so clearing earlier would
+    // blind it) -- but a MENU session has no pack and never will, so for it the frames alone are
+    // the proof. Without the menu arm, every force-killed menu session left a permanent false
+    // "crash" marker, and the next map launch was downgraded for it: the field symptom was a user
+    // launching interchange and getting the untextured M0 path with nothing wrong on their machine.
+    if pack.is_none() && menu.is_none() {
         return;
     }
     c.frames += 1;
@@ -235,9 +243,9 @@ mod tests {
         while let Some(cur) = p {
             p = downgrade(cur);
             steps += 1;
-            assert!(steps <= 3, "downgrade chain does not terminate");
+            assert!(steps <= 2, "downgrade chain does not terminate");
         }
-        assert_eq!(steps, 3, "gpu -> std -> m0 -> done");
+        assert_eq!(steps, 2, "gpu -> std -> done");
     }
 
     #[test]
@@ -272,9 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn repeated_crashes_converge_on_the_simplest_path() {
+    fn repeated_crashes_stay_on_standard_never_the_white_map() {
+        // Standard failing too means stay and fail VISIBLY: an auto-selected M0 is an untextured
+        // map that reads as breakage (field-reported twice as "launched with no color").
         let bad = [RenderPath::GpuDriven, RenderPath::Standard];
-        assert_eq!(pick(RenderPath::GpuDriven, &bad), RenderPath::M0Instanced);
+        assert_eq!(pick(RenderPath::GpuDriven, &bad), RenderPath::Standard);
     }
 
     #[test]
@@ -296,6 +306,6 @@ mod tests {
     fn everything_failing_still_yields_a_path() {
         // Refusing to start would be worse than retrying the last rung.
         let all = [RenderPath::GpuDriven, RenderPath::Standard, RenderPath::M0Instanced];
-        assert_eq!(pick(RenderPath::GpuDriven, &all), RenderPath::M0Instanced);
+        assert_eq!(pick(RenderPath::GpuDriven, &all), RenderPath::Standard);
     }
 }
