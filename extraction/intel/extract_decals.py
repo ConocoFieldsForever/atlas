@@ -439,6 +439,19 @@ def main():
         if lv_count:
             print("  [decals] level%d: %d projector(s)" % (lv, lv_count))
 
+    # PROJECT: clip each decal against the geometry inside its box, the way Unity's deferred pass
+    # does per-frame. These are Static decals on static geometry, so once is enough -- and it is
+    # the only way a decal spanning surfaces at different depths (the checkpoint's two staggered
+    # plates) paints all of them instead of just the nearest. EFT_DECAL_FLAT=1 keeps the old flat
+    # quads for comparison.
+    if os.environ.get("EFT_DECAL_FLAT") != "1":
+        try:
+            from decal_project import project_decals
+        except ImportError:
+            sys.path.insert(0, HERE)
+            from decal_project import project_decals
+        instances = project_decals(DS, instances)
+
     out = os.path.join(DS, "decals.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump({"instances": instances}, f)
