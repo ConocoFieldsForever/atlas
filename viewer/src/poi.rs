@@ -802,6 +802,11 @@ struct GdSpawn {
     side: Option<String>,
     #[serde(default)]
     categories_mask: Option<u32>,
+    /// The extractor's DECODED category names ("player"/"bot"/"boss"/"botpmc"). The mask alone
+    /// cannot say "this is a raid start": the co-op/group markers (masks 8/16/32) carry the pmc
+    /// side with no player bit, which is the trap nav_bake's --side audit documents.
+    #[serde(default)]
+    categories: Vec<String>,
     #[serde(default)]
     infiltration: Option<String>,
     /// Owning BotZone's GameObject name ("ZoneTagilla") — AI markers only.
@@ -866,12 +871,16 @@ fn gd_spawn_layer(s: &GdSpawn) -> Option<PoiLayer> {
     match s.side.as_deref() {
         Some("pmc") | Some("all") => Some(PoiLayer::PmcSpawn),
         Some("savage") | Some("usec+savage") | Some("bear+savage") => {
-            if m & 2 != 0 {
+            // Boss FIRST: most boss-capable markers also carry the plain bot bit (interchange:
+            // masks 6 and 7 — 28 of the 31 boss spawns), and testing bot first swallowed them
+            // into the Scav layer where the only trace was one card line. The game flags where
+            // a boss can stand; that belongs on the Boss layer.
+            if m & 4 != 0 {
+                Some(PoiLayer::Boss)
+            } else if m & 2 != 0 {
                 Some(PoiLayer::ScavSpawn)
             } else if m & 64 != 0 {
                 Some(PoiLayer::PmcSpawn)
-            } else if m & 4 != 0 {
-                Some(PoiLayer::Boss)
             } else {
                 None
             }
@@ -2700,7 +2709,11 @@ fn spawn_pois(
             let mat = (layer == PoiLayer::PmcSpawn && !player_side).then(|| ai_pmc_mat.clone());
             let e = spawn(&mut commands, layer, s.pos, gd_spawn_info(s, layer, zd.as_deref()), mat);
             commands.entity(e).insert(DenseMarker);
-            if layer == PoiLayer::PmcSpawn && player_side {
+            // PlayerStart tags REAL raid starts only — the danger fields exempt these from
+            // "avoid PMCs", so tagging the co-op/group markers (pmc side, no `player` category)
+            // was quietly excluding 46 non-start points from avoidance on interchange.
+            let raid_start = player_side && s.categories.iter().any(|c| c == "player");
+            if layer == PoiLayer::PmcSpawn && raid_start {
                 commands.entity(e).insert(PlayerStart);
             }
             if let Some(r) = s.radius.filter(|r| *r > 0.0 && !player_side) {

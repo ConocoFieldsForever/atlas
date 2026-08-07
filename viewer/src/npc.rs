@@ -8,7 +8,14 @@
 //! nothing is an authored constant. At each waypoint the agent pauses briefly, then walks on;
 //! routes loop ping-pong like the game's patrols.
 //!
-//! `EFT_NPC=0` disables; `EFT_NPC_CHAR=<id>` overrides the default `scav` pack id.
+//! THE CAST IS DERIVED, NOT AUTHORED. A patrol way whose game-side name/zone carries a boss
+//! token (`KILLA_PATROL_ALT`, `ZoneTagilla`) walks that boss's character pack when one is built
+//! (`out/characters/boss*`); PMC bodies wander the map's REAL PMC spawn clusters (side=pmc,
+//! category `player`, grouped by the game's own infiltration zone), alternating the usec/bear
+//! packs; everything else stays a scav. Missing packs degrade to scav, never to an error.
+//!
+//! `EFT_NPC=0` disables; `EFT_NPC_CHAR=<id>` forces ONE pack id for every agent (the old
+//! behaviour, and still the right tool for eyeballing a single character).
 
 use crate::character::anim::{accumulate_clip, PoseAccumulator, WeightedClip};
 use crate::character::drive::{blended_root_speed, gather, states};
@@ -64,9 +71,14 @@ struct Npc {
     heading: f32,
 }
 
-/// The shared character data every NPC instance samples from.
+/// The loaded character packs, indexed by [`NpcCast`] on each agent. Index 0 is always the
+/// base pack (scav unless EFT_NPC_CHAR overrides), so a lone-pack session is the old behaviour.
 #[derive(Resource)]
-struct NpcCharacter(Arc<CharacterPack>);
+struct NpcCharacter(Vec<Arc<CharacterPack>>);
+
+/// Which entry of [`NpcCharacter`] this agent samples from.
+#[derive(Component, Clone, Copy)]
+struct NpcCast(usize);
 
 /// The weapon every agent carries (one `.eftweap`, shared handles).
 #[derive(Resource)]
@@ -93,18 +105,21 @@ fn attach_weapons(
     mut commands: Commands,
     weapon: Option<Res<NpcWeapon>>,
     cpack: Option<Res<NpcCharacter>>,
-    agents: Query<(Entity, &CharacterRoot), (With<Npc>, Without<WeaponAttached>)>,
+    agents: Query<(Entity, &CharacterRoot, &NpcCast), (With<Npc>, Without<WeaponAttached>)>,
 ) {
     let (Some(weapon), Some(cpack)) = (weapon, cpack) else { return };
-    let Some(bi) = cpack
-        .0
-        .bones
-        .iter()
-        .position(|b| b.name == crate::character::weapon::WEAPON_BONE)
-    else {
-        return;
-    };
-    for (e, root) in &agents {
+    for (e, root, cast) in &agents {
+        // The weapon bone index is PER PACK: rigs share a skeleton family but not necessarily
+        // an ordering, so resolving it once against pack 0 could parent rifles to the wrong
+        // bone on every non-scav body.
+        let Some(pack) = cpack.0.get(cast.0) else { continue };
+        let Some(bi) = pack
+            .bones
+            .iter()
+            .position(|b| b.name == crate::character::weapon::WEAPON_BONE)
+        else {
+            continue;
+        };
         let Some(&bone) = root.bones.get(bi) else { continue };
         for (mesh, mat) in &weapon.0.parts {
             let child = commands
@@ -142,25 +157,65 @@ fn spawn_npcs(
         return;
     }
     let Some(pack) = pack else { return };
-    // Patrol routes from the pack's own gamedata (the game's AI scene data).
+    // Patrol routes from the pack's own gamedata (the game's AI scene data), WITH their names —
+    // the name is what casts a boss.
     let routes = load_patrol_ways(&pack.0.root);
     if routes.is_empty() {
         info!("npc: no patrol_ways in gamedata — no patrols to walk");
         return;
     }
-    // The character pack: default `scav`, overridable. Missing pack = a log, not an error —
-    // the map is fully usable without NPCs.
-    let id = std::env::var("EFT_NPC_CHAR").unwrap_or_else(|_| "scav".into());
-    let dir = std::path::PathBuf::from("out").join("characters").join(id.trim());
-    let cpack = match crate::character::pack::load(&dir) {
+    // The base pack: `scav` unless EFT_NPC_CHAR forces one id for everyone (which also disables
+    // the cast below — one pack, old behaviour, still the debugging tool).
+    let forced = std::env::var("EFT_NPC_CHAR").ok().map(|s| s.trim().to_string());
+    let base_id = forced.clone().unwrap_or_else(|| "scav".into());
+    let char_dir = |id: &str| std::path::PathBuf::from("out").join("characters").join(id);
+    let base = match crate::character::pack::load(&char_dir(&base_id)) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             info!(
                 "npc: character pack {} not loadable ({e}) — run \
                  extraction/characters/build_character.py --character scav",
-                dir.display()
+                char_dir(&base_id).display()
             );
             return;
+        }
+    };
+    // The available cast: every built character pack on disk. Boss packs are matched to patrol
+    // ways by TOKEN (bosskilla_0 -> "killa" appearing in the way's name/zone/go); pmc packs
+    // wander the real PMC spawn clusters. Lazy-loaded so a map that casts nobody costs nothing.
+    let available: Vec<String> = if forced.is_some() {
+        Vec::new() // forced id: everyone is that character, no casting
+    } else {
+        std::fs::read_dir("out/characters")
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .filter(|e| e.path().join("manifest.json").is_file())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let boss_token = |id: &str| -> Option<String> {
+        let stem = id.strip_suffix("_0").unwrap_or(id);
+        let t = stem.strip_prefix("boss")?;
+        (!t.is_empty()).then(|| t.to_ascii_lowercase())
+    };
+    let mut packs: Vec<Arc<CharacterPack>> = vec![base];
+    let mut pack_ids: Vec<String> = vec![base_id.clone()];
+    let mut ensure_pack = |id: &str, packs: &mut Vec<Arc<CharacterPack>>, pack_ids: &mut Vec<String>| -> Option<usize> {
+        if let Some(i) = pack_ids.iter().position(|p| p == id) {
+            return Some(i);
+        }
+        match crate::character::pack::load(&char_dir(id)) {
+            Ok(p) => {
+                packs.push(Arc::new(p));
+                pack_ids.push(id.to_string());
+                Some(packs.len() - 1)
+            }
+            Err(e) => {
+                info!("npc: cast pack '{id}' not loadable ({e}) — that role stays a scav");
+                None
+            }
         }
     };
     // Wander plans: the game's own bot interest points, grouped by ITS `cg` core-group id.
@@ -184,16 +239,18 @@ fn spawn_npcs(
         .and_then(|d| crate::character::weapon::load(&d, &mut meshes, &mut materials, &mut images));
 
     let mut n = 0usize;
-    let mut spawn_agent = |targets: Vec<Vec3>, ping_pong: bool,
+    let mut spawn_agent = |targets: Vec<Vec3>, ping_pong: bool, cast: usize,
+                           packs: &Vec<Arc<CharacterPack>>,
                            commands: &mut Commands,
                            meshes: &mut Assets<Mesh>,
                            materials: &mut Assets<StandardMaterial>,
                            images: &mut Assets<Image>,
                            ibms: &mut Assets<SkinnedMeshInverseBindposes>| {
-        let root = rig::spawn(&cpack, 0, commands, meshes, materials, images, ibms).root;
+        let root = rig::spawn(&packs[cast], 0, commands, meshes, materials, images, ibms).root;
         let start = targets[0];
         commands.entity(root).insert((
             Transform::from_translation(start),
+            NpcCast(cast),
             Npc {
                 targets,
                 at: 0,
@@ -209,18 +266,57 @@ fn spawn_npcs(
         ));
         n += 1;
     };
+    let mut bosses_cast = 0usize;
     for route in &routes {
-        if route.len() >= 2 {
-            spawn_agent(route.clone(), true, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+        if route.points.len() < 2 {
+            continue;
         }
+        // A boss walks its own patrol: the game names the way after them.
+        let hay = format!("{} {} {}", route.name, route.zone, route.go).to_ascii_lowercase();
+        let mut cast = 0usize;
+        for id in &available {
+            if let Some(tok) = boss_token(id) {
+                if hay.contains(&tok) {
+                    if let Some(i) = ensure_pack(id, &mut packs, &mut pack_ids) {
+                        cast = i;
+                        bosses_cast += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        spawn_agent(route.points.clone(), true, cast, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
     }
     // One wanderer per core group with enough points to circulate; capped so big maps stay light.
     const MAX_WANDERERS: usize = 8;
     let mut wanderers = 0usize;
     for pts in groups {
         if pts.len() >= 3 && wanderers < MAX_WANDERERS {
-            spawn_agent(pts, false, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+            spawn_agent(pts, false, 0, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
             wanderers += 1;
+        }
+    }
+    // PMC bodies on the map's REAL raid starts: side=pmc spawn points whose categories include
+    // `player` (the same rule nav_bake documents — the co-op/group masks are NOT raid starts),
+    // grouped by the game's own infiltration zone. One body per zone cluster walks between that
+    // zone's spawn points, usec/bear alternating, capped like the wanderers.
+    const MAX_PMC: usize = 6;
+    let mut pmc_cast = 0usize;
+    if forced.is_none() {
+        let clusters = load_pmc_spawn_clusters(&pack.0.root);
+        for (ci, pts) in clusters.into_iter().enumerate() {
+            if pmc_cast >= MAX_PMC || pts.len() < 2 {
+                continue;
+            }
+            let want = if ci % 2 == 0 { "pmcusec_0" } else { "pmcbear_0" };
+            let alt = if ci % 2 == 0 { "pmcbear_0" } else { "pmcusec_0" };
+            let Some(i) = ensure_pack(want, &mut packs, &mut pack_ids)
+                .or_else(|| ensure_pack(alt, &mut packs, &mut pack_ids))
+            else {
+                break; // neither pmc pack is built — the map still has its markers
+            };
+            spawn_agent(pts, false, i, &packs, &mut commands, &mut meshes, &mut materials, &mut images, &mut ibms);
+            pmc_cast += 1;
         }
     }
     if let Some(w) = weapon {
@@ -228,11 +324,59 @@ fn spawn_npcs(
     }
     if n > 0 {
         info!(
-            "npc: {n} agent(s) — {} on patrol_ways, {wanderers} circulating core-point groups",
-            n - wanderers
+            "npc: {n} agent(s) — {} on patrol_ways ({bosses_cast} boss-cast), {wanderers} \
+             circulating core-point groups, {pmc_cast} PMCs on infiltration clusters ({} pack(s))",
+            n - wanderers - pmc_cast,
+            packs.len(),
         );
-        commands.insert_resource(NpcCharacter(cpack));
+        commands.insert_resource(NpcCharacter(packs));
     }
+}
+
+/// PMC raid starts -> one wander circuit per infiltration zone.
+///
+/// `side == "pmc"` alone is NOT the filter: the co-op/group markers (masks 8/16/32) carry the
+/// pmc side without being raid starts, which is the exact trap nav_bake's --side audit documents.
+/// The decoded `categories` list must contain "player".
+fn load_pmc_spawn_clusters(root: &std::path::Path) -> Vec<Vec<Vec3>> {
+    let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Vec::new();
+    };
+    let mut by_infil: std::collections::BTreeMap<String, Vec<Vec3>> = Default::default();
+    for s in v
+        .get("spawn_points")
+        .and_then(|x| x.as_array())
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        if s.get("side").and_then(|x| x.as_str()) != Some("pmc") {
+            continue;
+        }
+        let is_player = s
+            .get("categories")
+            .and_then(|c| c.as_array())
+            .is_some_and(|a| a.iter().any(|c| c.as_str() == Some("player")));
+        if !is_player {
+            continue;
+        }
+        let Some(pos) = s.get("pos").and_then(|p| p.as_array()).filter(|p| p.len() >= 3) else {
+            continue;
+        };
+        let infil = s
+            .get("infiltration")
+            .and_then(|x| x.as_str())
+            .unwrap_or("?")
+            .to_string();
+        by_infil.entry(infil).or_default().push(Vec3::new(
+            pos[0].as_f64().unwrap_or(0.0) as f32,
+            pos[1].as_f64().unwrap_or(0.0) as f32,
+            pos[2].as_f64().unwrap_or(0.0) as f32,
+        ));
+    }
+    by_infil.into_values().collect()
 }
 
 /// `core_points` grouped by the game's own `cg` (core-group) id -> wander circuits.
@@ -309,8 +453,17 @@ fn sync_character_light(
     }
 }
 
-/// `patrol_ways` -> world polylines (already in viewer space; the extractor conjugates).
-fn load_patrol_ways(root: &std::path::Path) -> Vec<Vec<Vec3>> {
+/// One patrol way with the game-side names that cast it.
+struct PatrolRoute {
+    name: String,
+    zone: String,
+    go: String,
+    points: Vec<Vec3>,
+}
+
+/// `patrol_ways` -> world polylines (already in viewer space; the extractor conjugates), keeping
+/// name/zone/go — a way called `KILLA_PATROL_ALT` in `ZoneTagilla` is the cast list.
+fn load_patrol_ways(root: &std::path::Path) -> Vec<PatrolRoute> {
     let Ok(txt) = std::fs::read_to_string(root.join("gamedata.json")) else {
         return Vec::new();
     };
@@ -324,6 +477,7 @@ fn load_patrol_ways(root: &std::path::Path) -> Vec<Vec<Vec3>> {
         .map(|a| a.as_slice())
         .unwrap_or(&[])
     {
+        let s = |k: &str| w.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         let pts: Vec<Vec3> = w
             .get("points")
             .and_then(|p| p.as_array())
@@ -342,7 +496,7 @@ fn load_patrol_ways(root: &std::path::Path) -> Vec<Vec<Vec3>> {
             })
             .unwrap_or_default();
         if pts.len() >= 2 {
-            out.push(pts);
+            out.push(PatrolRoute { name: s("name"), zone: s("zone"), go: s("go"), points: pts });
         }
     }
     out
@@ -361,21 +515,24 @@ fn drive_npcs(
     time: Res<Time>,
     cpack: Option<Res<NpcCharacter>>,
     nav: Option<Res<crate::pathfind::Nav>>,
-    mut acc: Local<Option<PoseAccumulator>>,
+    // One accumulator PER PACK INDEX: different rigs can have different bone counts, and an
+    // accumulator sized for the first pack would index out of range on a larger one.
+    mut accs: Local<HashMap<usize, PoseAccumulator>>,
     mut scratch: Local<Vec<WeightedClip>>,
     mut prev_scratch: Local<Vec<WeightedClip>>,
     mut params: Local<HashMap<String, f32>>,
     mut commands: Commands,
     mut pending: Query<&mut PendingRoute>,
-    mut root_q: Query<(Entity, &mut Npc, &mut CharacterRoot, &mut Transform), Without<CharacterBone>>,
+    mut root_q: Query<(Entity, &mut Npc, &NpcCast, &mut CharacterRoot, &mut Transform), Without<CharacterBone>>,
     mut bone_q: Query<&mut Transform, (With<CharacterBone>, Without<Npc>)>,
 ) {
     let Some(cpack) = cpack else { return };
-    let pack: &CharacterPack = &cpack.0;
     let dt = time.delta_secs().min(0.1);
     let grid = nav.as_ref().and_then(|n| n.0.as_ref());
 
-    for (e, mut npc, mut root, mut tf) in &mut root_q {
+    for (e, mut npc, cast, mut root, mut tf) in &mut root_q {
+        let Some(pack) = cpack.0.get(cast.0) else { continue };
+        let pack: &CharacterPack = pack;
         // ---- plan: (re)route the current leg through the NAV GRID, OFF the main thread ----
         if npc.path.len() < 2 {
             match pending.get_mut(e) {
@@ -552,7 +709,9 @@ fn drive_npcs(
         let fading = !root.prev_state.is_empty() && root.fade < 1.0;
 
         // ---- accumulate + resolve + write bones (the drive_character recipe) ----
-        let acc = acc.get_or_insert_with(|| PoseAccumulator::new(pack.bones.len()));
+        let acc = accs
+            .entry(cast.0)
+            .or_insert_with(|| PoseAccumulator::new(pack.bones.len()));
         acc.clear();
         let ft = root.fade.clamp(0.0, 1.0);
         let w_in = if fading { ft * ft * (3.0 - 2.0 * ft) } else { 1.0 };
