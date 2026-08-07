@@ -146,6 +146,8 @@ pub enum K {
     LanguageTip,
     ProcessInBackground,
     ProcessInBackgroundTip,
+    AllLodExtract,
+    AllLodExtractTip,
     ForceCpuProcess,
     ForceCpuProcessTip,
     CustomShotsDir,
@@ -455,6 +457,11 @@ fn pair(k: K) -> [&'static str; 2] {
         ProcessInBackgroundTip => [
             "Builds keep running even if you close Atlas - reopen it later to see the progress or the finished map.",
             "Сборка продолжается, даже если закрыть Atlas - откройте его позже, чтобы увидеть прогресс или готовую карту.",
+        ],
+        AllLodExtract => ["Extract all LOD levels", "Извлекать все уровни LOD"],
+        AllLodExtractTip => [
+            "Keep every LOD level in the pack for correct distance detail (about 47% larger dataset). Changing this needs a FORCED rebuild: the LOD levels are decided when the map is first extracted.",
+            "Хранить в паке все уровни LOD для честной детализации на расстоянии (датасет больше примерно на 47%). Изменение требует ПРИНУДИТЕЛЬНОЙ пересборки: уровни LOD определяются при первом извлечении карты.",
         ],
         ForceCpuProcess => [
             "Force CPU processing (no GPU bakes)",

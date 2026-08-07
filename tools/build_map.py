@@ -653,11 +653,13 @@ def main():
     # light sidecars), never the big mesh/texture exports or the existing .eftpack, so a failed
     # re-extract can't leave the user with nothing (the old pack stays playable until stage 4).
     force = "--force" in sys.argv or os.environ.get("EFT_FORCE_REBUILD", "").strip() == "1"
-    # --alllod (or EFT_ALLLOD=1): keep EVERY LOD level in the dataset + pack (instead of the default
-    # LOD0-only resolve) so the viewer can offer a forced-LOD selector. ~47% bigger; opt-in. NOTE:
-    # only takes effect on a FRESH extraction -- delete the existing LOD0 dataset first, else the
-    # stage-1 "dataset exists" check reuses the LOD0 dataset.
-    all_lod = "--alllod" in sys.argv or os.environ.get("EFT_ALLLOD", "").strip() == "1"
+    # ALL LOD levels are the DEFAULT (dataset + pack keep every level, so the viewer draws real
+    # distance detail and can offer a forced-LOD selector; ~47% bigger). Opt OUT with --lod0 or
+    # EFT_ALLLOD=0 (the menu's "Extract all LOD levels" checkbox exports this; --alllod/=1 remain
+    # accepted no-ops for old scripts). The mode only takes effect on a FRESH extraction, so the
+    # dataset records which mode built it (lodmode.json below) and a mismatch warns loudly instead
+    # of silently shipping a pack without the shells the settings promised.
+    all_lod = not ("--lod0" in sys.argv or os.environ.get("EFT_ALLLOD", "").strip() == "0")
     alllod_extract = ["--alllod"] if all_lod else []
     keeplods_flag = ["--keep-lods"] if all_lod else []
     if not args:
@@ -754,6 +756,26 @@ def main():
     #    so one click goes from "no data" to a playable pack. Resumable - a re-run skips already
     #    exported meshes/textures.
     print(f"[STAGE 1/{total}] check dataset", flush=True)
+    # The LOD mode is baked into the dataset at extraction; a reused dataset in the WRONG mode
+    # cannot honour the requested one, and the old behaviour -- silently building a LOD0 pack
+    # while the settings said all-LOD -- is exactly the kind of quiet lie this build has been
+    # taught not to tell. Absent marker = a dataset from before the marker existed = LOD0-only.
+    _lodmode = os.path.join(dataset, "lodmode.json")
+    if os.path.isfile(os.path.join(dataset, "scene.json")) and not force:
+        try:
+            with open(_lodmode, encoding="utf-8") as f:
+                _ds_alllod = bool(json.load(f).get("alllod"))
+        except (OSError, ValueError):
+            _ds_alllod = False
+        if _ds_alllod != all_lod:
+            want = "all-LOD" if all_lod else "LOD0-only"
+            have = "all-LOD" if _ds_alllod else "LOD0-only"
+            print(f"[STAGE 1/{total}] WARNING: the settings ask for a {want} build but the "
+                  f"existing dataset was extracted {have}. The pack will be {have} until the "
+                  f"dataset is re-extracted - run a FORCED rebuild (menu: Update with force, or "
+                  f"--force) to re-extract in the requested mode.", flush=True)
+            all_lod = _ds_alllod
+            keeplods_flag = ["--keep-lods"] if all_lod else []
     if force or not os.path.isfile(os.path.join(dataset, "scene.json")):
         levels = dataset_levels(m)
         if not levels:
@@ -767,6 +789,13 @@ def main():
         run(1, total, "extract dataset (geometry + textures)",
             [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "extract_parallel.py"),
              "--levels", levels, "--name", dsname] + alllod_extract, VIEWER)
+        # Stamp the mode INTO the dataset so every later build knows what this extraction can
+        # honour (see the mismatch warning above).
+        try:
+            with open(_lodmode, "w", encoding="utf-8") as f:
+                json.dump({"alllod": all_lod}, f)
+        except OSError as e:
+            print(f"  lodmode stamp failed ({e}) - future builds will assume LOD0-only", flush=True)
         # Grass density is extracted for EVERY map here; indoor/no-terrain maps simply yield no
         # grids and are skipped at pack time (stage 5) -- no hardcoded indoor list.
         run(1, total, "extract grass density",

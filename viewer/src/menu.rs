@@ -197,6 +197,12 @@ impl BuildJob {
         if config_force_cpu_process() {
             cmd.env("EFT_BAKE_CPU", "1");
         }
+        // Settings ▸ General ▸ "Extract all LOD levels": default ON; the build treats all-LOD as
+        // its own default, so only the opt-OUT needs exporting. Read at spawn time like the CPU
+        // toggle above.
+        if !config_all_lod() {
+            cmd.env("EFT_ALLLOD", "0");
+        }
         if key_as_args {
             cmd.args(key.split([',', ' ']).filter(|s| !s.is_empty()));
         }
@@ -972,6 +978,8 @@ pub struct MenuState {
     /// "Screenshot to locate current position" — poll the EFT screenshot folder and move the
     /// camera onto each new position fix (see `config_screenshot_locate`).
     pub screenshot_locate: bool,
+    /// Settings ▸ General ▸ "Extract all LOD levels" (config `allLodExtract`, default true).
+    pub all_lod: bool,
     /// Custom screenshots/logs folder edits (issue #8). Empty string = automatic discovery.
     /// The `_saved` copies are what the SET buttons diff against, mirroring `game_dir_edit`.
     pub shots_dir_edit: String,
@@ -1353,6 +1361,16 @@ pub fn save_config_process_in_background(on: bool) -> bool {
 /// spawner exports EFT_BAKE_CPU=1 into the build child's environment. The override for machines
 /// whose GPU driver crashes or TDRs inside the compute bakes (e.g. a bad Vulkan ICD). Persisted
 /// in atlas.config.json under `forceCpuProcessing`.
+/// Settings ▸ General ▸ "Extract all LOD levels" (default TRUE): the pack keeps every LOD
+/// level for real distance detail (~47% bigger dataset). Only takes effect on a fresh
+/// extraction; build_map warns on a mismatched reused dataset.
+pub fn config_all_lod() -> bool {
+    config_bool("allLodExtract").unwrap_or(true)
+}
+pub fn save_config_all_lod(on: bool) -> bool {
+    save_config_bool("allLodExtract", on)
+}
+
 pub fn config_force_cpu_process() -> bool {
     config_bool("forceCpuProcessing").unwrap_or(false)
 }
@@ -1812,6 +1830,7 @@ pub fn build_state() -> MenuState {
         process_in_background: config_process_in_background(),
         force_cpu_process: config_force_cpu_process(),
         screenshot_locate: config_screenshot_locate(),
+        all_lod: config_all_lod(),
         shots_dir_edit: config_str_pub("screenshotsDir").unwrap_or_default(),
         shots_dir_saved: config_str_pub("screenshotsDir").unwrap_or_default(),
         logs_dir_edit: config_str_pub("gameLogsDir").unwrap_or_default(),
@@ -3330,6 +3349,25 @@ pub fn menu_ui(
                         {
                             state.force_cpu_process = cpu;
                             if !save_config_force_cpu_process(cpu) {
+                                state.config_err = Some(t(lg, K::ConfigSaveFailed).to_string());
+                            }
+                        }
+                        ui.add_space(6.0);
+                        // ALL LOD LEVELS (default ON) — the pack keeps every LOD shell for real
+                        // distance detail. Only a FRESH extraction can honour a change, and
+                        // build_map refuses to lie about it (it warns and builds what the dataset
+                        // holds), so the tip says the rebuild is a forced one.
+                        let mut alllod = state.all_lod;
+                        if ui
+                            .checkbox(
+                                &mut alllod,
+                                RichText::new(t(lg, K::AllLodExtract)).size(11.0),
+                            )
+                            .on_hover_text(t(lg, K::AllLodExtractTip))
+                            .changed()
+                        {
+                            state.all_lod = alllod;
+                            if !save_config_all_lod(alllod) {
                                 state.config_err = Some(t(lg, K::ConfigSaveFailed).to_string());
                             }
                         }
