@@ -1275,8 +1275,32 @@ def main():
         lod_groups.append(g2)
 
     # ---- sidecars: referenced IN PLACE by default; COPIED INTO THE PACK with --self-contained ----------------
-    beamng = os.path.dirname(os.path.dirname(DS))           # .../beamng_blender_pipeline
-    vol_dir = os.path.join(beamng, 'tarkmap', 'out', MAP)
+    # THE TARKMAP WORKING DIR (holds out/<map>/volume.* and out/{loot,tasks,eft_grade_lut}.*). It is
+    # a SHIPPED SETTING -- the start menu's tarkmap dir (EFT_TARKMAP_ROOT > config tarkmapRoot >
+    # sibling of the assets dir), forwarded to every stage by the build driver -- so READ it rather
+    # than reconstruct it. The old walk (dataset -> up two -> a literal 'tarkmap') agrees with the
+    # setting only when the datasets dir and the tarkmap dir are siblings AND that dir is named
+    # exactly 'tarkmap'. On a split workspace it resolved to a path that does not exist and every
+    # symptom was SILENT; the one nothing else repairs is packs/shared/grade_lut.bin, which only
+    # this file writes, so the viewer found no LUT and fell back to its default tonemap on every map.
+    #
+    # The walk stays as the fallback, and ALSO wins when the environment points somewhere that does
+    # not exist while the walk does: reading the setting must not make a working layout worse just
+    # because a stale EFT_TARKMAP_ROOT is left over from another workspace.
+    _tk_walk = os.path.join(os.path.dirname(os.path.dirname(DS)), 'tarkmap')
+    _tk_env = os.environ.get('EFT_TARKMAP_ROOT')
+    TK_ROOT = _tk_env or _tk_walk
+    if _tk_env and not os.path.isdir(os.path.join(_tk_env, 'out')) \
+            and os.path.isdir(os.path.join(_tk_walk, 'out')):
+        print(f"[bevy] WARNING: EFT_TARKMAP_ROOT={_tk_env} has no out/ dir; falling back to the "
+              f"dataset-sibling tarkmap at {_tk_walk}")
+        TK_ROOT = _tk_walk
+    tk_out = os.path.join(TK_ROOT, 'out')
+    vol_dir = os.path.join(tk_out, MAP)
+    if not os.path.isdir(tk_out):
+        print(f"[bevy] WARNING: no tarkmap out dir at {tk_out} (EFT_TARKMAP_ROOT="
+              f"{_tk_env or '<unset; derived from the dataset path>'}) -- the SH volume sidecars "
+              f"and the shared loot/tasks/grade sidecars will be skipped")
     def _abs(p): return p.replace('\\', '/') if p and os.path.exists(p) else None
     lights = sorted(g for g in glob.glob(os.path.join(DS, 'lights_*.json')) if not g.endswith('_all.json'))
     lights_primary = next((l for l in lights if os.path.basename(l) == 'lights_64.json'), (lights[0] if lights else None))
@@ -1392,7 +1416,8 @@ def main():
     #      map-AGNOSTIC, so they live ONCE in packs/shared/ (above the packs; the viewer resolves
     #      pack-local -> shared -> cwd). Refreshed here when the upstream copy is newer. Per-map
     #      sidecars (gamedata/semantics/grass/volume) still have their own steps.
-    tk_out = os.path.join(beamng, 'tarkmap', 'out')
+    # tk_out is bound once, above, from the tarkmap setting. Reconstructing it a second time here
+    # is how the two halves of this function came to disagree about where the workspace was.
     shared = os.path.join(os.path.dirname(FINAL_OUT), 'shared')
     os.makedirs(shared, exist_ok=True)
     for src, dst in ((os.path.join(tk_out, 'loot.json'), 'loot.json'),
@@ -1421,19 +1446,75 @@ def main():
     # ---- atomic swap: migrate per-map sidecars the build doesn't regenerate (semantics.json,
     #      grass.bin/grass_sidecar.json, and any loot/tasks/grade already in the live pack), then
     #      retire the old dir and move the staging dir into place. ----
+    #
+    # Migrating them is REQUIRED -- a geometry rebuild must not throw away hours of bake time -- but
+    # a migrated sidecar can describe a world this pack no longer contains. So each one is checked
+    # against the inputs ITS OWN producer reads (eft_pipeline/sidecars.py) and any that went stale
+    # is named, with the command that refreshes it. Nothing is deleted: a wrong warning is cheap,
+    # and silently retiring 50 MB of physics geometry because one extract stage flaked is not.
+    from eft_pipeline import sidecars as _sc
+    _prev_ids = None
+    if os.path.exists(os.path.join(FINAL_OUT, 'manifest.json')):
+        try:
+            with open(os.path.join(FINAL_OUT, 'manifest.json'), encoding='utf-8') as _f:
+                _prev_ids = (json.load(_f) or {}).get('inputIds')
+        except Exception:
+            _prev_ids = None                      # unreadable old manifest -> treat as a first build
+    _new_ids = _sc.input_ids(OUT, manifest, DS)
+    manifest['inputIds'] = _new_ids
+
     if os.path.abspath(FINAL_OUT) != os.path.abspath(OUT):
         old_dir = FINAL_OUT + '.old'
         if os.path.exists(old_dir):
             shutil.rmtree(old_dir)
+        _migrated = []
         if os.path.exists(FINAL_OUT):
             for fn in os.listdir(FINAL_OUT):
                 if not os.path.exists(os.path.join(OUT, fn)):
                     shutil.move(os.path.join(FINAL_OUT, fn), os.path.join(OUT, fn))
+                    _migrated.append(fn)
             os.rename(FINAL_OUT, old_dir)
+
+        # ADOPT migrated sidecars the manifest could not resolve upstream. The sidecar table is
+        # built from the tarkmap out dir, but the portable SH baker writes volume.bin INTO THE
+        # PACK, so a standalone assemble resolved "volume" to null while the 37 MB file sat right
+        # there, migrated and unreferenced. The viewer then fell back to 1x1x1 flat ambient and the
+        # whole map rendered dark with no error -- the pack was not broken, just not described.
+        # A file present in the pack is authoritative over a path that does not exist.
+        # NB: write into manifest['sidecars'], not the local `sidecars`. `_sane()` above returns a
+        # sanitised COPY of the manifest, so the two stopped being the same object there.
+        _sidecars = manifest.setdefault('sidecars', {})
+        _adopted = []
+        for _key, _fn in (('volume', 'volume.bin'), ('volumeMeta', 'volume.json'),
+                          ('volumeVis', 'volume.vis.bin')):
+            if not _sidecars.get(_key) and os.path.exists(os.path.join(OUT, _fn)):
+                _sidecars[_key] = _fn
+                _adopted.append(_fn)
+        if _adopted:
+            print(f"[bevy] adopted {len(_adopted)} pack-local sidecar(s) the upstream lookup "
+                  f"missed: {_adopted}")
+
+        with open(os.path.join(OUT, 'manifest.json'), 'w', encoding='utf-8') as _f:
+            json.dump(manifest, _f, indent=1, allow_nan=False)
         os.rename(OUT, FINAL_OUT)
         if os.path.exists(old_dir):
             shutil.rmtree(old_dir)
         print(f"[bevy] pack swapped into place: {FINAL_OUT}")
+        _stale = [f for f in _sc.stale_sidecars(FINAL_OUT, _prev_ids, _new_ids) if f in _migrated]
+        if _stale:
+            print(f"[bevy] WARNING: {len(_stale)} migrated sidecar(s) were baked against inputs "
+                  f"that have since changed, so they describe an older world:")
+            for fn in _stale:
+                hint = _sc.REBUILD_HINT.get(_sc.GEOMETRY_DERIVED.get(fn), '')
+                print(f"[bevy]   {fn}  -> refresh with: {hint}")
+        _unknown = [f for f in _migrated if _sc.classify(f) == 'unknown']
+        if _unknown:
+            print(f"[bevy] note: migrated {len(_unknown)} unclassified file(s) forward: "
+                  f"{sorted(_unknown)[:6]}{' ...' if len(_unknown) > 6 else ''}. Add them to "
+                  f"eft_pipeline/sidecars.py so their freshness is checked too.")
+    else:
+        with open(os.path.join(OUT, 'manifest.json'), 'w', encoding='utf-8') as _f:
+            json.dump(manifest, _f, indent=1, allow_nan=False)
     print(f"[bevy] done in {time.time()-t0:.0f}s")
 
 

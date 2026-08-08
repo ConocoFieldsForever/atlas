@@ -466,6 +466,21 @@ pub(crate) fn build_tris(pack: &Pack) -> (Vec<Tri>, Vec<Tri>, f32, f32, usize) {
             let door = door_tagged && instance_small_footprint(&aff, lmin, lmax);
             for (fi, tri) in geom.indices.chunks_exact(3).enumerate() {
                 let mat = face_mat[fi];
+                // A projected decal is paint, not collision. The sprays are baked as real geometry
+                // clipped to the surface they cover and sitting ~12 mm off it, so they arrive here
+                // as ordinary meshes: 1.4M triangles on Interchange, coplanar with the walls and
+                // floors they are painted on. They cannot change where a bot may walk (the surface
+                // underneath is already in the soup) but they inflate the BVH, and a decal-only
+                // rebuild would otherwise invalidate a 30-minute nav bake for a spray can.
+                // Keyed on the material ROLE, which is what makes a decal a decal, rather than on
+                // the generated mesh name.
+                if pack
+                    .materials
+                    .get(mat as usize)
+                    .is_some_and(|m| m.role == "decal")
+                {
+                    continue;
+                }
                 let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
                 // Defensive: a bad index just skips the face (release is panic=abort).
                 if i0 >= geom.positions.len() || i1 >= geom.positions.len() || i2 >= geom.positions.len() {

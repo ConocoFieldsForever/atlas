@@ -5,7 +5,9 @@ set -e
 cd "$(dirname "$0")/.."
 LEVELS="${1:-62}"
 export EFT_ASSETS_ROOT="$PWD/eft_assets"
-export EFT_TARKMAP_ROOT="$PWD/packs"
+# the dir holding maps/ and out/, NOT the pack output dir (build_map.py:13). Pointing this at
+# packs/ went unnoticed while the assembler reconstructed the path instead of reading the setting.
+export EFT_TARKMAP_ROOT="$PWD/tarkmap"
 echo "[iter] projecting decals for level(s) $LEVELS"
 venv/Scripts/python.exe extraction/intel/extract_decals.py interchange \
     --dataset="$PWD/eft_assets/interchange_v2" --levels="$LEVELS" 2>&1 | tail -2
