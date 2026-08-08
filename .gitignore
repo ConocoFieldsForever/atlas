@@ -80,6 +80,10 @@ docs/_bench_logs/
 *.md
 !README.md
 !third_party/**/README.md
+# Exception: agent skills. Unlike a working note these describe the pipeline's invariants rather
+# than one investigation, they are verified against the source they document, and they are only
+# useful to a contributor if they arrive with the code that has to obey them.
+!.claude/skills/**/*.md
 
 # GAME CONTENT — never tracked. The grade LUT source is extracted verbatim from the
 # game's resources.assets and its .bin is that asset's derivative; both are rebuilt
