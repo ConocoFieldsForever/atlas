@@ -252,7 +252,9 @@ def get_bake_mesh(cfg):
 # ================================================================================================
 def load_lights(G3, DS):
     """FILTERED live lights (the extractor already applies m_Enabled + ancestor m_IsActive).
-    Unity world -> glb world = G3 @ p; spot forward = G3 @ (R_quat @ (0,0,1)); spotAngle is the FULL cone."""
+    Unity world -> glb world = G3 @ p; spot forward = G3 @ direction, preferring the sidecar's
+    explicit beam axis over the quaternion (which is only correct when the light's father chain
+    carried no scale); spotAngle is the FULL cone."""
     cand = sorted(glob.glob(os.path.join(DS, 'lights_*.json')))
     # Skip .bak and the *_all.json superset (that variant includes off/disabled lights tagged
     # on:false, which are not for baking).
@@ -293,8 +295,12 @@ def load_lights(G3, DS):
         r = float(l.get('range', 6.0) or 6.0)
         pos.append(p); ci.append(col * inten); rng_.append(max(r, 4.0))
         if l.get('type') == 'Spot':
-            x, y, z, w = np.array(l['rotation'], np.float64)
-            fwd = np.array([2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)], np.float64)
+            d = l.get('direction')            # explicit beam axis (sidecars post scale-fix)
+            if d:
+                fwd = np.array(d, np.float64)
+            else:                             # legacy sidecar: derive it from the quat
+                x, y, z, w = np.array(l['rotation'], np.float64)
+                fwd = np.array([2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)], np.float64)
             fwd = G3 @ fwd; fwd /= (np.linalg.norm(fwd) + 1e-9)
             ho = math.radians(float(l.get('spotAngle', 90.0)) * 0.5)                      # FULL -> half
             hi = math.radians(float(l.get('innerSpotAngle') or l.get('spotAngle', 90.0) * 0.8) * 0.5)

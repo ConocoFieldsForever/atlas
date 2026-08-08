@@ -50,6 +50,9 @@ struct GameLight {
     position: [f32; 3],
     #[serde(default = "quat_ident")]
     rotation: [f32; 4],
+    /// Beam axis in Unity world space; authoritative when present (see `eftpack::LightRaw`).
+    #[serde(default)]
+    direction: Option<[f32; 3]>,
     color: [f32; 4],
     intensity: f32,
     #[serde(default)]
@@ -118,8 +121,14 @@ fn spawn_ingame_lights(mut commands: Commands, pack: Option<Res<LoadedPack>>) {
         let range = if l.range > 0.0 { l.range } else { 15.0 };
         if l.kind == "Spot" {
             // Unity spot shines along +Z; conjugate the world forward via X-flip.
-            let q = Quat::from_xyzw(l.rotation[0], l.rotation[1], l.rotation[2], l.rotation[3]);
-            let fwd_u = q * Vec3::Z;
+            let fwd_u = l
+                .direction
+                .map(Vec3::from)
+                .filter(|v| v.length_squared() > 1e-8)
+                .unwrap_or_else(|| {
+                    Quat::from_xyzw(l.rotation[0], l.rotation[1], l.rotation[2], l.rotation[3])
+                        * Vec3::Z
+                });
             let fwd = Vec3::new(-fwd_u.x, fwd_u.y, fwd_u.z);
             let fwd = if fwd.length_squared() > 1e-6 { fwd.normalize() } else { Vec3::NEG_Y };
             let outer = (l.spot_angle.clamp(1.0, 179.0).to_radians()) * 0.5;

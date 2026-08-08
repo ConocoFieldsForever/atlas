@@ -5,8 +5,9 @@ eft_build_gn.py auto-imports. Interchange's light scene is level64 (Shopping_Mal
 
 Schema (bmpq-compatible): a flat array of
   {name, type:"Point"|"Spot"|"Directional", position:[x,y,z] (Unity world),
-   rotation:[x,y,z,w] (Unity world quat), color:[r,g,b,a] (linear), intensity, range,
-   spotAngle, innerSpotAngle, shadowType}
+   rotation:[x,y,z,w] (Unity world quat), direction:[x,y,z] (Unity world beam axis, AUTHORITATIVE
+   for spot cones; rotation is derived from it and carries no roll), color:[r,g,b,a] (linear),
+   intensity, range, spotAngle, innerSpotAngle, shadowType}
 The builder maps these to Blender lamps: location=(-x,-z,y), a rotation fixup, energy=intensity*MULT,
 color linear, spot_size=rad(spotAngle), spot_blend=1-inner/outer, cutoff_distance=range.
 """
@@ -179,8 +180,35 @@ def main():
                     continue
             pos = W[:3, 3]
             if abs(pos[0]) < 0.01 and abs(pos[2]) < 0.01: continue   # pooled-at-origin
-            # world quaternion from the rotation part (orthonormal R -> quat, xyzw)
-            R = W[:3, :3]
+            # ---- BEAM AXIS: the image of local +Z, never a decomposition ------------------------
+            # W[:3,:3] is R*S, NOT a rotation: any ancestor with a non-unit m_LocalScale leaves
+            # scale in it. The trace/largest-diagonal extraction below is only defined on an
+            # ORTHONORMAL matrix (its `tr + 1.0` and `0.25/s` terms bake in |column| == 1), so a
+            # scaled matrix yields a DIFFERENT rotation, not a scaled one. UNIFORM scale is not
+            # safe either: tan(theta'/2) = 2s/(s+1) * tan(theta/2), so a ceiling downlight under a
+            # uniform scale of 3 comes back 22.6 deg off vertical. Measured on interchange_v2:
+            # 2,246 of 3,399 level64 spots wrong, median 10.6 deg, worst 31.0 deg.
+            #
+            # The cone direction was never a decomposition problem. It is W[:3,:3] @ (0,0,1),
+            # i.e. column 2 normalized, which is exactly the rule the geometry pipeline uses.
+            R3 = np.asarray(W[:3, :3], dtype=np.float64)
+            fwd = R3[:, 2]
+            nf = float(np.linalg.norm(fwd))
+            if nf < 1e-12:
+                continue                                   # degenerate chain (a zero m_LocalScale)
+            fwd = fwd / nf
+            # `rotation` stays in the schema for readers that predate `direction`, but it is now
+            # built FROM fwd on an orthonormal basis, so quat*(0,0,1) == direction by construction.
+            # Roll about the beam is discarded deliberately: nothing downstream consumes it (there
+            # are no light cookies), and inventing a roll from a scaled matrix is what caused this.
+            ref = R3[:, 0] if np.linalg.norm(np.cross(R3[:, 0], fwd)) > 1e-6 else R3[:, 1]
+            x_ax = ref - fwd * float(ref @ fwd)
+            if np.linalg.norm(x_ax) < 1e-9:                # last-resort seed for a degenerate ref
+                x_ax = np.array([1.0, 0.0, 0.0]) if abs(fwd[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+                x_ax = x_ax - fwd * float(x_ax @ fwd)
+            x_ax = x_ax / np.linalg.norm(x_ax)
+            y_ax = np.cross(fwd, x_ax)                     # right-handed: x_ax cross y_ax == fwd
+            R = np.column_stack((x_ax, y_ax, fwd))         # orthonormal, det = +1
             tr = R[0, 0] + R[1, 1] + R[2, 2]
             if tr > 0:
                 s = 0.5 / np.sqrt(tr + 1.0); qw = 0.25 / s
@@ -191,6 +219,15 @@ def main():
                 q = [0, 0, 0]; q[i] = 0.25 * s
                 q[j] = (R[j, i] + R[i, j]) / s; q[k] = (R[k, i] + R[i, k]) / s
                 qw = (R[k, j] - R[j, k]) / s; qx, qy, qz = q
+            # Two fields describing one axis can drift apart. They cannot here, because the quat is
+            # built from fwd -- so assert it rather than trusting the construction to stay that way.
+            _qf = np.array([2 * (qx * qz + qy * qw), 2 * (qy * qz - qx * qw),
+                            1 - 2 * (qx * qx + qy * qy)], np.float64)
+            _err = float(np.max(np.abs(_qf - fwd)))
+            if _err > 1e-4:
+                raise SystemExit("[lights] BUG: rotation and direction disagree by %.2e on light "
+                                 "path_id=%s -- the quaternion is no longer derived from the beam "
+                                 "axis" % (_err, getattr(o, 'path_id', '?')))
             # the read() object's attribute access silently misses several Light fields
             # (m_Type read as absent -> everything defaulted to Point); the TYPETREE is
             # the reliable source for scalars
@@ -204,6 +241,7 @@ def main():
                 "type": TYPE.get(int(tt.get("m_Type", 2)), "Point"),
                 "position": [round(float(pos[0]), 4), round(float(pos[1]), 4), round(float(pos[2]), 4)],
                 "rotation": [round(float(qx), 5), round(float(qy), 5), round(float(qz), 5), round(float(qw), 5)],
+                "direction": [round(float(fwd[0]), 6), round(float(fwd[1]), 6), round(float(fwd[2]), 6)],
                 "color": [round(c, 4) for c in color],
                 "intensity": round(intensity, 4),
                 "range": round(ctrl[1] if (ctrl and ctrl[1] > 0) else float(tt.get("m_Range", 0.0) or 0.0), 3),

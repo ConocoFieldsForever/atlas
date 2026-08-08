@@ -625,6 +625,12 @@ struct LightRaw {
     position: [f32; 3],
     #[serde(default = "ident_quat")]
     rotation: [f32; 4],
+    /// Spot beam axis in UNITY world space: the extractor's `W[:3,:3] @ (0,0,1)`, normalized. The
+    /// image of the light's local +Z under the raw father-chain 3x3, never a decomposition.
+    /// Absent on sidecars written before the scale-contamination fix, which fall back to
+    /// `rotation` and are wrong by up to 31 deg wherever an ancestor carried non-unit scale.
+    #[serde(default)]
+    direction: Option<[f32; 3]>,
     #[serde(default = "default_tint")]
     color: [f32; 4],
     #[serde(default = "one")]
@@ -695,14 +701,21 @@ fn reduce_light(r: &LightRaw, group_map: &mut std::collections::HashMap<String, 
     let pos = Vec3::new(-r.position[0], r.position[1], r.position[2]);
     let color = Vec3::new(r.color[0], r.color[1], r.color[2]) * r.intensity;
     let (dir, cos_outer, cos_inner) = if is_spot {
-        // Unity forward is +Z; rotate by the light's quat, then apply the same G3 X-flip.
-        let q = Quat::from_xyzw(r.rotation[0], r.rotation[1], r.rotation[2], r.rotation[3]);
-        let q = if q.length_squared() > 1e-8 {
-            q.normalize()
-        } else {
-            Quat::IDENTITY
-        };
-        let f = q * Vec3::Z;
+        // Beam axis in Unity world space, then the same G3 X-flip. Prefer the sidecar's explicit
+        // `direction`; fall back to rotating +Z by the quat for sidecars written before it existed.
+        let f = r
+            .direction
+            .map(Vec3::from)
+            .filter(|v| v.length_squared() > 1e-8)
+            .unwrap_or_else(|| {
+                let q = Quat::from_xyzw(r.rotation[0], r.rotation[1], r.rotation[2], r.rotation[3]);
+                let q = if q.length_squared() > 1e-8 {
+                    q.normalize()
+                } else {
+                    Quat::IDENTITY
+                };
+                q * Vec3::Z
+            });
         let fwd = Vec3::new(-f.x, f.y, f.z).normalize_or_zero();
         let co = (r.spot_angle.to_radians() * 0.5).cos();
         let mut ci = (r.inner_spot_angle.to_radians() * 0.5).cos();
