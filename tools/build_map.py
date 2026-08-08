@@ -786,9 +786,18 @@ def main():
               f"game and launcher first (file locks). This can take a long time.", flush=True)
         # extract_parallel splits the levels across cores (reusing the unchanged eft_extract_v2 per
         # chunk) then merges — big maps go multi-core. EFT_JOBS=1 forces the plain serial extractor.
+        # --force has to REACH the extractor. It never did: `force` was a build_map-only flag and
+        # nothing under extraction/ read it, so the deletions above covered only the cache GATES
+        # (scene.json, lights_*, volume/nav/glb), never meshes/ or tex/. The extractor then reused
+        # every complete-looking OBJ/PNG and, on the multi-core path, RESUMED a prior run's chunks
+        # outright, after which stage 9 stamped the CURRENT fingerprint over the survivors.
+        # meshes/ and tex/ are still NOT deleted here: making the extractor distrust them is the
+        # fix. Deleting them would throw away the texcache hardlinks and the fallback that keeps
+        # the old pack playable if the re-extract fails.
         run(1, total, "extract dataset (geometry + textures)",
             [PY_UNITY, os.path.join(VIEWER, "extraction", "unity", "extract_parallel.py"),
-             "--levels", levels, "--name", dsname] + alllod_extract, VIEWER)
+             "--levels", levels, "--name", dsname] + alllod_extract
+            + (["--force"] if force else []), VIEWER)
         # Stamp the mode INTO the dataset so every later build knows what this extraction can
         # honour (see the mismatch warning above).
         try:

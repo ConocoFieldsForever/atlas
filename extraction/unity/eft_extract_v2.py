@@ -788,7 +788,22 @@ def main():
     ap.add_argument("--data-root", default=EFTDATA,
                     help="Unity <Game>_Data dir to read levels/sharedassets from; defaults to the EFT install "
                          "(pass the Arena *_Data dir to extract Arena maps). Back-compat: EFT invocations omit it.")
+    # --force: a forced rebuild is a PROVENANCE invalidation, not a corruption check. Every reuse
+    # guard below (_obj_complete / _png_complete / _vcol_usable / plain exists) answers "is this
+    # file intact?", which is the wrong question after a game patch or an extractor fix: an intact
+    # STALE file passes all of them. FORCE makes this run distrust anything a PREVIOUS run left in
+    # this dataset. Default off, so an incremental build reuses exactly what it reuses today.
+    #
+    # The content-addressed texcache is deliberately NOT invalidated: its key IS the resolved
+    # source bytes (plus w/h/format/normal-flag/PIL version), so a hit is provably the bytes the
+    # game would produce now, and clearing it would turn a short forced re-extract into an hour for
+    # no correctness gain. Pair --force with EFT_TEXCACHE=0 only when the DECODER changed, which is
+    # the one thing that key cannot see.
+    ap.add_argument("--force", action="store_true",
+                    help="re-derive every export in this dataset from the game files, ignoring "
+                         "complete-looking artifacts left by a previous run")
     args = ap.parse_args()
+    FORCE = args.force
     EFTDATA = args.data_root                                             # every level{lv}/sharedassets read uses this module global
     import UnityPy
     levels = [int(x) for x in args.levels.split(",")]
@@ -798,6 +813,8 @@ def main():
     exported = {}        # (lv,fid,pid) mesh -> obj filename
     _repaired = []       # OBJs that existed but held no geometry (NUL-filled/truncated) -> dropped + re-exported
     _repaired_vcol = []  # vertex-colour sidecars that were missing or all-zero -> re-derived from the bundle
+    # intact-but-stale artifacts re-derived because of --force, kept apart from the repair counters
+    _forced = {"obj": 0, "vcol": 0, "tex": 0, "terrain": 0}
     tex_done = set()     # (fid,pid) textures already written
     mat_cache = {}       # (fid,pid) material -> (alb,nrm,sh,tile)
     instances = []
@@ -933,10 +950,20 @@ def main():
                     out_fp = os.path.join(td, nm + ".png")
                     # Skip only a COMPLETE file from a prior run. exists() alone kept half-written
                     # zero-padded PNGs (killed pre-atomic-write run) alive through every rebuild.
-                    if not _png_complete(out_fp):
-                        _drop_incomplete(out_fp)
+                    # ...and under --force skip NOTHING: "complete" means intact, not current.
+                    _intact = _png_complete(out_fp)
+                    if FORCE or not _intact:
+                        if _intact:
+                            _forced["tex"] += 1
+                        else:
+                            _drop_incomplete(out_fp)
                         cache_fp = _texcache_key_path(to, is_normal) if _TEXCACHE_ENABLED else None
                         if cache_fp and _png_complete(cache_fp):
+                            # os.link raises FileExistsError and _link_or_copy SWALLOWS it, so a
+                            # forced re-derive would silently keep the stale PNG. Clear the target,
+                            # but only here, where the replacement bytes are already proven complete.
+                            if _intact:
+                                _drop_incomplete(out_fp)
                             _link_or_copy(cache_fp, out_fp)  # cache HIT: skip decode + PNG encode entirely
                             _texstats["hit"] += 1
                         else:
@@ -1226,8 +1253,17 @@ def main():
                 # ...and re-export a file that EXISTS at full size but holds no geometry: _obj_complete catches the
                 # NUL-filled/truncated casualties of a killed run, which a size check cannot see and which the old
                 # guard therefore preserved through every rebuild. Drop it first so nothing can resurrect it.
-                if not _obj_complete(fp):
-                    if os.path.exists(fp):
+                # --force adds a SECOND reason to re-export: intact, but written by an earlier
+                # run. Keep the two apart -- `_repaired` is the CORRUPTION report, and pushing every
+                # OBJ of a forced rebuild through it would drown the signal it exists for. Do NOT
+                # drop an intact file: _atomic_write replaces it only on a successful export, so a
+                # re-export that fails (locked bundle, unresolved .resS) leaves the good file in
+                # place rather than turning a stale mesh into a missing one.
+                _intact = _obj_complete(fp)
+                if FORCE or not _intact:
+                    if _intact:
+                        _forced["obj"] += 1
+                    elif os.path.exists(fp):
                         _drop_incomplete(fp); _repaired.append(obj_fn)
                     data = mesh.export()
                     if isinstance(data, str) and data:
@@ -1257,7 +1293,8 @@ def main():
                     # instead of zero, so its construction-site mud rendered as bare road base. Writing NO
                     # file is visually identical for a genuinely unpainted mesh (load_vcol -> None ->
                     # assemble's (1,0,0,1) -> layer 0, the same branch) and leaves the next run free to retry.
-                    if not _vcol_usable(vc_fp):
+                    _vc_ok = _vcol_usable(vc_fp)
+                    if FORCE or not _vc_ok:
                         try:
                             chs = mesh.m_VertexData.m_Channels
                             if len(chs) > 3 and getattr(chs[3], "dimension", 0):
@@ -1267,7 +1304,10 @@ def main():
                                     _vc = np.asarray(_c, np.float32).reshape(-1, 4)
                                     if _vc.any():
                                         _atomic_write(vc_fp, lambda t: _save_npy(t, _vc))
-                                        if os.path.exists(vc_fp): _repaired_vcol.append(os.path.basename(vc_fp))
+                                        if os.path.exists(vc_fp):
+                                            # a forced re-derive is not a repair; keep the reports apart
+                                            if _vc_ok: _forced["vcol"] += 1
+                                            else:      _repaired_vcol.append(os.path.basename(vc_fp))
                                     elif os.path.exists(vc_fp):
                                         _drop_incomplete(vc_fp)          # stop a zeroed sidecar surviving another run
                         except Exception: pass
@@ -1712,7 +1752,12 @@ def main():
                 tdata = tdpp.read(); tname = san(g(tdata, "m_Name", default=f"terr{o.path_id}"))
                 obj_fn = f"terrain_{lv}_{tname}.obj"
                 fp = os.path.join(md, obj_fn)
-                if not os.path.exists(fp):
+                # Plain `exists`: this OBJ never got a completeness guard because
+                # write_terrain_obj is temp + os.replace, so a truncated one is impossible. --force
+                # re-derives it; a patched heightmap is exactly what a forced rebuild is for.
+                if FORCE or not os.path.exists(fp):
+                    if FORCE and os.path.exists(fp):
+                        _forced["terrain"] += 1
                     write_terrain_obj(tdata, fp, step=args.terrain_step)
                 # bake albedo whenever the PNG is missing (decoupled from OBJ existence)
                 alb_name = f"terrain_{lv}_{tname}_albedo"
@@ -1725,8 +1770,10 @@ def main():
                 # this one did not. A broken terrain albedo binds the 1x1 magenta placeholder over
                 # a whole tile, and on the 5 of 7 packs whose terrainLayers is null the baked
                 # albedo IS the ground.
-                if not _png_complete(alb_path):
-                    _drop_incomplete(alb_path)
+                _alb_ok = _png_complete(alb_path)
+                if FORCE or not _alb_ok:
+                    if not _alb_ok:
+                        _drop_incomplete(alb_path)   # _atomic_write covers the FORCE case
                     prep = _terrain_bake_prepare(tdata)
                     if prep is not None:
                         _tile_jobs.append((tname, alb_path, prep))
@@ -1883,6 +1930,10 @@ def main():
     if _repaired_vcol:
         print(f"  REPAIRED {len(_repaired_vcol)} vertex-colour sidecar(s) that were missing or all-zero - "
               f"re-derived from the bundles. e.g. {_repaired_vcol[:3]}", flush=True)
+    if FORCE and any(_forced.values()):
+        print(f"  FORCE re-derived {_forced['obj']} OBJ, {_forced['vcol']} vcol sidecar(s), "
+              f"{_forced['tex']} texture(s), {_forced['terrain']} terrain mesh(es) that were intact "
+              f"on disk but written by an earlier run", flush=True)
     print(f"\nDONE {len(instances)} instances, {len([v for v in exported.values() if v])} meshes, "
           f"{len(tex_done)} textures in {time.time()-T0:.0f}s -> {out}", flush=True)
 

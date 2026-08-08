@@ -225,12 +225,18 @@ def _move_into(src_dir, dst_dir, overwrite, skip=()):
     return n
 
 
+# Every top-level key eft_extract_v2 writes into scene.json. _merge() rebuilds the merged file
+# from scratch, so a key added there and not here is silently DELETED on every parallel (i.e. every
+# real) extraction -- which is exactly how waterBodies disappeared from all three shipped datasets.
+_MERGE_KNOWN_KEYS = {"instances", "up", "levels", "lodGroups", "lod_schema", "waterBodies", "note"}
+
+
 def _merge(name, n_chunks, out, levels_order):
     """Merge <name>__p0..p{n-1} into <name>/. Offsets per-chunk LODGroup indices; dedups tex/layers."""
     md, td, tl = (os.path.join(out, d) for d in ("meshes", "tex", "terrain_layers"))
     os.makedirs(md, exist_ok=True)
     os.makedirs(td, exist_ok=True)
-    all_inst, all_lod, all_levels = [], [], []
+    all_inst, all_lod, all_levels, all_water = [], [], [], []
     terrain = {"tiles": {}, "layers": []}
     for idx in range(n_chunks):
         cout = os.path.join(OUTROOT, f"{name}__p{idx}")
@@ -246,6 +252,17 @@ def _merge(name, n_chunks, out, levels_order):
             all_inst.append(it)
         all_lod.extend(sc.get("lodGroups", []))
         all_levels.extend(sc.get("levels", []))
+        # waterBodies records are per-LEVEL and levels are disjoint across chunks, so concatenation
+        # IS the merge (same rule as all_levels; there is no index to offset, unlike lod.g).
+        all_water.extend(sc.get("waterBodies") or [])
+        # A key this merge does not know about would vanish exactly the way waterBodies did. Report
+        # it loudly rather than aborting: this runs at the END of a multi-minute extraction, and a
+        # chunk written by a different extractor version is a normal thing to find on disk.
+        _unknown = set(sc) - _MERGE_KNOWN_KEYS
+        if _unknown:
+            print(f"[MERGE] WARNING: chunk {idx} scene.json carries top-level key(s) "
+                  f"{sorted(_unknown)} that _merge() does not carry forward. They are being "
+                  f"DROPPED. Add them to _MERGE_KNOWN_KEYS and merge them explicitly.", flush=True)
         # meshes: level-scoped -> disjoint across chunks (overwrite is a no-op safety net).
         _move_into(os.path.join(cout, "meshes"), md, overwrite=True)
         # textures + terrain layers: source-identity scoped -> dedup (keep first, drop identical dup).
@@ -273,12 +290,12 @@ def _merge(name, n_chunks, out, levels_order):
     # Emit scene.json in the CONFIGURED level order (provenance only; instances already carry lv).
     json.dump(
         {"instances": all_inst, "up": "unity", "levels": levels_order, "lodGroups": all_lod,
-         "lod_schema": 1,
+         "lod_schema": 1, "waterBodies": all_water,
          "note": "OBJ verts are UnityPy X-flipped+winding-reversed; builder must un-flip"},
         open(os.path.join(out, "scene.json"), "w"),
     )
     print(f"[MERGE] {len(all_inst)} instances, {len(all_lod)} LODGroups, {len(terrain['tiles'])} "
-          f"terrain tiles -> {out}", flush=True)
+          f"terrain tiles, {len(all_water)} water bodies -> {out}", flush=True)
     return len(all_inst)
 
 
@@ -299,6 +316,8 @@ def main():
     ap.add_argument("--data-root", default=None)
     ap.add_argument("--terrain-step", type=int, default=None)
     ap.add_argument("--alllod", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="forced rebuild: never resume a prior run, and re-derive every export")
     ap.add_argument("--terrain-only", action="store_true")
     args = ap.parse_args()
 
@@ -316,6 +335,9 @@ def main():
         passthrough.append("--alllod")
     if args.terrain_only:
         passthrough.append("--terrain-only")
+    if args.force:
+        # reaches the jobs<=1 serial branch AND every chunk process
+        passthrough.append("--force")
 
     env_jobs = os.environ.get("EFT_JOBS")
     jobs = int(env_jobs) if env_jobs and env_jobs.strip().isdigit() else args.jobs
@@ -357,6 +379,17 @@ def main():
     # re-run chunks reuse their already-written meshes/textures (eft_extract_v2's skip-if-exists + texcache).
     # A missing / mismatched / complete manifest is a fresh start: clear any stale staging up front (as before).
     prev = _read_progress(args.name)
+    # --force means "re-derive from the game files NOW"; RESUME means the exact opposite. It skips
+    # every chunk whose scene.json parsed last run and merges that run's bytes into the dataset,
+    # after which build_map stamps the CURRENT game fingerprint over them. Force therefore drops
+    # the manifest; the staging is then cleared as usual. If EFT_KEEP_STAGING preserves it, the
+    # chunks re-run with --force and overwrite it, so no stale byte can reach the merge.
+    if args.force and prev:
+        print(f"[FORCE] discarding the in-progress manifest for {args.name} "
+              f"(status={prev.get('status')}, phase={prev.get('phase')}): a forced rebuild does "
+              f"not resume a prior run", flush=True)
+        _delete_progress(args.name)
+        prev = None
     resume = bool(prev and prev.get("status") != "complete"
                   and prev.get("levels") == levels and prev.get("jobs") == jobs
                   and prev.get("chunks") == chunks)
