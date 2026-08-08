@@ -420,7 +420,10 @@ pub struct Material {
     /// "OPAQUE" | "MASK" | "BLEND"
     #[serde(rename = "alphaMode", default = "opaque_mode")]
     pub alpha_mode: String,
-    #[serde(rename = "alphaCutoff", default)]
+    /// Authored Unity `_Cutoff`. 0.0 is MEANINGFUL ("discard nothing") and must not be read as
+    /// unset. A pack written before the field existed gets the legacy 0.5 from the explicit
+    /// default below, which `#[serde(default)]` alone could not express: that yields 0.0.
+    #[serde(rename = "alphaCutoff", default = "default_alpha_cutoff")]
     pub alpha_cutoff: f32,
     /// _col4(_Color): sRGB->linear RGB, alpha linear. Albedo = tex * tint.
     #[serde(default = "default_tint")]
@@ -508,6 +511,12 @@ fn default_tint() -> [f32; 4] {
 }
 fn opaque_mode() -> String {
     "OPAQUE".to_string()
+}
+
+/// Legacy cutoff for packs written before `alphaCutoff` was emitted. Only the ABSENCE of the field
+/// means "unknown"; a 0.0 that is present in the pack is an authored "discard nothing".
+fn default_alpha_cutoff() -> f32 {
+    0.5
 }
 
 // ---------------------------------------------------------------------------

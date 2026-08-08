@@ -306,7 +306,12 @@ class MaterialFactory:
         tint = _col4(col)
         alpha_mode, alpha_cutoff = 'OPAQUE', 0.0
         if role == 'cutout':
-            alpha_mode, alpha_cutoff = 'MASK', round(float(sb.get('cut', 0.5) or 0.5), 4)
+            # `or 0.5` mapped an AUTHORED _Cutoff of exactly 0.0 ("alpha-test discards nothing")
+            # onto 0.5 ("discard below half"), because 0.0 is falsy. Only a MISSING cut may take
+            # the default: extract_decals.py writes "cut": None on every projector sub, so None
+            # must still fall back or this TypeErrors. Test the value, never its truthiness.
+            _cut = sb.get('cut')
+            alpha_mode, alpha_cutoff = 'MASK', round(float(0.5 if _cut is None else _cut), 4)
         elif role in ('glass', 'decal', 'water'):
             alpha_mode = 'BLEND'
         if role == 'glass':
@@ -984,7 +989,12 @@ def main():
                 _otsu = tex.alpha_coverage(sb.get('tex'))
                 if _otsu is not None:
                     sb['role'] = 'cutout'
-                    sb['cut'] = float(sb.get('cut') or _otsu)
+                    # ASYMMETRIC vs _build(), on purpose: role was OPAQUE, so this material's
+                    # _Cutoff is a leftover the shader never evaluated. An authored 0.0 here
+                    # carries no information -- the histogram split is the only real signal and
+                    # wins. Honouring a 0.0 would turn the whole Otsu recovery into a no-op.
+                    _auth = sb.get('cut')
+                    sb['cut'] = float(_auth) if (_auth is not None and float(_auth) > 0.0) else float(_otsu)
             n = sb.get('n', -1); n = (len(F) - f0) if n < 0 else n
             if n <= 0 or f0 + n > len(F):
                 if f0 + n > len(F):

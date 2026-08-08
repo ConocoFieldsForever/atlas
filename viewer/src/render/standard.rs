@@ -351,7 +351,9 @@ fn build_material(
     //   cutout -> Mask (foliage/fences; the albedo alpha IS the coverage mask),
     //   glass/decal/water -> Blend, everything else Opaque.
     let alpha_mode = match m.role.as_str() {
-        "cutout" => AlphaMode::Mask(if m.alpha_cutoff > 0.0 { m.alpha_cutoff } else { 0.5 }),
+        // The absent-field fallback now lives in the serde default (eftpack.rs). A 0.0 that IS in
+        // the pack means "discard nothing" and has to reach the alpha test unchanged.
+        "cutout" => AlphaMode::Mask(m.alpha_cutoff),
         "glass" | "decal" | "water" => AlphaMode::Blend,
         _ => AlphaMode::Opaque,
     };

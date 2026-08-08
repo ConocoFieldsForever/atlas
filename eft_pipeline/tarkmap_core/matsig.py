@@ -15,12 +15,21 @@ def vp_sig(vp):
     return (tuple((ly.get('tex'), ly.get('nrm'), tuple(ly.get('uv') or ()), tuple(ly.get('col') or ())) for ly in (vp.get('layers') or [])), vp.get('heights'), vp.get('blend'))
 
 
+def _cut_key(s):
+    """Authored _Cutoff for the dedup key. 0.0 is a REAL value ("discard nothing") and must not
+    collapse onto the 0.5 default -- `or 0.5` did exactly that, so a cut=0.0 material and an
+    otherwise identical cut=0.5 material shared ONE signature and ONE materials.json record.
+    Only a missing cut defaults (decals.json writes "cut": None)."""
+    c = s.get('cut')
+    return round(float(0.5 if c is None else c), 3)
+
+
 def sub_sig(subs):
     """Everything material_for()/the UV-bake keys on: tex/nrm/col/shader/role/cutoff/uv-tiling/vert-paint + the
     faithfulness extras (emissive/gloss/metal/bumpScale — materials differing only in these must NOT collapse)
     (+ face count so a differing geometry split can't collapse)."""
     return tuple((s.get('tex'), s.get('nrm'), tuple(s.get('col') or ()), s.get('sh'), s.get('role'),
-                  round(float(s.get('cut', 0.5) or 0.5), 3), tuple(s.get('uv') or (1, 1, 0, 0)), vp_sig(s.get('vp')), s.get('n', -1),
+                  _cut_key(s), tuple(s.get('uv') or (1, 1, 0, 0)), vp_sig(s.get('vp')), s.get('n', -1),
                   s.get('emis'), tuple(s.get('emisCol') or ()), s.get('gloss'), s.get('metal'), s.get('bumpScale'),
                   # real-specular + detail-map fields (2026-07): materials differing only in spec/smoothness source
                   # or detail layering must NOT collapse (different roughness/detail textures + extras)
