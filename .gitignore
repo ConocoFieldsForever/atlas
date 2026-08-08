@@ -74,15 +74,22 @@ venv/
 # one-off probe scripts (the repo's leading-underscore = scratch convention)
 tools/_*
 docs/_bench_logs/
+# the viewer's double-click geometry probe dumps the picked instance here
+pick.json
+# scratch cargo target dirs from side-by-side builds (the real one is already ignored above)
+target_*/
 
 # No markdown in the repo: docs live locally only (working notes, not shippables).
 # Exception: the README (release landing page).
 *.md
 !README.md
 !third_party/**/README.md
-# Exception: agent skills. Unlike a working note these describe the pipeline's invariants rather
-# than one investigation, they are verified against the source they document, and they are only
-# useful to a contributor if they arrive with the code that has to obey them.
+# Exception: docs/extraction/. Unlike a working note these describe the pipeline's invariants
+# rather than one investigation, they are verified against the source they document, and they are
+# only useful to a contributor if they arrive with the code that has to obey them. Kept in plain
+# markdown at a neutral path so an importer author, a person, or any agent reads the same source;
+# .claude/skills/ holds only a discovery shim pointing here.
+!docs/extraction/**/*.md
 !.claude/skills/**/*.md
 
 # GAME CONTENT — never tracked. The grade LUT source is extracted verbatim from the
