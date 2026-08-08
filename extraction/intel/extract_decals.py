@@ -94,13 +94,27 @@ def write_quad(path):
         f.write("f 1/1 2/2 3/3\nf 1/1 3/3 4/4\n")
 
 
-def quat_mat(q):
-    x, y, z, w = q
-    return np.array([
+def trs4(lp, lr, ls):
+    """One Transform's local TRS as a single 4x4, in RAW Unity space.
+
+    Deliberately bit-for-bit identical to `eft_scene_extract.trs()`, which is what
+    eft_extract_v2 uses for every geometry instance -- including the quaternion NORMALISATION
+    that the old local quat_mat() skipped. The point of this function is that a decal and the
+    wall it is painted on come out of the same arithmetic; "almost the same arithmetic" is how
+    they drifted apart in the first place.
+    """
+    x, y, z, w = lr
+    n = (x * x + y * y + z * z + w * w) ** 0.5 or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    R = np.array([
         [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
         [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
         [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
     ], np.float64)
+    M = np.eye(4)
+    M[:3, :3] = R @ np.diag(np.asarray(ls, np.float64))
+    M[:3, 3] = lp
+    return M
 
 
 def main():
@@ -271,34 +285,41 @@ def main():
         world_cache = {}
 
         def world(pid):
-            """Parent-composed (pos, quat, scale) in RAW Unity space."""
-            if pid in world_cache:
-                return world_cache[pid]
-            e = tf.get(pid)
-            if e is None:
+            """RAW-Unity world 4x4 as the FATHER-CHAIN PRODUCT: W(n) = W(father) @ trs4(n).
+
+            This used to accumulate (position, quaternion, componentwise scale) and rebuild the
+            matrix at the emit site as quat_mat(rot) @ diag(scale). A componentwise
+            parent_scale * local_scale asserts that the child's X rides the parent's X, which is
+            true only when no rotation sits between them. Lighthouse level208's road sprays hang
+            under a GRASS node scaled (3.3485, 3.3485, 9.3641) whose rotation swaps Y and Z, so
+            the projector box composed to (12.77, 1.40, 35.71) where it is really
+            (12.77, 3.90, 12.77): the marking painted 2.8x too long on a box 2.8x too shallow.
+            Reserve level119's basement graffiti sits under a non-uniform R and a 180-degree
+            basement_part_15*, and came out up to 1.31 m off the wall.
+
+            A 4x4 product cannot express that bug because it never names an axis, and it is the
+            same walk eft_extract_v2 uses for geometry, so a decal and its wall now agree.
+
+            Iterative rather than recursive, matching eft_extract_v2's world(): a 256-deep guard
+            and an identity seed for an absent or unreadable father.
+            """
+            W = world_cache.get(pid)
+            if W is not None:
+                return W
+            if pid not in tf:
                 return None
-            go, fa, lp_, lr, ls = e
-            if fa == 0 or fa not in tf:
-                w = (np.array(lp_, np.float64), lr, np.array(ls, np.float64))
-            else:
-                pw = world(fa)
-                if pw is None:
-                    w = (np.array(lp_, np.float64), lr, np.array(ls, np.float64))
-                else:
-                    pp, pr, ps = pw
-                    R = quat_mat(pr)
-                    pos = pp + R @ (np.array(lp_, np.float64) * ps)
-                    x1, y1, z1, w1 = pr
-                    x2, y2, z2, w2 = lr
-                    rot = (
-                        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-                        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-                        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-                        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-                    )
-                    w = (pos, rot, ps * np.array(ls, np.float64))
-            world_cache[pid] = w
-            return w
+            stack, cur = [], pid
+            while cur and cur in tf and cur not in world_cache and len(stack) < 256:
+                stack.append(cur)
+                fa = tf[cur][1]
+                cur = fa if fa in tf else 0
+            W = world_cache.get(cur) if cur else None
+            if W is None:
+                W = np.eye(4)
+            for p in reversed(stack):          # W(node) = W(father) @ trs4(node), cached per node
+                W = W @ trs4(tf[p][2], tf[p][3], tf[p][4])
+                world_cache[p] = W
+            return world_cache[pid]
 
         def active_chain(pid):
             seen = 0
@@ -387,18 +408,19 @@ def main():
             active = active_chain(tpid) and bool(h.get("m_Enabled", 1))
             if not active:
                 n_inactive += 1
-            pos, rot, scl = w
-            R = quat_mat(rot)
-            M3 = R @ np.diag(scl)
             # RAW UNITY SPACE, exactly like scene.json's instance matrices: `assemble_bevy`
             # owns the handedness conjugation for every instance it ships, decals included, so
             # conjugating here would apply the flip TWICE. Verified against the checkpoint whose
             # photo started this: the writings projector reads x=+130.9 raw, its shields read
             # +131.2 raw, and the viewer's pick HUD shows +131.2 -- same side, same frame.
+            #
+            # `w` IS the world matrix now. Take the raw 3x3 and the translation column straight
+            # out of it: no decomposition to translation/rotation/scale anywhere on this path,
+            # because that decomposition was the bug.
             m = [
-                M3[0, 0], M3[0, 1], M3[0, 2], pos[0],
-                M3[1, 0], M3[1, 1], M3[1, 2], pos[1],
-                M3[2, 0], M3[2, 1], M3[2, 2], pos[2],
+                w[0, 0], w[0, 1], w[0, 2], w[0, 3],
+                w[1, 0], w[1, 1], w[1, 2], w[1, 3],
+                w[2, 0], w[2, 1], w[2, 2], w[2, 3],
                 0.0, 0.0, 0.0, 1.0,
             ]
             W, H = mat["w"], mat["h"]
@@ -416,7 +438,7 @@ def main():
             # "UNTAR GO HOME"). Confirmed against a photograph of the real checkpoint.
             ou, ov = cx1 / W, cy1 / H
             if _trace:
-                print("  [trace] %s: EMITTED at (%.1f, %.1f, %.1f)" % (_tname, pos[0], pos[1], pos[2]))
+                print("  [trace] %s: EMITTED at (%.1f, %.1f, %.1f)" % (_tname, w[0, 3], w[1, 3], w[2, 3]))
             instances.append({
                 "mesh": QUAD_NAME,
                 "m": [round(float(v), 6) for v in m],

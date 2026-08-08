@@ -88,6 +88,44 @@ def _clip_poly(poly, normal, dist):
     return out
 
 
+def _tri_box_overlap(bx, by, bz, F, hx, hy, hz):
+    """Exact triangle-vs-box overlap (Akenine-Moller separating axes), vectorised over all faces.
+
+    bx/by/bz are the PER-VERTEX coordinates in the projector's own frame that the caller already
+    computes (box centred on the origin, half-extents hx/hy/hz); F is the (n,3) face table.
+    Returns a bool (n,): true when the triangle overlaps the box.
+
+    Axes 1-3 are the box's own face normals and reduce to an interval test on numbers already in
+    hand; they reject the overwhelming majority of a receiver's triangles. The remaining ten (the
+    triangle's plane, plus the nine box-axis x triangle-edge crosses) are evaluated ONLY on the
+    survivors, so the exact test costs barely more than a conservative one.
+    """
+    tx, ty, tz = bx[F], by[F], bz[F]                        # (n, 3) per-triangle vertex coords
+    ok = ((tx.min(1) <= hx) & (tx.max(1) >= -hx)
+          & (ty.min(1) <= hy) & (ty.max(1) >= -hy)
+          & (tz.min(1) <= hz) & (tz.max(1) >= -hz))
+    idx = np.nonzero(ok)[0]
+    if idx.size == 0:
+        return ok
+    h = np.array([hx, hy, hz], np.float64)
+    v = np.stack((tx[idx], ty[idx], tz[idx]), axis=2)       # (m, 3 verts, 3 box axes)
+    e = (v[:, 1] - v[:, 0], v[:, 2] - v[:, 1], v[:, 0] - v[:, 2])
+    good = np.ones(idx.size, bool)
+    n = np.cross(e[0], e[1])                                # axis 13: the triangle's own plane
+    good &= np.abs(np.einsum("ij,ij->i", n, v[:, 0])) <= np.abs(n) @ h
+    for f in e:                                             # axes 4-12: box axis x triangle edge
+        for k in range(3):
+            i1, i2 = (k + 1) % 3, (k + 2) % 3
+            a = np.zeros_like(f)
+            a[:, i1] = -f[:, i2]                            # a = e_k x f, written out
+            a[:, i2] = f[:, i1]
+            pr = np.einsum("ijk,ik->ij", v, a)
+            r = np.abs(a) @ h
+            good &= (pr.min(1) <= r) & (pr.max(1) >= -r)
+    ok[idx] = good
+    return ok
+
+
 def project_decals(dataset, decals, log=print):
     """Bake every decal against the dataset's own geometry. Returns the surviving instances."""
     import json
@@ -190,22 +228,37 @@ def project_decals(dataset, decals, log=print):
             V, F = geo
             W = V.astype(np.float64) @ M3.T + T
             rel = W - C
-            # Per-vertex box coordinates; a triangle is a candidate when any vertex is inside the
-            # slab on every axis after a generous margin (clipping fixes the rest).
             bx = rel @ ux
             by = rel @ uy
             bz = rel @ uz
-            # GATE: this instance is a receiver only if some of it is genuinely inside the
-            # authored box (all three axes, tight). Everything painted afterwards belongs to a
-            # surface the projector really touches, which is what makes the generous depth bound
-            # below safe -- it extends along the SAME surface instead of finding a new one.
+            # Cheap conservative reject before any per-triangle work: if EVERY vertex of this
+            # instance lies beyond one of the box's slabs, no triangle of it can reach the box.
+            if (bx.min() > hx or bx.max() < -hx or by.min() > hy or by.max() < -hy
+                    or bz.min() > hz or bz.max() < -hz):
+                continue
+            # GATE: this instance is a receiver only if a TRIANGLE genuinely overlaps the authored
+            # box. The old test asked whether a VERTEX was inside it, which silently skipped every
+            # triangle that CONTAINS or straddles the projector with all three corners outside --
+            # the normal case for a small projector on a large plate. On Interchange that left 57
+            # of 1,737 projectors painting nothing at all and under-painted 948 more. The clip
+            # below was always able to handle those triangles; it was never handed them.
+            # A vertex inside the box implies its triangles overlap it, so this is a strict
+            # SUPERSET of the old gate: nothing that used to bake can stop baking.
+            touch = _tri_box_overlap(bx, by, bz, F, hx, hy, hz)
+            if not touch.any():
+                continue
+            cand_mask = touch
+            # The LOOSE slab stays tied to the ORIGINAL vertex condition, deliberately. Once a
+            # vertex is inside the authored box the clip may follow that same surface out to
+            # DEPTH_REACH (the slanted checkpoint plates). Extending that licence to every
+            # instance the new gate admits would let a large projector drag in everything within
+            # 2.5x its depth and blow the density guard. Old set UNION new set, nothing wider.
             touches = (np.abs(bx) <= hx) & (np.abs(by) <= hy) & (np.abs(bz) <= hz)
-            if not touches.any():
-                continue
-            inside = (np.abs(bx) <= hx * 1.2) & (np.abs(by) <= hy * DEPTH_REACH) & (np.abs(bz) <= hz * 1.2)
-            if not inside.any():
-                continue
-            cand = np.nonzero(inside[F].any(axis=1))[0]
+            if touches.any():
+                inside = ((np.abs(bx) <= hx * 1.2) & (np.abs(by) <= hy * DEPTH_REACH)
+                          & (np.abs(bz) <= hz * 1.2))
+                cand_mask = cand_mask | inside[F].any(axis=1)
+            cand = np.nonzero(cand_mask)[0]
             for fi in cand:
                 tri = [W[F[fi, k]] for k in range(3)]
                 e1 = tri[1] - tri[0]
